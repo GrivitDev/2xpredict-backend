@@ -19,16 +19,13 @@ import { EspnActiveCompetitionService } from './services/espn-active-competition
 import { EspnQueueService } from './services/espn-queue.service';
 import { EspnQueueBuilderService } from './services/espn-queue-builder.service';
 import { EspnQueueWorkerService } from './services/espn-queue-worker.service';
+import { SportsSyncStateService } from './services/sports-sync-state.service';
 
 import { SportsCollectionService } from './services/sports-collection.service';
 import { SportsDataReadService } from './services/sports-data-read.service';
+import { SportsSystemMonitorService } from './services/sports-system-monitor.service';
 
 import { SportsStartupService } from './services/sports-startup.service';
-
-import { TeamCompetitionStatsService } from './services/team-competition-stats.service';
-import { TeamPerformanceProfileService } from './services/team-performance-profile.service';
-import { HeadToHeadService } from './services/head-to-head.service';
-import { MatchDerivedDataService } from './services/match-derived-data.service';
 
 import { YoutubeHighlightService } from './services/youtube-highlight.service';
 
@@ -60,6 +57,11 @@ import {
 import { EspnTeam, EspnTeamSchema } from './schemas/espn/espn-team.schema';
 
 import { EspnQueue, EspnQueueSchema } from './schemas/espn-queue.schema';
+
+import {
+  SportsSyncState,
+  SportsSyncStateSchema,
+} from './schemas/sports-sync-state.schema';
 
 import {
   FootballDataCompetition,
@@ -97,27 +99,9 @@ import {
 } from './schemas/sports-provider-rate-limit.schema';
 
 import {
-  TeamCompetitionStats,
-  TeamCompetitionStatsSchema,
-} from './schemas/team-competition-stats.schema';
-
-import {
-  TeamPerformanceProfile,
-  TeamPerformanceProfileSchema,
-} from './schemas/team-performance-profile.schema';
-
-import { HeadToHead, HeadToHeadSchema } from './schemas/head-to-head.schema';
-
-import {
-  MatchDerivedData,
-  MatchDerivedDataSchema,
-} from './schemas/match-derived-data.schema';
-
-import {
   YouTubeHighlight,
   YouTubeHighlightSchema,
 } from './schemas/youtube-highlight.schema';
-import { SportsDerivedDataBootstrapService } from './services/sports-derived-data-bootstrap.service';
 
 @Module({
   imports: [
@@ -137,11 +121,19 @@ import { SportsDerivedDataBootstrapService } from './services/sports-derived-dat
         schema: EspnFixtureSchema,
       },
 
+      /*
+       * ESPN News remains registered as fallback/manual provider data.
+       * It is no longer part of the normal collection queue.
+       */
       {
         name: EspnNews.name,
         schema: EspnNewsSchema,
       },
 
+      /*
+       * ESPN Standings remains registered as fallback/manual provider data.
+       * Normal startup/live processing uses ESPN Summary instead.
+       */
       {
         name: EspnStanding.name,
         schema: EspnStandingSchema,
@@ -152,9 +144,19 @@ import { SportsDerivedDataBootstrapService } from './services/sports-derived-dat
         schema: EspnTeamSchema,
       },
 
+      /*
+       * Queue now contains only:
+       * - FIXTURE_REFRESH
+       * - SUMMARY_REFRESH
+       */
       {
         name: EspnQueue.name,
         schema: EspnQueueSchema,
+      },
+
+      {
+        name: SportsSyncState.name,
+        schema: SportsSyncStateSchema,
       },
 
       {
@@ -193,26 +195,6 @@ import { SportsDerivedDataBootstrapService } from './services/sports-derived-dat
       },
 
       {
-        name: TeamCompetitionStats.name,
-        schema: TeamCompetitionStatsSchema,
-      },
-
-      {
-        name: TeamPerformanceProfile.name,
-        schema: TeamPerformanceProfileSchema,
-      },
-
-      {
-        name: HeadToHead.name,
-        schema: HeadToHeadSchema,
-      },
-
-      {
-        name: MatchDerivedData.name,
-        schema: MatchDerivedDataSchema,
-      },
-
-      {
         name: YouTubeHighlight.name,
         schema: YouTubeHighlightSchema,
       },
@@ -244,23 +226,18 @@ import { SportsDerivedDataBootstrapService } from './services/sports-derived-dat
     EspnQueueService,
     EspnQueueBuilderService,
     EspnQueueWorkerService,
+    SportsSyncStateService,
 
     // Collection / read
     SportsCollectionService,
     SportsDataReadService,
-
-    // Derived data
-    TeamCompetitionStatsService,
-    TeamPerformanceProfileService,
-    HeadToHeadService,
-    MatchDerivedDataService,
+    SportsSystemMonitorService,
 
     // YouTube lifecycle
     YoutubeHighlightService,
 
     // Startup
     SportsStartupService,
-    SportsDerivedDataBootstrapService,
 
     // Remaining scheduled providers
     FootballDataScheduler,
@@ -270,12 +247,10 @@ import { SportsDerivedDataBootstrapService } from './services/sports-derived-dat
   exports: [
     SportsService,
     SportsDataReadService,
+    SportsSystemMonitorService,
     ActiveCompetitionService,
     EspnService,
-    TeamCompetitionStatsService,
-    TeamPerformanceProfileService,
-    HeadToHeadService,
-    MatchDerivedDataService,
+    SportsSyncStateService,
   ],
 })
 export class SportsModule {}

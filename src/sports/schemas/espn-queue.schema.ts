@@ -1,5 +1,3 @@
-// src/sports/schemas/espn-queue.schema.ts
-
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
 
@@ -18,7 +16,6 @@ export class EspnQueue {
   @Prop({
     required: true,
     unique: true,
-    index: true,
     trim: true,
   })
   jobKey!: string;
@@ -35,6 +32,7 @@ export class EspnQueue {
     required: true,
     trim: true,
     index: true,
+    lowercase: true,
   })
   leagueId!: string;
 
@@ -44,12 +42,32 @@ export class EspnQueue {
   })
   season?: number;
 
+  /**
+   * ESPN event ID.
+   *
+   * Required for SUMMARY_REFRESH.
+   */
   @Prop({
     trim: true,
     index: true,
   })
   eventId?: string;
 
+  /**
+   * Event that caused a fixture refresh.
+   *
+   * Normally populated when a completed match triggers
+   * an immediate refresh of its league's scoreboard.
+   */
+  @Prop({
+    trim: true,
+    index: true,
+  })
+  triggerEventId?: string;
+
+  /**
+   * Internal competition identifier.
+   */
   @Prop({
     trim: true,
     index: true,
@@ -148,11 +166,35 @@ EspnQueueSchema.index({
 });
 
 // ============================================================
+// EVENT / JOB TYPE INDEX
+// ============================================================
+
+/**
+ * Used to quickly determine whether a Summary job already
+ * exists for a fixture and to prevent duplicate Summary work.
+ */
+EspnQueueSchema.index({
+  type: 1,
+  eventId: 1,
+  status: 1,
+  scheduledFor: 1,
+});
+
+// ============================================================
 // LEAGUE / SEASON INDEX
 // ============================================================
 
 EspnQueueSchema.index({
   leagueId: 1,
   season: 1,
+  type: 1,
+});
+
+// ============================================================
+// TRIGGER EVENT INDEX
+// ============================================================
+
+EspnQueueSchema.index({
+  triggerEventId: 1,
   type: 1,
 });

@@ -77,12 +77,12 @@ export class EspnActiveCompetitionService {
   // ============================================================
 
   /**
-   * Existing full synchronization method.
+   * Full league-detail synchronization.
    *
-   * This remains available for explicit full synchronization.
-   *
-   * Startup does NOT use this method because it would call
-   * ESPN's league-detail endpoint for every stored league.
+   * This is an explicit/full synchronization path.
+   * Startup uses synchronizeMissingLeagueDetails() instead so that
+   * already-synchronized leagues do not consume unnecessary ESPN
+   * league-detail requests.
    */
   async synchronizeLeagueDetails(): Promise<{
     processed: number;
@@ -168,11 +168,9 @@ export class EspnActiveCompetitionService {
   /**
    * Startup synchronization.
    *
-   * Only leagues that do not yet have a successful detail
-   * synchronization are sent to ESPN.
-   *
-   * Existing ActiveCompetition documents are deliberately left
-   * untouched when a league already has detail data.
+   * Only leagues without a successful detail synchronization are sent
+   * to ESPN. Existing ActiveCompetition documents are left untouched
+   * for leagues that already have synchronized detail data.
    */
   async synchronizeMissingLeagueDetails(): Promise<{
     processed: number;
@@ -225,6 +223,13 @@ export class EspnActiveCompetitionService {
         );
       }
     }
+
+    /*
+     * ActiveCompetition remains the operational source of truth for
+     * currently active competitions. Refresh its status after startup
+     * detail synchronization so expired competitions are removed.
+     */
+    await this.activeCompetitionService.refreshStatuses();
 
     this.logger.log(
       `ESPN missing league details synchronized: ` +
@@ -535,7 +540,7 @@ export class EspnActiveCompetitionService {
             isPriority: Boolean(priorityConfig),
 
             /*
-             * Catalogue synchronization must NOT overwrite the
+             * Catalogue synchronization must not overwrite the
              * authoritative league-detail payload.
              */
             lastSyncedAt: now,

@@ -1,3 +1,5 @@
+// backend/src/sports/services/sports-data-read.service.ts
+
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -48,6 +50,19 @@ import {
 } from '../interfaces/espn-queue.interface';
 
 // ============================================================
+// SYNC STATE
+// ============================================================
+
+import {
+  SportsSyncState,
+  SportsSyncStateDocument,
+  SportsSyncStateKind,
+  SportsSyncStateStatus,
+  SportsSyncUnitStatus,
+  SportsSyncUnitType,
+} from '../schemas/sports-sync-state.schema';
+
+// ============================================================
 // FOOTBALL-DATA
 // ============================================================
 
@@ -95,22 +110,6 @@ import {
 } from '../schemas/sports-provider-rate-limit.schema';
 
 // ============================================================
-// DERIVED DATA
-// ============================================================
-
-import {
-  TeamCompetitionStats,
-  TeamCompetitionStatsDocument,
-} from '../schemas/team-competition-stats.schema';
-
-import {
-  TeamPerformanceProfile,
-  TeamPerformanceProfileDocument,
-} from '../schemas/team-performance-profile.schema';
-
-import { HeadToHead, HeadToHeadDocument } from '../schemas/head-to-head.schema';
-
-// ============================================================
 // YOUTUBE
 // ============================================================
 
@@ -131,12 +130,14 @@ export interface SportsAdminQuery {
 
   status?: string;
   type?: string;
+  kind?: string;
   leagueId?: string;
   season?: number;
   eventId?: string;
   competitionId?: string;
   teamId?: string;
   provider?: string;
+  stateKey?: string;
 
   from?: Date;
   to?: Date;
@@ -191,6 +192,13 @@ export class SportsDataReadService {
     private readonly espnQueueModel: Model<EspnQueueDocument>,
 
     // ----------------------------------------------------------
+    // SYNC STATE
+    // ----------------------------------------------------------
+
+    @InjectModel(SportsSyncState.name)
+    private readonly sportsSyncStateModel: Model<SportsSyncStateDocument>,
+
+    // ----------------------------------------------------------
     // FOOTBALL-DATA
     // ----------------------------------------------------------
 
@@ -224,19 +232,6 @@ export class SportsDataReadService {
     private readonly sportsProviderRateLimitModel: Model<SportsProviderRateLimitDocument>,
 
     // ----------------------------------------------------------
-    // DERIVED DATA
-    // ----------------------------------------------------------
-
-    @InjectModel(TeamCompetitionStats.name)
-    private readonly teamCompetitionStatsModel: Model<TeamCompetitionStatsDocument>,
-
-    @InjectModel(TeamPerformanceProfile.name)
-    private readonly teamPerformanceProfileModel: Model<TeamPerformanceProfileDocument>,
-
-    @InjectModel(HeadToHead.name)
-    private readonly headToHeadModel: Model<HeadToHeadDocument>,
-
-    // ----------------------------------------------------------
     // YOUTUBE
     // ----------------------------------------------------------
 
@@ -260,8 +255,17 @@ export class SportsDataReadService {
     return this.getFinishedFixtures(undefined, undefined, competitionId);
   }
 
-  async getStandings(competitionId: string): Promise<unknown[]> {
-    return this.getLeagueTable(competitionId);
+  /**
+   * Emergency/fallback standings read.
+   *
+   * Normal application presentation should use ESPN Summary data
+   * stored inside the canonical fixture payload.
+   */
+  async getStandings(
+    competitionId: string,
+    season?: number,
+  ): Promise<unknown[]> {
+    return this.getLeagueTable(competitionId, season);
   }
 
   async getTeams(competitionId: string): Promise<unknown[]> {
@@ -410,6 +414,7 @@ export class SportsDataReadService {
       .lean()
       .exec();
   }
+
   async getFinishedFixtures(
     from?: Date,
     to?: Date,
@@ -445,7 +450,69 @@ export class SportsDataReadService {
   }
 
   // ============================================================
-  // LEAGUE TABLE
+  // ESPN SUMMARY
+  // ============================================================
+
+  /**
+   * Returns the canonical ESPN Summary stored inside the
+   * corresponding fixture document.
+   */
+  async getFixtureSummary(eventId: string): Promise<unknown> {
+    const normalizedEventId = eventId.trim();
+
+    if (!normalizedEventId) {
+      return null;
+    }
+
+    const fixture = await this.espnFixtureModel
+      .findOne({
+        eventId: normalizedEventId,
+      })
+      .select({
+        eventId: 1,
+        leagueId: 1,
+        season: 1,
+        fixtureDate: 1,
+        completed: 1,
+        payload: 1,
+      })
+      .lean()
+      .exec();
+
+    if (!fixture) {
+      return null;
+    }
+
+    const payload =
+      fixture.payload && typeof fixture.payload === 'object'
+        ? fixture.payload
+        : undefined;
+
+    const summary = payload?.summary;
+
+    if (!summary || typeof summary !== 'object') {
+      return null;
+    }
+
+    return {
+      eventId: fixture.eventId,
+
+      leagueId: fixture.leagueId,
+
+      season: fixture.season,
+
+      fixtureDate: fixture.fixtureDate,
+
+      completed: fixture.completed,
+
+      summary,
+
+      summaryCollectedAt: payload?.summaryCollectedAt ?? null,
+    };
+  }
+
+  // ============================================================
+  // LEAGUE TABLE — FALLBACK
   // ============================================================
 
   async getLeagueTable(
@@ -469,71 +536,6 @@ export class SportsDataReadService {
       .exec();
   }
 
-  // ============================================================
-  // TEAM STATS
-  // ============================================================
-
-  async getTeamCompetitionStats(
-    competitionId: string,
-    season: number,
-  ): Promise<TeamCompetitionStatsDocument[]> {
-    const filter: Record<string, unknown> = {
-      competitionId: String(competitionId).trim().toLowerCase(),
-      season,
-    };
-
-    return this.teamCompetitionStatsModel
-      .find(filter)
-      .sort({
-        position: 1,
-        teamName: 1,
-      })
-      .lean()
-      .exec();
-  }
-
-  async getTeamStats(
-    competitionId: string,
-    season: number,
-    teamId: string | number,
-  ): Promise<TeamCompetitionStatsDocument | null> {
-    const normalizedTeamId = String(teamId).trim();
-
-    const filter: Record<string, unknown> = {
-      competitionId: String(competitionId).trim().toLowerCase(),
-      season,
-      teamId: normalizedTeamId,
-    };
-
-    return this.teamCompetitionStatsModel.findOne(filter).lean().exec();
-  }
-  // ============================================================
-  // HEAD TO HEAD
-  // ============================================================
-  async getHeadToHead(
-    teamOneId: string | number,
-    teamTwoId: string | number,
-  ): Promise<HeadToHeadDocument | null> {
-    const first = String(teamOneId).trim();
-    const second = String(teamTwoId).trim();
-
-    if (!first || !second || first === second) {
-      return null;
-    }
-
-    const [teamAId, teamBId] = [first, second].sort((a, b) =>
-      a.localeCompare(b, undefined, {
-        numeric: true,
-      }),
-    );
-
-    return this.headToHeadModel
-      .findOne({
-        pairKey: `${teamAId}:${teamBId}`,
-      })
-      .lean()
-      .exec();
-  }
   // ============================================================
   // ODDS
   // ============================================================
@@ -605,9 +607,13 @@ export class SportsDataReadService {
 
     return {
       data,
+
       page,
+
       limit,
+
       total,
+
       totalPages: Math.ceil(total / limit),
     };
   }
@@ -686,6 +692,377 @@ export class SportsDataReadService {
   }
 
   // ============================================================
+  // ADMIN: SPORTS SYNC STATES
+  // ============================================================
+
+  async getAdminSportsSyncStates(query: SportsAdminQuery = {}) {
+    const filter: Record<string, unknown> = {};
+
+    if (query.kind) {
+      filter.kind = query.kind;
+    }
+
+    if (query.status) {
+      filter.status = query.status;
+    }
+
+    if (query.type) {
+      filter.jobType = query.type;
+    }
+
+    if (query.stateKey) {
+      filter.stateKey = query.stateKey.trim();
+    }
+
+    if (query.leagueId) {
+      filter.leagueId = query.leagueId.trim().toLowerCase();
+    }
+
+    if (typeof query.season === 'number') {
+      filter.season = query.season;
+    }
+
+    if (query.eventId) {
+      filter.eventId = query.eventId.trim();
+    }
+
+    const result = await this.paginateModel(
+      this.sportsSyncStateModel,
+      {
+        ...query,
+        sortBy: query.sortBy ?? 'updatedAt',
+      },
+      filter,
+    );
+
+    return {
+      ...result,
+
+      data: result.data.map((state) => this.summarizeSyncState(state)),
+    };
+  }
+
+  async getAdminSportsSyncStateSummary(): Promise<unknown> {
+    const [
+      queueStates,
+      cronStates,
+      processingStates,
+      pendingStates,
+      partialStates,
+      failedStates,
+      successfulStates,
+    ] = await Promise.all([
+      this.sportsSyncStateModel.countDocuments({
+        kind: SportsSyncStateKind.QUEUE,
+      }),
+
+      this.sportsSyncStateModel.countDocuments({
+        kind: SportsSyncStateKind.CRON,
+      }),
+
+      this.sportsSyncStateModel.countDocuments({
+        status: SportsSyncStateStatus.PROCESSING,
+      }),
+
+      this.sportsSyncStateModel.countDocuments({
+        status: SportsSyncStateStatus.PENDING,
+      }),
+
+      this.sportsSyncStateModel.countDocuments({
+        status: SportsSyncStateStatus.PARTIAL,
+      }),
+
+      this.sportsSyncStateModel.countDocuments({
+        status: SportsSyncStateStatus.FAILED,
+      }),
+
+      this.sportsSyncStateModel.countDocuments({
+        status: SportsSyncStateStatus.SUCCESS,
+      }),
+    ]);
+
+    const current = await this.sportsSyncStateModel
+      .findOne({
+        status: SportsSyncStateStatus.PROCESSING,
+      })
+      .sort({
+        updatedAt: -1,
+      })
+      .lean()
+      .exec();
+
+    return {
+      total: queueStates + cronStates,
+
+      kind: {
+        queue: queueStates,
+        cron: cronStates,
+      },
+
+      status: {
+        pending: pendingStates,
+        processing: processingStates,
+        partial: partialStates,
+        failed: failedStates,
+        success: successfulStates,
+      },
+
+      current: current
+        ? {
+            ...this.summarizeSyncState(current),
+
+            currentUnit: this.getCurrentSyncUnit(current),
+          }
+        : null,
+    };
+  }
+
+  async getAdminSportsSyncState(stateKey: string) {
+    const normalizedStateKey = stateKey.trim();
+
+    if (!normalizedStateKey) {
+      return null;
+    }
+
+    const state = await this.sportsSyncStateModel
+      .findOne({
+        stateKey: normalizedStateKey,
+      })
+      .lean()
+      .exec();
+
+    if (!state) {
+      return null;
+    }
+
+    const units = state.units ?? [];
+
+    const dates = units.filter((unit) => unit.type === SportsSyncUnitType.DATE);
+
+    const steps = units.filter((unit) => unit.type === SportsSyncUnitType.STEP);
+
+    return {
+      ...state,
+
+      progress: {
+        total: units.length,
+
+        completed: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
+        ).length,
+
+        processing: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.PROCESSING,
+        ).length,
+
+        pending: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.PENDING,
+        ).length,
+
+        failed: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.FAILED,
+        ).length,
+
+        dates: {
+          total: dates.length,
+
+          completed: dates.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
+          ).length,
+
+          processing: dates.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.PROCESSING,
+          ).length,
+
+          pending: dates.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.PENDING,
+          ).length,
+
+          failed: dates.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.FAILED,
+          ).length,
+        },
+
+        steps: {
+          total: steps.length,
+
+          completed: steps.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
+          ).length,
+
+          processing: steps.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.PROCESSING,
+          ).length,
+
+          pending: steps.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.PENDING,
+          ).length,
+
+          failed: steps.filter(
+            (unit) => unit.status === SportsSyncUnitStatus.FAILED,
+          ).length,
+        },
+
+        percent:
+          units.length > 0
+            ? Math.round(
+                (units.filter(
+                  (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
+                ).length /
+                  units.length) *
+                  100,
+              )
+            : 0,
+      },
+
+      currentUnit: this.getCurrentSyncUnit(state),
+
+      incompleteUnits: units
+        .filter(
+          (unit) =>
+            unit.status === SportsSyncUnitStatus.PENDING ||
+            unit.status === SportsSyncUnitStatus.PROCESSING ||
+            unit.status === SportsSyncUnitStatus.FAILED,
+        )
+        .map((unit) => ({
+          key: unit.key,
+          type: unit.type,
+          dateKey: unit.dateKey,
+          stepKey: unit.stepKey,
+          status: unit.status,
+          attempts: unit.attempts,
+          startedAt: unit.startedAt,
+          completedAt: unit.completedAt,
+          nextAttemptAt: unit.nextAttemptAt,
+          lastError: unit.lastError,
+        })),
+    };
+  }
+
+  private summarizeSyncState(state: SportsSyncStateDocument) {
+    const units = state.units ?? [];
+
+    const completed = units.filter(
+      (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
+    ).length;
+
+    return {
+      stateKey: state.stateKey,
+
+      kind: state.kind,
+
+      jobType: state.jobType,
+
+      taskKey: state.taskKey,
+
+      leagueId: state.leagueId,
+
+      season: state.season,
+
+      eventId: state.eventId,
+
+      priority: state.priority,
+
+      status: state.status,
+
+      trackingMode: state.trackingMode,
+
+      dateFrom: state.dateFrom,
+
+      dateTo: state.dateTo,
+
+      cronExpression: state.cronExpression,
+
+      timeZone: state.timeZone,
+
+      lastStartedAt: state.lastStartedAt,
+
+      lastSuccessfulAt: state.lastSuccessfulAt,
+
+      nextRunAt: state.nextRunAt,
+
+      lastCompletedAt: state.lastCompletedAt,
+
+      lastQueueJobKey: state.lastQueueJobKey,
+
+      consecutiveFailures: state.consecutiveFailures,
+
+      lastError: state.lastError,
+
+      units,
+
+      updatedAt: state.updatedAt,
+
+      createdAt: state.createdAt,
+
+      progress: {
+        total: units.length,
+
+        completed,
+
+        processing: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.PROCESSING,
+        ).length,
+
+        pending: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.PENDING,
+        ).length,
+
+        failed: units.filter(
+          (unit) => unit.status === SportsSyncUnitStatus.FAILED,
+        ).length,
+
+        percent:
+          units.length > 0 ? Math.round((completed / units.length) * 100) : 0,
+      },
+
+      currentUnit: this.getCurrentSyncUnit(state),
+    };
+  }
+
+  private getCurrentSyncUnit(state: Pick<SportsSyncState, 'units'> | null) {
+    if (!state?.units?.length) {
+      return null;
+    }
+
+    const unit =
+      state.units.find(
+        (candidate) => candidate.status === SportsSyncUnitStatus.PROCESSING,
+      ) ??
+      state.units.find(
+        (candidate) =>
+          candidate.status === SportsSyncUnitStatus.FAILED ||
+          candidate.status === SportsSyncUnitStatus.PENDING,
+      );
+
+    if (!unit) {
+      return null;
+    }
+
+    return {
+      key: unit.key,
+
+      type: unit.type,
+
+      dateKey: unit.dateKey,
+
+      stepKey: unit.stepKey,
+
+      status: unit.status,
+
+      attempts: unit.attempts,
+
+      startedAt: unit.startedAt,
+
+      completedAt: unit.completedAt,
+
+      nextAttemptAt: unit.nextAttemptAt,
+
+      lastError: unit.lastError,
+    };
+  }
+
+  // ============================================================
   // ADMIN: ESPN QUEUE
   // ============================================================
 
@@ -734,9 +1111,8 @@ export class SportsDataReadService {
       processing,
       completed,
       failed,
-      leagueRefresh,
-      upcomingMatch,
-      finishedMatch,
+      fixtureRefresh,
+      summaryRefresh,
       total,
     ] = await Promise.all([
       this.espnQueueModel.countDocuments({
@@ -756,15 +1132,11 @@ export class SportsDataReadService {
       }),
 
       this.espnQueueModel.countDocuments({
-        type: EspnQueueJobType.LEAGUE_REFRESH,
+        type: EspnQueueJobType.FIXTURE_REFRESH,
       }),
 
       this.espnQueueModel.countDocuments({
-        type: EspnQueueJobType.UPCOMING_MATCH,
-      }),
-
-      this.espnQueueModel.countDocuments({
-        type: EspnQueueJobType.FINISHED_MATCH,
+        type: EspnQueueJobType.SUMMARY_REFRESH,
       }),
 
       this.espnQueueModel.countDocuments(),
@@ -781,9 +1153,8 @@ export class SportsDataReadService {
       },
 
       type: {
-        leagueRefresh,
-        upcomingMatch,
-        finishedMatch,
+        fixtureRefresh,
+        summaryRefresh,
       },
     };
   }
@@ -886,6 +1257,7 @@ export class SportsDataReadService {
       filter,
     );
   }
+
   // ============================================================
   // ADMIN: ESPN NEWS
   // ============================================================
@@ -906,7 +1278,7 @@ export class SportsDataReadService {
   }
 
   // ============================================================
-  // ADMIN: ESPN STANDINGS
+  // ADMIN: ESPN STANDINGS FALLBACK
   // ============================================================
 
   async getAdminEspnStandings(query: SportsAdminQuery = {}) {
@@ -1123,91 +1495,6 @@ export class SportsDataReadService {
   }
 
   // ============================================================
-  // ADMIN: TEAM COMPETITION STATS
-  // ============================================================
-
-  async getAdminTeamCompetitionStats(query: SportsAdminQuery = {}) {
-    const filter: Record<string, unknown> = {};
-
-    if (query.competitionId) {
-      filter.competitionId = query.competitionId.trim().toLowerCase();
-    }
-
-    if (typeof query.season === 'number') {
-      filter.season = query.season;
-    }
-
-    if (query.teamId) {
-      filter.teamId = query.teamId.trim();
-    }
-
-    return this.paginateModel(
-      this.teamCompetitionStatsModel,
-      {
-        ...query,
-        sortBy: query.sortBy ?? 'position',
-        sortOrder: query.sortOrder ?? 'asc',
-      },
-      filter,
-    );
-  }
-
-  // ============================================================
-  // ADMIN: TEAM PERFORMANCE PROFILES
-  // ============================================================
-
-  async getAdminTeamPerformanceProfiles(query: SportsAdminQuery = {}) {
-    const filter: Record<string, unknown> = {};
-
-    if (query.teamId) {
-      filter.teamId = query.teamId.trim();
-    }
-
-    if (query.competitionId) {
-      filter.competitionId = query.competitionId.trim().toLowerCase();
-    }
-
-    return this.paginateModel(
-      this.teamPerformanceProfileModel,
-      {
-        ...query,
-        sortBy: query.sortBy ?? 'updatedAt',
-      },
-      filter,
-    );
-  }
-
-  // ============================================================
-  // ADMIN: HEAD TO HEAD
-  // ============================================================
-
-  async getAdminHeadToHead(query: SportsAdminQuery = {}) {
-    const filter: Record<string, unknown> = {};
-
-    if (query.teamId) {
-      const teamId = query.teamId.trim();
-
-      filter.$or = [
-        {
-          teamAId: teamId,
-        },
-        {
-          teamBId: teamId,
-        },
-      ];
-    }
-
-    return this.paginateModel(
-      this.headToHeadModel,
-      {
-        ...query,
-        sortBy: query.sortBy ?? 'calculatedAt',
-      },
-      filter,
-    );
-  }
-
-  // ============================================================
   // ADMIN: YOUTUBE HIGHLIGHTS
   // ============================================================
 
@@ -1236,5 +1523,47 @@ export class SportsDataReadService {
       },
       filter,
     );
+  }
+
+  // ============================================================
+  // FIXTURE HELPERS
+  // ============================================================
+
+  async getFixtureByEventId(
+    eventId: string,
+  ): Promise<EspnFixtureDocument | null> {
+    const normalizedEventId = eventId.trim();
+
+    if (!normalizedEventId) {
+      return null;
+    }
+
+    return this.espnFixtureModel
+      .findOne({
+        eventId: normalizedEventId,
+      })
+      .lean()
+      .exec();
+  }
+
+  async getFixturesByEventIds(
+    eventIds: string[],
+  ): Promise<EspnFixtureDocument[]> {
+    const normalizedEventIds = [
+      ...new Set(eventIds.map((id) => id.trim()).filter(Boolean)),
+    ];
+
+    if (!normalizedEventIds.length) {
+      return [];
+    }
+
+    return this.espnFixtureModel
+      .find({
+        eventId: {
+          $in: normalizedEventIds,
+        },
+      })
+      .lean()
+      .exec();
   }
 }

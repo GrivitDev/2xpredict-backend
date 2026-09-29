@@ -18,6 +18,7 @@ import { YoutubeHighlightStatus } from '../interfaces/youtube-highlight.interfac
 
 import { SportsProviderRateLimitService } from './sports-provider-rate-limit.service';
 import { PriorityCompetitionService } from './priority-competition.service';
+import { CompetitionPriority } from '../enums/competition-priority.enum';
 
 interface MatchInfo {
   fixtureId: string;
@@ -79,19 +80,6 @@ export class YoutubeHighlightService {
       throw new Error('YouTube fixture ID is required');
     }
 
-    const existing = await this.highlightModel
-      .findOne({
-        fixtureId: normalizedFixtureId,
-      })
-      .exec();
-
-    /*
-     * A FOUND highlight does not need to be searched again.
-     */
-    if (existing && existing.status === YoutubeHighlightStatus.FOUND) {
-      return;
-    }
-
     /*
      * Match information comes from the fixture already stored
      * by the ESPN scoreboard refresh.
@@ -105,11 +93,13 @@ export class YoutubeHighlightService {
     }
 
     /*
-     * YouTube is only allowed to search fixtures belonging
-     * to the configured priority competitions.
+     * YouTube is restricted to the configured priority
+     * competitions.
      *
-     * This filter applies only to YouTube.
-     * It does not affect the ESPN queue or any other provider.
+     * SELECTIVE is a HARD BLOCK.
+     *
+     * It must NEVER reach the YouTube provider endpoint,
+     * consume quota, or perform a YouTube search.
      */
     const priorityCompetition = this.priorityCompetitionService.getById(
       match.leagueId,
@@ -120,6 +110,31 @@ export class YoutubeHighlightService {
         `Skipping YouTube highlight for non-priority competition ${match.leagueId}`,
       );
 
+      return;
+    }
+
+    if (priorityCompetition.priority === CompetitionPriority.SELECTIVE) {
+      this.logger.debug(
+        `Skipping YouTube highlight for SELECTIVE competition ${match.leagueId}`,
+      );
+
+      return;
+    }
+
+    /*
+     * A FOUND highlight does not need to be searched again.
+     *
+     * This check deliberately happens only after the priority
+     * restriction above. SELECTIVE competitions are therefore
+     * always excluded from the YouTube workflow.
+     */
+    const existing = await this.highlightModel
+      .findOne({
+        fixtureId: normalizedFixtureId,
+      })
+      .exec();
+
+    if (existing && existing.status === YoutubeHighlightStatus.FOUND) {
       return;
     }
 
@@ -210,7 +225,6 @@ export class YoutubeHighlightService {
       `YouTube highlight collected for ESPN fixture ${normalizedFixtureId}`,
     );
   }
-
   // ============================================================
   // REMAINING DAILY QUOTA
   // ============================================================

@@ -20,6 +20,119 @@ const FOOTBALL_DATA_CODES: Record<string, string> = Object.fromEntries(
 );
 
 // ============================================================
+// THE ODDS API MAPPINGS
+// ============================================================
+
+/**
+ * The Odds API uses its own sport-key namespace.
+ *
+ * These values are intentionally NOT derived from ESPN league IDs.
+ *
+ * Only competitions with a currently documented Odds API sport key
+ * are mapped here.
+ *
+ * Source:
+ * The Odds API current sports catalogue.
+ */
+const ODDS_API_SPORT_KEYS: Record<string, string> = {
+  // ----------------------------------------------------------
+  // DOMESTIC LEAGUES
+  // ----------------------------------------------------------
+
+  'eng.1': 'soccer_epl',
+
+  'eng.2': 'soccer_efl_champ',
+
+  'esp.1': 'soccer_spain_la_liga',
+
+  'ita.1': 'soccer_italy_serie_a',
+
+  'ger.1': 'soccer_germany_bundesliga',
+
+  'fra.1': 'soccer_france_ligue_one',
+
+  'ned.1': 'soccer_netherlands_eredivisie',
+
+  'por.1': 'soccer_portugal_primeira_liga',
+
+  'sco.1': 'soccer_spl',
+
+  'bel.1': 'soccer_belgium_first_div',
+
+  'tur.1': 'soccer_turkey_super_league',
+
+  'bra.1': 'soccer_brazil_campeonato',
+
+  'arg.1': 'soccer_argentina_primera_division',
+
+  'mex.1': 'soccer_mexico_ligamx',
+
+  'usa.1': 'soccer_usa_mls',
+
+  'ksa.1': 'soccer_saudi_arabia_pro_league',
+
+  // ----------------------------------------------------------
+  // UEFA CLUB COMPETITIONS
+  // ----------------------------------------------------------
+
+  'uefa.champions': 'soccer_uefa_champs_league',
+
+  'uefa.europa': 'soccer_uefa_europa_league',
+
+  'uefa.europa.conf': 'soccer_uefa_europa_conference_league',
+
+  // ----------------------------------------------------------
+  // SOUTH AMERICAN CLUB COMPETITIONS
+  // ----------------------------------------------------------
+
+  'conmebol.libertadores': 'soccer_conmebol_copa_libertadores',
+
+  'conmebol.sudamericana': 'soccer_conmebol_copa_sudamericana',
+
+  // ----------------------------------------------------------
+  // INTERNATIONAL COMPETITIONS
+  // ----------------------------------------------------------
+
+  'fifa.world': 'soccer_fifa_world_cup',
+
+  'caf.nations': 'soccer_africa_cup_of_nations',
+
+  'uefa.euro': 'soccer_uefa_european_championship',
+
+  'uefa.euroq': 'soccer_uefa_euro_qualification',
+
+  'uefa.nations': 'soccer_uefa_nations_league',
+
+  'conmebol.america': 'soccer_conmebol_copa_america',
+
+  'concacaf.gold': 'soccer_concacaf_gold_cup',
+};
+
+/**
+ * Some priority competitions in our catalogue currently do not
+ * have a corresponding Odds API sport key in the provider's
+ * published sports catalogue.
+ *
+ * Those competitions intentionally remain:
+ *
+ *   oddsEnabled = false
+ *
+ * rather than making an invalid Odds API request.
+ *
+ * Examples currently without a direct mapping here include:
+ *
+ * - Nigeria Premier Football League
+ * - South African Premiership
+ * - CAF Champions League
+ * - CAF Confederation Cup
+ * - CONCACAF Champions Cup
+ * - FIFA World Cup Qualifiers (generic ESPN competition)
+ * - AFCON Qualifiers
+ * - CONCACAF Nations League
+ * - AFC Asian Cup
+ */
+
+// ============================================================
 // PRIORITY COMPETITION DISPLAY NAMES
 // ============================================================
 
@@ -95,6 +208,18 @@ function getFootballDataMapping(espnLeagueSlug: string): {
     : {};
 }
 
+function getOddsApiMapping(espnLeagueSlug: string): {
+  oddsApiSportKey?: string;
+} {
+  const sportKey = ODDS_API_SPORT_KEYS[espnLeagueSlug];
+
+  return sportKey
+    ? {
+        oddsApiSportKey: sportKey,
+      }
+    : {};
+}
+
 function buildCompetition(
   espnLeagueSlug: string,
   type: CompetitionType,
@@ -106,8 +231,21 @@ function buildCompetition(
     seasonal?: boolean;
     gender?: 'MEN' | 'WOMEN';
     notes?: string;
+    oddsApiSportKey?: string;
   },
 ): SupportedCompetitionConfig {
+  const oddsApiMapping = getOddsApiMapping(espnLeagueSlug);
+
+  const oddsApiSportKey =
+    options?.oddsApiSportKey ?? oddsApiMapping.oddsApiSportKey;
+
+  /*
+   * Odds are only enabled when there is an actual Odds API
+   * sport key available, unless the caller explicitly overrides
+   * oddsEnabled.
+   */
+  const oddsEnabled = options?.oddsEnabled ?? Boolean(oddsApiSportKey);
+
   return {
     id: createId(espnLeagueSlug),
 
@@ -123,12 +261,18 @@ function buildCompetition(
 
     predictionEnabled: options?.predictionEnabled ?? true,
 
-    oddsEnabled: options?.oddsEnabled ?? true,
+    oddsEnabled,
 
     collectionFrequency: CollectionFrequency.DAILY,
 
     providers: {
       ...getFootballDataMapping(espnLeagueSlug),
+
+      ...(oddsApiSportKey
+        ? {
+            oddsApiSportKey,
+          }
+        : {}),
 
       /**
        * ESPN is now the canonical competition provider.

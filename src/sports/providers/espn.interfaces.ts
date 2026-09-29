@@ -4,8 +4,11 @@
 
 export interface EspnApiResponse<T = unknown> {
   count?: number;
+
   pageIndex?: number;
+
   pageSize?: number;
+
   pageCount?: number;
 
   items?: EspnReferenceItem[];
@@ -17,6 +20,74 @@ export interface EspnApiResponse<T = unknown> {
   season?: EspnSeason;
 
   day?: EspnDay;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN FIXTURE PAYLOAD
+// ============================================================
+
+/**
+ * Complete ESPN match/fixture object persisted inside
+ * sports_espn_fixtures.payload.
+ */
+export interface EspnFixturePayload extends EspnEvent {
+  status?: EspnCompetitionStatus;
+
+  venue?: EspnVenue;
+
+  summary?: EspnMatchSummary;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH SUMMARY
+// ============================================================
+
+/**
+ * Full detailed ESPN match Summary response persisted inside
+ * sports_espn_fixtures.payload.summary.
+ */
+export interface EspnMatchSummary {
+  boxscore?: EspnBoxscore;
+
+  format?: EspnMatchFormat;
+
+  gameInfo?: EspnGameInfo;
+
+  lastFiveGames?: EspnLastFiveGameTeam[];
+
+  leaders?: EspnMatchLeaderTeam[];
+
+  broadcasts?: EspnBroadcast[];
+
+  pickcenter?: EspnPickCenter[];
+
+  odds?: EspnOdds[];
+
+  hasOdds?: boolean;
+
+  rosters?: EspnMatchRosterTeam[];
+
+  news?: EspnMatchNews;
+
+  seasonseries?: EspnSeasonSeries[];
+
+  videos?: EspnVideo[];
+
+  header?: EspnMatchHeader;
+
+  keyEvents?: EspnKeyEvent[];
+
+  commentary?: EspnCommentaryItem[];
+
+  wallclockAvailable?: boolean;
+
+  meta?: EspnMatchMeta;
+
+  standings?: EspnSummaryStandings;
 
   [key: string]: unknown;
 }
@@ -52,8 +123,11 @@ export interface EspnLeague {
 
   country?: {
     id?: string;
+
     name?: string;
+
     abbreviation?: string;
+
     slug?: string;
 
     [key: string]: unknown;
@@ -61,21 +135,18 @@ export interface EspnLeague {
 
   type?: {
     id?: string;
+
     name?: string;
+
     abbreviation?: string;
+
     slug?: string;
 
     [key: string]: unknown;
   };
 
-  /**
-   * Current season returned by the ESPN league-detail endpoint.
-   */
   season?: EspnSeason;
 
-  /**
-   * Some ESPN responses may expose multiple seasons.
-   */
   seasons?: EspnSeason[];
 
   logos?: EspnLogo[];
@@ -157,6 +228,26 @@ export interface EspnLogo {
   rel?: string[];
 
   lastUpdated?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN IMAGE
+// ============================================================
+
+export interface EspnImage {
+  href?: string;
+
+  width?: number;
+
+  height?: number;
+
+  alt?: string;
+
+  rel?: string[];
+
+  source?: string;
 
   [key: string]: unknown;
 }
@@ -336,13 +427,51 @@ export interface EspnVenue {
 // ============================================================
 
 export interface EspnFormat {
-  regulation?: number;
+  regulation?:
+    | number
+    | {
+        periods?: number;
+
+        displayName?: string;
+
+        slug?: string;
+
+        clock?: number;
+
+        [key: string]: unknown;
+      };
 
   overtime?: boolean;
 
   periods?: number;
 
+  displayName?: string;
+
+  slug?: string;
+
   clock?: number;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH FORMAT
+// ============================================================
+
+export interface EspnMatchFormat {
+  regulation?: {
+    periods?: number;
+
+    displayName?: string;
+
+    slug?: string;
+
+    clock?: number;
+
+    [key: string]: unknown;
+  };
+
+  overtime?: boolean;
 
   [key: string]: unknown;
 }
@@ -367,10 +496,20 @@ export interface EspnBroadcast {
   };
 
   media?: {
+    callLetters?: string;
+
+    name?: string;
+
     shortName?: string;
 
     [key: string]: unknown;
   };
+
+  language?: string;
+
+  region?: string;
+
+  national?: boolean;
 
   [key: string]: unknown;
 }
@@ -458,6 +597,10 @@ export interface EspnTeam {
 
   record?: EspnTeamRecord[];
 
+  groups?: unknown[];
+
+  form?: string;
+
   [key: string]: unknown;
 }
 
@@ -526,7 +669,7 @@ export interface EspnTeamMatchStatistic {
 
   abbreviation?: string;
 
-  value?: number;
+  value?: number | string;
 
   displayValue?: string;
 
@@ -586,11 +729,17 @@ export interface EspnAthlete {
 
   uid?: string;
 
+  guid?: string;
+
   displayName?: string;
 
   shortName?: string;
 
   fullName?: string;
+
+  firstName?: string;
+
+  lastName?: string;
 
   jersey?: string;
 
@@ -607,6 +756,18 @@ export interface EspnAthlete {
   team?: EspnTeam;
 
   links?: EspnLink[];
+
+  status?: {
+    id?: string;
+
+    name?: string;
+
+    type?: string;
+
+    abbreviation?: string;
+
+    [key: string]: unknown;
+  };
 
   [key: string]: unknown;
 }
@@ -638,25 +799,7 @@ export interface EspnEventDetail {
 
   ownGoal?: boolean;
 
-  [key: string]: unknown;
-}
-
-// ============================================================
-// ESPN IMAGE
-// ============================================================
-
-export interface EspnImage {
-  href?: string;
-
-  width?: number;
-
-  height?: number;
-
-  alt?: string;
-
-  rel?: string[];
-
-  source?: string;
+  participants?: EspnAthlete[];
 
   [key: string]: unknown;
 }
@@ -756,11 +899,65 @@ export interface EspnStandingStatistic {
 
   type?: string;
 
-  value?: number;
+  value?: number | string;
 
   displayValue?: string;
 
   rank?: number;
+
+  summary?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN SUMMARY STANDINGS
+// ============================================================
+
+export interface EspnSummaryStandings {
+  fullViewLink?:
+    | EspnLink
+    | {
+        text?: string;
+
+        href?: string;
+
+        [key: string]: unknown;
+      };
+
+  header?: string;
+
+  groups?: EspnSummaryStandingsGroup[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnSummaryStandingsGroup {
+  standings?: {
+    entries?: EspnSummaryStandingEntry[];
+
+    [key: string]: unknown;
+  };
+
+  header?: string;
+
+  href?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnSummaryStandingEntry {
+  team?: string;
+
+  link?: string;
+
+  id?: string;
+
+  uid?: string;
+
+  stats?: EspnStandingStatistic[];
+
+  logo?: EspnLogo[];
 
   [key: string]: unknown;
 }
@@ -856,6 +1053,8 @@ export interface EspnLeader {
 
   leaders?: EspnLeaderItem[];
 
+  team?: EspnTeam;
+
   [key: string]: unknown;
 }
 
@@ -873,6 +1072,757 @@ export interface EspnLeaderItem {
   displayValue?: string;
 
   statistics?: EspnTeamMatchStatistic[];
+
+  mainStat?: string;
+
+  summary?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH LEADERS
+// ============================================================
+
+export interface EspnMatchLeaderTeam {
+  team?: EspnTeam;
+
+  leaders?: EspnMatchLeaderGroup[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchLeaderGroup {
+  name?: string;
+
+  displayName?: string;
+
+  shortDisplayName?: string;
+
+  abbreviation?: string;
+
+  leaders?: EspnMatchLeaderItem[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchLeaderItem {
+  displayValue?: string;
+
+  athlete?: EspnAthlete;
+
+  statistics?: EspnTeamMatchStatistic[];
+
+  mainStat?: string;
+
+  summary?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN BOXSCORE
+// ============================================================
+
+export interface EspnBoxscore {
+  teams?: EspnBoxscoreTeam[];
+
+  players?: EspnBoxscorePlayerTeam[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnBoxscoreTeam {
+  homeAway?: 'home' | 'away';
+
+  team?: EspnTeam;
+
+  displayOrder?: number;
+
+  statistics?: EspnTeamMatchStatistic[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnBoxscorePlayerTeam {
+  team?: EspnTeam;
+
+  statistics?: EspnPlayerBoxscoreGroup[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnPlayerBoxscoreGroup {
+  name?: string;
+
+  displayName?: string;
+
+  keys?: string[];
+
+  athletes?: EspnPlayerBoxscoreEntry[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnPlayerBoxscoreEntry {
+  athlete?: EspnAthlete;
+
+  stats?: EspnTeamMatchStatistic[];
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN GAME INFO
+// ============================================================
+
+export interface EspnGameInfo {
+  venue?: EspnVenue;
+
+  attendance?: number;
+
+  officials?: EspnOfficial[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnOfficial {
+  fullName?: string;
+
+  displayName?: string;
+
+  order?: number;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN LAST FIVE GAMES
+// ============================================================
+
+export interface EspnLastFiveGameTeam {
+  team?: EspnTeam;
+
+  events?: EspnLastFiveGameEvent[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnLastFiveGameEvent {
+  id?: string;
+
+  uid?: string;
+
+  summary?: string;
+
+  atVs?: string;
+
+  gameDate?: string;
+
+  score?: string;
+
+  homeTeamId?: string;
+
+  awayTeamId?: string;
+
+  homeTeamScore?: string | number;
+
+  awayTeamScore?: string | number;
+
+  aggregateScore?: string;
+
+  shootoutScore?: string;
+
+  gameResult?: string;
+
+  advance?: boolean;
+
+  advanceType?: string;
+
+  matchNote?: string;
+
+  competitionName?: string;
+
+  roundName?: string;
+
+  leagueName?: string;
+
+  leagueAbbreviation?: string;
+
+  opponent?: EspnTeam;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH ROSTERS
+// ============================================================
+
+export interface EspnMatchRosterTeam {
+  homeAway?: 'home' | 'away';
+
+  winner?: boolean;
+
+  team?: EspnTeam;
+
+  roster?: EspnMatchRosterPlayer[];
+
+  uniform?: EspnRosterUniform;
+
+  formation?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchRosterPlayer {
+  active?: boolean;
+
+  starter?: boolean;
+
+  jersey?: string;
+
+  athlete?: EspnAthlete;
+
+  subbedIn?: boolean;
+
+  subbedOut?: boolean;
+
+  formationPlace?: string;
+
+  media?: Record<string, unknown>;
+
+  stats?: EspnPlayerMatchStatistic[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnRosterUniform {
+  type?: string;
+
+  color?: string;
+
+  number?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN PLAYER MATCH STATISTICS
+// ============================================================
+
+export interface EspnPlayerMatchStatistic {
+  name?: string;
+
+  displayName?: string;
+
+  shortDisplayName?: string;
+
+  description?: string;
+
+  abbreviation?: string;
+
+  value?: number | string;
+
+  displayValue?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN SEASON SERIES / H2H SNAPSHOT
+// ============================================================
+
+export interface EspnSeasonSeries {
+  type?: string;
+
+  title?: string;
+
+  summary?: string;
+
+  completed?: boolean;
+
+  totalCompetitions?: number;
+
+  seriesLabel?: string;
+
+  seriesScore?: string;
+
+  shortSummary?: string;
+
+  events?: EspnSeasonSeriesEvent[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnSeasonSeriesEvent {
+  id?: string;
+
+  uid?: string;
+
+  date?: string;
+
+  timeValid?: boolean;
+
+  status?: EspnCompetitionStatus;
+
+  neutralSite?: boolean;
+
+  competitors?: EspnSeasonSeriesCompetitor[];
+
+  links?: EspnLink[];
+
+  competitionName?: string;
+
+  roundName?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnSeasonSeriesCompetitor {
+  id?: string;
+
+  uid?: string;
+
+  order?: number;
+
+  homeAway?: 'home' | 'away';
+
+  winner?: boolean;
+
+  team?: EspnTeam;
+
+  score?: string | number;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN KEY EVENTS
+// ============================================================
+
+export interface EspnKeyEvent extends EspnEventDetail {
+  sequence?: number;
+
+  period?: number;
+
+  shortText?: string;
+
+  clock?: EspnClock;
+
+  wallclock?: string;
+
+  source?: string;
+
+  shootout?: boolean;
+
+  penaltyKick?: boolean;
+
+  ownGoal?: boolean;
+
+  goalPosition?: EspnFieldPosition;
+
+  fieldPosition?: EspnFieldPosition;
+
+  participants?: EspnEventParticipant[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnEventParticipant {
+  athlete?: EspnAthlete;
+
+  [key: string]: unknown;
+}
+
+export interface EspnFieldPosition {
+  x?: number;
+
+  y?: number;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN COMMENTARY
+// ============================================================
+
+export interface EspnCommentaryItem {
+  sequence?: number;
+
+  time?: EspnClock;
+
+  text?: string;
+
+  play?: EspnCommentaryPlay;
+
+  [key: string]: unknown;
+}
+
+export interface EspnCommentaryPlay {
+  id?: string;
+
+  type?: string;
+
+  text?: string;
+
+  shortText?: string;
+
+  sequence?: number;
+
+  clock?: EspnClock;
+
+  period?: number;
+
+  team?: EspnTeam;
+
+  athlete?: EspnAthlete;
+
+  participants?: EspnEventParticipant[];
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH META
+// ============================================================
+
+export interface EspnMatchMeta {
+  gp_topic?: string;
+
+  gameSwitcherEnabled?: boolean;
+
+  picker_topic?: string;
+
+  lastUpdatedAt?: string;
+
+  firstPlayWallClock?: string;
+
+  lastPlayWallClock?: string;
+
+  gameState?: string;
+
+  syncUrl?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH HEADER
+// ============================================================
+
+export interface EspnMatchHeader {
+  id?: string;
+
+  uid?: string;
+
+  season?: EspnMatchHeaderSeason;
+
+  timeValid?: boolean;
+
+  competitions?: EspnMatchHeaderCompetition[];
+
+  links?: EspnLink[];
+
+  league?: EspnLeague;
+
+  linksv4?: EspnLink[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchHeaderSeason {
+  year?: number;
+
+  current?: boolean;
+
+  type?: number | string;
+
+  name?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchHeaderCompetition {
+  id?: string;
+
+  uid?: string;
+
+  date?: string;
+
+  neutralSite?: boolean;
+
+  conferenceCompetition?: boolean;
+
+  boxscoreAvailable?: boolean;
+
+  commentaryAvailable?: boolean;
+
+  liveAvailable?: boolean;
+
+  onWatchESPN?: boolean;
+
+  recent?: boolean;
+
+  wallclockAvailable?: boolean;
+
+  boxscoreSource?: string;
+
+  playByPlaySource?: string;
+
+  competitors?: EspnMatchHeaderCompetitor[];
+
+  notes?: EspnNote[];
+
+  status?: EspnCompetitionStatus;
+
+  broadcasts?: EspnBroadcast[];
+
+  details?: EspnMatchHeaderDetail[];
+
+  groups?: unknown[];
+
+  isFinal?: boolean;
+
+  isThirdPlace?: boolean;
+
+  altGameNote?: string;
+
+  boxscoreMinutes?: number;
+
+  shotMapAvailable?: boolean;
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchHeaderCompetitor {
+  id?: string;
+
+  uid?: string;
+
+  order?: number;
+
+  homeAway?: 'home' | 'away';
+
+  winner?: boolean;
+
+  advance?: boolean;
+
+  team?: EspnTeam;
+
+  score?: string | number;
+
+  linescores?: EspnLineScore[];
+
+  record?: EspnHeaderTeamRecord[];
+
+  groups?: unknown[];
+
+  possession?: boolean | number;
+
+  [key: string]: unknown;
+}
+
+export interface EspnLineScore {
+  value?: number;
+
+  displayValue?: string;
+
+  period?: number;
+
+  [key: string]: unknown;
+}
+
+export interface EspnHeaderTeamRecord {
+  name?: string;
+
+  type?: string;
+
+  summary?: string;
+
+  displayValue?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnMatchHeaderDetail {
+  clock?: EspnClock;
+
+  scoringPlay?: boolean;
+
+  team?: EspnTeam;
+
+  participants?: EspnEventParticipant[];
+
+  addedClock?: number;
+
+  redCard?: boolean;
+
+  penaltyKick?: boolean;
+
+  ownGoal?: boolean;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN VIDEOS
+// ============================================================
+
+export interface EspnVideo {
+  id?: string;
+
+  cerebroId?: string;
+
+  source?: string;
+
+  headline?: string;
+
+  description?: string;
+
+  lastModified?: string;
+
+  originalPublishDate?: string;
+
+  duration?: number;
+
+  timeRestrictions?: EspnVideoTimeRestrictions;
+
+  deviceRestrictions?: EspnVideoDeviceRestrictions;
+
+  thumbnail?: string;
+
+  links?: EspnVideoLinks;
+
+  ad?: unknown;
+
+  tracking?: EspnVideoTracking;
+
+  [key: string]: unknown;
+}
+
+export interface EspnVideoTimeRestrictions {
+  embargoDate?: string;
+
+  expirationDate?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnVideoDeviceRestrictions {
+  allowed?: string[];
+
+  forbidden?: string[];
+
+  [key: string]: unknown;
+}
+
+export interface EspnVideoLinks {
+  api?: {
+    artwork?: EspnLink;
+
+    self?: EspnLink;
+
+    [key: string]: unknown;
+  };
+
+  mobile?: Record<string, unknown>;
+
+  progressiveDownload?: Record<string, unknown>;
+
+  streaming?: Record<string, unknown>;
+
+  source?: EspnVideoSourceLinks;
+
+  sportscenter?: EspnLink;
+
+  web?: EspnLink;
+
+  [key: string]: unknown;
+}
+
+export interface EspnVideoSourceLinks {
+  href?: string;
+
+  hrefHd?: string;
+
+  hls?: string;
+
+  cmaf?: string;
+
+  shield?: string;
+
+  flash?: string;
+
+  full?: string;
+
+  hds?: string;
+
+  mezzanine?: string;
+
+  [key: string]: unknown;
+}
+
+export interface EspnVideoTracking {
+  coverageType?: string;
+
+  leagueName?: string;
+
+  sportName?: string;
+
+  trackingId?: string;
+
+  trackingName?: string;
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN MATCH NEWS
+// ============================================================
+
+export interface EspnMatchNews {
+  header?: string;
+
+  link?: string;
+
+  articles?: EspnNewsArticle[];
+
+  /*
+   * Some ESPN responses may wrap the same structure inside
+   * a nested `news` property. Keep this tolerant for provider
+   * response variations.
+   */
+  news?: {
+    header?: string;
+
+    link?: string;
+
+    articles?: EspnNewsArticle[];
+
+    [key: string]: unknown;
+  };
+
+  [key: string]: unknown;
+}
+
+// ============================================================
+// ESPN PICK CENTER
+// ============================================================
+
+export interface EspnPickCenter {
+  provider?: EspnOddsProvider;
+
+  details?: string;
+
+  overUnder?: number;
+
+  spread?: number;
+
+  moneyline?: EspnMoneyline;
+
+  homeTeamOdds?: EspnTeamOdds;
+
+  awayTeamOdds?: EspnTeamOdds;
 
   [key: string]: unknown;
 }
@@ -902,6 +1852,10 @@ export interface EspnNewsArticle {
 
   nowId?: string;
 
+  contentKey?: string;
+
+  dataSourceIdentifier?: string;
+
   type?: string;
 
   headline?: string;
@@ -915,6 +1869,8 @@ export interface EspnNewsArticle {
   story?: string;
 
   source?: string;
+
+  byline?: string;
 
   author?: string;
 
@@ -946,6 +1902,18 @@ export interface EspnNewsArticle {
 
       [key: string]: unknown;
     };
+
+    api?: {
+      self?: EspnLink;
+
+      [key: string]: unknown;
+    };
+
+    mobile?: EspnLink;
+
+    app?: EspnLink;
+
+    sportscenter?: EspnLink;
 
     [key: string]: unknown;
   };

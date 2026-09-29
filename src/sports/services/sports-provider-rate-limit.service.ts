@@ -10,6 +10,8 @@ import {
 
 export type SportsProvider = 'espn' | 'football-data' | 'odds-api' | 'youtube';
 
+export type SportsProviderRequestLane = 'live' | 'normal';
+
 export class SportsProviderQuotaExceededError extends Error {
   constructor(
     public readonly provider: SportsProvider,
@@ -27,13 +29,69 @@ interface ProviderLimitConfig {
   monthlyLimit?: number;
 }
 
+interface ExecuteOptions {
+  lane?: SportsProviderRequestLane;
+}
+
+class AsyncConcurrencyLimiter {
+  private active = 0;
+
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error(
+        `Concurrency limiter requires a positive integer limit. Received: ${limit}`,
+      );
+    }
+  }
+
+  async acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1;
+
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      this.waiters.push(resolve);
+    });
+
+    this.active += 1;
+  }
+
+  release(): void {
+    if (this.active > 0) {
+      this.active -= 1;
+    }
+
+    const next = this.waiters.shift();
+
+    if (next) {
+      next();
+    }
+  }
+
+  getActive(): number {
+    return this.active;
+  }
+
+  getWaiting(): number {
+    return this.waiters.length;
+  }
+
+  getLimit(): number {
+    return this.limit;
+  }
+}
+
 @Injectable()
 export class SportsProviderRateLimitService {
   private readonly logger = new Logger(SportsProviderRateLimitService.name);
 
   private readonly limits: Record<SportsProvider, ProviderLimitConfig> = {
     espn: {
-      minIntervalSeconds: 3,
+      minIntervalSeconds: 2,
     },
 
     'football-data': {
@@ -55,6 +113,18 @@ export class SportsProviderRateLimitService {
 
   private readonly lockSeconds = 30;
 
+  /*
+   * ESPN request concurrency:
+   *
+   * 1 reserved slot for live polling.
+   * 4 slots for every other ESPN operation.
+   *
+   * Total maximum concurrent ESPN requests = 5.
+   */
+  private readonly espnLiveLimiter = new AsyncConcurrencyLimiter(1);
+
+  private readonly espnNormalLimiter = new AsyncConcurrencyLimiter(4);
+
   constructor(
     @InjectModel(SportsProviderRateLimit.name)
     private readonly rateLimitModel: Model<SportsProviderRateLimitDocument>,
@@ -68,23 +138,95 @@ export class SportsProviderRateLimitService {
     provider: SportsProvider,
     endpoint: string,
     operation: () => Promise<T>,
+    options: ExecuteOptions = {},
   ): Promise<T> {
     const normalizedEndpoint = this.normalizeEndpoint(endpoint);
 
-    await this.acquireSlot(provider, normalizedEndpoint);
+    const lane =
+      provider === 'espn'
+        ? (options.lane ?? 'normal')
+        : ('normal' as SportsProviderRequestLane);
+
+    const limiter = this.getConcurrencyLimiter(provider, lane);
+
+    if (limiter) {
+      await limiter.acquire();
+    }
+
+    let lockUntil: Date | null = null;
 
     try {
+      lockUntil = await this.acquireSlot(provider, normalizedEndpoint);
+
       return await operation();
     } finally {
-      await this.releaseSlot(provider, normalizedEndpoint);
+      if (lockUntil) {
+        await this.releaseSlot(provider, normalizedEndpoint, lockUntil);
+      }
+
+      if (limiter) {
+        limiter.release();
+      }
     }
+  }
+
+  // ============================================================
+  // ESPN CONCURRENCY STATE
+  // ============================================================
+
+  getEspnConcurrencyState(): {
+    totalLimit: number;
+    active: number;
+    waiting: number;
+    live: {
+      limit: number;
+      active: number;
+      waiting: number;
+    };
+    normal: {
+      limit: number;
+      active: number;
+      waiting: number;
+    };
+  } {
+    const liveLimit = this.espnLiveLimiter.getLimit();
+
+    const normalLimit = this.espnNormalLimiter.getLimit();
+
+    const liveActive = this.espnLiveLimiter.getActive();
+
+    const normalActive = this.espnNormalLimiter.getActive();
+
+    const liveWaiting = this.espnLiveLimiter.getWaiting();
+
+    const normalWaiting = this.espnNormalLimiter.getWaiting();
+
+    return {
+      totalLimit: liveLimit + normalLimit,
+
+      active: liveActive + normalActive,
+
+      waiting: liveWaiting + normalWaiting,
+
+      live: {
+        limit: liveLimit,
+        active: liveActive,
+        waiting: liveWaiting,
+      },
+
+      normal: {
+        limit: normalLimit,
+        active: normalActive,
+        waiting: normalWaiting,
+      },
+    };
   }
 
   // ============================================================
   // ENDPOINT SLOT
   // ============================================================
 
-  async acquireSlot(provider: SportsProvider, endpoint: string): Promise<void> {
+  async acquireSlot(provider: SportsProvider, endpoint: string): Promise<Date> {
     const normalizedEndpoint = this.normalizeEndpoint(endpoint);
 
     const config = this.getConfig(provider);
@@ -126,6 +268,10 @@ export class SportsProviderRateLimitService {
 
       /*
        * Claim this endpoint slot atomically.
+       *
+       * lockedUntil is returned to the caller so the exact
+       * lock can later be released without accidentally
+       * releasing a newer request's lock.
        */
       const lockedUntil = new Date(now.getTime() + this.lockSeconds * 1000);
 
@@ -188,6 +334,7 @@ export class SportsProviderRateLimitService {
       } catch (error) {
         if (this.isDuplicateEndpointKeyError(error)) {
           await this.sleep(100);
+
           continue;
         }
 
@@ -196,6 +343,7 @@ export class SportsProviderRateLimitService {
 
       if (!updated) {
         await this.sleep(250);
+
         continue;
       }
 
@@ -249,7 +397,7 @@ export class SportsProviderRateLimitService {
         )
         .exec();
 
-      return;
+      return lockedUntil;
     }
   }
 
@@ -257,22 +405,36 @@ export class SportsProviderRateLimitService {
   // RELEASE SLOT
   // ============================================================
 
-  async releaseSlot(provider: SportsProvider, endpoint: string): Promise<void> {
+  async releaseSlot(
+    provider: SportsProvider,
+    endpoint: string,
+    lockedUntil?: Date,
+  ): Promise<void> {
     const normalizedEndpoint = this.normalizeEndpoint(endpoint);
 
     try {
+      const filter: Record<string, unknown> = {
+        provider,
+        endpoint: normalizedEndpoint,
+      };
+
+      /*
+       * When execute() releases a lock, require the exact
+       * lock timestamp that was claimed by that request.
+       *
+       * This prevents an older request from clearing a lock
+       * that has already been expired and reassigned.
+       */
+      if (lockedUntil) {
+        filter.lockedUntil = lockedUntil;
+      }
+
       await this.rateLimitModel
-        .updateOne(
-          {
-            provider,
-            endpoint: normalizedEndpoint,
+        .updateOne(filter, {
+          $unset: {
+            lockedUntil: 1,
           },
-          {
-            $unset: {
-              lockedUntil: 1,
-            },
-          },
-        )
+        })
         .exec();
     } catch (error) {
       this.logger.warn(
@@ -683,15 +845,10 @@ export class SportsProviderRateLimitService {
       try {
         await this.rateLimitModel.create({
           provider,
-
           endpoint: this.PROVIDER_QUOTA_ENDPOINT,
-
           dailyPeriod,
-
           dailyRequests: 0,
-
           monthlyPeriod,
-
           monthlyRequests: 0,
         });
 
@@ -709,13 +866,11 @@ export class SportsProviderRateLimitService {
 
     if (existing.dailyPeriod !== dailyPeriod) {
       update.dailyPeriod = dailyPeriod;
-
       update.dailyRequests = 0;
     }
 
     if (existing.monthlyPeriod !== monthlyPeriod) {
       update.monthlyPeriod = monthlyPeriod;
-
       update.monthlyRequests = 0;
     }
 
@@ -832,6 +987,21 @@ export class SportsProviderRateLimitService {
       .exec();
 
     return result.modifiedCount;
+  }
+
+  // ============================================================
+  // CONCURRENCY
+  // ============================================================
+
+  private getConcurrencyLimiter(
+    provider: SportsProvider,
+    lane: SportsProviderRequestLane,
+  ): AsyncConcurrencyLimiter | null {
+    if (provider !== 'espn') {
+      return null;
+    }
+
+    return lane === 'live' ? this.espnLiveLimiter : this.espnNormalLimiter;
   }
 
   // ============================================================

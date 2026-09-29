@@ -1,3 +1,5 @@
+// backend/src/sports/services/priority-competition.service.ts
+
 import { Injectable } from '@nestjs/common';
 
 import {
@@ -36,15 +38,30 @@ import {
 
 @Injectable()
 export class PriorityCompetitionService {
-  private readonly competitions = PRIORITY_COMPETITIONS;
+  private readonly competitions: SupportedCompetitionConfig[] =
+    PRIORITY_COMPETITIONS;
+
+  // ============================================================
+  // ALL CONFIGURATION
+  // ============================================================
 
   getAll(): SupportedCompetitionConfig[] {
     return [...this.competitions];
   }
 
   getById(competitionId: string): SupportedCompetitionConfig | undefined {
-    return getPriorityCompetition(competitionId);
+    const normalizedId = this.normalizeId(competitionId);
+
+    if (!normalizedId) {
+      return undefined;
+    }
+
+    return getPriorityCompetition(normalizedId);
   }
+
+  // ============================================================
+  // FILTERS
+  // ============================================================
 
   getEnabled(): SupportedCompetitionConfig[] {
     return getEnabledCompetitions(this.competitions);
@@ -74,6 +91,10 @@ export class PriorityCompetitionService {
     return getCompetitionsByFrequency(this.competitions, frequency);
   }
 
+  // ============================================================
+  // COLLECTION GROUPS
+  // ============================================================
+
   getDaily(): SupportedCompetitionConfig[] {
     return getDailyCompetitions(this.competitions);
   }
@@ -102,6 +123,10 @@ export class PriorityCompetitionService {
     return getActiveMensCompetitions(this.competitions);
   }
 
+  // ============================================================
+  // PROVIDER MAPPINGS
+  // ============================================================
+
   getWithEspn(): SupportedCompetitionConfig[] {
     return this.competitions.filter(hasEspnMapping);
   }
@@ -114,6 +139,10 @@ export class PriorityCompetitionService {
     return this.competitions.filter(hasOddsApiMapping);
   }
 
+  // ============================================================
+  // SORTING / COUNTS
+  // ============================================================
+
   getSortedByPriority(): SupportedCompetitionConfig[] {
     return sortByPriority(this.competitions);
   }
@@ -122,7 +151,19 @@ export class PriorityCompetitionService {
     return getCompetitionCounts(this.competitions);
   }
 
+  // ============================================================
+  // LOOKUPS
+  // ============================================================
+
   isPriorityCompetition(competitionId: string): boolean {
     return Boolean(this.getById(competitionId));
+  }
+
+  // ============================================================
+  // HELPERS
+  // ============================================================
+
+  private normalizeId(value: string | undefined): string {
+    return typeof value === 'string' ? value.trim().toLowerCase() : '';
   }
 }

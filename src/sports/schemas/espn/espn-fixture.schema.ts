@@ -2,6 +2,8 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 
 import { HydratedDocument } from 'mongoose';
 
+import type { EspnFixturePayload } from '../../providers/espn.interfaces';
+
 export type EspnFixtureDocument = HydratedDocument<EspnFixture>;
 
 @Schema({
@@ -132,12 +134,15 @@ export class EspnFixture {
 
   /**
    * Complete latest ESPN event/fixture object.
+   *
+   * The runtime MongoDB representation remains an object,
+   * while TypeScript uses the complete ESPN fixture payload type.
    */
   @Prop({
     type: Object,
     required: true,
   })
-  payload!: Record<string, unknown>;
+  payload!: EspnFixturePayload;
 
   @Prop({
     required: true,

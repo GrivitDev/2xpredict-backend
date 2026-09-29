@@ -10,17 +10,25 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
      * ESPN does not have an application-level daily quota
      * in our collection architecture.
      *
-     * We enforce one outbound ESPN request every 10 seconds
-     * through the provider-wide rate-limit service.
+     * Endpoint request spacing is enforced by the provider
+     * rate-limit service at two seconds.
+     *
+     * ESPN concurrency is controlled separately by that
+     * service:
+     *
+     *   1 reserved live request
+     *   4 normal requests
+     *
+     * for a maximum of five concurrent ESPN requests.
      */
     rateLimit: {
-      minIntervalSeconds: 3,
+      minIntervalSeconds: 2,
     },
 
     /**
      * Complete ESPN soccer league catalogue.
      *
-     * The catalogue is refreshed monthly.
+     * The catalogue is refreshed weekly.
      */
     catalogue: {
       refreshIntervalDays: 7,
@@ -34,7 +42,7 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
      */
     activeCompetitions: {
       enabled: true,
-      refreshIntervalMinutes: 15,
+      refreshIntervalMinutes: 10,
     },
 
     /**
@@ -42,11 +50,72 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
      *
      * Active competitions are processed according to priority.
      *
-     * 0.5 minutes = 30 seconds.
+     * Normal operations keep today's fixtures and the
+     * configured upcoming window synchronized.
+     *
+     * A league is also considered stale when its fixture
+     * collection has not been refreshed for 48 hours.
      */
     fixtures: {
       enabled: true,
-      slotIntervalMinutes: 0.1,
+
+      /**
+       * Number of days ahead included in normal fixture
+       * synchronization.
+       */
+      forwardDays: 8,
+
+      /**
+       * Minimum freshness guarantee for active competitions.
+       *
+       * If a league has not had a fixture refresh for this
+       * many hours, a refresh should be scheduled after
+       * confirming the competition is still active.
+       */
+      staleAfterHours: 48,
+
+      /**
+       * Queue spacing between normal fixture work slots.
+       */
+      slotIntervalMinutes: 0.02,
+    },
+
+    /**
+     * ESPN Summary collection.
+     *
+     * Summary is the canonical detailed match-data payload
+     * stored in:
+     *
+     *   sports_espn_fixtures.payload.summary
+     *
+     * Startup hydrates Summary for all persisted fixtures.
+     *
+     * Normal operations collect Summary for:
+     *
+     *   1. fixtures within the next four days
+     *   2. fixtures that have just completed
+     *
+     * A Summary job must never be created when the fixture
+     * already contains payload.summary.
+     */
+    summary: {
+      enabled: true,
+
+      /**
+       * Upcoming Summary collection window.
+       */
+      upcomingWindowDays: 4,
+
+      /**
+       * Finished fixtures receive Summary immediately after
+       * completion is detected.
+       */
+      immediatelyAfterFinished: true,
+
+      /**
+       * Startup hydrates Summary for all persisted fixtures.
+       */
+      startupAllFixtures: true,
     },
 
     /**

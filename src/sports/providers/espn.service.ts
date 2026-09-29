@@ -11,11 +11,15 @@ import {
   EspnApiResponse,
   EspnEvent,
   EspnLeague,
+  EspnMatchSummary,
   EspnNewsResponse,
   EspnStandingsResponse,
 } from './espn.interfaces';
 
-import { SportsProviderRateLimitService } from '../services/sports-provider-rate-limit.service';
+import {
+  SportsProviderRateLimitService,
+  SportsProviderRequestLane,
+} from '../services/sports-provider-rate-limit.service';
 
 @Injectable()
 export class EspnService {
@@ -39,6 +43,7 @@ export class EspnService {
   ) {
     this.http = axios.create({
       timeout: 15_000,
+
       headers: {
         Accept: 'application/json',
       },
@@ -65,6 +70,7 @@ export class EspnService {
       'leagues',
       {
         page: String(page),
+
         limit: String(limit),
       },
     );
@@ -106,9 +112,46 @@ export class EspnService {
   }
 
   // ============================================================
-  // 3. LEAGUE SCOREBOARD
+  // 3. SCOREBOARD — SINGLE DATE
   // ============================================================
 
+  /**
+   * Performs exactly ONE ESPN scoreboard request.
+   *
+   * The queue owns the date range and decides how many
+   * individual dates must be processed.
+   */
+  async getFixturesForDate(
+    league: string,
+    date: string,
+  ): Promise<EspnApiResponse> {
+    this.validateLeague(league);
+
+    if (!this.isValidDate(date)) {
+      throw new BadRequestException('date must be a valid YYYY-MM-DD date');
+    }
+
+    return this.request<EspnApiResponse>(
+      `${this.siteBaseUrl}/${encodeURIComponent(
+        league.trim().toLowerCase(),
+      )}/scoreboard`,
+      'scoreboard',
+      {
+        dates: this.formatEspnDate(date),
+      },
+    );
+  }
+
+  // ============================================================
+  // 4. LEAGUE SCOREBOARD
+  // ============================================================
+
+  /**
+   * Legacy range-capable method.
+   *
+   * Queue workflows should prefer getFixturesForDate()
+   * so each date is individually tracked.
+   */
   async getFixtures(
     league: string,
     dateFrom?: string,
@@ -120,27 +163,15 @@ export class EspnService {
 
     const normalizedLeague = league.trim().toLowerCase();
 
-    /*
-     * Existing single-day/range behaviour is intentionally retained
-     * here for normal queue/runtime operations.
-     *
-     * Startup historical bootstrap uses getFixturesRange(), which
-     * sends one ESPN scoreboard request for the complete date range.
-     */
     if (dateFrom && dateTo) {
       const events: EspnEvent[] = [];
 
       let currentDate = dateFrom;
 
       while (currentDate <= dateTo) {
-        const response = await this.request<EspnApiResponse>(
-          `${this.siteBaseUrl}/${encodeURIComponent(
-            normalizedLeague,
-          )}/scoreboard`,
-          'scoreboard',
-          {
-            dates: this.formatEspnDate(currentDate),
-          },
+        const response = await this.getFixturesForDate(
+          normalizedLeague,
+          currentDate,
         );
 
         events.push(...this.extractEvents(response));
@@ -154,15 +185,7 @@ export class EspnService {
     }
 
     if (dateFrom || dateTo) {
-      return this.request<EspnApiResponse>(
-        `${this.siteBaseUrl}/${encodeURIComponent(
-          normalizedLeague,
-        )}/scoreboard`,
-        'scoreboard',
-        {
-          dates: this.formatEspnDate(dateFrom ?? dateTo!),
-        },
-      );
+      return this.getFixturesForDate(normalizedLeague, dateFrom ?? dateTo!);
     }
 
     return this.request<EspnApiResponse>(
@@ -172,7 +195,7 @@ export class EspnService {
   }
 
   // ============================================================
-  // 4. RESULTS
+  // 5. RESULTS
   // ============================================================
 
   async getResults(
@@ -184,9 +207,18 @@ export class EspnService {
   }
 
   // ============================================================
-  // 5. STANDINGS
+  // 6. STANDINGS
   // ============================================================
 
+  /**
+   * Emergency/fallback provider endpoint.
+   *
+   * Normal match processing should first use:
+   *
+   *   fixture.payload.summary.standings
+   *
+   * This endpoint remains available when explicitly required.
+   */
   async getStandings(league: string): Promise<EspnStandingsResponse> {
     this.validateLeague(league);
 
@@ -202,15 +234,22 @@ export class EspnService {
   // 7. MATCH SUMMARY
   // ============================================================
 
+  /**
+   * Primary detailed ESPN match-data endpoint.
+   *
+   * The returned payload is persisted directly as:
+   *
+   *   sports_espn_fixtures.payload.summary
+   */
   async getMatchSummary(
     league: string,
     eventId: string,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<EspnMatchSummary> {
     this.validateLeague(league);
 
     this.validateId(eventId, 'eventId');
 
-    return this.request<Record<string, unknown>>(
+    return this.request<EspnMatchSummary>(
       `${this.siteBaseUrl}/${encodeURIComponent(
         league.trim().toLowerCase(),
       )}/summary`,
@@ -225,10 +264,18 @@ export class EspnService {
   // 8. GLOBAL LIVE SCOREBOARD
   // ============================================================
 
+  /**
+   * Live polling always uses the reserved ESPN live lane.
+   *
+   * The rate-limit service reserves one concurrent slot for
+   * this lane so normal ESPN requests cannot starve live data.
+   */
   async getLiveMatches(): Promise<EspnApiResponse> {
     return this.request<EspnApiResponse>(
       `${this.siteBaseUrl}/all/scoreboard`,
       'live-scoreboard',
+      undefined,
+      'live',
     );
   }
 
@@ -236,6 +283,12 @@ export class EspnService {
   // 9. GLOBAL SOCCER NEWS
   // ============================================================
 
+  /**
+   * Emergency/manual ESPN news endpoint.
+   *
+   * This remains available but is not part of the normal
+   * scheduled sports synchronization pipeline.
+   */
   async getNews(limit = 50): Promise<EspnNewsResponse> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new BadRequestException(
@@ -245,6 +298,7 @@ export class EspnService {
 
     return this.request<EspnNewsResponse>(`${this.newsBaseUrl}/news`, 'news', {
       sport: 'soccer',
+
       limit: String(limit),
     });
   }
@@ -257,6 +311,7 @@ export class EspnService {
     endpoint: string,
     rateLimitEndpoint: string,
     params?: Record<string, string>,
+    lane: SportsProviderRequestLane = 'normal',
   ): Promise<T> {
     return this.providerRateLimitService.execute(
       'espn',
@@ -279,6 +334,9 @@ export class EspnService {
 
           throw new InternalServerErrorException('ESPN request failed');
         }
+      },
+      {
+        lane,
       },
     );
   }
@@ -313,7 +371,9 @@ export class EspnService {
 
       leagues.push({
         id: leagueSlug,
+
         slug: leagueSlug,
+
         $ref: reference,
       });
     }
@@ -361,7 +421,9 @@ export class EspnService {
       if (!existing) {
         map.set(slug, {
           ...league,
+
           id: league.id ?? slug,
+
           slug,
         });
 
@@ -370,8 +432,11 @@ export class EspnService {
 
       map.set(slug, {
         ...existing,
+
         ...league,
+
         id: league.id ?? existing.id ?? slug,
+
         slug,
       });
     }
@@ -380,7 +445,7 @@ export class EspnService {
   }
 
   // ============================================================
-  // SCOREBOARD HELPERS
+  // RESPONSE HELPERS
   // ============================================================
 
   private getPageCount(response: EspnApiResponse): number {
