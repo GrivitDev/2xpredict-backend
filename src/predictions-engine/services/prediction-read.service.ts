@@ -1,192 +1,126 @@
-import { Injectable } from '@nestjs/common';
-
-import { InjectModel } from '@nestjs/mongoose';
-
-import { Model } from 'mongoose';
-
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { PredictionAccessService } from '../../prediction-access/prediction-access.service';
 import {
-  PredictionEnginePrediction,
-  PredictionEnginePredictionDocument,
-} from '../schemas/prediction.schema';
-
+  AccessRequestUser,
+  PredictionReadFilters,
+} from '../../prediction-access/interfaces/prediction-access.interface';
+import { PredictionMarket } from '../enums/prediction-market.enum';
 import { PredictionStatus } from '../enums/prediction-status.enum';
+import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
+import { FOOTBALL_MARKET_CATALOG } from '../catalog/football-market-catalog';
 
-import { PredictionQuery } from '../interfaces/prediction-query.interface';
-
-import { PredictionListResult } from '../interfaces/prediction-list-result.interface';
-
+/**
+ * Compatibility facade for the existing prediction-engine routes. All reads
+ * go through PredictionAccessService so raw market documents/slips cannot
+ * bypass subscription entitlements or ranked market visibility.
+ */
 @Injectable()
 export class PredictionReadService {
-  constructor(
-    @InjectModel(PredictionEnginePrediction.name)
-    private readonly predictionModel: Model<PredictionEnginePredictionDocument>,
-  ) {}
+  constructor(private readonly access: PredictionAccessService) {}
 
-  async find(
-    query: PredictionQuery = {},
-  ): Promise<PredictionListResult<PredictionEnginePredictionDocument>> {
-    const page = this.normalizePage(query.page);
-
-    const limit = this.normalizeLimit(query.limit);
-
-    const filter = this.buildFilter(query);
-
-    const skip = (page - 1) * limit;
-
-    const [data, total] = await Promise.all([
-      this.predictionModel
-        .find(filter)
-        .sort({
-          fixtureDate: 1,
-          confidence: -1,
-          generatedAt: -1,
-        })
-        .skip(skip)
-        .limit(limit)
-        .lean()
-        .exec(),
-
-      this.predictionModel.countDocuments(filter).exec(),
-    ]);
-
-    return {
-      data: data,
-      page,
-      limit,
-      total,
-      totalPages: Math.ceil(total / limit),
-    };
+  getMarketCatalog(): unknown {
+    return FOOTBALL_MARKET_CATALOG.map((market) => ({
+      ...market,
+      selections: market.selections.map((selection) => ({ ...selection })),
+    }));
   }
 
-  async findByEvent(
+  listMarkets(
+    input: PredictionReadFilters = {},
+    user?: AccessRequestUser | null,
+  ): Promise<Record<string, unknown>> {
+    this.validateMarketFilters(input);
+    return this.access.listMarkets(input, user);
+  }
+
+  getFixtureMarkets(
     eventId: string,
-  ): Promise<PredictionEnginePredictionDocument[]> {
-    const normalized = this.normalizeRequiredId(eventId);
-
-    return this.predictionModel
-      .find({
-        eventId: normalized,
-      })
-      .sort({
-        confidence: -1,
-        probability: -1,
-      })
-      .lean()
-      .exec();
+    user?: AccessRequestUser | null,
+  ): Promise<Record<string, unknown>[]> {
+    return this.access.getFixtureMarkets(eventId, user);
   }
 
-  async findRun(eventId: string) {
-    return this.predictionModel
-      .find({
-        eventId: this.normalizeRequiredId(eventId),
-      })
-      .sort({
-        confidence: -1,
-        probability: -1,
-      })
-      .lean()
-      .exec();
+  listPickCenter(
+    input: PredictionReadFilters = {},
+    user?: AccessRequestUser | null,
+  ): Promise<Record<string, unknown>> {
+    return this.access.listPickCenter(input, user);
   }
 
-  async findUpcoming(
-    limit = 20,
-  ): Promise<PredictionEnginePredictionDocument[]> {
-    const safeLimit = this.normalizeLimit(limit);
-
-    return this.predictionModel
-      .find({
-        fixtureDate: {
-          $gte: new Date(),
-        },
-        status: {
-          $in: [PredictionStatus.ACTIVE, PredictionStatus.PENDING],
-        },
-      })
-      .sort({
-        fixtureDate: 1,
-        confidence: -1,
-        probability: -1,
-      })
-      .limit(safeLimit)
-      .lean()
-      .exec();
+  getPickCenter(
+    eventId: string,
+    user?: AccessRequestUser | null,
+  ): Promise<Record<string, unknown>> {
+    return this.access.getPickCenter(eventId, user);
   }
 
-  async findSettled(limit = 20): Promise<PredictionEnginePredictionDocument[]> {
-    const safeLimit = this.normalizeLimit(limit);
-
-    return this.predictionModel
-      .find({
-        status: {
-          $in: [
-            PredictionStatus.WON,
-            PredictionStatus.LOST,
-            PredictionStatus.VOID,
-          ],
-        },
-      })
-      .sort({
-        settledAt: -1,
-        fixtureDate: -1,
-      })
-      .limit(safeLimit)
-      .lean()
-      .exec();
+  listSlips(
+    input: {
+      from?: string;
+      to?: string;
+      productType?: string;
+      automatic?: boolean;
+      page?: number;
+      pageSize?: number;
+      includeDrafts?: boolean;
+      status?: string;
+    } = {},
+    user?: AccessRequestUser | null,
+  ): Promise<Record<string, unknown>> {
+    // Draft and cancelled slips are not exposed; automatic READY slips are accessible when entitled.
+    return this.access.listSlips(
+      {
+        from: input.from,
+        to: input.to,
+        productType: input.productType,
+        automatic: input.automatic,
+        page: input.page,
+        pageSize: input.pageSize,
+      },
+      user,
+    );
   }
 
-  private buildFilter(query: PredictionQuery): Record<string, unknown> {
-    const filter: Record<string, unknown> = {};
-
-    if (query.eventId?.trim()) {
-      filter.eventId = query.eventId.trim();
-    }
-
-    if (query.competitionId?.trim()) {
-      filter.competitionId = query.competitionId.trim().toLowerCase();
-    }
-
-    if (query.market) {
-      filter.market = query.market;
-    }
-
-    if (query.status) {
-      filter.status = query.status;
-    }
-
-    if (query.from || query.to) {
-      const fixtureDate: Record<string, Date> = {};
-
-      if (query.from) {
-        fixtureDate.$gte = query.from;
-      }
-
-      if (query.to) {
-        fixtureDate.$lt = query.to;
-      }
-
-      filter.fixtureDate = fixtureDate;
-    }
-
-    return filter;
+  getSlip(
+    slipId: string,
+    user?: AccessRequestUser | null,
+  ): Promise<Record<string, unknown>> {
+    return this.access.getSlip(slipId, user);
   }
 
-  private normalizePage(value?: number): number {
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-      return 1;
+  private validateMarketFilters(input: PredictionReadFilters): void {
+    if (
+      input.marketKey?.trim() &&
+      !Object.values(PredictionMarket).includes(
+        input.marketKey as PredictionMarket,
+      )
+    ) {
+      throw new BadRequestException(`Unknown marketKey "${input.marketKey}".`);
     }
-
-    return Math.max(Math.floor(value), 1);
-  }
-
-  private normalizeLimit(value?: number): number {
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-      return 20;
+    if (
+      input.status?.trim() &&
+      String(input.status) !== String(PredictionStatus.CALCULATED)
+    ) {
+      throw new BadRequestException(
+        'Active public markets support only CALCULATED status. Use the settled-history endpoint for results.',
+      );
     }
-
-    return Math.min(Math.max(Math.floor(value), 1), 100);
-  }
-
-  private normalizeRequiredId(value: string): string {
-    return String(value).trim();
+    if (input.minimumProbability !== undefined) {
+      const value = Number(input.minimumProbability);
+      if (!Number.isFinite(value) || value < 0 || value > 1)
+        throw new BadRequestException(
+          'minimumProbability must be between 0 and 1.',
+        );
+    }
+    if (input.minimumConfidence !== undefined) {
+      const value = Number(input.minimumConfidence);
+      if (!Number.isFinite(value) || value < 0 || value > PREDICTION_ENGINE_CONFIG.model.maximumConfidence)
+        throw new BadRequestException(
+          `minimumConfidence must be between 0 and ${PREDICTION_ENGINE_CONFIG.model.maximumConfidence}.`,
+        );
+    }
   }
 }
+
+
+

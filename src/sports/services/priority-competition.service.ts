@@ -167,3 +167,4 @@ export class PriorityCompetitionService {
     return typeof value === 'string' ? value.trim().toLowerCase() : '';
   }
 }
+

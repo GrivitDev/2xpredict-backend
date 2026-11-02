@@ -1,154 +1,107 @@
-import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
-
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-
+import { Controller, Get, Param, Query, Req, UseGuards } from '@nestjs/common';
+import { OptionalJwtAuthGuard } from '../../common/guards/optional-jwt-auth.guard';
 import { PredictionReadService } from '../services/prediction-read.service';
 
-import { PredictionRunReadService } from '../services/prediction-run-read.service';
+type PredictionRequest = {
+  user?: Parameters<PredictionReadService['listMarkets']>[1];
+};
 
-import { PredictionMarket } from '../enums/prediction-market.enum';
-
-import { PredictionStatus } from '../enums/prediction-status.enum';
-
-import { PredictionQuery } from '../interfaces/prediction-query.interface';
-
-@Controller('predictions-engine')
-@UseGuards(JwtAuthGuard)
+@Controller('predictions')
+@UseGuards(OptionalJwtAuthGuard)
 export class PredictionsReadController {
-  constructor(
-    private readonly predictionReadService: PredictionReadService,
+  constructor(private readonly reads: PredictionReadService) {}
 
-    private readonly predictionRunReadService: PredictionRunReadService,
-  ) {}
-
-  @Get()
-  async find(
-    @Query('eventId')
-    eventId?: string,
-
-    @Query('competitionId')
-    competitionId?: string,
-
-    @Query('market')
-    market?: PredictionMarket,
-
-    @Query('status')
-    status?: PredictionStatus,
-
-    @Query('from')
-    from?: string,
-
-    @Query('to')
-    to?: string,
-
-    @Query('page')
-    page?: string,
-
-    @Query('limit')
-    limit?: string,
+  @Get('markets')
+  listMarkets(
+    @Req() request: PredictionRequest,
+    @Query() query: Record<string, string | undefined>,
   ) {
-    const query: PredictionQuery = {
-      eventId: eventId?.trim(),
-
-      competitionId: competitionId?.trim(),
-
-      market,
-
-      status,
-
-      from: this.parseDate(from),
-
-      to: this.parseDate(to),
-
-      page: this.parsePositiveNumber(page),
-
-      limit: this.parsePositiveNumber(limit),
-    };
-
-    return this.predictionReadService.find(query);
-  }
-
-  @Get('upcoming')
-  async findUpcoming(
-    @Query('limit')
-    limit?: string,
-  ) {
-    return this.predictionReadService.findUpcoming(
-      this.parsePositiveNumber(limit),
+    return this.reads.listMarkets(
+      {
+        eventId: query.eventId,
+        leagueId: query.leagueId,
+        marketKey: query.marketKey,
+        status: query.status,
+        from: query.from,
+        to: query.to,
+        selectionKey: query.selectionKey,
+        minimumProbability: this.optionalNumber(query.minimumProbability),
+        minimumConfidence: this.optionalNumber(query.minimumConfidence),
+        page: this.optionalNumber(query.page),
+        pageSize: this.optionalNumber(query.pageSize),
+        includePast: query.includePast === 'true',
+      },
+      request?.user ?? null,
     );
   }
 
-  @Get('settled')
-  async findSettled(
-    @Query('limit')
-    limit?: string,
+  @Get('markets/:eventId')
+  getFixtureMarkets(
+    @Param('eventId') eventId: string,
+    @Req() request: PredictionRequest,
   ) {
-    return this.predictionReadService.findSettled(
-      this.parsePositiveNumber(limit),
+    return this.reads.getFixtureMarkets(eventId, request?.user ?? null);
+  }
+
+  @Get('pick-center')
+  listPickCenter(
+    @Req() request: PredictionRequest,
+    @Query() query: Record<string, string | undefined>,
+  ) {
+    return this.reads.listPickCenter(
+      {
+        leagueId: query.leagueId,
+        from: query.from,
+        to: query.to,
+        page: this.optionalNumber(query.page),
+        pageSize: this.optionalNumber(query.pageSize),
+        includePast: query.includePast === 'true',
+      },
+      request?.user ?? null,
     );
   }
 
-  @Get('events/:eventId')
-  async findByEvent(
-    @Param('eventId')
-    eventId: string,
+  @Get('pick-center/:eventId')
+  getPickCenter(
+    @Param('eventId') eventId: string,
+    @Req() request: PredictionRequest,
   ) {
-    return this.predictionReadService.findByEvent(eventId);
+    return this.reads.getPickCenter(eventId, request?.user ?? null);
   }
 
-  @Get('runs/recent')
-  async findRecentRuns(
-    @Query('limit')
-    limit?: string,
+  @Get('slips')
+  listSlips(
+    @Req() request: PredictionRequest,
+    @Query() query: Record<string, string | undefined>,
   ) {
-    return this.predictionRunReadService.findRecent(
-      this.parsePositiveNumber(limit),
+    return this.reads.listSlips(
+      {
+        from: query.from,
+        to: query.to,
+        productType: query.productType,
+        automatic:
+          query.automatic === undefined
+            ? undefined
+            : query.automatic === 'true',
+        page: this.optionalNumber(query.page),
+        pageSize: this.optionalNumber(query.pageSize),
+        status: query.status,
+        includeDrafts: false,
+      },
+      request?.user ?? null,
     );
   }
 
-  @Get('runs/upcoming')
-  async findUpcomingRuns(
-    @Query('limit')
-    limit?: string,
-  ) {
-    return this.predictionRunReadService.findUpcoming(
-      this.parsePositiveNumber(limit),
-    );
+  @Get('slips/:slipId')
+  getSlip(@Param('slipId') slipId: string, @Req() request: PredictionRequest) {
+    return this.reads.getSlip(slipId, request?.user ?? null);
   }
 
-  @Get('runs/:eventId')
-  async findRun(
-    @Param('eventId')
-    eventId: string,
-  ) {
-    return this.predictionRunReadService.findByEvent(eventId);
-  }
-
-  private parsePositiveNumber(value?: string): number | undefined {
-    if (value === undefined) {
-      return undefined;
-    }
-
-    const number = Number(value);
-
-    if (!Number.isFinite(number) || number < 1) {
-      return undefined;
-    }
-
-    return Math.floor(number);
-  }
-
-  private parseDate(value?: string): Date | undefined {
-    if (!value?.trim()) {
-      return undefined;
-    }
-
-    const date = new Date(value);
-
-    if (!Number.isFinite(date.getTime())) {
-      return undefined;
-    }
-
-    return date;
+  private optionalNumber(value: string | undefined): number | undefined {
+    if (value === undefined || value.trim() === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
   }
 }
+
+

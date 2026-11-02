@@ -1,0 +1,9 @@
+export enum AdType {
+  BANNER = 'BANNER',
+  INTERSTITIAL = 'INTERSTITIAL',
+  NATIVE = 'NATIVE',
+  REWARDED = 'REWARDED',
+  POPUP = 'POPUP',
+  STICKY = 'STICKY',
+  VIDEO = 'VIDEO',
+}

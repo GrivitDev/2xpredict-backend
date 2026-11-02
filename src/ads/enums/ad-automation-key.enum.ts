@@ -1,0 +1,11 @@
+/** Dynamic selector keys. They choose existing content; they never generate predictions or grant rewards. */
+export enum AdAutomationKey {
+  TOP_PREDICTION = 'TOP_PREDICTION',
+  TODAYS_SURE_ODDS = 'TODAYS_SURE_ODDS',
+  FEATURED_SLIP = 'FEATURED_SLIP',
+  AVAILABLE_BONUS = 'AVAILABLE_BONUS',
+  ACTIVE_PROMO = 'ACTIVE_PROMO',
+  REFERRAL_CAMPAIGN = 'REFERRAL_CAMPAIGN',
+  SUBSCRIPTION_OFFER = 'SUBSCRIPTION_OFFER',
+  BET_LAB_WELCOME_POINTS = 'BET_LAB_WELCOME_POINTS',
+}

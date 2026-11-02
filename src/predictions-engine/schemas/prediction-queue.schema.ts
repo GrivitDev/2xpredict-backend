@@ -1,79 +1,20 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
-
-import { CompetitionPriority } from '../../sports/enums/competition-priority.enum';
 import { PredictionQueueStatus } from '../enums/prediction-queue-status.enum';
 
-export type PredictionQueueDocument = HydratedDocument<PredictionQueue>;
-
-@Schema({
-  collection: 'predictions_queue',
-  timestamps: true,
-})
+@Schema({ timestamps: true, collection: 'predictions_engine_queue' })
 export class PredictionQueue {
-  @Prop({
-    type: String,
-    required: true,
-    unique: true,
-    index: true,
-    trim: true,
-  })
+  @Prop({ required: true, unique: true, trim: true, index: true })
   eventId!: string;
 
-  @Prop({
-    type: String,
-    required: true,
-    index: true,
-    trim: true,
-    lowercase: true,
-  })
-  competitionId!: string;
+  @Prop({ required: true, trim: true, lowercase: true, index: true })
+  leagueId!: string;
 
-  @Prop({
-    type: Number,
-    required: true,
-    index: true,
-  })
-  season!: number;
-
-  @Prop({
-    type: Date,
-    required: true,
-    index: true,
-  })
+  @Prop({ required: true, type: Date, index: true })
   fixtureDate!: Date;
 
   @Prop({
-    type: String,
     required: true,
-    trim: true,
-  })
-  homeTeamId!: string;
-
-  @Prop({
-    type: String,
-    required: true,
-    trim: true,
-  })
-  awayTeamId!: string;
-
-  @Prop({
-    type: String,
-    enum: Object.values(CompetitionPriority),
-    default: CompetitionPriority.SELECTIVE,
-    index: true,
-  })
-  priority!: CompetitionPriority;
-
-  @Prop({
-    type: Number,
-    required: true,
-    default: 4,
-    index: true,
-  })
-  priorityWeight!: number;
-
-  @Prop({
     type: String,
     enum: Object.values(PredictionQueueStatus),
     default: PredictionQueueStatus.PENDING,
@@ -81,89 +22,63 @@ export class PredictionQueue {
   })
   status!: PredictionQueueStatus;
 
-  @Prop({
-    type: Number,
-    required: true,
-    default: 0,
-  })
+  @Prop({ type: Number, default: 0, index: true })
+  priority!: number;
+
+  @Prop({ type: Number, default: 0, min: 0 })
   attempts!: number;
 
-  @Prop({
-    type: Number,
-    required: true,
-    default: 3,
-  })
-  maxAttempts!: number;
-
-  @Prop({
-    type: Date,
-    required: true,
-    default: Date.now,
-    index: true,
-  })
+  @Prop({ required: true, type: Date, default: Date.now, index: true })
   availableAt!: Date;
 
-  @Prop({
-    type: Date,
-    default: null,
-    index: true,
-  })
-  lockedUntil!: Date | null;
+  @Prop({ type: Date })
+  lockedAt?: Date;
 
-  @Prop({
-    type: Date,
-    default: null,
-  })
-  startedAt!: Date | null;
+  @Prop({ type: Date })
+  completedAt?: Date;
 
-  @Prop({
-    type: Date,
-    default: null,
-  })
-  completedAt!: Date | null;
+  @Prop({ type: Date })
+  summaryCollectedAt?: Date;
 
-  @Prop({
-    type: Date,
-    default: null,
-  })
-  failedAt!: Date | null;
+  @Prop({ type: Date })
+  lastProcessedSummaryAt?: Date;
 
-  @Prop({
-    type: Date,
-    default: null,
-  })
-  lastAttemptAt!: Date | null;
+  @Prop({ type: Date })
+  oddsUpdatedAt?: Date;
 
-  @Prop({
-    type: String,
-    default: null,
-    trim: true,
-  })
-  lastErrorCode!: string | null;
+  @Prop({ type: Date })
+  lastProcessedOddsAt?: Date;
 
-  @Prop({
-    type: String,
-    default: null,
-    trim: true,
-  })
-  lastErrorMessage!: string | null;
+  @Prop({ type: String, trim: true })
+  modelVersion?: string;
+
+  @Prop({ type: String, trim: true })
+  scoreSnapshot?: string;
+
+  @Prop({ type: String, trim: true })
+  lastProcessedScoreSnapshot?: string;
+
+  @Prop({ type: String, default: 'INITIAL' })
+  reason!: string;
+
+  @Prop({ type: String })
+  errorMessage?: string;
+
+  @Prop({ type: Number, min: 0 })
+  processingDurationMs?: number;
+
+  @Prop({ type: Number, default: 0 })
+  refreshCount!: number;
 }
-
+export type PredictionQueueDocument = HydratedDocument<PredictionQueue>;
 export const PredictionQueueSchema =
   SchemaFactory.createForClass(PredictionQueue);
-
-PredictionQueueSchema.index({
-  status: 1,
-  priorityWeight: 1,
-  fixtureDate: 1,
-});
-
 PredictionQueueSchema.index({
   status: 1,
   availableAt: 1,
+  priority: -1,
+  fixtureDate: 1,
 });
+PredictionQueueSchema.index({ status: 1, fixtureDate: 1 });
 
-PredictionQueueSchema.index({
-  status: 1,
-  lockedUntil: 1,
-});
+

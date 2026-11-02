@@ -104,6 +104,17 @@ export class SportsProviderRateLimit {
   dailyRequests!: number;
 
   /**
+   * Optional hard stop for provider-reported or internally exhausted daily
+   * quotas. It survives UTC counter rollover so YouTube searches cannot resume
+   * in the middle of the user's Nigerian calendar day.
+   */
+  @Prop({
+    type: Date,
+    index: true,
+  })
+  quotaBlockedUntil?: Date;
+
+  /**
    * Current UTC month: YYYY-MM
    *
    * Used by provider-wide quota accounting.

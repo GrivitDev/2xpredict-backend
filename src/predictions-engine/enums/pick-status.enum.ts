@@ -1,0 +1,5 @@
+export enum PickStatus {
+  SELECTED = 'SELECTED',
+  REJECTED = 'REJECTED',
+  INELIGIBLE = 'INELIGIBLE',
+}

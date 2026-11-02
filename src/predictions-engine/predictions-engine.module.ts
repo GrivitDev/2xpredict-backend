@@ -1,233 +1,160 @@
 import { Module } from '@nestjs/common';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { PredictionAccessModule } from '../prediction-access/prediction-access.module';
+import { OddsModule } from '../odds/odds.module';
+import { SportsModule } from '../sports/sports.module';
 import { MongooseModule } from '@nestjs/mongoose';
 
-import { SportsModule } from '../sports/sports.module';
+import {
+  ActiveCompetition,
+  ActiveCompetitionSchema,
+} from '../sports/schemas/active-competition.schema';
+import {
+  EspnFixture,
+  EspnFixtureSchema,
+} from '../sports/schemas/espn/espn-fixture.schema';
+import {
+  EspnTeam,
+  EspnTeamSchema,
+} from '../sports/schemas/espn/espn-team.schema';
+import {
+  EspnStanding,
+  EspnStandingSchema,
+} from '../sports/schemas/espn/espn-standing.schema';
+
+import { PredictionEngineController } from './controllers/prediction-engine.controller';
+import { PredictionsReadController } from './controllers/predictions-read.controller';
 
 import {
-  PredictionEnginePrediction,
-  PredictionEnginePredictionSchema,
-} from './schemas/prediction.schema';
-
-import {
-  PredictionQueue,
-  PredictionQueueSchema,
-} from './schemas/prediction-queue.schema';
-
-import {
-  PredictionCalibration,
-  PredictionCalibrationSchema,
-} from './schemas/prediction-calibration.schema';
-
+  MarketPrediction,
+  MarketPredictionSchema,
+} from './schemas/market-prediction.schema';
 import {
   PredictionRun,
   PredictionRunSchema,
 } from './schemas/prediction-run.schema';
+import {
+  PredictionQueue,
+  PredictionQueueSchema,
+} from './schemas/prediction-queue.schema';
+import { PickCenter, PickCenterSchema } from './schemas/pick-center.schema';
+import { SlipCenterGenerationLock, SlipCenterGenerationLockSchema } from './schemas/slip-center-generation-lock.schema';
+import {
+  PredictionSlip,
+  PredictionSlipSchema,
+} from './schemas/prediction-slip.schema';
+import { CuratedPrediction, CuratedPredictionSchema } from './schemas/curated-prediction.schema';
+import {
+  PredictionEngineEvent,
+  PredictionEngineEventSchema,
+} from './schemas/prediction-engine-event.schema';
+import {
+  PredictionEngineState,
+  PredictionEngineStateSchema,
+} from './schemas/prediction-engine-state.schema';
+import {
+  MarketCalibration,
+  MarketCalibrationSchema,
+} from './schemas/market-calibration.schema';
 
-import { PredictionTriggerService } from './services/prediction-trigger.service';
-import { PredictionProcessingService } from './services/prediction-processing.service';
-import { PredictionQueueService } from './services/prediction-queue.service';
-import { PredictionWorkerService } from './services/prediction-worker.service';
+import { PredictionConfidenceService } from './services/prediction-confidence.service';
+import { PredictionDataService } from './services/prediction-data.service';
+import { ExpectedGoalsService } from './services/expected-goals.service';
+import { MarketOddsService } from './services/market-odds.service';
+import { MarketStatForecastService } from './services/market-stat-forecast.service';
+import { MarketPredictionCalculationService } from './services/market-prediction-calculation.service';
 import { PredictionEngineService } from './services/prediction-engine.service';
-import { PredictionSaveService } from './services/prediction-save.service';
-import { PredictionReadService } from './services/prediction-read.service';
-import { PredictionRunReadService } from './services/prediction-run-read.service';
-import { RawPredictionDataService } from './services/raw-prediction-data.service';
-import { RawPredictionFeatureService } from './services/raw-prediction-feature.service';
-import { MarketEvaluationService } from './services/market-evaluation.service';
-
-import { CalibrationService } from './calibration/calibration.service';
-import { CalibrationCalculator } from './calibration/calibration.calculator';
-import { CalibrationAssessment } from './calibration/calibration.assessment';
-import { CalibrationEngine } from './calibration/calibration.engine';
-
-import { ValueEngine } from './engines/value/value.engine';
-import { SafetyEngine } from './engines/safety/safety.engine';
-import { ProbabilityEngine } from './engines/probability/probability.engine';
-import { MarketModelRegistry } from './engines/probability/market-model.registry';
-
-import { ResultMarketEngine } from './engines/probability/result-market.engine';
-import { BttsMarketEngine } from './engines/probability/btts-market.engine';
-import { GoalMarketEngine } from './engines/probability/goal-market.engine';
-import { HalfMarketEngine } from './engines/probability/half-market.engine';
-import { HandicapMarketEngine } from './engines/probability/handicap-market.engine';
-
-import { EnsembleEngine } from './engines/ensemble/ensemble.engine';
-import { ConfidenceEngine } from './engines/ensemble/confidence.engine';
-import { FinalDecisionEngine } from './engines/final/final-decision.engine';
-
-import { SettlementModule } from './settlement/settlement.module';
-
-import { PredictionsEngineController } from './controllers/predictions-engine.controller';
-import { PredictionsReadController } from './controllers/predictions-read.controller';
-import { SettlementController } from './controllers/settlement.controller';
+import { PredictionQueueService } from './services/prediction-queue.service';
 import { PredictionQueueWorkerService } from './services/prediction-queue-worker.service';
-import {
-  EspnFixture,
-  EspnFixtureSchema,
-} from 'src/sports/schemas/espn/espn-fixture.schema';
-import {
-  ActiveCompetition,
-  ActiveCompetitionSchema,
-} from 'src/sports/schemas/active-competition.schema';
-import {
-  EspnTeam,
-  EspnTeamSchema,
-} from 'src/sports/schemas/espn/espn-team.schema';
-import {
-  EspnStanding,
-  EspnStandingSchema,
-} from 'src/sports/schemas/espn/espn-standing.schema';
-import {
-  HeadToHead,
-  HeadToHeadSchema,
-} from 'src/sports/schemas/head-to-head.schema';
-import {
-  TeamCompetitionStats,
-  TeamCompetitionStatsSchema,
-} from 'src/sports/schemas/team-competition-stats.schema';
-import {
-  TeamPerformanceProfile,
-  TeamPerformanceProfileSchema,
-} from 'src/sports/schemas/team-performance-profile.schema';
-import { OddsCalculationService } from './engines/value/odds-calculation.service';
-import { TeamComparisonService } from './services/team-comparison.service';
-import { MarketCoherenceService } from './services/market-coherence.service';
+import { PredictionTriggerService } from './services/prediction-trigger.service';
+import { PredictionReadService } from './services/prediction-read.service';
+import { PredictionEngineMonitorService } from './services/prediction-engine-monitor.service';
+import { PickCenterService } from './services/pick-center.service';
+import { SlipCenterService } from './services/slip-center.service';
+import { CuratedPredictionService } from './services/curated-prediction.service';
+import { MarketCalibrationService } from './services/market-calibration.service';
 
+import { ResultMarketEngine } from './services/market-engines/result-market.engine';
+import { GoalsMarketEngine } from './services/market-engines/goals-market.engine';
+import { PeriodMarketEngine } from './services/market-engines/period-market.engine';
+import { HandicapMarketEngine } from './services/market-engines/handicap-market.engine';
+import { StatisticsMarketEngine } from './services/market-engines/statistics-market.engine';
+import { PlayerMarketEngine } from './services/market-engines/player-market.engine';
+import { CombinationMarketEngine } from './services/market-engines/combination-market.engine';
+import { SpecialMarketEngine } from './services/market-engines/special-market.engine';
+
+import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
+import { SettlementModule } from '../settlement/settlement.module';
 @Module({
   imports: [
-    /*
-     * Sports owns all factual sports models and services.
-     */
+    PredictionAccessModule,
+    OddsModule,
     SportsModule,
-
     SettlementModule,
-
-    /*
-     * Prediction-specific persistence only.
-     *
-     * Sports models are intentionally not registered again
-     * in this module.
-     */
     MongooseModule.forFeature([
-      {
-        name: PredictionEnginePrediction.name,
-        schema: PredictionEnginePredictionSchema,
-      },
-
-      {
-        name: PredictionQueue.name,
-        schema: PredictionQueueSchema,
-      },
-
-      {
-        name: PredictionCalibration.name,
-        schema: PredictionCalibrationSchema,
-      },
-
-      {
-        name: PredictionRun.name,
-        schema: PredictionRunSchema,
-      },
-      {
-        name: EspnFixture.name,
-        schema: EspnFixtureSchema,
-      },
-
-      {
-        name: ActiveCompetition.name,
-        schema: ActiveCompetitionSchema,
-      },
-      {
-        name: EspnTeam.name,
-        schema: EspnTeamSchema,
-      },
-
-      {
-        name: EspnStanding.name,
-        schema: EspnStandingSchema,
-      },
-
-      {
-        name: TeamCompetitionStats.name,
-        schema: TeamCompetitionStatsSchema,
-      },
-
-      {
-        name: TeamPerformanceProfile.name,
-        schema: TeamPerformanceProfileSchema,
-      },
-
-      {
-        name: HeadToHead.name,
-        schema: HeadToHeadSchema,
-      },
+      { name: EspnFixture.name, schema: EspnFixtureSchema },
+      { name: EspnTeam.name, schema: EspnTeamSchema },
+      { name: EspnStanding.name, schema: EspnStandingSchema },
+      { name: ActiveCompetition.name, schema: ActiveCompetitionSchema },
+      { name: MarketPrediction.name, schema: MarketPredictionSchema },
+      { name: PredictionRun.name, schema: PredictionRunSchema },
+      { name: PredictionQueue.name, schema: PredictionQueueSchema },
+      { name: PickCenter.name, schema: PickCenterSchema },
+      { name: PredictionSlip.name, schema: PredictionSlipSchema },
+      { name: SlipCenterGenerationLock.name, schema: SlipCenterGenerationLockSchema },
+      { name: CuratedPrediction.name, schema: CuratedPredictionSchema },
+      { name: PredictionEngineEvent.name, schema: PredictionEngineEventSchema },
+      { name: PredictionEngineState.name, schema: PredictionEngineStateSchema },
+      { name: MarketCalibration.name, schema: MarketCalibrationSchema },
     ]),
   ],
-
-  controllers: [
-    PredictionsEngineController,
-    PredictionsReadController,
-    SettlementController,
-  ],
-
+  controllers: [PredictionEngineController, PredictionsReadController],
   providers: [
-    PredictionTriggerService,
-    PredictionProcessingService,
+    adminRealtimeRegistrationProvider('predictions-engine', 'Prediction Engine: queue, workers, prediction runs, calibration and engine events.'),
+    PredictionConfidenceService,
+    PredictionDataService,
+    ExpectedGoalsService,
+    MarketOddsService,
+    MarketStatForecastService,
+    MarketPredictionCalculationService,
+    PredictionEngineService,
     PredictionQueueService,
     PredictionQueueWorkerService,
-    PredictionWorkerService,
-
-    PredictionEngineService,
-    PredictionSaveService,
-
-    PredictionReadService,
-    PredictionRunReadService,
-
-    RawPredictionDataService,
-    RawPredictionFeatureService,
-
-    MarketEvaluationService,
-
-    CalibrationService,
-    CalibrationCalculator,
-    CalibrationAssessment,
-    CalibrationEngine,
-
-    ValueEngine,
-    OddsCalculationService,
-    SafetyEngine,
-    ProbabilityEngine,
-    MarketModelRegistry,
-
-    ResultMarketEngine,
-    BttsMarketEngine,
-    GoalMarketEngine,
-    HalfMarketEngine,
-    HandicapMarketEngine,
-
-    EnsembleEngine,
-    ConfidenceEngine,
-    FinalDecisionEngine,
-
-    MarketCoherenceService,
-
-    TeamComparisonService,
-  ],
-
-  exports: [
     PredictionTriggerService,
-    PredictionProcessingService,
-    PredictionEngineService,
-
     PredictionReadService,
-    PredictionRunReadService,
-
-    CalibrationService,
-
-    RawPredictionDataService,
-    RawPredictionFeatureService,
-
-    TeamComparisonService,
+    PredictionEngineMonitorService,
+    PickCenterService,
+    SlipCenterService,
+    CuratedPredictionService,
+    MarketCalibrationService,
+    ResultMarketEngine,
+    GoalsMarketEngine,
+    PeriodMarketEngine,
+    HandicapMarketEngine,
+    StatisticsMarketEngine,
+    PlayerMarketEngine,
+    CombinationMarketEngine,
+    SpecialMarketEngine,
+    JwtAuthGuard,
+    OptionalJwtAuthGuard,
+    RolesGuard,
+  ],
+  exports: [
+    PredictionEngineService,
+    PredictionQueueService,
+    PredictionQueueWorkerService,
+    PredictionTriggerService,
+    PredictionReadService,
+    PredictionEngineMonitorService,
+    PickCenterService,
+    SlipCenterService,
+    CuratedPredictionService,
+    MarketCalibrationService,
   ],
 })
 export class PredictionsEngineModule {}
+
+
+

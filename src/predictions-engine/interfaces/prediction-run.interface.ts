@@ -1,49 +1,21 @@
-import { PredictionMarket } from '../enums/prediction-market.enum';
-
-export interface MatchResultProbabilities {
-  home: number;
-  draw: number;
-  away: number;
-}
-
-export interface PredictionRunItemInput {
-  market: PredictionMarket;
-
-  selection: string;
-
-  probability: number;
-
-  confidence: number;
-
-  predictionId: string;
-
-  fairOdds?: number;
-
-  matchResultProbabilities?: MatchResultProbabilities;
-}
-
-export interface PredictionRunInput {
+export interface PredictionRunSummary {
+  runId: string;
   eventId: string;
-
-  competitionId: string;
-
-  season: number;
-
-  fixtureDate: Date;
-
-  homeTeam: {
-    id: string;
-    name: string;
-  };
-
-  awayTeam: {
-    id: string;
-    name: string;
-  };
-
-  source?: string;
-
-  modelVersion?: string;
-
-  predictions?: PredictionRunItemInput[];
+  status: string;
+  modelVersion: string;
+  startedAt: Date;
+  completedAt?: Date;
+  durationMs?: number;
+  totalMarkets: number;
+  calculatedMarkets: number;
+  partialMarkets: number;
+  unavailableMarkets: number;
+  failedMarkets: number;
+  totalSelections: number;
+  calculatedSelections: number;
+  averageConfidence?: number;
+  generalConfidence?: number;
+  expectedHomeGoals?: number;
+  expectedAwayGoals?: number;
+  errorMessage?: string;
 }

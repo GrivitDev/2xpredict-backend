@@ -808,25 +808,26 @@ export interface EspnEventDetail {
 // ESPN STANDINGS RESPONSE
 // ============================================================
 
+/**
+ * ESPN standings response. Known fields are typed for convenience, while the
+ * index signature deliberately preserves every additional provider field.
+ * The full object is stored without normalization in sports_espn_standings.payload.
+ */
 export interface EspnStandingsResponse {
   uid?: string;
-
+  id?: string;
   name?: string;
-
   abbreviation?: string;
-
   season?: EspnSeason;
-
   seasonType?: EspnSeasonType;
-
   fullViewLink?: EspnLink;
-
   children?: EspnStandingsGroup[];
-
   standings?: EspnStandingsContainer;
-
   [key: string]: unknown;
 }
+
+/** Full raw ESPN response payload, including unmodelled nested/group fields. */
+export type EspnStandingsPayload = EspnStandingsResponse & Record<string, unknown>;
 
 // ============================================================
 // ESPN STANDINGS GROUP
@@ -1829,22 +1830,6 @@ export interface EspnPickCenter {
 
 // ============================================================
 // ESPN NEWS RESPONSE
-// ============================================================
-
-export interface EspnNewsResponse {
-  resultsCount?: number;
-
-  resultsLimit?: number;
-
-  resultsOffset?: number;
-
-  headlines?: EspnNewsArticle[];
-
-  [key: string]: unknown;
-}
-
-// ============================================================
-// ESPN NEWS ARTICLE
 // ============================================================
 
 export interface EspnNewsArticle {

@@ -14,6 +14,29 @@ import {
   WebhookEvent,
 } from '../interfaces/payment-gateway.interface';
 
+interface PaystackResponse<T> {
+  status: boolean;
+  message?: string;
+  data?: T;
+}
+
+interface PaystackInitializationData {
+  authorization_url: string;
+  access_code: string;
+  reference: string;
+}
+
+interface PaystackTransaction {
+  id?: string | number;
+  status?: string;
+  amount?: number;
+  currency?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 @Injectable()
 export class PaystackProvider implements PaymentGateway {
   private readonly secretKey: string;
@@ -24,7 +47,7 @@ export class PaystackProvider implements PaymentGateway {
     private readonly http: HttpService,
     private readonly config: ConfigService,
   ) {
-    this.secretKey = this.config.get<string>('PAYSTACK_SECRET_KEY')!;
+    this.secretKey = this.config.getOrThrow<string>('PAYSTACK_SECRET_KEY');
   }
 
   // =====================================================
@@ -34,7 +57,7 @@ export class PaystackProvider implements PaymentGateway {
     input: InitializePaymentInput,
   ): Promise<InitializePaymentResult> {
     const { data } = await firstValueFrom(
-      this.http.post(
+      this.http.post<PaystackResponse<PaystackInitializationData>>(
         `${this.baseUrl}/transaction/initialize`,
         {
           email: input.email,
@@ -55,7 +78,7 @@ export class PaystackProvider implements PaymentGateway {
       ),
     );
 
-    if (!data.status) {
+    if (!data.status || !data.data) {
       throw new BadRequestException(
         data.message ?? 'Unable to initialize payment.',
       );
@@ -75,16 +98,15 @@ export class PaystackProvider implements PaymentGateway {
   // =====================================================
   async verifyPayment(reference: string): Promise<VerifyPaymentResult> {
     const { data } = await firstValueFrom(
-      this.http.get(`${this.baseUrl}/transaction/verify/${reference}`, {
-        headers: {
-          Authorization: `Bearer ${this.secretKey}`,
+      this.http.get<PaystackResponse<PaystackTransaction>>(
+        `${this.baseUrl}/transaction/verify/${encodeURIComponent(reference)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${this.secretKey}`,
+          },
         },
-      }),
+      ),
     );
-    // 👇 ADD THIS
-    console.log('================ PAYSTACK VERIFY ================');
-    console.log(JSON.stringify(data, null, 2));
-    console.log('=================================================');
     const payment = data.data;
 
     // ===================================================
@@ -100,7 +122,8 @@ export class PaystackProvider implements PaymentGateway {
         message: data.message ?? 'Unable to verify payment.',
 
         transactionId: payment?.id ? String(payment.id) : undefined,
-
+        amountMinor: typeof payment?.amount === 'number' ? payment.amount : undefined,
+        currency: payment?.currency,
         raw: data,
       };
     }
@@ -124,7 +147,8 @@ export class PaystackProvider implements PaymentGateway {
         message: data.message ?? 'Payment verified successfully.',
 
         transactionId: payment.id ? String(payment.id) : undefined,
-
+        amountMinor: typeof payment.amount === 'number' ? payment.amount : undefined,
+        currency: payment.currency,
         raw: payment,
       };
     }
@@ -142,7 +166,8 @@ export class PaystackProvider implements PaymentGateway {
         message: data.message ?? 'Your payment is still being processed.',
 
         transactionId: payment.id ? String(payment.id) : undefined,
-
+        amountMinor: typeof payment.amount === 'number' ? payment.amount : undefined,
+        currency: payment.currency,
         raw: payment,
       };
     }
@@ -160,7 +185,8 @@ export class PaystackProvider implements PaymentGateway {
         data.message ?? `Payment status: ${payment.status ?? 'unknown'}.`,
 
       transactionId: payment.id ? String(payment.id) : undefined,
-
+      amountMinor: typeof payment.amount === 'number' ? payment.amount : undefined,
+      currency: payment.currency,
       raw: payment,
     };
   }
@@ -168,31 +194,48 @@ export class PaystackProvider implements PaymentGateway {
   // =====================================================
   // VALIDATE WEBHOOK
   // =====================================================
-  async validateWebhook(payload: any, signature?: string): Promise<boolean> {
-    if (!signature) {
-      return false;
-    }
+  validateWebhook(
+    payload: unknown,
+    signature?: string,
+    rawBody?: Buffer,
+  ): Promise<boolean> {
+    if (!signature || !rawBody?.length) return Promise.resolve(false);
+    if (!/^[a-f0-9]{128}$/i.test(signature)) return Promise.resolve(false);
 
-    const hash = crypto
+    const expected = crypto
       .createHmac('sha512', this.secretKey)
-      .update(JSON.stringify(payload))
-      .digest('hex');
-
-    return hash === signature;
+      .update(rawBody)
+      .digest();
+    const received = Buffer.from(signature, 'hex');
+    if (expected.length !== received.length) return Promise.resolve(false);
+    return Promise.resolve(crypto.timingSafeEqual(expected, received));
   }
 
   // =====================================================
   // PARSE WEBHOOK
   // =====================================================
-  async parseWebhook(payload: any): Promise<WebhookEvent> {
-    return {
-      reference: payload.data.reference,
+  parseWebhook(payload: unknown): Promise<WebhookEvent> {
+    if (!isRecord(payload) || !isRecord(payload.data)) {
+      throw new BadRequestException('Invalid Paystack webhook payload.');
+    }
 
-      transactionId: String(payload.data.id),
+    const { reference, id, status, amount, currency } = payload.data;
+    if (
+      typeof reference !== 'string' ||
+      (typeof id !== 'string' && typeof id !== 'number') ||
+      typeof status !== 'string'
+    ) {
+      throw new BadRequestException('Invalid Paystack webhook payload.');
+    }
 
-      status: payload.data.status === 'success' ? 'success' : 'failed',
-
-      raw: payload,
-    };
+    return Promise.resolve({
+      reference,
+      transactionId: String(id),
+      status: status === 'success' ? 'success' : 'failed',
+      amountMinor: typeof amount === 'number' ? amount : undefined,
+      currency: typeof currency === 'string' ? currency : undefined,
+      raw: payload as Record<string, any>,
+    });
   }
 }
+

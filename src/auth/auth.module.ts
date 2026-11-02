@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
@@ -13,12 +14,11 @@ import { UserSessionModule } from '../user-session/user-session.module'; // ✅ 
 import { JwtStrategy } from './strategies/jwt.strategy';
 
 import { OtpModule } from '../otp/otp.module';
-import { EmailService } from '../notifications/email.service';
-import { TelegramModule } from 'src/telegram/telegram.module';
+import { TelegramModule } from '../telegram/telegram.module';
 import { ReferralsModule } from '../referrals/referrals.module';
 import { PromosModule } from '../promos/promos.module';
-import { EmailModule } from 'src/notifications/email.module';
-import { CommonModule } from 'src/common/common.module';
+import { EmailModule } from '../notifications/email.module';
+import { CommonModule } from '../common/common.module';
 
 @Module({
   imports: [
@@ -49,8 +49,13 @@ import { CommonModule } from 'src/common/common.module';
 
   controllers: [AuthController],
 
-  providers: [AuthService, JwtStrategy, EmailService],
+  providers: [
+    AuthService,
+    JwtStrategy,
+    JwtAuthGuard,
+  ],
 
   exports: [PassportModule, JwtStrategy],
 })
 export class AuthModule {}
+

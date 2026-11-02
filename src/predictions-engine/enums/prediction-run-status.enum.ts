@@ -1,0 +1,7 @@
+export enum PredictionRunStatus {
+  QUEUED = 'QUEUED',
+  PROCESSING = 'PROCESSING',
+  COMPLETED = 'COMPLETED',
+  PARTIAL = 'PARTIAL',
+  FAILED = 'FAILED',
+}

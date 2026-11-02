@@ -34,7 +34,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Account deleted');
     }
 
-    if (user.status !== UserStatus.ACTIVE) {
+    const allowedStatus =
+      user.status === UserStatus.ACTIVE ||
+      (!user.isVerified && user.status === UserStatus.PENDING);
+    if (!allowedStatus) {
       throw new UnauthorizedException('Account not active');
     }
 
@@ -68,6 +71,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       countryCode: user.countryCode,
 
       currency: user.currency,
+
+      isVerified: user.isVerified,
+
+      status: user.status,
 
       sessionId: payload.sessionId,
     };

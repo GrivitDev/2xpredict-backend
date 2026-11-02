@@ -1,8 +1,8 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-
 import { HydratedDocument } from 'mongoose';
 
 export type EspnNewsDocument = HydratedDocument<EspnNews>;
+export type EspnNewsKind = 'NEWS' | 'VIDEO';
 
 @Schema({
   timestamps: true,
@@ -10,7 +10,9 @@ export type EspnNewsDocument = HydratedDocument<EspnNews>;
 })
 export class EspnNews {
   /**
-   * ESPN article ID.
+   * Stable ID derived from the normalized headline and content kind.
+   * This makes repeated appearances of the same item across fixture summaries
+   * resolve to one MongoDB document.
    */
   @Prop({
     required: true,
@@ -20,13 +22,23 @@ export class EspnNews {
   })
   articleId!: string;
 
-  /**
-   * ESPN league identifier associated with the article.
-   *
-   * This may be the ESPN league ID, abbreviation,
-   * or canonical league slug depending on the
-   * ESPN news payload and collection mapping.
-   */
+  @Prop({
+    type: String,
+    unique: true,
+    sparse: true,
+    index: true,
+    trim: true,
+  })
+  contentId?: string;
+
+  @Prop({
+    type: String,
+    index: true,
+    trim: true,
+    lowercase: true,
+  })
+  normalizedHeadline?: string;
+
   @Prop({
     required: true,
     index: true,
@@ -35,70 +47,86 @@ export class EspnNews {
   })
   leagueId!: string;
 
-  @Prop({
-    required: false,
-  })
-  headline?: string;
+  @Prop({ type: [String], default: [], index: true })
+  leagueIds!: string[];
 
-  @Prop({
-    required: false,
-  })
-  description?: string;
+  @Prop({ type: [String], default: [], index: true })
+  eventIds!: string[];
 
-  @Prop({
-    required: false,
-  })
-  published?: Date;
+  @Prop({ type: [String], default: [], index: true })
+  teamIds!: string[];
 
-  @Prop({
-    required: false,
-  })
-  lastModified?: Date;
+  @Prop({ type: String, trim: true, index: true })
+  eventId?: string;
 
-  @Prop({
-    required: false,
-  })
-  link?: string;
+  @Prop({ type: String, trim: true })
+  homeTeamId?: string;
 
-  @Prop({
-    required: false,
-  })
-  imageUrl?: string;
+  @Prop({ type: String, trim: true })
+  awayTeamId?: string;
 
-  @Prop({
-    required: false,
-  })
-  type?: string;
-
-  @Prop({
-    required: false,
-  })
-  author?: string;
-
-  /**
-   * Complete ESPN article payload.
-   */
-  @Prop({
-    type: Object,
-    required: true,
-  })
-  payload!: Record<string, unknown>;
+  @Prop({ type: Date, index: true })
+  fixtureDate?: Date;
 
   @Prop({
     required: true,
-    type: Date,
+    type: String,
+    enum: ['NEWS', 'VIDEO'],
+    default: 'NEWS',
     index: true,
   })
+  kind!: EspnNewsKind;
+
+  @Prop({ type: String, trim: true })
+  headline?: string;
+
+  @Prop({ type: String })
+  description?: string;
+
+  /** Original provider publication timestamp, when supplied. */
+  @Prop({ type: Date })
+  published?: Date;
+
+  @Prop({ type: Date })
+  lastModified?: Date;
+
+  /**
+   * Effective feed date: original publication date, falling back to
+   * lastModified only when the provider did not supply a publication date.
+   */
+  @Prop({ required: true, type: Date, index: true })
+  feedPublishedAt!: Date;
+
+  @Prop({ type: String })
+  link?: string;
+
+  @Prop({ type: String })
+  imageUrl?: string;
+
+  @Prop({ type: String })
+  type?: string;
+
+  @Prop({ type: String })
+  author?: string;
+
+  @Prop({ type: String, index: true })
+  sourceArticleId?: string;
+
+  @Prop({ type: Object, required: true })
+  payload!: Record<string, unknown>;
+
+  @Prop({ required: true, type: Date, index: true })
   collectedAt!: Date;
 }
 
 export const EspnNewsSchema = SchemaFactory.createForClass(EspnNews);
 
-EspnNewsSchema.index({
-  leagueId: 1,
-  published: -1,
-});
-
-EspnNewsSchema.index({
-  published: -1,
-});
+/*
+ * Feed queries sort by the effective publication date and commonly filter by
+ * content kind, competition, or team. These compound indexes keep those reads
+ * inside MongoDB instead of rescanning fixture summaries in Node.
+ */
+EspnNewsSchema.index({ feedPublishedAt: -1, _id: 1 });
+EspnNewsSchema.index({ kind: 1, feedPublishedAt: -1 });
+EspnNewsSchema.index({ leagueIds: 1, kind: 1, feedPublishedAt: -1 });
+EspnNewsSchema.index({ teamIds: 1, kind: 1, feedPublishedAt: -1 });

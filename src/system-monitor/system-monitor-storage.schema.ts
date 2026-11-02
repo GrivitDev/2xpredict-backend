@@ -162,3 +162,10 @@ export const SystemMonitorStorageSnapshotSchema = SchemaFactory.createForClass(
 SystemMonitorStorageSnapshotSchema.index({
   capturedAt: -1,
 });
+
+// Storage history is operational telemetry, not permanent business data.
+SystemMonitorStorageSnapshotSchema.index(
+  { capturedAt: 1 },
+  { expireAfterSeconds: 14 * 24 * 60 * 60, name: 'system_monitor_storage_ttl_14d' },
+);
+

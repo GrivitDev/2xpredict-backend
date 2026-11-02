@@ -7,22 +7,15 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
     enabled: true,
 
     /**
-     * ESPN does not have an application-level daily quota
-     * in our collection architecture.
-     *
-     * Endpoint request spacing is enforced by the provider
-     * rate-limit service at two seconds.
-     *
-     * ESPN concurrency is controlled separately by that
-     * service:
-     *
-     *   1 reserved live request
-     *   4 normal requests
-     *
-     * for a maximum of five concurrent ESPN requests.
+     * ESPN exposes no published application quota. We therefore use
+     * a small process-local start interval and a bounded concurrency
+     * pool. The rate-limit service applies adaptive backoff when ESPN
+     * returns throttling or transient server errors.
      */
     rateLimit: {
-      minIntervalSeconds: 2,
+      minIntervalSeconds: 0.1,
+      normalConcurrency: 4,
+      liveConcurrency: 1,
     },
 
     /**
@@ -36,91 +29,85 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 
     /**
      * Active competition matching.
-     *
-     * The stored ESPN catalogue is checked for competitions
-     * that currently have active fixtures.
      */
     activeCompetitions: {
       enabled: true,
       refreshIntervalMinutes: 10,
     },
 
+    /** Explicit endpoint gates; standalone standings is enabled for league tables. */
+    endpoints: {
+      globalLiveScoreboardEnabled: false,
+      // The dedicated endpoint is the primary source for ordinary league tables.
+      dedicatedStandingsEnabled: true,
+    },
+
     /**
      * Fixture collection.
      *
-     * Active competitions are processed according to priority.
-     *
-     * Normal operations keep today's fixtures and the
-     * configured upcoming window synchronized.
-     *
-     * A league is also considered stale when its fixture
-     * collection has not been refreshed for 48 hours.
+     * Startup covers every calendar month from season start through season
+     * end. Normal refresh jobs also use monthly scoreboard requests, grouped
+     * by month, while the sync ledger can still track individual dates.
+     * A month is never split into per-day ESPN requests as a fallback.
      */
     fixtures: {
       enabled: true,
 
-      /**
-       * Number of days ahead included in normal fixture
-       * synchronization.
-       */
+      /** Fixture-index refresh window only; Summary, Odds, and Prediction use their own explicit timing contracts. */
       forwardDays: 8,
 
-      /**
-       * Minimum freshness guarantee for active competitions.
-       *
-       * If a league has not had a fixture refresh for this
-       * many hours, a refresh should be scheduled after
-       * confirming the competition is still active.
-       */
+      /** Minimum freshness guarantee for active competitions. */
       staleAfterHours: 48,
 
-      /**
-       * Queue spacing between normal fixture work slots.
-       */
+      /** Queue spacing between normal fixture work slots. */
       slotIntervalMinutes: 0.02,
+
+      /** Maximum scoreboard events requested from ESPN for one month. */
+      startupMonthLimit: 500000,
+
+      /** Maximum simultaneous startup scoreboard requests. */
+      startupConcurrency: 2,
     },
 
     /**
      * ESPN Summary collection.
-     *
-     * Summary is the canonical detailed match-data payload
-     * stored in:
-     *
-     *   sports_espn_fixtures.payload.summary
-     *
-     * Startup hydrates Summary for all persisted fixtures.
-     *
-     * Normal operations collect Summary for:
-     *
-     *   1. fixtures within the next four days
-     *   2. fixtures that have just completed
-     *
-     * A Summary job must never be created when the fixture
-     * already contains payload.summary.
      */
     summary: {
       enabled: true,
 
-      /**
-       * Upcoming Summary collection window.
-       */
-      upcomingWindowDays: 4,
+      /** Bounded startup Summary lookahead, measured in elapsed hours from now. */
+      startupWindowHours: 80,
+
+      /** Runtime upcoming Summary window; keep aligned with the 82-hour startup horizon. */
+      upcomingWindowHours: 82,
+
+      /** First post-kickoff Summary refresh. 160 minutes is close to three hours. */
+      finishedMatchDelayMinutes: 160,
 
       /**
-       * Finished fixtures receive Summary immediately after
-       * completion is detected.
+       * Additional post-kickoff result checks if the persisted fixture remains
+       * incomplete after a successful Summary response. These are offsets from
+       * kickoff, not repeated delays from the time the previous job completed.
        */
-      immediatelyAfterFinished: true,
+      postMatchRecoveryCheckpointsMinutes: [240, 360, 720, 1440],
 
       /**
-       * Startup hydrates Summary for all persisted fixtures.
+       * Daily integrity recovery scans only this recent history window. The
+       * queue builder rotates through bounded batches instead of scanning the
+       * full fixture collection or issuing provider requests from a timer.
        */
-      startupAllFixtures: true,
+      integrityRecoveryLookbackDays: 30,
+      integrityRecoveryBatchSize: 100,
+      integrityRecoveryMaxQueuedPerPass: 20,
+
+      /** Summary queue-write batch size; provider calls execute in the durable worker after startup unlocks. */
+      startupBatchSize: 10,
+
+      /** Maximum transient retry attempts inside the ESPN client. */
+      maxRetries: 3,
     },
 
-    /**
-     * Queue safety.
-     */
+    /** Queue safety. */
     queue: {
       enabled: true,
       maxAttempts: 3,
@@ -134,7 +121,7 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
   // ==========================================================
 
   FOOTBALL_DATA: {
-    enabled: true,
+    enabled: false,
 
     rateLimit: {
       minIntervalSeconds: 60,
@@ -142,33 +129,6 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 
     live: {
       intervalMinutes: 5,
-    },
-  },
-
-  // ==========================================================
-  // THE ODDS API
-  // ==========================================================
-
-  ODDS_API: {
-    enabled: true,
-
-    /**
-     * Application-level monthly request budget.
-     */
-    monthlyRequestLimit: 450,
-
-    rateLimit: {
-      minIntervalSeconds: 60,
-    },
-
-    /**
-     * Refresh the provider sport catalogue periodically.
-     */
-    sportsRefreshDays: 30,
-
-    oddsCollection: {
-      daily: true,
-      slotIntervalMinutes: 1,
     },
   },
 
@@ -190,10 +150,16 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
       minIntervalSeconds: 200,
     },
 
+    /**
+     * Each durable YouTube job executes exactly one provider search. The
+     * worker schedules retry/fallback timing from YOUTUBE_CONFIG.searchWorkflow.
+     * The interval/retryDelay fields remain for config-shape compatibility;
+     * they do not control the bounded highlight search sequence.
+     */
     queue: {
       enabled: true,
       intervalMinutes: 20,
-      maxAttempts: 3,
+      maxAttempts: 1,
       retryDelayMinutes: 20,
     },
   },

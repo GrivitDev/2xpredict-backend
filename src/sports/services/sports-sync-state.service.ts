@@ -20,8 +20,25 @@ import {
 
 import { EspnQueueJobType } from '../interfaces/espn-queue.interface';
 
+import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
+
 @Injectable()
 export class SportsSyncStateService {
+  /**
+   * Maximum number of lightweight fixture records MongoDB streams into
+   * Node during Summary-state reconciliation. The actual ESPN payload is
+   * never projected into the application process.
+   */
+  private readonly summaryFixtureCursorBatchSize = 500;
+
+  /** Initial startup attempt plus configured background retries. */
+  private readonly summaryTotalAttempts =
+    SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxAttempts + 1;
+
+  /** One startup attempt plus the configured retry budget for fixture months. */
+  private readonly fixtureTotalAttempts =
+    SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxAttempts + 1;
+
   constructor(
     @InjectModel(SportsSyncState.name)
     private readonly syncStateModel: Model<SportsSyncStateDocument>,
@@ -190,6 +207,7 @@ export class SportsSyncStateService {
     dateFrom: string;
     dateTo: string;
     trackingMode?: 'WINDOW' | 'HISTORY';
+    granularity?: 'DAY' | 'MONTH';
   }): Promise<SportsSyncStateDocument> {
     const leagueId = this.normalize(params.leagueId);
 
@@ -204,120 +222,120 @@ export class SportsSyncStateService {
     }
 
     const requestedDateFrom = this.normalizeDateOnly(params.dateFrom);
-
     const requestedDateTo = this.normalizeDateOnly(params.dateTo);
 
+    if (requestedDateFrom > requestedDateTo) {
+      throw new Error(
+        `Invalid fixture synchronization range for ${leagueId}: ` +
+          `${requestedDateFrom} -> ${requestedDateTo}`,
+      );
+    }
+
     const trackingMode = params.trackingMode ?? 'HISTORY';
+    const granularity = params.granularity ?? 'DAY';
 
     const stateKey = this.getQueueStateKey({
       jobType: EspnQueueJobType.FIXTURE_REFRESH,
-
       leagueId,
-
       season: params.season,
     });
 
     await this.ensureQueueState({
       jobType: EspnQueueJobType.FIXTURE_REFRESH,
-
       leagueId,
-
       season: params.season,
-
       priority: params.priority,
-
       trackingMode,
     });
 
     let state = await this.requireState(stateKey);
 
-    const effectiveDateFrom = state.dateFrom
-      ? this.minDateOnly(state.dateFrom, requestedDateFrom)
-      : requestedDateFrom;
+    const effectiveDateFrom =
+      trackingMode === 'HISTORY' && state.dateFrom
+        ? this.minDateOnly(state.dateFrom, requestedDateFrom)
+        : requestedDateFrom;
 
-    const effectiveDateTo = state.dateTo
-      ? this.maxDateOnly(state.dateTo, requestedDateTo)
-      : requestedDateTo;
+    const effectiveDateTo =
+      trackingMode === 'HISTORY' && state.dateTo
+        ? this.maxDateOnly(state.dateTo, requestedDateTo)
+        : requestedDateTo;
 
-    await this.ensureDateWindow({
-      stateKey,
+    state.fixtureGranularity = granularity;
 
-      dateFrom: effectiveDateFrom,
+    if (granularity === 'MONTH') {
+      await this.ensureMonthWindow({
+        stateKey,
+        dateFrom: effectiveDateFrom,
+        dateTo: effectiveDateTo,
+        trackingMode,
+      });
+    } else {
+      await this.ensureDateWindow({
+        stateKey,
+        dateFrom: effectiveDateFrom,
+        dateTo: effectiveDateTo,
+        trackingMode,
+      });
 
-      dateTo: effectiveDateTo,
+      state = await this.requireState(stateKey);
 
-      trackingMode,
-    });
+      /*
+       * A runtime date refresh can safely infer SUCCESS from an
+       * already-persisted fixture for the exact date. This optimization
+       * is intentionally NOT used for MONTH units because an empty ESPN
+       * month response is a valid successful synchronization.
+       */
+      const fixtureDateKeys = await this.getFixtureDateKeys({
+        leagueId,
+        season: params.season,
+        dateFrom: effectiveDateFrom,
+        dateTo: effectiveDateTo,
+      });
 
-    state = await this.requireState(stateKey);
+      let changed = false;
 
-    /*
-     * A date with at least one persisted fixture is already
-     * synchronized and therefore does not need another ESPN call.
-     */
-    const fixtureDateKeys = await this.getFixtureDateKeys({
-      leagueId,
+      for (const unit of state.units) {
+        if (
+          unit.type !== SportsSyncUnitType.DATE ||
+          !unit.dateKey ||
+          !fixtureDateKeys.has(unit.dateKey)
+        ) {
+          continue;
+        }
 
-      season: params.season,
+        if (unit.status === SportsSyncUnitStatus.SUCCESS) {
+          continue;
+        }
 
-      dateFrom: effectiveDateFrom,
-
-      dateTo: effectiveDateTo,
-    });
-
-    let changed = false;
-
-    for (const unit of state.units) {
-      if (
-        unit.type !== SportsSyncUnitType.DATE ||
-        !unit.dateKey ||
-        !fixtureDateKeys.has(unit.dateKey)
-      ) {
-        continue;
+        unit.status = SportsSyncUnitStatus.SUCCESS;
+        unit.completedAt = new Date();
+        unit.startedAt = undefined;
+        unit.nextAttemptAt = undefined;
+        unit.lastError = undefined;
+        changed = true;
       }
 
-      if (unit.status === SportsSyncUnitStatus.SUCCESS) {
-        continue;
+      const nextStatus = this.calculateOverallStatus(state);
+
+      if (state.status !== nextStatus) {
+        state.status = nextStatus;
+        changed = true;
       }
 
-      unit.status = SportsSyncUnitStatus.SUCCESS;
+      if (state.status === SportsSyncStateStatus.SUCCESS) {
+        state.lastSuccessfulAt = new Date();
+        state.lastCompletedAt = new Date();
+        state.lastError = undefined;
+        state.consecutiveFailures = 0;
+      }
 
-      unit.completedAt = new Date();
-
-      unit.startedAt = undefined;
-
-      unit.nextAttemptAt = undefined;
-
-      unit.lastError = undefined;
-
-      changed = true;
+      if (changed) {
+        state.markModified('units');
+        await state.save();
+      }
     }
 
-    const nextStatus = this.calculateOverallStatus(state);
-
-    if (state.status !== nextStatus) {
-      state.status = nextStatus;
-
-      changed = true;
-    }
-
-    if (state.status === SportsSyncStateStatus.SUCCESS) {
-      state.lastSuccessfulAt = new Date();
-
-      state.lastCompletedAt = new Date();
-
-      state.lastError = undefined;
-
-      state.consecutiveFailures = 0;
-    }
-
-    if (changed) {
-      state.markModified('units');
-
-      await state.save();
-    }
-
-    return state;
+    return this.requireState(stateKey);
   }
 
   // ============================================================
@@ -349,6 +367,8 @@ export class SportsSyncStateService {
     season: number;
     priority: number;
     trackingMode?: 'WINDOW' | 'HISTORY';
+    kickoffWindowStart?: Date;
+    kickoffWindowEnd?: Date;
   }): Promise<SportsSyncStateDocument> {
     const leagueId = this.normalize(params.leagueId);
 
@@ -392,19 +412,55 @@ export class SportsSyncStateService {
      * This is the source of truth for whether a Summary actually
      * exists in the canonical sports_espn_fixtures collection.
      */
-    const fixtures = await this.espnFixtureModel
-      .find({
-        leagueId,
-
-        season: params.season,
-      })
-      .select({
-        eventId: 1,
-
-        payload: 1,
-      })
-      .lean()
-      .exec();
+    const fixtureCursor = this.espnFixtureModel
+      .aggregate<{
+        eventId?: string;
+        hasSummary?: boolean;
+      }>([
+        {
+          $match: {
+            leagueId,
+            season: params.season,
+            ...(params.trackingMode === 'WINDOW' &&
+            params.kickoffWindowStart &&
+            params.kickoffWindowEnd
+              ? {
+                  fixtureDate: {
+                    $gte: params.kickoffWindowStart,
+                    $lte: params.kickoffWindowEnd,
+                  },
+                }
+              : {}),
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            eventId: 1,
+            hasSummary: {
+              $cond: [
+                { $eq: [{ $type: '$payload.summary' }, 'object'] },
+                {
+                  $gt: [
+                    {
+                      $size: {
+                        $objectToArray: {
+                          $ifNull: ['$payload.summary', {}],
+                        },
+                      },
+                    },
+                    0,
+                  ],
+                },
+                false,
+              ],
+            },
+          },
+        },
+      ])
+      .cursor({
+        batchSize: this.summaryFixtureCursorBatchSize,
+      });
 
     /*
      * Existing synchronization units are indexed once so that
@@ -424,8 +480,14 @@ export class SportsSyncStateService {
 
     let changed = false;
 
-    for (const fixture of fixtures) {
-      const eventId = String(fixture.eventId ?? '').trim();
+    for await (const fixture of fixtureCursor) {
+      const rawEventId = (fixture as { eventId?: unknown }).eventId;
+      const eventId =
+        typeof rawEventId === 'string'
+          ? rawEventId.trim()
+          : typeof rawEventId === 'number' && Number.isFinite(rawEventId)
+            ? String(rawEventId)
+            : '';
 
       if (!eventId) {
         continue;
@@ -433,7 +495,8 @@ export class SportsSyncStateService {
 
       const stepKey = this.getSummaryStepKey(eventId);
 
-      const hasSummary = this.hasSummaryPayload(fixture.payload);
+      const hasSummary =
+        (fixture as { hasSummary?: boolean }).hasSummary === true;
 
       const existing = existingUnits.get(stepKey);
 
@@ -515,17 +578,30 @@ export class SportsSyncStateService {
       }
     }
 
-    const nextStatus = this.calculateOverallStatus(state);
+    const nextStatus =
+      state.units.filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.STEP &&
+          typeof unit.stepKey === 'string' &&
+          unit.stepKey.startsWith('SUMMARY:'),
+      ).length === 0
+        ? SportsSyncStateStatus.SUCCESS
+        : this.calculateOverallStatus(state);
 
     if (state.status !== nextStatus) {
       state.status = nextStatus;
-
       changed = true;
+    }
+
+    if (nextStatus === SportsSyncStateStatus.SUCCESS) {
+      state.lastSuccessfulAt = new Date();
+      state.lastCompletedAt = new Date();
+      state.lastError = undefined;
+      state.consecutiveFailures = 0;
     }
 
     if (changed) {
       state.markModified('units');
-
       await state.save();
     }
 
@@ -548,115 +624,124 @@ export class SportsSyncStateService {
     trackingMode?: 'WINDOW' | 'HISTORY';
   }): Promise<SportsSyncStateDocument> {
     const leagueId = this.normalize(params.leagueId);
-
     const eventId = String(params.eventId).trim();
 
     if (!leagueId) {
       throw new Error('Summary event state requires a valid league ID');
     }
-
     if (typeof params.season !== 'number') {
       throw new Error('Summary event state requires a valid season');
     }
-
     if (!eventId) {
       throw new Error('Summary event state requires a valid event ID');
     }
 
     const stateKey = this.getQueueStateKey({
       jobType: EspnQueueJobType.SUMMARY_REFRESH,
-
       leagueId,
-
       season: params.season,
     });
 
     await this.ensureQueueState({
       jobType: EspnQueueJobType.SUMMARY_REFRESH,
-
       leagueId,
-
       season: params.season,
-
       priority: params.priority,
-
       trackingMode: params.trackingMode ?? 'HISTORY',
     });
 
-    const state = await this.requireState(stateKey);
-
     const stepKey = this.getSummaryStepKey(eventId);
-
-    const existing = state.units.find(
-      (unit) =>
-        unit.type === SportsSyncUnitType.STEP && unit.stepKey === stepKey,
-    );
-
+    const unitKey = `STEP:${stepKey}`;
     let changed = false;
 
-    if (!existing) {
-      state.units.push({
-        key: `STEP:${stepKey}`,
+    // Insert only if another concurrent caller has not already created this unit.
+    const initialUnitStatus =
+      params.hasSummary === true
+        ? SportsSyncUnitStatus.SUCCESS
+        : SportsSyncUnitStatus.PENDING;
+    const inserted = await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          units: { $not: { $elemMatch: { key: unitKey } } },
+        },
+        {
+          $push: {
+            units: {
+              key: unitKey,
+              type: SportsSyncUnitType.STEP,
+              stepKey,
+              status: initialUnitStatus,
+              attempts: 0,
+              ...(params.hasSummary === true
+                ? { completedAt: new Date() }
+                : {}),
+            },
+          },
+        },
+      )
+      .exec();
+    changed = inserted.modifiedCount > 0;
 
-        type: SportsSyncUnitType.STEP,
-
-        stepKey,
-
-        status:
-          params.hasSummary === true
-            ? SportsSyncUnitStatus.SUCCESS
-            : SportsSyncUnitStatus.PENDING,
-
-        attempts: 0,
-
-        ...(params.hasSummary === true
-          ? {
-              completedAt: new Date(),
-            }
-          : {}),
-      });
-
-      changed = true;
-    } else if (params.hasSummary === true) {
-      if (existing.status !== SportsSyncUnitStatus.SUCCESS) {
-        existing.status = SportsSyncUnitStatus.SUCCESS;
-
-        existing.completedAt = new Date();
-
-        existing.startedAt = undefined;
-
-        existing.nextAttemptAt = undefined;
-
-        existing.lastError = undefined;
-
-        changed = true;
-      }
-    } else if (
-      existing.status === SportsSyncUnitStatus.SUCCESS ||
-      existing.status === SportsSyncUnitStatus.PROCESSING
-    ) {
-      existing.status = SportsSyncUnitStatus.PENDING;
-
-      existing.startedAt = undefined;
-
-      existing.completedAt = undefined;
-
-      existing.nextAttemptAt = undefined;
-
-      existing.lastError = undefined;
-
-      changed = true;
+    if (params.hasSummary === true) {
+      const result = await this.syncStateModel
+        .updateOne(
+          {
+            stateKey,
+            units: {
+              $elemMatch: {
+                key: unitKey,
+                status: { $ne: SportsSyncUnitStatus.SUCCESS },
+              },
+            },
+          },
+          {
+            $set: {
+              'units.$.status': SportsSyncUnitStatus.SUCCESS,
+              'units.$.completedAt': new Date(),
+            },
+            $unset: {
+              'units.$.startedAt': 1,
+              'units.$.nextAttemptAt': 1,
+              'units.$.lastError': 1,
+            },
+          },
+        )
+        .exec();
+      changed = changed || result.modifiedCount > 0;
+    } else {
+      // Do not reset a currently-running worker merely because a queue builder
+      // observed that the Summary has not yet been persisted.
+      const result = await this.syncStateModel
+        .updateOne(
+          {
+            stateKey,
+            units: {
+              $elemMatch: {
+                key: unitKey,
+                status: SportsSyncUnitStatus.SUCCESS,
+              },
+            },
+          },
+          {
+            $set: { 'units.$.status': SportsSyncUnitStatus.PENDING },
+            $unset: {
+              'units.$.startedAt': 1,
+              'units.$.completedAt': 1,
+              'units.$.nextAttemptAt': 1,
+              'units.$.lastError': 1,
+            },
+          },
+        )
+        .exec();
+      changed = changed || result.modifiedCount > 0;
     }
 
     if (changed) {
-      state.status = this.calculateOverallStatus(state);
-
-      state.markModified('units');
-
-      await state.save();
+      await this.refreshOverallStatus(stateKey);
     }
 
-    return state;
+    return this.requireState(stateKey);
   }
 
   /**
@@ -667,69 +752,91 @@ export class SportsSyncStateService {
     stateKey: string,
     eventIds: string[],
   ): Promise<void> {
-    const state = await this.requireState(stateKey);
+    const normalizedEventIds = [
+      ...new Set(
+        eventIds.map((eventId) => String(eventId).trim()).filter(Boolean),
+      ),
+    ];
+    if (normalizedEventIds.length === 0) return;
 
-    const eventIdSet = new Set(
-      eventIds.map((eventId) => String(eventId).trim()).filter(Boolean),
+    const stepKeys = normalizedEventIds.map((eventId) =>
+      this.getSummaryStepKey(eventId),
     );
+    const state = await this.syncStateModel
+      .findOne({ stateKey })
+      .select({
+        stateKey: 1,
+        'units.type': 1,
+        'units.stepKey': 1,
+        'units.status': 1,
+      })
+      .lean()
+      .exec();
 
-    if (eventIdSet.size === 0) {
-      return;
+    if (!state) {
+      throw new Error(`Sports synchronization state ${stateKey} was not found`);
     }
 
-    const unitsByStepKey = new Map(
-      state.units
-        .filter(
-          (unit) =>
-            unit.type === SportsSyncUnitType.STEP &&
-            typeof unit.stepKey === 'string',
-        )
-        .map((unit) => [unit.stepKey as string, unit]),
-    );
+    const statusByStepKey = new Map<string, SportsSyncUnitStatus>();
+    for (const unit of state.units ?? []) {
+      if (unit.type === SportsSyncUnitType.STEP && unit.stepKey) {
+        statusByStepKey.set(unit.stepKey, unit.status);
+      }
+    }
 
-    const now = new Date();
-
-    let changed = false;
-
-    for (const eventId of eventIdSet) {
-      const stepKey = this.getSummaryStepKey(eventId);
-
-      const unit = unitsByStepKey.get(stepKey);
-
-      if (!unit) {
+    for (const stepKey of stepKeys) {
+      if (!statusByStepKey.has(stepKey)) {
         throw new Error(
           `Summary synchronization unit ${stepKey} does not exist in ${stateKey}`,
         );
       }
-
-      if (unit.status === SportsSyncUnitStatus.SUCCESS) {
-        continue;
-      }
-
-      unit.status = SportsSyncUnitStatus.PROCESSING;
-
-      unit.attempts += 1;
-
-      unit.startedAt = now;
-
-      unit.completedAt = undefined;
-
-      unit.nextAttemptAt = undefined;
-
-      unit.lastError = undefined;
-
-      changed = true;
     }
 
-    if (!changed) {
-      return;
-    }
+    const pendingStepKeys = stepKeys.filter(
+      (stepKey) =>
+        statusByStepKey.get(stepKey) !== SportsSyncUnitStatus.SUCCESS,
+    );
+    if (pendingStepKeys.length === 0) return;
 
-    state.status = SportsSyncStateStatus.PROCESSING;
-
-    state.markModified('units');
-
-    await state.save();
+    const now = new Date();
+    await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          units: {
+            $elemMatch: {
+              type: SportsSyncUnitType.STEP,
+              stepKey: { $in: pendingStepKeys },
+              status: { $ne: SportsSyncUnitStatus.SUCCESS },
+            },
+          },
+        },
+        {
+          $set: {
+            status: SportsSyncStateStatus.PROCESSING,
+            'units.$[unit].status': SportsSyncUnitStatus.PROCESSING,
+            'units.$[unit].startedAt': now,
+          },
+          $unset: {
+            'units.$[unit].completedAt': 1,
+            'units.$[unit].nextAttemptAt': 1,
+            'units.$[unit].lastError': 1,
+          },
+          $inc: {
+            'units.$[unit].attempts': 1,
+          },
+        },
+        {
+          arrayFilters: [
+            {
+              'unit.type': SportsSyncUnitType.STEP,
+              'unit.stepKey': { $in: pendingStepKeys },
+              'unit.status': { $ne: SportsSyncUnitStatus.SUCCESS },
+            },
+          ],
+        },
+      )
+      .exec();
   }
 
   /**
@@ -794,55 +901,127 @@ export class SportsSyncStateService {
   /**
    * Records one individual ESPN Summary fetch failure immediately.
    */
-  async markSummaryEventFetchFailed(
+  /**
+   * Marks a bounded group of successfully persisted Summary events as
+   * SUCCESS in one MongoDB update. The fixture payloads must already have
+   * been persisted before this method is called.
+   */
+  async markSummaryEventFetchSuccessBatch(
     stateKey: string,
-    eventId: string,
-    error: unknown,
+    eventIds: string[],
   ): Promise<void> {
-    const stepKey = this.getSummaryStepKey(eventId);
+    const normalizedEventIds = [
+      ...new Set(
+        eventIds.map((eventId) => String(eventId).trim()).filter(Boolean),
+      ),
+    ];
 
-    const message = error instanceof Error ? error.message : String(error);
+    if (normalizedEventIds.length === 0) {
+      return;
+    }
 
-    const nextAttemptAt = new Date(Date.now() + this.getRetryDelay(1));
+    const stepKeys = normalizedEventIds.map((eventId) =>
+      this.getSummaryStepKey(eventId),
+    );
+
+    const now = new Date();
 
     const result = await this.syncStateModel
       .updateOne(
-        {
-          stateKey,
-
-          'units.key': `STEP:${stepKey}`,
-        },
+        { stateKey },
         {
           $set: {
-            'units.$.status': SportsSyncUnitStatus.FAILED,
-
-            'units.$.nextAttemptAt': nextAttemptAt,
-
-            'units.$.lastError': message,
-
-            status: SportsSyncStateStatus.PARTIAL,
-
-            lastError: message,
+            'units.$[unit].status': SportsSyncUnitStatus.SUCCESS,
+            'units.$[unit].completedAt': now,
           },
-
           $unset: {
-            'units.$.startedAt': 1,
-
-            'units.$.completedAt': 1,
+            'units.$[unit].startedAt': 1,
+            'units.$[unit].nextAttemptAt': 1,
+            'units.$[unit].lastError': 1,
           },
-
-          $inc: {
-            consecutiveFailures: 1,
-          },
+        },
+        {
+          arrayFilters: [
+            {
+              'unit.type': SportsSyncUnitType.STEP,
+              'unit.stepKey': { $in: stepKeys },
+            },
+          ],
         },
       )
       .exec();
 
     if (result.matchedCount === 0) {
       throw new Error(
+        `Summary synchronization state ${stateKey} was not found`,
+      );
+    }
+  }
+
+  async markSummaryEventFetchFailed(
+    stateKey: string,
+    eventId: string,
+    error: unknown,
+  ): Promise<void> {
+    const stepKey = this.getSummaryStepKey(eventId);
+    const unitKey = `STEP:${stepKey}`;
+    const state = await this.syncStateModel
+      .findOne({ stateKey, 'units.key': unitKey }, { 'units.$': 1 })
+      .lean()
+      .exec();
+    const unit = state?.units?.[0];
+
+    if (!unit) {
+      throw new Error(
         `Summary synchronization unit ${stepKey} does not exist in ${stateKey}`,
       );
     }
+
+    // Do not let a delayed failure overwrite a unit completed by another worker.
+    if (unit.status !== SportsSyncUnitStatus.PROCESSING) return;
+
+    const message = error instanceof Error ? error.message : String(error);
+    const attemptNumber = Math.max(1, unit.attempts ?? 0);
+    const terminal = attemptNumber >= this.summaryTotalAttempts;
+    const nextAttemptAt = terminal
+      ? undefined
+      : new Date(Date.now() + this.getRetryDelay(attemptNumber));
+
+    const set: Record<string, unknown> = {
+      'units.$.status': SportsSyncUnitStatus.FAILED,
+      'units.$.lastError': message,
+      status: SportsSyncStateStatus.PARTIAL,
+      lastError: message,
+    };
+    const unset: Record<string, 1> = {
+      'units.$.startedAt': 1,
+      'units.$.completedAt': 1,
+    };
+    if (nextAttemptAt) {
+      set['units.$.nextAttemptAt'] = nextAttemptAt;
+    } else {
+      unset['units.$.nextAttemptAt'] = 1;
+    }
+
+    await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          units: {
+            $elemMatch: {
+              key: unitKey,
+              status: SportsSyncUnitStatus.PROCESSING,
+              attempts: unit.attempts ?? 0,
+            },
+          },
+        },
+        {
+          $set: set,
+          $unset: unset,
+          $inc: { consecutiveFailures: 1 },
+        },
+      )
+      .exec();
   }
 
   /**
@@ -861,10 +1040,31 @@ export class SportsSyncStateService {
     eventIds: string[],
     error: unknown,
   ): Promise<void> {
-    const state = await this.requireState(stateKey);
+    const normalizedEventIds = [
+      ...new Set(
+        eventIds.map((eventId) => String(eventId).trim()).filter(Boolean),
+      ),
+    ];
+    if (normalizedEventIds.length === 0) return;
 
-    const unitsByStepKey = new Map(
-      state.units
+    const state = await this.syncStateModel
+      .findOne({ stateKey })
+      .select({
+        stateKey: 1,
+        'units.key': 1,
+        'units.stepKey': 1,
+        'units.type': 1,
+        'units.status': 1,
+        'units.attempts': 1,
+      })
+      .lean()
+      .exec();
+    if (!state) {
+      throw new Error(`Sports synchronization state ${stateKey} was not found`);
+    }
+
+    const unitByStepKey = new Map(
+      (state.units ?? [])
         .filter(
           (unit) =>
             unit.type === SportsSyncUnitType.STEP &&
@@ -872,60 +1072,63 @@ export class SportsSyncStateService {
         )
         .map((unit) => [unit.stepKey as string, unit]),
     );
-
     const message = error instanceof Error ? error.message : String(error);
 
-    const now = new Date();
+    // The caller persists at most one configured persistence batch at a time.
+    // Use targeted atomic writes so a large shared units array is never saved.
+    await Promise.all(
+      normalizedEventIds.map(async (eventId) => {
+        const stepKey = this.getSummaryStepKey(eventId);
+        const unit = unitByStepKey.get(stepKey);
+        if (!unit) return;
 
-    const nextAttemptAt = new Date(now.getTime() + this.getRetryDelay(1));
+        const attempts = unit.attempts ?? 0;
+        const terminal = attempts >= this.summaryTotalAttempts;
+        const nextAttemptAt = terminal
+          ? undefined
+          : new Date(Date.now() + this.getRetryDelay(Math.max(1, attempts)));
+        const set: Record<string, unknown> = {
+          status: SportsSyncStateStatus.PARTIAL,
+          lastError: message,
+          'units.$.status': SportsSyncUnitStatus.FAILED,
+          'units.$.lastError': message,
+        };
+        const unset: Record<string, 1> = {
+          'units.$.startedAt': 1,
+          'units.$.completedAt': 1,
+        };
+        if (nextAttemptAt) {
+          set['units.$.nextAttemptAt'] = nextAttemptAt;
+        } else {
+          unset['units.$.nextAttemptAt'] = 1;
+        }
 
-    let changed = false;
-
-    let failuresAdded = 0;
-
-    for (const eventId of eventIds) {
-      const normalizedEventId = String(eventId).trim();
-
-      if (!normalizedEventId) {
-        continue;
-      }
-
-      const stepKey = this.getSummaryStepKey(normalizedEventId);
-
-      const unit = unitsByStepKey.get(stepKey);
-
-      if (!unit) {
-        continue;
-      }
-
-      unit.status = SportsSyncUnitStatus.FAILED;
-
-      unit.startedAt = undefined;
-
-      unit.completedAt = undefined;
-
-      unit.nextAttemptAt = nextAttemptAt;
-
-      unit.lastError = message;
-
-      failuresAdded += 1;
-
-      changed = true;
-    }
-
-    if (!changed) {
-      return;
-    }
-
-    state.status = SportsSyncStateStatus.PARTIAL;
-
-    state.lastError = message;
-
-    state.consecutiveFailures += failuresAdded;
-
-    state.markModified('units');
-
-    await state.save();
+        await this.syncStateModel
+          .updateOne(
+            {
+              stateKey,
+              units: {
+                $elemMatch: {
+                  key: `STEP:${stepKey}`,
+                  attempts,
+                  status: {
+                    $in: [
+                      SportsSyncUnitStatus.PROCESSING,
+                      SportsSyncUnitStatus.SUCCESS,
+                    ],
+                  },
+                },
+              },
+            },
+            {
+              $set: set,
+              $unset: unset,
+              $inc: { consecutiveFailures: 1 },
+            },
+          )
+          .exec();
+      }),
+    );
   }
 
   /**
@@ -947,41 +1150,206 @@ export class SportsSyncStateService {
   }
 
   /**
-   * Returns incomplete Summary event IDs from a persistent
-   * SUMMARY_REFRESH state.
+   * Returns Summary event IDs that still require work and have not
+   * exhausted the configured total-attempt budget.
    */
-  async getIncompleteSummaryEvents(stateKey: string): Promise<string[]> {
+  async getIncompleteSummaryEvents(
+    stateKey: string,
+    limit?: number,
+  ): Promise<string[]> {
     const state = await this.requireState(stateKey);
 
-    return state.units
+    const events = state.units
       .filter(
         (unit) =>
           unit.type === SportsSyncUnitType.STEP &&
           typeof unit.stepKey === 'string' &&
           unit.stepKey.startsWith('SUMMARY:') &&
           (unit.status === SportsSyncUnitStatus.PENDING ||
-            unit.status === SportsSyncUnitStatus.FAILED),
+            unit.status === SportsSyncUnitStatus.FAILED) &&
+          unit.attempts < this.summaryTotalAttempts,
       )
       .map((unit) => String(unit.stepKey).slice('SUMMARY:'.length))
       .filter(Boolean)
       .sort();
+
+    return limit && limit > 0 ? events.slice(0, limit) : events;
   }
 
-  async isSummaryEventSuccessful(
+  /**
+   * Returns Summary event IDs that have never been attempted.
+   *
+   * Startup uses this to guarantee exactly one initial attempt.
+   */
+  async getSummaryEventIdsInWindow(
+    stateKey: string,
+    kickoffWindowStart: Date,
+    kickoffWindowEnd: Date,
+  ): Promise<Set<string>> {
+    const state = await this.requireState(stateKey);
+    if (!state.leagueId || !Number.isInteger(state.season)) return new Set();
+
+    const rows = await this.espnFixtureModel
+      .find({
+        leagueId: state.leagueId,
+        season: state.season,
+        // Startup callers pass season-start as the lower bound. Do not
+        // exclude live or completed fixtures: the startup phase must reconcile
+        // every fixture in the requested season-date range.
+        fixtureDate: { $gte: kickoffWindowStart, $lte: kickoffWindowEnd },
+      })
+      .select({ _id: 0, eventId: 1 })
+      .lean()
+      .exec();
+
+    return new Set(
+      rows
+        .map((row) =>
+          String((row as { eventId?: unknown }).eventId ?? '').trim(),
+        )
+        .filter(Boolean),
+    );
+  }
+
+  async getInitialSummaryEvents(
+    stateKey: string,
+    limit?: number,
+    eligibleEventIds?: ReadonlySet<string>,
+  ): Promise<string[]> {
+    const state = await this.requireState(stateKey);
+
+    const events = state.units
+      .filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.STEP &&
+          typeof unit.stepKey === 'string' &&
+          unit.stepKey.startsWith('SUMMARY:') &&
+          unit.status === SportsSyncUnitStatus.PENDING &&
+          unit.attempts === 0,
+      )
+      .map((unit) => String(unit.stepKey).slice('SUMMARY:'.length))
+      .filter(
+        (eventId) =>
+          Boolean(eventId) &&
+          (!eligibleEventIds || eligibleEventIds.has(eventId)),
+      )
+      .sort();
+
+    return limit && limit > 0 ? events.slice(0, limit) : events;
+  }
+
+  async getDueIncompleteSummaryEvents(
+    stateKey: string,
+    limit?: number,
+  ): Promise<string[]> {
+    const state = await this.requireState(stateKey);
+
+    const now = Date.now();
+
+    const events = state.units
+      .filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.STEP &&
+          typeof unit.stepKey === 'string' &&
+          unit.stepKey.startsWith('SUMMARY:') &&
+          (unit.status === SportsSyncUnitStatus.PENDING ||
+            unit.status === SportsSyncUnitStatus.FAILED) &&
+          unit.attempts < this.summaryTotalAttempts,
+      )
+      .filter((unit) => {
+        if (!unit.nextAttemptAt) {
+          return true;
+        }
+
+        return new Date(unit.nextAttemptAt).getTime() <= now;
+      })
+      .map((unit) => String(unit.stepKey).slice('SUMMARY:'.length))
+      .filter(Boolean)
+      .sort();
+
+    return limit && limit > 0 ? events.slice(0, limit) : events;
+  }
+
+  async getNextIncompleteSummaryRetryAt(
+    stateKey: string,
+  ): Promise<Date | null> {
+    const state = await this.requireState(stateKey);
+
+    const now = Date.now();
+    let earliest: number | null = null;
+
+    for (const unit of state.units) {
+      if (
+        unit.type !== SportsSyncUnitType.STEP ||
+        typeof unit.stepKey !== 'string' ||
+        !unit.stepKey.startsWith('SUMMARY:') ||
+        (unit.status !== SportsSyncUnitStatus.PENDING &&
+          unit.status !== SportsSyncUnitStatus.FAILED) ||
+        unit.attempts >= this.summaryTotalAttempts ||
+        !unit.nextAttemptAt
+      ) {
+        continue;
+      }
+
+      const retryAt = new Date(unit.nextAttemptAt).getTime();
+
+      if (retryAt <= now) {
+        continue;
+      }
+
+      if (earliest === null || retryAt < earliest) {
+        earliest = retryAt;
+      }
+    }
+
+    return earliest === null ? null : new Date(earliest);
+  }
+
+  async isSummaryComplete(stateKey: string): Promise<boolean> {
+    const state = await this.requireState(stateKey);
+
+    const summaryUnits = state.units.filter(
+      (unit) =>
+        unit.type === SportsSyncUnitType.STEP &&
+        typeof unit.stepKey === 'string' &&
+        unit.stepKey.startsWith('SUMMARY:'),
+    );
+
+    return summaryUnits.every(
+      (unit) =>
+        unit.status === SportsSyncUnitStatus.SUCCESS ||
+        (unit.status === SportsSyncUnitStatus.FAILED &&
+          unit.attempts >= this.summaryTotalAttempts),
+    );
+  }
+
+  async isSummaryEventComplete(
     stateKey: string,
     eventId: string,
   ): Promise<boolean> {
-    const state = await this.requireState(stateKey);
-
     const stepKey = this.getSummaryStepKey(eventId);
 
-    const unit = state.units.find(
-      (candidate) =>
-        candidate.type === SportsSyncUnitType.STEP &&
-        candidate.key === `STEP:${stepKey}`,
-    );
+    const state = await this.syncStateModel
+      .findOne(
+        {
+          stateKey,
+          'units.key': `STEP:${stepKey}`,
+        },
+        {
+          'units.$': 1,
+        },
+      )
+      .lean()
+      .exec();
 
-    return unit?.status === SportsSyncUnitStatus.SUCCESS;
+    const unit = state?.units?.[0];
+
+    return Boolean(
+      unit &&
+      (unit.status === SportsSyncUnitStatus.SUCCESS ||
+        (unit.status === SportsSyncUnitStatus.FAILED &&
+          unit.attempts >= this.summaryTotalAttempts)),
+    );
   }
 
   // ============================================================
@@ -1045,8 +1413,13 @@ export class SportsSyncStateService {
     const state = await this.requireState(params.stateKey);
 
     const desiredDateFrom = this.normalizeDateOnly(params.dateFrom);
-
     const desiredDateTo = this.normalizeDateOnly(params.dateTo);
+
+    if (desiredDateFrom > desiredDateTo) {
+      throw new Error(
+        `Invalid date window: ${desiredDateFrom} -> ${desiredDateTo}`,
+      );
+    }
 
     const existingDateUnits = new Map(
       state.units
@@ -1054,21 +1427,23 @@ export class SportsSyncStateService {
         .map((unit) => [unit.dateKey ?? unit.key, unit]),
     );
 
+    const existingMonthUnits = state.units.filter(
+      (unit) => unit.type === SportsSyncUnitType.MONTH,
+    );
+
     const existingStepUnits = state.units.filter(
       (unit) => unit.type === SportsSyncUnitType.STEP,
     );
 
-    let effectiveDateFrom = desiredDateFrom;
+    const effectiveDateFrom =
+      params.trackingMode === 'HISTORY' && state.dateFrom
+        ? this.minDateOnly(state.dateFrom, desiredDateFrom)
+        : desiredDateFrom;
 
-    let effectiveDateTo = desiredDateTo;
-
-    if (state.dateFrom) {
-      effectiveDateFrom = this.minDateOnly(state.dateFrom, desiredDateFrom);
-    }
-
-    if (state.dateTo) {
-      effectiveDateTo = this.maxDateOnly(state.dateTo, desiredDateTo);
-    }
+    const effectiveDateTo =
+      params.trackingMode === 'HISTORY' && state.dateTo
+        ? this.maxDateOnly(state.dateTo, desiredDateTo)
+        : desiredDateTo;
 
     const effectiveDates = this.buildDateRange(
       effectiveDateFrom,
@@ -1084,27 +1459,21 @@ export class SportsSyncStateService {
 
       return {
         key: `DATE:${dateKey}`,
-
         type: SportsSyncUnitType.DATE,
-
         dateKey,
-
         status: SportsSyncUnitStatus.PENDING,
-
         attempts: 0,
       };
     });
 
     state.dateFrom = effectiveDateFrom;
-
     state.dateTo = effectiveDateTo;
-
     state.trackingMode = params.trackingMode;
+    state.fixtureGranularity = 'DAY';
 
     if (params.trackingMode === 'HISTORY') {
       const desiredDateSet = new Set(effectiveDates);
-
-      const historicalUnits = state.units.filter(
+      const historicalDateUnits = state.units.filter(
         (unit) =>
           unit.type === SportsSyncUnitType.DATE &&
           unit.dateKey &&
@@ -1112,16 +1481,99 @@ export class SportsSyncStateService {
       );
 
       state.units = [
-        ...historicalUnits,
+        ...historicalDateUnits,
         ...effectiveDateUnits,
+        ...existingMonthUnits,
         ...existingStepUnits,
       ];
     } else {
-      state.units = [...effectiveDateUnits, ...existingStepUnits];
+      state.units = [
+        ...effectiveDateUnits,
+        ...existingMonthUnits,
+        ...existingStepUnits,
+      ];
     }
 
     state.status = this.calculateOverallStatus(state);
+    state.markModified('units');
 
+    await state.save();
+
+    return state;
+  }
+
+  // ============================================================
+  // MONTH WINDOW
+  // ============================================================
+
+  async ensureMonthWindow(params: {
+    stateKey: string;
+    dateFrom: string;
+    dateTo: string;
+    trackingMode: 'WINDOW' | 'HISTORY';
+  }): Promise<SportsSyncStateDocument> {
+    const state = await this.requireState(params.stateKey);
+
+    const desiredDateFrom = this.normalizeDateOnly(params.dateFrom);
+    const desiredDateTo = this.normalizeDateOnly(params.dateTo);
+
+    if (desiredDateFrom > desiredDateTo) {
+      throw new Error(
+        `Invalid month synchronization window: ${desiredDateFrom} -> ${desiredDateTo}`,
+      );
+    }
+
+    const effectiveDateFrom =
+      params.trackingMode === 'HISTORY' && state.dateFrom
+        ? this.minDateOnly(state.dateFrom, desiredDateFrom)
+        : desiredDateFrom;
+
+    const effectiveDateTo =
+      params.trackingMode === 'HISTORY' && state.dateTo
+        ? this.maxDateOnly(state.dateTo, desiredDateTo)
+        : desiredDateTo;
+
+    const monthKeys = this.buildMonthRange(effectiveDateFrom, effectiveDateTo);
+
+    const existingMonthUnits = new Map(
+      state.units
+        .filter((unit) => unit.type === SportsSyncUnitType.MONTH)
+        .map((unit) => [unit.monthKey ?? unit.key, unit]),
+    );
+
+    const effectiveMonthUnits = monthKeys.map((monthKey) => {
+      const existing = existingMonthUnits.get(monthKey);
+
+      if (existing) {
+        return existing;
+      }
+
+      return {
+        key: `MONTH:${monthKey}`,
+        type: SportsSyncUnitType.MONTH,
+        monthKey,
+        status: SportsSyncUnitStatus.PENDING,
+        attempts: 0,
+      };
+    });
+
+    const existingStepUnits = state.units.filter(
+      (unit) => unit.type === SportsSyncUnitType.STEP,
+    );
+
+    /*
+     * MONTH startup state deliberately drops legacy historical DATE units.
+     * This is an intentional migration from the previous daily startup
+     * ledger and prevents old season-sized DATE arrays from surviving the
+     * new deployment.
+     */
+    state.units = [...effectiveMonthUnits, ...existingStepUnits];
+
+    state.dateFrom = effectiveDateFrom;
+    state.dateTo = effectiveDateTo;
+    state.trackingMode = params.trackingMode;
+    state.fixtureGranularity = 'MONTH';
+    state.status = this.calculateOverallStatus(state);
     state.markModified('units');
 
     await state.save();
@@ -1167,7 +1619,11 @@ export class SportsSyncStateService {
       (unit) => unit.type === SportsSyncUnitType.DATE,
     );
 
-    state.units = [...dateUnits, ...existingSteps.values()];
+    const monthUnits = state.units.filter(
+      (unit) => unit.type === SportsSyncUnitType.MONTH,
+    );
+
+    state.units = [...monthUnits, ...dateUnits, ...existingSteps.values()];
 
     state.status = this.calculateOverallStatus(state);
 
@@ -1178,38 +1634,199 @@ export class SportsSyncStateService {
     return state;
   }
 
+  /** Reopens a tracked step after a new source payload arrives. */
+  async resetStepForRefresh(stateKey: string, stepKey: string): Promise<void> {
+    const unitKey = `STEP:${stepKey}`;
+    const state = await this.syncStateModel
+      .findOne({ stateKey, 'units.key': unitKey }, { 'units.$': 1 })
+      .lean()
+      .exec();
+
+    if (!state?.units?.length) {
+      throw new Error(
+        `Synchronization step ${stepKey} does not exist in ${stateKey}`,
+      );
+    }
+
+    // Leave active work alone; a source refresh can re-open the step once the
+    // current worker has finished or the stale-work recovery has released it.
+    const result = await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          units: {
+            $elemMatch: {
+              key: unitKey,
+              status: { $ne: SportsSyncUnitStatus.PROCESSING },
+            },
+          },
+        },
+        {
+          $set: {
+            status: SportsSyncStateStatus.PENDING,
+            'units.$.status': SportsSyncUnitStatus.PENDING,
+            consecutiveFailures: 0,
+          },
+          $unset: {
+            lastError: 1,
+            'units.$.startedAt': 1,
+            'units.$.completedAt': 1,
+            'units.$.nextAttemptAt': 1,
+            'units.$.lastError': 1,
+          },
+        },
+      )
+      .exec();
+
+    if (result.modifiedCount > 0) {
+      await this.refreshOverallStatus(stateKey);
+    }
+  }
+
   // ============================================================
   // INTERRUPTED UNIT RECOVERY
   // ============================================================
 
-  async resetInterruptedUnits(stateKey: string): Promise<void> {
+  async resetInterruptedUnits(
+    stateKey: string,
+    staleBefore?: Date,
+  ): Promise<void> {
+    const stateExists = await this.syncStateModel.exists({ stateKey });
+    if (!stateExists) {
+      throw new Error(`Sports synchronization state ${stateKey} was not found`);
+    }
+
+    const unitFilter: Record<string, unknown> = {
+      'unit.status': SportsSyncUnitStatus.PROCESSING,
+    };
+    const unitMatch: Record<string, unknown> = {
+      status: SportsSyncUnitStatus.PROCESSING,
+    };
+    if (staleBefore) {
+      unitFilter.$or = [
+        { 'unit.startedAt': { $lte: staleBefore } },
+        { 'unit.startedAt': { $exists: false } },
+      ];
+      unitMatch.$or = [
+        { startedAt: { $lte: staleBefore } },
+        { startedAt: { $exists: false } },
+      ];
+    }
+
+    await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          units: { $elemMatch: unitMatch },
+        },
+        {
+          $set: {
+            status: SportsSyncStateStatus.PARTIAL,
+            'units.$[unit].status': SportsSyncUnitStatus.PENDING,
+          },
+          $unset: {
+            'units.$[unit].startedAt': 1,
+            'units.$[unit].nextAttemptAt': 1,
+          },
+        },
+        { arrayFilters: [unitFilter] },
+      )
+      .exec();
+  }
+
+  // ============================================================
+  // MONTH STATE
+  // ============================================================
+
+  async getIncompleteMonths(stateKey: string): Promise<string[]> {
     const state = await this.requireState(stateKey);
 
-    let changed = false;
+    return state.units
+      .filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.MONTH &&
+          (unit.status === SportsSyncUnitStatus.PENDING ||
+            unit.status === SportsSyncUnitStatus.FAILED) &&
+          unit.attempts < this.fixtureTotalAttempts,
+      )
+      .map((unit) => unit.monthKey)
+      .filter((month): month is string => Boolean(month))
+      .sort();
+  }
+
+  async getDueIncompleteMonths(
+    stateKey: string,
+    limit?: number,
+  ): Promise<string[]> {
+    const state = await this.requireState(stateKey);
+    const now = Date.now();
+
+    const months = state.units
+      .filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.MONTH &&
+          (unit.status === SportsSyncUnitStatus.PENDING ||
+            unit.status === SportsSyncUnitStatus.FAILED) &&
+          unit.attempts < this.fixtureTotalAttempts,
+      )
+      .filter((unit) => {
+        if (!unit.nextAttemptAt) {
+          return true;
+        }
+
+        return new Date(unit.nextAttemptAt).getTime() <= now;
+      })
+      .map((unit) => unit.monthKey)
+      .filter((month): month is string => Boolean(month))
+      .sort();
+
+    return limit && limit > 0 ? months.slice(0, limit) : months;
+  }
+
+  async getNextIncompleteMonthRetryAt(stateKey: string): Promise<Date | null> {
+    const state = await this.requireState(stateKey);
+    const now = Date.now();
+    let earliest: number | null = null;
 
     for (const unit of state.units) {
-      if (unit.status !== SportsSyncUnitStatus.PROCESSING) {
+      if (
+        unit.type !== SportsSyncUnitType.MONTH ||
+        (unit.status !== SportsSyncUnitStatus.PENDING &&
+          unit.status !== SportsSyncUnitStatus.FAILED) ||
+        unit.attempts >= this.fixtureTotalAttempts ||
+        !unit.nextAttemptAt
+      ) {
         continue;
       }
 
-      unit.status = SportsSyncUnitStatus.PENDING;
+      const retryAt = new Date(unit.nextAttemptAt).getTime();
 
-      unit.nextAttemptAt = undefined;
+      if (retryAt <= now) {
+        continue;
+      }
 
-      unit.startedAt = undefined;
-
-      changed = true;
+      if (earliest === null || retryAt < earliest) {
+        earliest = retryAt;
+      }
     }
 
-    if (!changed) {
-      return;
-    }
+    return earliest === null ? null : new Date(earliest);
+  }
 
-    state.status = SportsSyncStateStatus.PARTIAL;
+  async markMonthProcessing(stateKey: string, monthKey: string): Promise<void> {
+    await this.markUnitProcessing(stateKey, `MONTH:${monthKey}`);
+  }
 
-    state.markModified('units');
+  async markMonthSuccess(stateKey: string, monthKey: string): Promise<void> {
+    await this.markUnitSuccess(stateKey, `MONTH:${monthKey}`);
+  }
 
-    await state.save();
+  async markMonthFailed(
+    stateKey: string,
+    monthKey: string,
+    error: unknown,
+  ): Promise<void> {
+    await this.markUnitFailed(stateKey, `MONTH:${monthKey}`, error);
   }
 
   // ============================================================
@@ -1229,6 +1846,136 @@ export class SportsSyncStateService {
       .map((unit) => unit.dateKey)
       .filter((date): date is string => Boolean(date))
       .sort((a, b) => a.localeCompare(b));
+  }
+
+  async getDueIncompleteDates(stateKey: string): Promise<string[]> {
+    const state = await this.requireState(stateKey);
+
+    const now = Date.now();
+
+    return state.units
+      .filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.DATE &&
+          (unit.status === SportsSyncUnitStatus.PENDING ||
+            unit.status === SportsSyncUnitStatus.FAILED),
+      )
+      .filter((unit) => {
+        if (!unit.nextAttemptAt) {
+          return true;
+        }
+
+        return new Date(unit.nextAttemptAt).getTime() <= now;
+      })
+      .map((unit) => unit.dateKey)
+      .filter((date): date is string => Boolean(date))
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  async getNextIncompleteDateRetryAt(stateKey: string): Promise<Date | null> {
+    const state = await this.requireState(stateKey);
+
+    const now = Date.now();
+
+    const retryTimes = state.units
+      .filter(
+        (unit) =>
+          unit.type === SportsSyncUnitType.DATE &&
+          (unit.status === SportsSyncUnitStatus.PENDING ||
+            unit.status === SportsSyncUnitStatus.FAILED) &&
+          unit.nextAttemptAt,
+      )
+      .map((unit) => new Date(unit.nextAttemptAt as Date).getTime())
+      .filter((time) => time > now)
+      .sort((a, b) => a - b);
+
+    if (retryTimes.length === 0) {
+      return null;
+    }
+
+    return new Date(retryTimes[0]);
+  }
+
+  /**
+   * Reopens all month units after ESPN reported a successful but empty
+   * new-season catalogue. The lifecycle watcher retries the season later;
+   * resetting the units prevents empty responses from permanently blocking
+   * a season whose fixtures have not been published yet.
+   */
+  async resetMonthUnitsForRetry(stateKey: string): Promise<number> {
+    const state = await this.requireState(stateKey);
+    let resetCount = 0;
+
+    for (const unit of state.units) {
+      if (unit.type !== SportsSyncUnitType.MONTH) {
+        continue;
+      }
+
+      unit.status = SportsSyncUnitStatus.PENDING;
+      unit.startedAt = undefined;
+      unit.completedAt = undefined;
+      unit.nextAttemptAt = undefined;
+      unit.lastError = undefined;
+      unit.attempts = 0;
+      resetCount += 1;
+    }
+
+    if (resetCount > 0) {
+      state.status = SportsSyncStateStatus.PENDING;
+      state.lastError = undefined;
+      state.lastSuccessfulAt = undefined;
+      state.lastCompletedAt = undefined;
+      state.consecutiveFailures = 0;
+      state.markModified('units');
+      await state.save();
+    }
+
+    return resetCount;
+  }
+
+  /**
+   * Forces a previously successful day back into the refresh queue.
+   * Used when an event has just finished and the day-level scoreboard
+   * must be re-read for the final score/status update.
+   */
+  async resetDateForRefresh(stateKey: string, dateKey: string): Promise<void> {
+    const normalizedDate = this.normalizeDateOnly(dateKey);
+
+    const result = await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          'units.type': SportsSyncUnitType.DATE,
+          'units.dateKey': normalizedDate,
+        },
+        {
+          $set: {
+            status: SportsSyncStateStatus.PENDING,
+            'units.$[unit].status': SportsSyncUnitStatus.PENDING,
+          },
+          $unset: {
+            'units.$[unit].startedAt': 1,
+            'units.$[unit].completedAt': 1,
+            'units.$[unit].nextAttemptAt': 1,
+            'units.$[unit].lastError': 1,
+          },
+        },
+        {
+          arrayFilters: [
+            {
+              'unit.type': SportsSyncUnitType.DATE,
+              'unit.dateKey': normalizedDate,
+            },
+          ],
+        },
+      )
+      .exec();
+
+    if (result.matchedCount === 0) {
+      throw new Error(
+        `Fixture synchronization unit DATE:${normalizedDate} does not exist in ${stateKey}`,
+      );
+    }
   }
 
   async markDateProcessing(stateKey: string, dateKey: string): Promise<void> {
@@ -1266,11 +2013,37 @@ export class SportsSyncStateService {
   }
 
   async isUnitSuccessful(stateKey: string, unitKey: string): Promise<boolean> {
-    const state = await this.requireState(stateKey);
+    const state = await this.syncStateModel
+      .findOne(
+        {
+          stateKey,
+          'units.key': unitKey,
+        },
+        {
+          'units.$': 1,
+        },
+      )
+      .lean()
+      .exec();
 
-    const unit = state.units.find((candidate) => candidate.key === unitKey);
+    return state?.units?.[0]?.status === SportsSyncUnitStatus.SUCCESS;
+  }
 
-    return unit?.status === SportsSyncUnitStatus.SUCCESS;
+  async isUnitUnavailable(stateKey: string, unitKey: string): Promise<boolean> {
+    const state = await this.syncStateModel
+      .findOne({ stateKey, 'units.key': unitKey }, { 'units.$': 1 })
+      .lean()
+      .exec();
+
+    return state?.units?.[0]?.status === SportsSyncUnitStatus.UNAVAILABLE;
+  }
+
+  async markStepUnavailable(
+    stateKey: string,
+    stepKey: string,
+    reason: string,
+  ): Promise<void> {
+    await this.markUnitUnavailable(stateKey, `STEP:${stepKey}`, reason);
   }
 
   async markStepProcessing(stateKey: string, stepKey: string): Promise<void> {
@@ -1297,72 +2070,103 @@ export class SportsSyncStateService {
     stateKey: string,
     unitKey: string,
   ): Promise<void> {
-    const state = await this.requireState(stateKey);
+    const now = new Date();
 
-    const unit = state.units.find((candidate) => candidate.key === unitKey);
+    const result = await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          'units.key': unitKey,
+        },
+        {
+          $set: {
+            status: SportsSyncStateStatus.PROCESSING,
+            'units.$.status': SportsSyncUnitStatus.PROCESSING,
+            'units.$.startedAt': now,
+          },
+          $unset: {
+            'units.$.completedAt': 1,
+            'units.$.nextAttemptAt': 1,
+            'units.$.lastError': 1,
+          },
+          $inc: {
+            'units.$.attempts': 1,
+          },
+        },
+      )
+      .exec();
 
-    if (!unit) {
+    if (result.matchedCount === 0) {
       throw new Error(
         `Synchronization unit ${unitKey} does not exist in ${stateKey}`,
       );
     }
-
-    unit.status = SportsSyncUnitStatus.PROCESSING;
-
-    unit.attempts += 1;
-
-    unit.startedAt = new Date();
-
-    unit.completedAt = undefined;
-
-    unit.nextAttemptAt = undefined;
-
-    unit.lastError = undefined;
-
-    state.status = SportsSyncStateStatus.PROCESSING;
-
-    state.markModified('units');
-
-    await state.save();
   }
 
   private async markUnitSuccess(
     stateKey: string,
     unitKey: string,
   ): Promise<void> {
-    const state = await this.requireState(stateKey);
+    const now = new Date();
 
-    const unit = state.units.find((candidate) => candidate.key === unitKey);
+    const result = await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          'units.key': unitKey,
+        },
+        {
+          $set: {
+            'units.$.status': SportsSyncUnitStatus.SUCCESS,
+            'units.$.completedAt': now,
+            lastCompletedAt: now,
+          },
+          $unset: {
+            'units.$.startedAt': 1,
+            'units.$.nextAttemptAt': 1,
+            'units.$.lastError': 1,
+          },
+        },
+      )
+      .exec();
 
-    if (!unit) {
+    if (result.matchedCount === 0) {
       throw new Error(
         `Synchronization unit ${unitKey} does not exist in ${stateKey}`,
       );
     }
+  }
 
-    unit.status = SportsSyncUnitStatus.SUCCESS;
+  private async markUnitUnavailable(
+    stateKey: string,
+    unitKey: string,
+    reason: string,
+  ): Promise<void> {
+    const now = new Date();
+    const result = await this.syncStateModel
+      .updateOne(
+        { stateKey, 'units.key': unitKey },
+        {
+          $set: {
+            status: SportsSyncStateStatus.PARTIAL,
+            lastError: reason,
+            'units.$.status': SportsSyncUnitStatus.UNAVAILABLE,
+            'units.$.lastError': reason,
+            'units.$.completedAt': now,
+          },
+          $unset: {
+            'units.$.startedAt': 1,
+            'units.$.nextAttemptAt': 1,
+          },
+        },
+      )
+      .exec();
 
-    unit.completedAt = new Date();
-
-    unit.nextAttemptAt = undefined;
-
-    unit.lastError = undefined;
-
-    state.lastCompletedAt = new Date();
-
-    state.status = this.calculateOverallStatus(state);
-
-    if (state.status === SportsSyncStateStatus.SUCCESS) {
-      state.lastSuccessfulAt = new Date();
-
-      state.lastError = undefined;
-
-      state.consecutiveFailures = 0;
+    if (result.matchedCount === 0) {
+      throw new Error(
+        `Synchronization unit ${unitKey} does not exist in ${stateKey}`,
+      );
     }
-
-    state.markModified('units');
-
-    await state.save();
   }
 
   private async markUnitFailed(
@@ -1370,9 +2174,11 @@ export class SportsSyncStateService {
     unitKey: string,
     error: unknown,
   ): Promise<void> {
-    const state = await this.requireState(stateKey);
-
-    const unit = state.units.find((candidate) => candidate.key === unitKey);
+    const state = await this.syncStateModel
+      .findOne({ stateKey, 'units.key': unitKey }, { 'units.$': 1 })
+      .lean()
+      .exec();
+    const unit = state?.units?.[0];
 
     if (!unit) {
       throw new Error(
@@ -1380,29 +2186,53 @@ export class SportsSyncStateService {
       );
     }
 
+    // Failure handling must not replace a newer success or retry attempt.
+    if (unit.status !== SportsSyncUnitStatus.PROCESSING) return;
+
     const message = error instanceof Error ? error.message : String(error);
+    const attempts = unit.attempts ?? 0;
+    const exhaustedFixtureMonth =
+      unit.type === SportsSyncUnitType.MONTH &&
+      attempts >= this.fixtureTotalAttempts;
+    const nextAttemptAt = exhaustedFixtureMonth
+      ? undefined
+      : new Date(Date.now() + this.getRetryDelay(attempts));
 
-    unit.status = SportsSyncUnitStatus.FAILED;
+    const set: Record<string, unknown> = {
+      status: SportsSyncStateStatus.PARTIAL,
+      lastError: message,
+      'units.$.status': SportsSyncUnitStatus.FAILED,
+      'units.$.lastError': message,
+    };
+    const unset: Record<string, 1> = {
+      'units.$.startedAt': 1,
+      'units.$.completedAt': 1,
+    };
+    if (nextAttemptAt) {
+      set['units.$.nextAttemptAt'] = nextAttemptAt;
+    } else {
+      unset['units.$.nextAttemptAt'] = 1;
+    }
 
-    unit.startedAt = undefined;
-
-    unit.completedAt = undefined;
-
-    unit.nextAttemptAt = new Date(
-      Date.now() + this.getRetryDelay(unit.attempts),
-    );
-
-    unit.lastError = message;
-
-    state.status = SportsSyncStateStatus.PARTIAL;
-
-    state.lastError = message;
-
-    state.consecutiveFailures += 1;
-
-    state.markModified('units');
-
-    await state.save();
+    await this.syncStateModel
+      .updateOne(
+        {
+          stateKey,
+          units: {
+            $elemMatch: {
+              key: unitKey,
+              status: SportsSyncUnitStatus.PROCESSING,
+              attempts,
+            },
+          },
+        },
+        {
+          $set: set,
+          $unset: unset,
+          $inc: { consecutiveFailures: 1 },
+        },
+      )
+      .exec();
   }
 
   // ============================================================
@@ -1410,31 +2240,170 @@ export class SportsSyncStateService {
   // ============================================================
 
   async refreshOverallStatus(stateKey: string): Promise<SportsSyncStateStatus> {
-    const state = await this.requireState(stateKey);
+    // updatedAt acts as a compare-and-set token: if any other update changes
+    // this state while status is calculated, retry against the newer snapshot.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const state = await this.syncStateModel
+        .findOne({ stateKey })
+        .select({
+          stateKey: 1,
+          status: 1,
+          updatedAt: 1,
+          'units.status': 1,
+        })
+        .exec();
 
-    state.status = this.calculateOverallStatus(state);
+      if (!state) {
+        throw new Error(
+          `Sports synchronization state ${stateKey} was not found`,
+        );
+      }
 
-    if (state.status === SportsSyncStateStatus.SUCCESS) {
-      state.lastSuccessfulAt = new Date();
+      const nextStatus = this.calculateOverallStatus(state);
+      const filter: Record<string, unknown> = { stateKey };
+      if (state.updatedAt) filter.updatedAt = state.updatedAt;
 
-      state.lastCompletedAt = new Date();
+      const update =
+        nextStatus === SportsSyncStateStatus.SUCCESS
+          ? {
+              $set: {
+                status: nextStatus,
+                lastSuccessfulAt: new Date(),
+                lastCompletedAt: new Date(),
+                consecutiveFailures: 0,
+              },
+              $unset: { lastError: 1 },
+            }
+          : { $set: { status: nextStatus } };
 
-      state.lastError = undefined;
-
-      state.consecutiveFailures = 0;
+      const result = await this.syncStateModel.updateOne(filter, update).exec();
+      if (result.matchedCount > 0) return nextStatus;
     }
 
-    state.markModified('units');
-
-    await state.save();
-
-    return state.status;
+    throw new Error(
+      `Could not refresh synchronization status for ${stateKey} because it kept changing`,
+    );
   }
 
   async isComplete(stateKey: string): Promise<boolean> {
     const state = await this.requireState(stateKey);
 
     return this.isStateComplete(state);
+  }
+
+  /**
+   * Verifies that the persistent FIXTURE_REFRESH state for a
+   * league/season is completely synchronized.
+   *
+   * This is the startup phase barrier used before SUMMARY_REFRESH
+   * state reconciliation begins.
+   *
+   * It does not create or modify synchronization state.
+   */
+  async assertFixtureRefreshComplete(
+    leagueId: string,
+    season: number,
+  ): Promise<void> {
+    const stateKey = this.getQueueStateKey({
+      jobType: EspnQueueJobType.FIXTURE_REFRESH,
+
+      leagueId,
+
+      season,
+    });
+
+    const complete = await this.isComplete(stateKey);
+
+    if (!complete) {
+      throw new Error(
+        `Fixture synchronization state ${stateKey} is not complete`,
+      );
+    }
+  }
+
+  async assertFixtureStartupComplete(
+    leagueId: string,
+    season: number,
+  ): Promise<void> {
+    const stateKey = this.getQueueStateKey({
+      jobType: EspnQueueJobType.FIXTURE_REFRESH,
+      leagueId,
+      season,
+    });
+
+    const state = await this.requireState(stateKey);
+    const monthUnits = state.units.filter(
+      (unit) => unit.type === SportsSyncUnitType.MONTH,
+    );
+
+    const complete =
+      state.fixtureGranularity === 'MONTH' &&
+      monthUnits.length > 0 &&
+      monthUnits.every(
+        (unit) =>
+          unit.status === SportsSyncUnitStatus.SUCCESS ||
+          (unit.status === SportsSyncUnitStatus.FAILED &&
+            unit.attempts >= this.fixtureTotalAttempts),
+      );
+
+    if (!complete) {
+      throw new Error(
+        `Fixture startup synchronization state ${stateKey} is not complete`,
+      );
+    }
+  }
+
+  async getFixtureStartupProgress(stateKey: string): Promise<{
+    totalMonths: number;
+    successMonths: number;
+    processingMonths: number;
+    pendingMonths: number;
+    failedMonths: number;
+    terminalFailedMonths: number;
+    completionPercent: number;
+    complete: boolean;
+  }> {
+    const state = await this.requireState(stateKey);
+
+    const monthUnits = state.units.filter(
+      (unit) => unit.type === SportsSyncUnitType.MONTH,
+    );
+
+    const successMonths = monthUnits.filter(
+      (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
+    ).length;
+
+    const processingMonths = monthUnits.filter(
+      (unit) => unit.status === SportsSyncUnitStatus.PROCESSING,
+    ).length;
+
+    const pendingMonths = monthUnits.filter(
+      (unit) => unit.status === SportsSyncUnitStatus.PENDING,
+    ).length;
+
+    const failedMonths = monthUnits.filter(
+      (unit) => unit.status === SportsSyncUnitStatus.FAILED,
+    ).length;
+
+    const totalMonths = monthUnits.length;
+    const terminalFailedMonths = monthUnits.filter(
+      (unit) =>
+        unit.status === SportsSyncUnitStatus.FAILED &&
+        unit.attempts >= this.fixtureTotalAttempts,
+    ).length;
+    const completedUnits = successMonths + terminalFailedMonths;
+
+    return {
+      totalMonths,
+      successMonths,
+      processingMonths,
+      pendingMonths,
+      failedMonths,
+      terminalFailedMonths,
+      completionPercent:
+        totalMonths > 0 ? (completedUnits / totalMonths) * 100 : 0,
+      complete: totalMonths > 0 && completedUnits === totalMonths,
+    };
   }
 
   // ============================================================
@@ -1573,35 +2542,21 @@ export class SportsSyncStateService {
     dateTo: string;
   }): Promise<Set<string>> {
     const from = this.parseDateOnly(params.dateFrom);
-
     const toExclusive = this.addUtcDays(this.parseDateOnly(params.dateTo), 1);
 
-    const fixtures = await this.espnFixtureModel
-      .find({
-        leagueId: this.normalize(params.leagueId),
-
-        season: params.season,
-
-        fixtureDate: {
-          $gte: from,
-
-          $lt: toExclusive,
-        },
-      })
-      .select({
-        fixtureDate: 1,
-      })
-      .lean()
-      .exec();
+    const fixtureDates = await this.espnFixtureModel.distinct('fixtureDate', {
+      leagueId: this.normalize(params.leagueId),
+      season: params.season,
+      fixtureDate: {
+        $gte: from,
+        $lt: toExclusive,
+      },
+    });
 
     const dates = new Set<string>();
 
-    for (const fixture of fixtures) {
-      if (!fixture.fixtureDate) {
-        continue;
-      }
-
-      const fixtureDate = new Date(fixture.fixtureDate);
+    for (const value of fixtureDates) {
+      const fixtureDate = new Date(value);
 
       if (Number.isNaN(fixtureDate.getTime())) {
         continue;
@@ -1617,27 +2572,38 @@ export class SportsSyncStateService {
   // HELPERS
   // ============================================================
 
-  private hasSummaryPayload(payload: unknown): boolean {
-    if (!payload || typeof payload !== 'object') {
-      return false;
-    }
-
-    const payloadRecord = payload as Record<string, unknown>;
-
-    const summary = payloadRecord.summary;
-
-    return Boolean(
-      summary &&
-      typeof summary === 'object' &&
-      Object.keys(summary as Record<string, unknown>).length > 0,
-    );
-  }
-
   private isStateComplete(state: SportsSyncStateDocument): boolean {
     return (
       state.units.length > 0 &&
       state.units.every((unit) => unit.status === SportsSyncUnitStatus.SUCCESS)
     );
+  }
+
+  private buildMonthRange(dateFrom: string, dateTo: string): string[] {
+    const start = this.parseDateOnly(dateFrom);
+    const end = this.parseDateOnly(dateTo);
+
+    const months: string[] = [];
+    let cursor = new Date(
+      Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1),
+    );
+    const endMonth = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1);
+
+    while (cursor.getTime() <= endMonth) {
+      months.push(
+        `${cursor.getUTCFullYear().toString().padStart(4, '0')}${(
+          cursor.getUTCMonth() + 1
+        )
+          .toString()
+          .padStart(2, '0')}`,
+      );
+
+      cursor = new Date(
+        Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1),
+      );
+    }
+
+    return months;
   }
 
   private buildDateRange(dateFrom: string, dateTo: string): string[] {
@@ -1720,7 +2686,11 @@ export class SportsSyncStateService {
     }
 
     if (
-      state.units.some((unit) => unit.status === SportsSyncUnitStatus.FAILED)
+      state.units.some(
+        (unit) =>
+          unit.status === SportsSyncUnitStatus.FAILED ||
+          unit.status === SportsSyncUnitStatus.UNAVAILABLE,
+      )
     ) {
       return SportsSyncStateStatus.PARTIAL;
     }

@@ -20,6 +20,12 @@ import { SportsProviderRateLimitService } from './sports-provider-rate-limit.ser
 import { PriorityCompetitionService } from './priority-competition.service';
 import { CompetitionPriority } from '../enums/competition-priority.enum';
 
+export type YoutubeHighlightSearchOutcome =
+  | 'FOUND'
+  | 'NOT_FOUND'
+  | 'SKIPPED'
+  | 'QUOTA_EXHAUSTED';
+
 interface MatchInfo {
   fixtureId: string;
   leagueId: string;
@@ -54,26 +60,34 @@ export class YoutubeHighlightService {
   // ============================================================
 
   /**
-   * Called directly by FINISHED_MATCH.
+   * Called only by the persistent ESPN queue worker after eligibility checks.
    *
    * Flow:
    *
-   * FINISHED_MATCH
+   * COMPLETED_FIXTURE_QUEUE_JOB
    *      ↓
    * load ESPN fixture
    *      ↓
    * check priority competition
    *      ↓
-   * YouTube search
+   * block SELECTIVE competitions
+   *      ↓
+   * check existing FOUND highlight
+   *      ↓
+   * check YouTube quota
+   *      ↓
+   * YouTube search restricted to match + 24h
    *      ↓
    * save/update highlight
    *
-   * There is no separate YouTube queue.
+   * Queue deduplication, persistence, retries and restart recovery are handled
+   * by EspnQueueService / EspnQueueWorkerService.
    */
   async processFixture(
     fixtureId: string,
     competitionId?: string,
-  ): Promise<void> {
+    channelId?: string,
+  ): Promise<YoutubeHighlightSearchOutcome> {
     const normalizedFixtureId = fixtureId.trim();
 
     if (!normalizedFixtureId) {
@@ -110,7 +124,7 @@ export class YoutubeHighlightService {
         `Skipping YouTube highlight for non-priority competition ${match.leagueId}`,
       );
 
-      return;
+      return 'SKIPPED';
     }
 
     if (priorityCompetition.priority === CompetitionPriority.SELECTIVE) {
@@ -118,7 +132,7 @@ export class YoutubeHighlightService {
         `Skipping YouTube highlight for SELECTIVE competition ${match.leagueId}`,
       );
 
-      return;
+      return 'SKIPPED';
     }
 
     /*
@@ -135,11 +149,11 @@ export class YoutubeHighlightService {
       .exec();
 
     if (existing && existing.status === YoutubeHighlightStatus.FOUND) {
-      return;
+      return 'FOUND';
     }
 
     /*
-     * FINISHED_MATCH is the only caller, so the provider quota
+     * The persistent queue worker is the only caller, so the provider quota
      * is checked immediately before the actual YouTube request.
      */
     const remaining =
@@ -148,22 +162,33 @@ export class YoutubeHighlightService {
       )) ?? 0;
 
     if (remaining <= 0) {
-      throw new Error('YouTube daily provider quota exhausted');
+      this.logger.warn(
+        `Stopping YouTube highlight search for ${normalizedFixtureId}: daily provider quota is exhausted`,
+      );
+      return 'QUOTA_EXHAUSTED';
     }
 
     /*
      * One YouTube search request.
+     *
+     * The YouTube provider itself enforces:
+     *
+     *     match date → match date + 24 hours
+     *
+     * so historical videos cannot be selected.
      */
     const result = await this.youtubeService.findHighlight(
       match.homeTeam,
       match.awayTeam,
       match.date,
+      channelId,
     );
 
     if (!result) {
-      throw new Error(
-        `No suitable YouTube highlight found for ${match.homeTeam} vs ${match.awayTeam}`,
+      this.logger.warn(
+        `No suitable YouTube highlight found for ${match.homeTeam} vs ${match.awayTeam} on ${channelId || 'any channel'}`,
       );
+      return 'NOT_FOUND';
     }
 
     /*
@@ -216,15 +241,19 @@ export class YoutubeHighlightService {
         },
         {
           upsert: true,
+
           returnDocument: 'after',
         },
       )
       .exec();
 
     this.logger.debug(
-      `YouTube highlight collected for ESPN fixture ${normalizedFixtureId}`,
+      `YouTube highlight collected for ESPN fixture ${normalizedFixtureId} from channel ${channelId}`,
     );
+
+    return 'FOUND';
   }
+
   // ============================================================
   // REMAINING DAILY QUOTA
   // ============================================================
@@ -259,19 +288,20 @@ export class YoutubeHighlightService {
       return null;
     }
 
-    const payload =
+    const payload: Record<string, unknown> =
       fixture.payload && typeof fixture.payload === 'object'
         ? fixture.payload
         : {};
 
-    const event =
+    const event: Record<string, unknown> =
       payload['event'] && typeof payload['event'] === 'object'
         ? (payload['event'] as Record<string, unknown>)
         : payload;
 
-    const competitionsValue = event['competitions'] ?? payload['competitions'];
+    const competitionsValue: unknown =
+      event['competitions'] ?? payload['competitions'];
 
-    const competitions = Array.isArray(competitionsValue)
+    const competitions: unknown[] = Array.isArray(competitionsValue)
       ? competitionsValue
       : [];
 
@@ -282,7 +312,8 @@ export class YoutubeHighlightService {
         ? (competitions[0] as Record<string, unknown>)
         : undefined;
 
-    const competitionValue = payload['competition'] ?? event['competition'];
+    const competitionValue: unknown =
+      payload['competition'] ?? event['competition'];
 
     const competition =
       competitionValue && typeof competitionValue === 'object'
@@ -330,7 +361,7 @@ export class YoutubeHighlightService {
      * Prefer the original event date, then the competition date,
      * then the normalized fixtureDate stored in MongoDB.
      */
-    const dateValue =
+    const dateValue: unknown =
       event['date'] ?? firstCompetition?.['date'] ?? fixture.fixtureDate;
 
     if (!homeName || !awayName || !dateValue) {
@@ -421,3 +452,4 @@ export class YoutubeHighlightService {
     return undefined;
   }
 }
+

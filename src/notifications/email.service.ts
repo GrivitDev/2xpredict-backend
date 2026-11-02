@@ -617,7 +617,7 @@ Our support team is always available if you have any questions regarding your pa
 
   async sendSubscriptionActivatedEmail(data: {
     email: string;
-    plan: 'regular' | 'vip';
+    plan: 'regular' | 'vip' | 'premium';
     amount: number;
     currency: string;
     activatedDate: Date;
@@ -630,7 +630,11 @@ Our support team is always available if you have any questions regarding your pa
     const symbol = data.currency === 'USD' ? '$' : '₦';
 
     const planName =
-      data.plan === 'vip' ? 'VIP Subscription' : 'Regular Subscription';
+      data.plan === 'premium'
+        ? 'Premium Subscription'
+        : data.plan === 'vip'
+          ? 'VIP Subscription'
+          : 'Regular Subscription';
 
     return this.resend.emails.send({
       from: '2XPredict <subscriptions@2xpredict.com>',
@@ -693,41 +697,29 @@ ${infoCard('Subscription Summary', [
 ])}
 
 ${
-  data.plan === 'vip'
+  data.plan === 'premium'
     ? `
-${infoCard('VIP Benefits', [
-  {
-    label: '✓ Premium Predictions',
-    value: '',
-  },
-  {
-    label: '✓ VIP Markets',
-    value: '',
-  },
-  {
-    label: '✓ Expert Analysis',
-    value: '',
-  },
-  {
-    label: '✓ Early Access',
-    value: '',
-  },
+${infoCard('Premium Benefits', [
+  { label: '✓ Premium Prediction Access', value: '' },
+  { label: '✓ Full Market Access', value: '' },
+  { label: '✓ Priority Member Features', value: '' },
+  { label: '✓ Advanced Analysis', value: '' },
 ])}
 `
-    : `
+    : data.plan === 'vip'
+      ? `
+${infoCard('VIP Benefits', [
+  { label: '✓ Premium Predictions', value: '' },
+  { label: '✓ VIP Markets', value: '' },
+  { label: '✓ Expert Analysis', value: '' },
+  { label: '✓ Early Access', value: '' },
+])}
+`
+      : `
 ${infoCard('Regular Benefits', [
-  {
-    label: '✓ Regular Predictions',
-    value: '',
-  },
-  {
-    label: '✓ Member Features',
-    value: '',
-  },
-  {
-    label: '✓ Daily Tips',
-    value: '',
-  },
+  { label: '✓ Regular Predictions', value: '' },
+  { label: '✓ Member Features', value: '' },
+  { label: '✓ Daily Tips', value: '' },
 ])}
 `
 }
@@ -880,9 +872,9 @@ As a member of 2XPredict, you can:
 
 • View free football predictions
 
-• Purchase premium predictions individually
+• Access predictions and markets included with your subscription
 
-• Upgrade to a Regular or VIP subscription
+• Choose a Regular, VIP, or Premium subscription
 
 • Access expert football analysis
 
@@ -893,7 +885,7 @@ ${primaryButton('Go to Dashboard', dashboardUrl)}
 
 ${secondaryButton('Browse Predictions', predictionsUrl)}
 
-${secondaryButton('Upgrade to VIP', vipUrl)}
+${secondaryButton('View Subscription Plans', vipUrl)}
 
 ${paragraph(`
 Thank you for choosing 2XPredict.
@@ -907,7 +899,7 @@ We wish you success and hope you enjoy everything our platform has to offer.
 
   async sendSubscriptionExpiringEmail(data: {
     email: string;
-    plan: 'regular' | 'vip';
+    plan: 'regular' | 'vip' | 'premium';
     expiryDate: Date;
     daysRemaining: number;
   }) {
@@ -983,7 +975,7 @@ We appreciate your continued support.
 
   async sendSubscriptionExpiredEmail(data: {
     email: string;
-    plan: 'regular' | 'vip';
+    plan: 'regular' | 'vip' | 'premium';
     expiryDate: Date;
   }) {
     const renewalUrl = 'https://www.2xpredict.com/subscription';

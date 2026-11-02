@@ -9,12 +9,8 @@ export class CreateAdActionDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(500)
-  @Matches(
-    /^(\/[a-zA-Z0-9\-_/]*|https?:\/\/.+)$/,
-
-    {
-      message: 'URL must be an internal route or valid external URL',
-    },
-  )
+  @Matches(/^(\/[a-zA-Z0-9\-_/?.=&%]*|https?:\/\/[^\s]+)$/i, {
+    message: 'URL must be an internal route or an HTTP(S) URL.',
+  })
   url!: string;
 }

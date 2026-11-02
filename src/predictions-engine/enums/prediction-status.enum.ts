@@ -1,8 +1,6 @@
 export enum PredictionStatus {
-  PENDING = 'PENDING',
-  ACTIVE = 'ACTIVE',
-  WON = 'WON',
-  LOST = 'LOST',
-  VOID = 'VOID',
-  CANCELLED = 'CANCELLED',
+  CALCULATED = 'CALCULATED',
+  PARTIAL = 'PARTIAL',
+  UNAVAILABLE = 'UNAVAILABLE',
+  FAILED = 'FAILED',
 }

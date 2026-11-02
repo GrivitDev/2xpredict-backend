@@ -20,7 +20,8 @@ export class PlanConfigController {
   @Roles('admin')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Patch()
-  update(@Body() body: any) {
+  update(@Body() body: unknown) {
     return this.service.update(body);
   }
 }
+

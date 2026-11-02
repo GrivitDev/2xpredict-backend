@@ -1,5 +1,8 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { MongooseModule } from '@nestjs/mongoose';
+import { SettlementModule } from '../settlement/settlement.module';
 
 import { SportsController } from './sports.controller';
 
@@ -7,7 +10,6 @@ import { SportsService } from './sports.service';
 
 import { EspnService } from './providers/espn.service';
 import { FootballDataService } from './providers/football-data.service';
-import { TheOddsApiService } from './providers/the-odds-api.service';
 import { YoutubeService } from './providers/youtube.service';
 
 import { SportsProviderRateLimitService } from './services/sports-provider-rate-limit.service';
@@ -19,7 +21,9 @@ import { EspnActiveCompetitionService } from './services/espn-active-competition
 import { EspnQueueService } from './services/espn-queue.service';
 import { EspnQueueBuilderService } from './services/espn-queue-builder.service';
 import { EspnQueueWorkerService } from './services/espn-queue-worker.service';
+import { EspnSeasonDataService } from './services/espn-season-data.service';
 import { SportsSyncStateService } from './services/sports-sync-state.service';
+import { EspnStandingsService } from './services/espn-standings.service';
 
 import { SportsCollectionService } from './services/sports-collection.service';
 import { SportsDataReadService } from './services/sports-data-read.service';
@@ -28,9 +32,6 @@ import { SportsSystemMonitorService } from './services/sports-system-monitor.ser
 import { SportsStartupService } from './services/sports-startup.service';
 
 import { YoutubeHighlightService } from './services/youtube-highlight.service';
-
-import { FootballDataScheduler } from './schedulers/football-data.scheduler';
-import { NewsScheduler } from './schedulers/news.scheduler';
 
 import {
   ActiveCompetition,
@@ -55,6 +56,11 @@ import {
 } from './schemas/espn/espn-standing.schema';
 
 import { EspnTeam, EspnTeamSchema } from './schemas/espn/espn-team.schema';
+
+import {
+  EspnStandingsCollectionState,
+  EspnStandingsCollectionStateSchema,
+} from './schemas/espn/espn-standings-collection-state.schema';
 
 import { EspnQueue, EspnQueueSchema } from './schemas/espn-queue.schema';
 
@@ -103,8 +109,10 @@ import {
   YouTubeHighlightSchema,
 } from './schemas/youtube-highlight.schema';
 
+import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
 @Module({
   imports: [
+    forwardRef(() => SettlementModule),
     MongooseModule.forFeature([
       {
         name: ActiveCompetition.name,
@@ -140,14 +148,18 @@ import {
       },
 
       {
+        name: EspnStandingsCollectionState.name,
+        schema: EspnStandingsCollectionStateSchema,
+      },
+
+      {
         name: EspnTeam.name,
         schema: EspnTeamSchema,
       },
 
       /*
-       * Queue now contains only:
-       * - FIXTURE_REFRESH
-       * - SUMMARY_REFRESH
+       * Normal queue work is limited to fixture refreshes, Summary refreshes,
+       * and YouTube highlights. News is extracted from saved Summaries.
        */
       {
         name: EspnQueue.name,
@@ -204,44 +216,37 @@ import {
   controllers: [SportsController],
 
   providers: [
+    adminRealtimeRegistrationProvider('sports', 'Sports: fixture collection, queues, sync state, standings, highlights and provider monitoring.'),
     SportsService,
-
     // ESPN
     EspnService,
     EspnActiveCompetitionService,
-
     // Other independent providers
     FootballDataService,
-    TheOddsApiService,
     YoutubeService,
-
     // Global provider rate limiting
     SportsProviderRateLimitService,
-
     // Competition registry
     PriorityCompetitionService,
     ActiveCompetitionService,
-
     // ESPN queue
     EspnQueueService,
     EspnQueueBuilderService,
     EspnQueueWorkerService,
+    EspnSeasonDataService,
     SportsSyncStateService,
-
+    EspnStandingsService,
     // Collection / read
     SportsCollectionService,
     SportsDataReadService,
     SportsSystemMonitorService,
-
     // YouTube lifecycle
     YoutubeHighlightService,
-
     // Startup
     SportsStartupService,
-
-    // Remaining scheduled providers
-    FootballDataScheduler,
-    NewsScheduler,
+    // Recurring sports work is persisted in the ESPN queue; no sports cron providers are registered.,
+    JwtAuthGuard,
+    RolesGuard,
   ],
 
   exports: [
@@ -250,7 +255,12 @@ import {
     SportsSystemMonitorService,
     ActiveCompetitionService,
     EspnService,
+    EspnQueueService,
+    SportsCollectionService,
+    EspnStandingsService,
     SportsSyncStateService,
   ],
 })
 export class SportsModule {}
+
+

@@ -1,358 +1,110 @@
 import { Injectable } from '@nestjs/common';
-
 import { InjectModel } from '@nestjs/mongoose';
-
 import { Model } from 'mongoose';
 
-import {
-  Subscription,
-  SubscriptionDocument,
-} from '../subscriptions/schemas/subscription.schema';
-
-import { Payment, PaymentDocument } from '../payments/schemas/payment.schema';
-
-import { User, UserDocument } from '../users/schemas/user.schema';
-
-import {
-  Referral,
-  ReferralDocument,
-} from '../referrals/schemas/referral.schema';
+import { Subscription, SubscriptionDocument } from '../subscriptions/schemas/subscription.schema';
+import { Referral, ReferralDocument } from '../referrals/schemas/referral.schema';
 
 @Injectable()
 export class AnalyticsLeaderboardService {
   constructor(
-    @InjectModel(Subscription.name)
-    private readonly subscriptionModel: Model<SubscriptionDocument>,
-
-    @InjectModel(Payment.name)
-    private readonly paymentModel: Model<PaymentDocument>,
-
-    @InjectModel(User.name)
-    private readonly userModel: Model<UserDocument>,
-
-    @InjectModel(Referral.name)
-    private readonly referralModel: Model<ReferralDocument>,
+    @InjectModel(Subscription.name) private readonly subscriptionModel: Model<SubscriptionDocument>,
+    @InjectModel(Referral.name) private readonly referralModel: Model<ReferralDocument>,
   ) {}
 
   async getLeaderboards() {
-    const [
-      topSubscribers,
+    const [topSubscribers, topVipSubscribers, topRegularSubscribers, topPremiumSubscribers, topReferrers] =
+      await Promise.all([
+        this.getTopSubscribers(),
+        this.getTopPlanSubscribers('vip', 'totalVipSubscriptions'),
+        this.getTopPlanSubscribers('regular', 'totalRegularSubscriptions'),
+        this.getTopPlanSubscribers('premium', 'totalPremiumSubscriptions'),
+        this.getTopReferrers(),
+      ]);
 
-      topVipSubscribers,
-
-      topRegularSubscribers,
-
-      topPredictionBuyers,
-
-      topReferrers,
-    ] = await Promise.all([
-      this.getTopSubscribers(),
-
-      this.getTopVipSubscribers(),
-
-      this.getTopRegularSubscribers(),
-
-      this.getTopPredictionBuyers(),
-
-      this.getTopReferrers(),
-    ]);
-
-    return {
-      topSubscribers,
-
-      topVipSubscribers,
-
-      topRegularSubscribers,
-
-      topPredictionBuyers,
-
-      topReferrers,
-    };
+    return { topSubscribers, topVipSubscribers, topRegularSubscribers, topPremiumSubscribers, topReferrers };
   }
-
-  // ==========================================
-  // TOP ALL SUBSCRIBERS
-  // ==========================================
 
   private async getTopSubscribers() {
     return this.subscriptionModel.aggregate([
       {
         $group: {
           _id: '$userId',
-
-          totalSubscriptions: {
-            $sum: 1,
-          },
-
-          totalSpent: {
-            $sum: '$amount',
-          },
+          totalSubscriptions: { $sum: 1 },
         },
       },
-
-      {
-        $sort: {
-          totalSubscriptions: -1,
-
-          totalSpent: -1,
-        },
-      },
-
-      {
-        $limit: 5,
-      },
-
+      { $sort: { totalSubscriptions: -1, _id: 1 } },
+      { $limit: 5 },
       ...this.lookupUser(),
-    ]);
+    ]).exec();
   }
 
-  // ==========================================
-  // TOP VIP SUBSCRIBERS
-  // ==========================================
-
-  private async getTopVipSubscribers() {
+  private async getTopPlanSubscribers(plan: 'vip' | 'regular' | 'premium', countField: string) {
     return this.subscriptionModel.aggregate([
-      {
-        $match: {
-          plan: 'vip',
-        },
-      },
-
-      {
-        $group: {
-          _id: '$userId',
-
-          totalVipSubscriptions: {
-            $sum: 1,
-          },
-
-          totalSpent: {
-            $sum: '$amount',
-          },
-        },
-      },
-
-      {
-        $sort: {
-          totalVipSubscriptions: -1,
-
-          totalSpent: -1,
-        },
-      },
-
-      {
-        $limit: 5,
-      },
-
+      { $match: { plan } },
+      { $group: { _id: '$userId', [countField]: { $sum: 1 } } },
+      { $sort: { [countField]: -1, _id: 1 } },
+      { $limit: 5 },
       ...this.lookupUser(),
-    ]);
+    ]).exec();
   }
-
-  // ==========================================
-  // TOP REGULAR SUBSCRIBERS
-  // ==========================================
-
-  private async getTopRegularSubscribers() {
-    return this.subscriptionModel.aggregate([
-      {
-        $match: {
-          plan: 'regular',
-        },
-      },
-
-      {
-        $group: {
-          _id: '$userId',
-
-          totalRegularSubscriptions: {
-            $sum: 1,
-          },
-
-          totalSpent: {
-            $sum: '$amount',
-          },
-        },
-      },
-
-      {
-        $sort: {
-          totalRegularSubscriptions: -1,
-
-          totalSpent: -1,
-        },
-      },
-
-      {
-        $limit: 5,
-      },
-
-      ...this.lookupUser(),
-    ]);
-  }
-
-  // ==========================================
-  // TOP PREDICTION BUYERS
-  // ==========================================
-
-  private async getTopPredictionBuyers() {
-    return this.paymentModel.aggregate([
-      {
-        $match: {
-          status: 'approved',
-
-          type: 'prediction',
-        },
-      },
-
-      {
-        $group: {
-          _id: '$userId',
-
-          totalPurchases: {
-            $sum: 1,
-          },
-
-          totalSpent: {
-            $sum: '$amount',
-          },
-        },
-      },
-
-      {
-        $sort: {
-          totalPurchases: -1,
-
-          totalSpent: -1,
-        },
-      },
-
-      {
-        $limit: 3,
-      },
-
-      ...this.lookupUser(),
-    ]);
-  }
-
-  // ==========================================
-  // TOP REFERRERS
-  // ==========================================
 
   private async getTopReferrers() {
     return this.referralModel.aggregate([
-      {
-        $group: {
-          _id: '$referrerId',
-
-          successfulReferrals: {
-            $sum: 1,
-          },
-        },
-      },
-
-      {
-        $sort: {
-          successfulReferrals: -1,
-        },
-      },
-
-      {
-        $limit: 5,
-      },
-
-      {
-        $addFields: {
-          userObjectId: {
-            $toObjectId: '$_id',
-          },
-        },
-      },
-
+      { $group: { _id: '$referrerId', successfulReferrals: { $sum: 1 } } },
+      { $sort: { successfulReferrals: -1, _id: 1 } },
+      { $limit: 5 },
       {
         $lookup: {
           from: 'users',
-
-          localField: 'userObjectId',
-
+          localField: '_id',
           foreignField: '_id',
-
           as: 'user',
         },
       },
-
-      {
-        $unwind: '$user',
-      },
-
+      { $unwind: '$user' },
       {
         $project: {
           _id: 0,
-
           userId: '$user._id',
-
           fullName: '$user.fullName',
-
           username: '$user.username',
-
           email: '$user.email',
-
           successfulReferrals: 1,
         },
       },
-    ]);
+    ]).exec();
   }
-
-  // ==========================================
-  // USER LOOKUP PIPELINE
-  // ==========================================
 
   private lookupUser() {
     return [
       {
         $addFields: {
           userObjectId: {
-            $toObjectId: '$_id',
+            $convert: { input: '$_id', to: 'objectId', onError: null, onNull: null },
           },
         },
       },
-
       {
         $lookup: {
           from: 'users',
-
           localField: 'userObjectId',
-
           foreignField: '_id',
-
           as: 'user',
         },
       },
-
-      {
-        $unwind: '$user',
-      },
-
+      { $unwind: '$user' },
       {
         $project: {
           _id: 0,
-
           userId: '$user._id',
-
           fullName: '$user.fullName',
-
           username: '$user.username',
-
           email: '$user.email',
-
           totalSubscriptions: 1,
-
           totalVipSubscriptions: 1,
-
           totalRegularSubscriptions: 1,
-
-          totalPurchases: 1,
-
-          totalSpent: 1,
+          totalPremiumSubscriptions: 1,
         },
       },
     ];

@@ -3,7 +3,8 @@ import { HydratedDocument } from 'mongoose';
 
 export type SubscriptionDocument = HydratedDocument<Subscription>;
 
-export type PlanType = 'free' | 'regular' | 'vip';
+export type PlanType = 'free' | 'regular' | 'vip' | 'premium';
+export type PaidPlanType = Exclude<PlanType, 'free'>;
 
 @Schema({ timestamps: true })
 export class Subscription {
@@ -14,10 +15,10 @@ export class Subscription {
   email!: string;
 
   @Prop({
-    enum: ['regular', 'vip'],
+    enum: ['regular', 'vip', 'premium'],
     required: true,
   })
-  plan!: 'regular' | 'vip';
+  plan!: PaidPlanType;
 
   @Prop({ required: true })
   amount!: number;
@@ -31,15 +32,21 @@ export class Subscription {
   @Prop({ default: true })
   isActive!: boolean;
 
-  @Prop({
-    default: false,
-  })
-  expiringReminderSent: boolean;
+  /** Stable originating payment reference used to prevent duplicate entitlements. */
+  @Prop({ type: String, default: undefined, trim: true })
+  sourceReference?: string;
 
   @Prop({
     default: false,
   })
-  expiredNotificationSent: boolean;
+  expiringReminderSent: boolean = false;
+
+  @Prop({
+    default: false,
+  })
+  expiredNotificationSent: boolean = false;
 }
 
 export const SubscriptionSchema = SchemaFactory.createForClass(Subscription);
+SubscriptionSchema.index({ sourceReference: 1 }, { unique: true, sparse: true });
+

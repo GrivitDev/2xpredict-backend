@@ -1,0 +1,6 @@
+export enum AdEventType {
+  IMPRESSION = 'IMPRESSION',
+  CLICK = 'CLICK',
+  CONVERSION = 'CONVERSION',
+  DISMISS = 'DISMISS',
+}

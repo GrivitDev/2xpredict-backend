@@ -7,5 +7,5 @@ export enum PromoRequirement {
 
   ANY_SUBSCRIPTION = 'any_subscription',
 
-  PREDICTION_PURCHASE = 'prediction_purchase',
+  PREMIUM_SUBSCRIPTION = 'premium_subscription',
 }

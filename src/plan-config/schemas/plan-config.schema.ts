@@ -23,6 +23,12 @@ export class PlanConfig {
   vipPrice!: number;
 
   @Prop({
+    default: 100000,
+    min: 0,
+  })
+  premiumPrice!: number;
+
+  @Prop({
     type: Object,
     default: {
       bankName: '',
@@ -54,6 +60,12 @@ export class PlanConfig {
   vipPriceUSD!: number;
 
   @Prop({
+    default: 100,
+    min: 0,
+  })
+  premiumPriceUSD!: number;
+
+  @Prop({
     type: Object,
     default: {
       bankName: '',
@@ -74,7 +86,8 @@ export class PlanConfig {
   // ===========================
   @Prop({
     default: 30,
-    min: 1,
+    min: 30,
+    max: 30,
   })
   subscriptionDurationDays!: number;
 
@@ -84,12 +97,14 @@ export class PlanConfig {
       free: 'Free Plan',
       regular: 'Regular Plan',
       vip: 'VIP Plan',
+      premium: 'Premium Plan',
     },
   })
   planLabels!: {
     free: string;
     regular: string;
     vip: string;
+    premium: string;
   };
 }
 

@@ -23,6 +23,18 @@ export enum EspnQueueJobType {
    * SELECTIVE competitions are never queued.
    */
   YOUTUBE_HIGHLIGHT = 'YOUTUBE_HIGHLIGHT',
+
+  /** Fetch and store the complete ESPN standings payload for one league and season. */
+  STANDINGS_REFRESH = 'STANDINGS_REFRESH',
+
+  /** Persistent weekly catalogue refresh. */
+  LEAGUE_CATALOGUE_REFRESH = 'LEAGUE_CATALOGUE_REFRESH',
+
+  /** Persistent league/season detail and lifecycle refresh. */
+  LEAGUE_DETAIL_REFRESH = 'LEAGUE_DETAIL_REFRESH',
+
+  /** Backfill a newly active season through today plus the startup horizon. */
+  SEASON_FIXTURE_BOOTSTRAP = 'SEASON_FIXTURE_BOOTSTRAP',
 }
 
 export enum EspnQueueStatus {
@@ -100,3 +112,4 @@ export interface EspnQueueJob {
 
   lastError?: string;
 }
+

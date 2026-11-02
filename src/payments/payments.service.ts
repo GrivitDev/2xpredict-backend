@@ -8,13 +8,20 @@ import { Payment, PaymentDocument } from './schemas/payment.schema';
 
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 
-import { PredictionPurchasesService } from '../prediction-purchases/prediction-purchases.service';
-import { AdminGateway } from 'src/realtime/admin.gateway';
-import { ReferralsService } from 'src/referrals/referrals.service';
-import { PlanConfigService } from 'src/plan-config/plan-config.service';
-import { EmailService } from 'src/notifications/email.service';
-import { TelegramService } from 'src/telegram/telegram.service';
-import { UsersService } from 'src/users/users.service';
+import { AdminGateway } from '../realtime/admin.gateway';
+import { ReferralsService } from '../referrals/referrals.service';
+import { PlanConfigService } from '../plan-config/plan-config.service';
+import { EmailService } from '../notifications/email.service';
+import { TelegramService } from '../telegram/telegram.service';
+import { UsersService } from '../users/users.service';
+import { PromosService, PromoPricingResult } from '../promos/promos.service';
+
+const ACTIVE_PAYMENT_TYPES = [
+  'subscription',
+  'vip_upgrade',
+  'premium_upgrade',
+] as const satisfies readonly Payment['type'][];
+type PaidPlan = 'regular' | 'vip' | 'premium';
 
 @Injectable()
 export class PaymentsService {
@@ -26,8 +33,6 @@ export class PaymentsService {
 
     private subscriptionsService: SubscriptionsService,
 
-    private predictionPurchaseService: PredictionPurchasesService,
-
     private adminGateway: AdminGateway,
 
     private referralsService: ReferralsService,
@@ -37,7 +42,33 @@ export class PaymentsService {
     private readonly planConfigService: PlanConfigService,
 
     private emailService: EmailService,
+    private readonly promosService: PromosService,
   ) {}
+
+  private validatePaymentTypeAndTarget(type: string, target: string): void {
+    if (
+      !ACTIVE_PAYMENT_TYPES.includes(
+        type as (typeof ACTIVE_PAYMENT_TYPES)[number],
+      )
+    ) {
+      throw new BadRequestException('Unsupported payment type.');
+    }
+
+    if (type === 'subscription') {
+      if (!['regular', 'vip', 'premium'].includes(target)) {
+        throw new BadRequestException('Invalid subscription plan.');
+      }
+      return;
+    }
+
+    if (type === 'vip_upgrade' && target !== 'vip') {
+      throw new BadRequestException('Invalid VIP upgrade target.');
+    }
+
+    if (type === 'premium_upgrade' && target !== 'premium') {
+      throw new BadRequestException('Invalid Premium upgrade target.');
+    }
+  }
 
   private async getUserPricing(userId: string) {
     const user = await this.usersService.findById(userId);
@@ -55,10 +86,12 @@ export class PaymentsService {
           ? {
               regular: config.regularPriceUSD,
               vip: config.vipPriceUSD,
+              premium: config.premiumPriceUSD,
             }
           : {
               regular: config.regularPrice,
               vip: config.vipPrice,
+              premium: config.premiumPrice,
             },
     };
   }
@@ -69,14 +102,16 @@ export class PaymentsService {
   async createPayment(dto: {
     userId: string;
     email: string;
-    type: 'subscription' | 'prediction' | 'vip_upgrade';
+    type: 'subscription' | 'vip_upgrade' | 'premium_upgrade';
     target: string;
 
     transferReference?: string;
     proofImageUrl?: string;
     proofPublicId?: string;
     proofMessage?: string;
+    promoCode?: string;
   }) {
+    this.validatePaymentTypeAndTarget(dto.type, dto.target);
     const existingPending = await this.paymentModel.findOne({
       userId: dto.userId,
       type: dto.type,
@@ -90,67 +125,10 @@ export class PaymentsService {
       );
     }
 
-    const existingPayment = await this.paymentModel.findOne({
-      type: 'prediction',
-      target: dto.target,
-      status: 'pending',
+    const pricing = await this.calculateGatewayPaymentAmount({
+      userId: dto.userId, type: dto.type, target: dto.target, promoCode: dto.promoCode,
     });
-
-    if (existingPayment) {
-      throw new BadRequestException('Payment already pending');
-    }
-
-    const config = await this.planConfigService.get();
-
-    const { currency, pricing } = await this.getUserPricing(dto.userId);
-
-    let amount = 0;
-
-    if (dto.type === 'subscription') {
-      if (dto.target !== 'regular' && dto.target !== 'vip') {
-        throw new BadRequestException('Invalid subscription plan.');
-      }
-
-      amount = dto.target === 'regular' ? pricing.regular : pricing.vip;
-    }
-
-    if (dto.type === 'vip_upgrade') {
-      const upgrade = await this.subscriptionsService.calculateUpgradePrice(
-        dto.userId,
-        pricing.regular,
-        pricing.vip,
-        config.subscriptionDurationDays,
-        currency,
-      );
-
-      if (!upgrade.canUpgrade) {
-        throw new BadRequestException(
-          'You are not eligible for a VIP upgrade.',
-        );
-      }
-
-      amount = upgrade.amount;
-    }
-
-    if (dto.type === 'prediction') {
-      const purchase = await this.predictionPurchaseService.getByReference(
-        dto.target,
-      );
-
-      if (!purchase) {
-        throw new BadRequestException('Purchase not found.');
-      }
-
-      if (purchase.userId.toString() !== dto.userId) {
-        throw new BadRequestException('Purchase does not belong to this user.');
-      }
-
-      if (purchase.status === 'success') {
-        throw new BadRequestException('Prediction already purchased.');
-      }
-
-      amount = purchase.amount;
-    }
+    const { amount, currency } = pricing;
 
     const reference = randomUUID();
 
@@ -159,6 +137,13 @@ export class PaymentsService {
       email: dto.email,
 
       amount,
+      baseAmount: pricing.baseAmount,
+      discountAmount: pricing.discountAmount,
+      promoCode: pricing.promoCode,
+      promoId: pricing.promoId,
+      discountType: pricing.discountType,
+      discountValue: pricing.discountValue,
+      pointsReward: pricing.pointsReward,
       currency,
 
       type: dto.type,
@@ -178,6 +163,17 @@ export class PaymentsService {
       adminNote: '',
     });
 
+    try {
+      await this.promosService.reserveRedemption({
+        promoId: pricing.promoId, userId: dto.userId, paymentReference: reference,
+        baseAmount: pricing.baseAmount, discountAmount: pricing.discountAmount,
+        finalAmount: amount, pointsReward: pricing.pointsReward, currency,
+      });
+    } catch (error) {
+      await this.paymentModel.deleteOne({ reference }).exec();
+      throw error;
+    }
+
     await this.emailService.sendPaymentReceivedEmail({
       email: payment.email,
 
@@ -189,7 +185,7 @@ export class PaymentsService {
           ? `${payment.target.toUpperCase()} Subscription`
           : payment.type === 'vip_upgrade'
             ? 'VIP Upgrade'
-            : 'Prediction Purchase',
+            : 'Premium Upgrade',
 
       reference: payment.reference,
     });
@@ -222,82 +218,60 @@ export class PaymentsService {
   async calculateGatewayPaymentAmount(dto: {
     userId: string;
 
-    type: 'subscription' | 'prediction' | 'vip_upgrade';
+    type: 'subscription' | 'vip_upgrade' | 'premium_upgrade';
 
     target: string;
-  }) {
-    const config = await this.planConfigService.get();
-
+    promoCode?: string;
+  }): Promise<PromoPricingResult & { currency: 'NGN' | 'USD' }> {
+    this.validatePaymentTypeAndTarget(dto.type, dto.target);
     const { currency, pricing } = await this.getUserPricing(dto.userId);
 
     let amount = 0;
 
-    // =====================================
-    // SUBSCRIPTION
-    // =====================================
+    const prices = {
+      regular: pricing.regular,
+      vip: pricing.vip,
+      premium: pricing.premium,
+    };
 
     if (dto.type === 'subscription') {
-      if (dto.target !== 'regular' && dto.target !== 'vip') {
+      if (!['regular', 'vip', 'premium'].includes(dto.target)) {
         throw new BadRequestException('Invalid subscription plan.');
       }
-
-      amount = dto.target === 'regular' ? pricing.regular : pricing.vip;
-    }
-
-    // =====================================
-    // VIP UPGRADE
-    // =====================================
-
-    if (dto.type === 'vip_upgrade') {
-      if (dto.target !== 'vip') {
-        throw new BadRequestException('Invalid VIP upgrade target.');
+      amount = prices[dto.target as PaidPlan];
+    } else {
+      const targetPlan: PaidPlan =
+        dto.type === 'vip_upgrade' ? 'vip' : 'premium';
+      if (dto.target !== targetPlan) {
+        throw new BadRequestException(`Invalid ${targetPlan} upgrade target.`);
       }
 
-      const upgrade = await this.subscriptionsService.calculateUpgradePrice(
+      const upgrade = await this.subscriptionsService.calculatePlanUpgradePrice(
         dto.userId,
-        pricing.regular,
-        pricing.vip,
-        config.subscriptionDurationDays,
+        prices,
+        targetPlan,
+        30,
         currency,
       );
 
       if (!upgrade.canUpgrade) {
         throw new BadRequestException(
-          'You are not eligible for a VIP upgrade.',
+          `You are not eligible for a ${targetPlan} upgrade.`,
         );
       }
-
       amount = upgrade.amount;
     }
 
-    // =====================================
-    // PREDICTION
-    // =====================================
-
-    if (dto.type === 'prediction') {
-      const purchase = await this.predictionPurchaseService.getByReference(
-        dto.target,
-      );
-
-      if (!purchase) {
-        throw new BadRequestException('Purchase not found.');
-      }
-
-      if (purchase.userId.toString() !== dto.userId) {
-        throw new BadRequestException('Purchase does not belong to this user.');
-      }
-
-      if (purchase.status === 'success') {
-        throw new BadRequestException('Prediction already purchased.');
-      }
-
-      amount = purchase.amount;
-    }
-
-    return {
-      amount,
+    const plan = dto.target as PaidPlan;
+    const discounted = await this.promosService.calculateDiscount({
+      userId: dto.userId,
+      promoCode: dto.promoCode,
+      plan,
+      purchaseType: dto.type,
+      baseAmount: amount,
       currency,
-    };
+    });
+    return { ...discounted, currency };
   }
 
   // =====================================
@@ -308,14 +282,20 @@ export class PaymentsService {
 
     email: string;
 
-    type: 'subscription' | 'prediction' | 'vip_upgrade';
+    type: 'subscription' | 'vip_upgrade' | 'premium_upgrade';
 
     target: string;
 
-    gateway: 'paystack' | 'opay';
+    gateway: 'paystack';
 
     amount: number;
-
+    baseAmount: number;
+    discountAmount: number;
+    promoId?: string;
+    promoCode?: string;
+    discountType?: 'percentage' | 'fixed_amount';
+    discountValue?: number;
+    pointsReward?: number;
     currency: 'NGN' | 'USD';
 
     gatewayAmount: number;
@@ -324,6 +304,7 @@ export class PaymentsService {
 
     exchangeRate?: number;
   }) {
+    this.validatePaymentTypeAndTarget(dto.type, dto.target);
     const existingPending = await this.paymentModel.findOne({
       userId: dto.userId,
       type: dto.type,
@@ -342,8 +323,15 @@ export class PaymentsService {
 
       email: dto.email,
 
-      // Original customer amount
+      // Final customer amount after server-side discount calculation
       amount: dto.amount,
+      baseAmount: dto.baseAmount,
+      discountAmount: dto.discountAmount,
+      promoId: dto.promoId,
+      promoCode: dto.promoCode,
+      discountType: dto.discountType,
+      discountValue: dto.discountValue,
+      pointsReward: dto.pointsReward ?? 0,
 
       // Original customer currency
       currency: dto.currency,
@@ -376,6 +364,17 @@ export class PaymentsService {
       gatewayTransactionId: '',
       gatewayResponse: null,
     });
+
+    try {
+      await this.promosService.reserveRedemption({
+        promoId: dto.promoId, userId: dto.userId, paymentReference: payment.reference,
+        baseAmount: dto.baseAmount, discountAmount: dto.discountAmount,
+        finalAmount: dto.amount, pointsReward: dto.pointsReward, currency: dto.currency,
+      });
+    } catch (error) {
+      await this.paymentModel.deleteOne({ reference: payment.reference }).exec();
+      throw error;
+    }
 
     await this.telegramService.notifyNewPayment({
       fullName: dto.email,
@@ -420,27 +419,16 @@ export class PaymentsService {
       throw new BadRequestException('Payment not found.');
     }
 
-    if (payment.status === 'approved') {
-      return payment;
-    }
+    if (payment.status === 'approved') return payment;
 
     if (payment.status !== 'pending') {
       throw new BadRequestException('Payment has already been processed.');
     }
 
-    // =====================================
-    // MARK PAYMENT AS APPROVED
-    // =====================================
-    payment.status = 'approved';
+    this.validatePaymentTypeAndTarget(payment.type, payment.target);
 
-    payment.gatewayTransactionId = gatewayTransactionId;
-
-    payment.gatewayResponse = gatewayResponse;
-
-    payment.processedAt = new Date();
-
-    await payment.save();
-
+    // Entitlements are granted idempotently by payment reference first. The
+    // payment is marked approved only after the core entitlement operation succeeds.
     const config = await this.planConfigService.get();
 
     // =====================================
@@ -449,7 +437,7 @@ export class PaymentsService {
     if (payment.type === 'subscription') {
       const plan = payment.target?.trim();
 
-      if (plan !== 'regular' && plan !== 'vip') {
+      if (plan !== 'regular' && plan !== 'vip' && plan !== 'premium') {
         throw new BadRequestException('Invalid subscription plan.');
       }
 
@@ -459,6 +447,7 @@ export class PaymentsService {
         plan,
         amount: payment.amount,
         durationDays: config.subscriptionDurationDays,
+        sourceReference: `payment:${String(payment._id)}`,
       });
 
       await this.emailService.sendSubscriptionActivatedEmail({
@@ -481,49 +470,56 @@ export class PaymentsService {
       if (plan === 'vip') {
         await this.referralsService.markVipSubscription(payment.userId);
       }
+      if (plan === 'premium') {
+        await this.referralsService.markPremiumSubscription(payment.userId);
+      }
     }
 
     // =====================================
-    // VIP UPGRADE
+    // VIP / PREMIUM UPGRADE
     // =====================================
-    if (payment.type === 'vip_upgrade') {
+    if (payment.type === 'vip_upgrade' || payment.type === 'premium_upgrade') {
+      const plan: PaidPlan = payment.type === 'vip_upgrade' ? 'vip' : 'premium';
+      if (payment.target !== plan) {
+        throw new BadRequestException(`Invalid ${plan} upgrade target.`);
+      }
+
       const subscription = await this.subscriptionsService.activatePlan({
         userId: payment.userId,
         email: payment.email,
-        plan: 'vip',
+        plan,
         amount: payment.amount,
-        durationDays: config.subscriptionDurationDays,
+        durationDays: 30,
+        sourceReference: `payment:${String(payment._id)}`,
       });
 
       await this.emailService.sendSubscriptionActivatedEmail({
         email: payment.email,
-
         plan: subscription.plan,
-
         amount: payment.amount,
         currency: payment.currency,
-
         activatedDate: subscription.startDate,
-
         expiryDate: subscription.expiryDate,
       });
 
-      await this.referralsService.markVipSubscription(payment.userId);
+      if (plan === 'vip') {
+        await this.referralsService.markVipSubscription(payment.userId);
+      } else {
+        await this.referralsService.markPremiumSubscription(payment.userId);
+      }
     }
 
-    // =====================================
-    // PREDICTION PURCHASE
-    // =====================================
-    if (payment.type === 'prediction') {
-      await this.predictionPurchaseService.markAsSuccessByReference(
-        payment.target,
-        payment._id.toString(),
-        gatewayResponse,
-      );
-    }
+    await this.promosService.completeSuccessfulRedemption({
+      promoId: payment.promoId, userId: payment.userId, reference: payment.reference, pointsReward: payment.pointsReward,
+    });
+
+    payment.status = 'approved';
+    payment.gatewayTransactionId = gatewayTransactionId;
+    payment.gatewayResponse = gatewayResponse;
+    payment.processedAt = new Date();
+    await payment.save();
 
     this.adminGateway.emitPaymentUpdate(payment);
-
     return payment;
   }
 
@@ -546,6 +542,8 @@ export class PaymentsService {
       return payment;
     }
 
+    this.validatePaymentTypeAndTarget(payment.type, payment.target);
+
     payment.status = 'rejected';
 
     payment.gatewayResponse = gatewayResponse ?? null;
@@ -553,6 +551,7 @@ export class PaymentsService {
     payment.processedAt = new Date();
 
     await payment.save();
+    await this.promosService.releaseRedemption(payment.reference);
 
     return payment;
   }
@@ -571,17 +570,9 @@ export class PaymentsService {
       throw new BadRequestException('Already processed');
     }
 
-    // =====================================
-    // MARK FIRST
-    // =====================================
-    payment.status = 'approved';
+    this.validatePaymentTypeAndTarget(payment.type, payment.target);
 
-    payment.processedAt = new Date();
-
-    payment.processedBy = adminId;
-
-    await payment.save();
-
+    // Grant the entitlement first; sourceReference makes retries idempotent.
     const config = await this.planConfigService.get();
 
     // =====================================
@@ -590,7 +581,7 @@ export class PaymentsService {
     if (payment.type === 'subscription') {
       const plan = payment.target?.trim();
 
-      if (plan !== 'regular' && plan !== 'vip') {
+      if (plan !== 'regular' && plan !== 'vip' && plan !== 'premium') {
         throw new BadRequestException('Invalid subscription plan');
       }
 
@@ -600,6 +591,7 @@ export class PaymentsService {
         plan,
         amount: payment.amount,
         durationDays: config.subscriptionDurationDays,
+        sourceReference: `payment:${String(payment._id)}`,
       });
 
       await this.emailService.sendSubscriptionActivatedEmail({
@@ -622,57 +614,53 @@ export class PaymentsService {
       if (plan === 'vip') {
         await this.referralsService.markVipSubscription(payment.userId);
       }
+      if (plan === 'premium') {
+        await this.referralsService.markPremiumSubscription(payment.userId);
+      }
     }
 
     // =====================================
-    // VIP UPGRADE
+    // VIP / PREMIUM UPGRADE
     // =====================================
-    if (payment.type === 'vip_upgrade') {
+    if (payment.type === 'vip_upgrade' || payment.type === 'premium_upgrade') {
+      const plan: PaidPlan = payment.type === 'vip_upgrade' ? 'vip' : 'premium';
+      if (payment.target !== plan) {
+        throw new BadRequestException(`Invalid ${plan} upgrade target.`);
+      }
+
       const subscription = await this.subscriptionsService.activatePlan({
         userId: payment.userId,
         email: payment.email,
-        plan: 'vip',
+        plan,
         amount: payment.amount,
-        durationDays: config.subscriptionDurationDays,
+        durationDays: 30,
+        sourceReference: `payment:${String(payment._id)}`,
       });
 
       await this.emailService.sendSubscriptionActivatedEmail({
         email: payment.email,
-
         plan: subscription.plan,
-
         amount: payment.amount,
         currency: payment.currency,
-
         activatedDate: subscription.startDate,
-
         expiryDate: subscription.expiryDate,
       });
 
-      await this.referralsService.markVipSubscription(payment.userId);
-    }
-
-    // =====================================
-    // PREDICTION PURCHASE
-    // =====================================
-    if (payment.type === 'prediction') {
-      const purchase = await this.predictionPurchaseService.getByReference(
-        payment.target,
-      );
-
-      if (!purchase) {
-        throw new BadRequestException('Prediction purchase not found');
+      if (plan === 'vip') {
+        await this.referralsService.markVipSubscription(payment.userId);
+      } else {
+        await this.referralsService.markPremiumSubscription(payment.userId);
       }
-
-      await this.predictionPurchaseService.markAsSuccessByReference(
-        payment.target,
-        payment._id.toString(),
-        {
-          source: 'manual_admin',
-        },
-      );
     }
 
+    await this.promosService.completeSuccessfulRedemption({
+      promoId: payment.promoId, userId: payment.userId, reference: payment.reference, pointsReward: payment.pointsReward,
+    });
+
+    payment.status = 'approved';
+    payment.processedAt = new Date();
+    payment.processedBy = adminId;
+    await payment.save();
     this.adminGateway.emitPaymentUpdate(payment);
 
     return {
@@ -688,10 +676,9 @@ export class PaymentsService {
     return this.paymentModel
       .find({
         userId,
+        type: { $in: ACTIVE_PAYMENT_TYPES },
       })
-      .sort({
-        createdAt: -1,
-      });
+      .sort({ createdAt: -1 });
   }
 
   // =====================================
@@ -708,6 +695,8 @@ export class PaymentsService {
       throw new BadRequestException('Already processed');
     }
 
+    this.validatePaymentTypeAndTarget(payment.type, payment.target);
+
     payment.status = 'rejected';
 
     payment.processedAt = new Date();
@@ -717,6 +706,7 @@ export class PaymentsService {
     payment.adminNote = adminNote || '';
 
     await payment.save();
+    await this.promosService.releaseRedemption(payment.reference);
 
     await this.emailService.sendPaymentRejectedEmail({
       email: payment.email,
@@ -726,7 +716,7 @@ export class PaymentsService {
           ? `${payment.target.toUpperCase()} Subscription`
           : payment.type === 'vip_upgrade'
             ? 'VIP Upgrade'
-            : 'Prediction Purchase',
+            : 'Premium Upgrade',
 
       amount: payment.amount,
       currency: payment.currency,
@@ -741,23 +731,24 @@ export class PaymentsService {
   // =====================================
   async getPendingPayments() {
     return this.paymentModel
-      .find({
-        status: 'pending',
-      })
+      .find({ status: 'pending', type: { $in: ACTIVE_PAYMENT_TYPES } })
       .sort({
         createdAt: -1,
       });
   }
 
   async getAllPayments() {
-    return this.paymentModel.find().sort({
-      createdAt: -1,
-    });
+    return this.paymentModel
+      .find({ type: { $in: ACTIVE_PAYMENT_TYPES } })
+      .sort({
+        createdAt: -1,
+      });
   }
 
   async getTotalRevenue() {
     const payments = await this.paymentModel.find({
       status: 'approved',
+      type: { $in: ACTIVE_PAYMENT_TYPES },
     });
 
     return {
@@ -776,12 +767,8 @@ export class PaymentsService {
   // =====================================
   async getPaymentSummary(userId: string) {
     const payments = await this.paymentModel
-      .find({
-        userId,
-      })
-      .sort({
-        createdAt: -1,
-      });
+      .find({ userId, type: { $in: ACTIVE_PAYMENT_TYPES } })
+      .sort({ createdAt: -1 });
 
     const approved = payments.filter((p) => p.status === 'approved');
     const pending = payments.filter((p) => p.status === 'pending');
@@ -791,16 +778,18 @@ export class PaymentsService {
     const approvedUSD = approved.filter((p) => p.currency === 'USD');
 
     const subscriptionNGN = approvedNGN.filter(
-      (p) => p.type === 'subscription' || p.type === 'vip_upgrade',
+      (p) =>
+        p.type === 'subscription' ||
+        p.type === 'vip_upgrade' ||
+        p.type === 'premium_upgrade',
     );
 
     const subscriptionUSD = approvedUSD.filter(
-      (p) => p.type === 'subscription' || p.type === 'vip_upgrade',
+      (p) =>
+        p.type === 'subscription' ||
+        p.type === 'vip_upgrade' ||
+        p.type === 'premium_upgrade',
     );
-
-    const predictionNGN = approvedNGN.filter((p) => p.type === 'prediction');
-
-    const predictionUSD = approvedUSD.filter((p) => p.type === 'prediction');
 
     return {
       payments,
@@ -818,9 +807,51 @@ export class PaymentsService {
           USD: subscriptionUSD.reduce((sum, p) => sum + p.amount, 0),
         },
 
-        predictions: {
-          NGN: predictionNGN.reduce((sum, p) => sum + p.amount, 0),
-          USD: predictionUSD.reduce((sum, p) => sum + p.amount, 0),
+        plans: {
+          regular: {
+            NGN: approvedNGN
+              .filter(
+                (p) => p.type === 'subscription' && p.target === 'regular',
+              )
+              .reduce((sum, p) => sum + p.amount, 0),
+            USD: approvedUSD
+              .filter(
+                (p) => p.type === 'subscription' && p.target === 'regular',
+              )
+              .reduce((sum, p) => sum + p.amount, 0),
+          },
+          vip: {
+            NGN: approvedNGN
+              .filter(
+                (p) =>
+                  (p.type === 'subscription' && p.target === 'vip') ||
+                  p.type === 'vip_upgrade',
+              )
+              .reduce((sum, p) => sum + p.amount, 0),
+            USD: approvedUSD
+              .filter(
+                (p) =>
+                  (p.type === 'subscription' && p.target === 'vip') ||
+                  p.type === 'vip_upgrade',
+              )
+              .reduce((sum, p) => sum + p.amount, 0),
+          },
+          premium: {
+            NGN: approvedNGN
+              .filter(
+                (p) =>
+                  (p.type === 'subscription' && p.target === 'premium') ||
+                  p.type === 'premium_upgrade',
+              )
+              .reduce((sum, p) => sum + p.amount, 0),
+            USD: approvedUSD
+              .filter(
+                (p) =>
+                  (p.type === 'subscription' && p.target === 'premium') ||
+                  p.type === 'premium_upgrade',
+              )
+              .reduce((sum, p) => sum + p.amount, 0),
+          },
         },
       },
 
@@ -836,14 +867,77 @@ export class PaymentsService {
   // =====================================
   // LATEST USER PAYMENTS
   // =====================================
+  // Lightweight summary for the admin user profile. It aggregates in MongoDB
+  // instead of loading the user's complete payment history into application memory.
+  async getUserPaymentAdminSummary(userId: string) {
+    const match = { userId, type: { $in: ACTIVE_PAYMENT_TYPES } };
+    const [groups, latestPayments] = await Promise.all([
+      this.paymentModel.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: { status: '$status', currency: '$currency', type: '$type', target: '$target' },
+            count: { $sum: 1 },
+            amount: { $sum: { $cond: [{ $eq: ['$status', 'approved'] }, '$amount', 0] } },
+          },
+        },
+      ]).exec(),
+      this.paymentModel.find(match).sort({ createdAt: -1 }).limit(10).lean().exec(),
+    ]);
+
+    const counts = { total: 0, approved: 0, pending: 0, rejected: 0 };
+    const totalRevenue = { NGN: 0, USD: 0 };
+    const subscriptionRevenue = { NGN: 0, USD: 0 };
+    const plans = {
+      regular: { NGN: 0, USD: 0 },
+      vip: { NGN: 0, USD: 0 },
+      premium: { NGN: 0, USD: 0 },
+    };
+    for (const group of groups as any[]) {
+      const status = String(group._id?.status ?? '').toLowerCase();
+      const currency = String(group._id?.currency ?? '').toUpperCase();
+      const type = String(group._id?.type ?? '');
+      const target = String(group._id?.target ?? '').toLowerCase();
+      const count = Number(group.count ?? 0);
+      const amount = Number(group.amount ?? 0);
+      counts.total += count;
+      if (status === 'approved') counts.approved += count;
+      if (status === 'pending') counts.pending += count;
+      if (status === 'rejected') counts.rejected += count;
+      if (status !== 'approved' || !(currency in totalRevenue)) continue;
+      (totalRevenue as any)[currency] += amount;
+      if (!ACTIVE_PAYMENT_TYPES.includes(type as any)) continue;
+      (subscriptionRevenue as any)[currency] += amount;
+      if (type === 'subscription' && target in plans) (plans as any)[target][currency] += amount;
+      if (type === 'vip_upgrade') (plans.vip as any)[currency] += amount;
+      if (type === 'premium_upgrade') (plans.premium as any)[currency] += amount;
+    }
+    return {
+      latestPayments,
+      totalPayments: counts.total,
+      approvedPayments: counts.approved,
+      pendingPayments: counts.pending,
+      rejectedPayments: counts.rejected,
+      revenue: { total: totalRevenue, subscriptions: subscriptionRevenue, plans },
+    };
+  }
+
+  // Paginated full payment history for the admin profile's History tab.
+  async getUserPaymentHistory(userId: string, pageValue = 1, limitValue = 10) {
+    const page = Math.max(1, Math.floor(Number(pageValue) || 1));
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(limitValue) || 10)));
+    const filter = { userId, type: { $in: ACTIVE_PAYMENT_TYPES } };
+    const [items, total] = await Promise.all([
+      this.paymentModel.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean().exec(),
+      this.paymentModel.countDocuments(filter).exec(),
+    ]);
+    return { items, pagination: { page, limit, total, pages: Math.ceil(total / limit) } };
+  }
+
   async getLatestUserPayments(userId: string, limit = 10) {
     return this.paymentModel
-      .find({
-        userId,
-      })
-      .sort({
-        createdAt: -1,
-      })
+      .find({ userId, type: { $in: ACTIVE_PAYMENT_TYPES } })
+      .sort({ createdAt: -1 })
       .limit(limit);
   }
 
@@ -854,6 +948,7 @@ export class PaymentsService {
     const payments = await this.paymentModel.find({
       userId,
       status: 'approved',
+      type: { $in: ACTIVE_PAYMENT_TYPES },
     });
 
     return {
@@ -871,7 +966,9 @@ export class PaymentsService {
   // COUNT PAYMENTS
   // =====================================
   async countPayments() {
-    return this.paymentModel.countDocuments();
+    return this.paymentModel.countDocuments({
+      type: { $in: ACTIVE_PAYMENT_TYPES },
+    });
   }
 
   // =====================================
@@ -879,7 +976,7 @@ export class PaymentsService {
   // =====================================
   async getRecentPayments(limit = 10) {
     return this.paymentModel
-      .find()
+      .find({ type: { $in: ACTIVE_PAYMENT_TYPES } })
       .sort({
         createdAt: -1,
       })
@@ -897,19 +994,14 @@ export class PaymentsService {
   // =====================================
   async deleteExpiredPendingGatewayPayments(): Promise<number> {
     const expirationTime = new Date(Date.now() - 30 * 60 * 1000);
-
+    const expired = await this.paymentModel.find({
+      status: 'pending', type: { $in: ACTIVE_PAYMENT_TYPES }, gateway: { $in: ['paystack'] }, createdAt: { $lt: expirationTime },
+    }).select('reference').lean().exec();
+    if (!expired.length) return 0;
+    for (const payment of expired) await this.promosService.releaseRedemption(payment.reference);
     const result = await this.paymentModel.deleteMany({
-      status: 'pending',
-
-      gateway: {
-        $in: ['paystack', 'opay'],
-      },
-
-      createdAt: {
-        $lt: expirationTime,
-      },
-    });
-
+      reference: { $in: expired.map((payment) => payment.reference) }, status: 'pending', gateway: { $in: ['paystack'] },
+    }).exec();
     return result.deletedCount ?? 0;
   }
 }

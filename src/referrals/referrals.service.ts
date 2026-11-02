@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, forwardRef, Inject, Injectable } from '@nestjs/common';
 
 import { InjectModel } from '@nestjs/mongoose';
 
@@ -20,6 +20,7 @@ export class ReferralsService {
 
     private readonly usersService: UsersService,
 
+    @Inject(forwardRef(() => PromoEngineService))
     private readonly promoEngineService: PromoEngineService,
   ) {}
 
@@ -92,7 +93,7 @@ export class ReferralsService {
 
       vipSubscription: false,
 
-      predictionPurchased: false,
+      premiumSubscription: false,
 
       rewardClaimed: false,
     });
@@ -216,42 +217,17 @@ export class ReferralsService {
   }
 
   // ============================================================
-  // MARK PREDICTION PURCHASE
+  // MARK PREMIUM SUBSCRIPTION
   // ============================================================
 
-  async markPredictionPurchased(userId: string) {
-    const referral = await this.referralModel.findOne({
-      referredUserId: userId,
-    });
+  async markPremiumSubscription(userId: string) {
+    const referral = await this.referralModel.findOne({ referredUserId: userId });
+    if (!referral) return null;
+    if (referral.premiumSubscription) return referral;
 
-    if (!referral) {
-      return null;
-    }
-
-    // ----------------------------------------------------------
-    // ALREADY PROCESSED
-    // ----------------------------------------------------------
-
-    if (referral.predictionPurchased) {
-      return referral;
-    }
-
-    // ----------------------------------------------------------
-    // MARK ACTION
-    // ----------------------------------------------------------
-
-    referral.predictionPurchased = true;
-
+    referral.premiumSubscription = true;
     await referral.save();
-
-    // ----------------------------------------------------------
-    // NOTIFY PROMO ENGINE
-    // ----------------------------------------------------------
-
-    await this.promoEngineService.checkUserPromos(
-      referral.referrerId.toString(),
-    );
-
+    await this.promoEngineService.checkUserPromos(referral.referrerId.toString());
     return referral;
   }
 
@@ -282,6 +258,17 @@ export class ReferralsService {
   // ============================================================
   // COUNT ALL REFERRALS
   // ============================================================
+
+  async getUserReferralsPaginated(userId: string, pageValue = 1, limitValue = 10) {
+    const page = Math.max(1, Math.floor(Number(pageValue) || 1));
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(limitValue) || 10)));
+    const filter = { referrerId: userId };
+    const [items, total] = await Promise.all([
+      this.referralModel.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean().exec(),
+      this.referralModel.countDocuments(filter).exec(),
+    ]);
+    return { items, pagination: { page, limit, total, pages: Math.ceil(total / limit) } };
+  }
 
   async countReferrals(userId: string) {
     return this.referralModel.countDocuments({
@@ -344,17 +331,20 @@ export class ReferralsService {
             {
               vipSubscription: true,
             },
+            {
+              premiumSubscription: true,
+            },
           ],
         });
 
       // --------------------------------------------------------
-      // PREDICTION PURCHASE
+      // PREMIUM SUBSCRIBERS
       // --------------------------------------------------------
 
-      case PromoRequirement.PREDICTION_PURCHASE:
+      case PromoRequirement.PREMIUM_SUBSCRIPTION:
         return this.referralModel.countDocuments({
           referrerId,
-          predictionPurchased: true,
+          premiumSubscription: true,
         });
 
       // --------------------------------------------------------
@@ -403,8 +393,12 @@ export class ReferralsService {
       vipSubscription: true,
     });
 
-    const predictionPurchases = await this.referralModel.countDocuments({
-      predictionPurchased: true,
+    const paidSubscribers = await this.referralModel.countDocuments({
+      $or: [
+        { regularSubscription: true },
+        { vipSubscription: true },
+        { premiumSubscription: true },
+      ],
     });
 
     const totalReferrers = await this.referralModel.distinct('referrerId');
@@ -420,10 +414,11 @@ export class ReferralsService {
 
       vipSubscribers,
 
-      predictionPurchases,
+      premiumSubscribers: await this.referralModel.countDocuments({ premiumSubscription: true }),
+      paidSubscribers,
 
       conversionRate:
-        total === 0 ? 0 : Math.round((vipSubscribers / total) * 100),
+        total === 0 ? 0 : Math.round((paidSubscribers / total) * 100),
     };
   }
 }

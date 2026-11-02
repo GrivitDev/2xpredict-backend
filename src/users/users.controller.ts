@@ -11,7 +11,7 @@ import { UsersService } from './users.service';
 
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { GetUser } from '../common/decorators/get-user.decorator';
-import { UserSessionService } from 'src/user-session/user-session.service';
+import { UserSessionService } from '../user-session/user-session.service';
 
 @Controller('users')
 export class UsersController {
@@ -48,3 +48,4 @@ export class UsersController {
     return this.usersService.softDeleteUser(user._id);
   }
 }
+

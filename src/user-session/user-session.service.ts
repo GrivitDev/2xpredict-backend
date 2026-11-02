@@ -6,7 +6,7 @@ import {
   UserSessionDocument,
 } from './schemas/user-session.schema';
 import { parseDevice } from '../common/utils/device-parser';
-import { GeoLocationService } from 'src/common/services/geo-location.service';
+import { GeoLocationService } from '../common/services/geo-location.service';
 
 @Injectable()
 export class UserSessionService {
@@ -35,8 +35,6 @@ export class UserSessionService {
       isActive: true,
     });
 
-    console.log('SESSION LOCATION', location);
-
     return session;
   }
 
@@ -64,10 +62,11 @@ export class UserSessionService {
     return session;
   }
 
-  async revokeSession(sessionId: string) {
+  async revokeSession(sessionId: string, userId?: string) {
     return this.sessionModel.findOneAndUpdate(
       {
         _id: sessionId,
+        ...(userId ? { userId: new Types.ObjectId(userId) } : {}),
         isActive: true,
       },
       {
@@ -93,39 +92,39 @@ export class UserSessionService {
   }
 
   async updateActivity(sessionId: string) {
-    return this.sessionModel.findOneAndUpdate(
+    // Avoid writing lastActiveAt on every authenticated request. Security checks
+    // still validate activity/expiry on reads; persistence is throttled to once
+    // per minute per session.
+    const now = new Date();
+    const writeAfter = new Date(now.getTime() - 60_000);
+    return this.sessionModel.updateOne(
       {
         _id: sessionId,
         isActive: true,
-        expiresAt: {
-          $gt: new Date(),
-        },
+        expiresAt: { $gt: now },
+        lastActiveAt: { $lte: writeAfter },
       },
-      {
-        $set: {
-          lastActiveAt: new Date(),
-        },
-      },
-    );
+      { $set: { lastActiveAt: now } },
+    ).exec();
   }
   // =====================================
   // ADMIN SUMMARY
   // =====================================
   async getSessionSummary(userId: string) {
-    const sessions = await this.getUserSessions(userId);
-
-    const activeSessions = sessions.filter((session) => session.isActive);
-
+    const userObjectId = new Types.ObjectId(userId);
+    const now = new Date();
+    const [sessions, totalSessions, activeSessions] = await Promise.all([
+      this.getUserSessions(userId),
+      this.sessionModel.countDocuments({ userId: userObjectId }).exec(),
+      this.sessionModel.countDocuments({ userId: userObjectId, isActive: true, expiresAt: { $gt: now } }).exec(),
+    ]);
+    const currentSession = sessions.find((session) => session.isActive && session.expiresAt > now) ?? null;
     return {
       latestSessions: sessions.slice(0, 10),
-
-      totalSessions: sessions.length,
-
-      activeSessions: activeSessions.length,
-
+      totalSessions,
+      activeSessions,
       lastLogin: sessions.length ? sessions[0].lastActiveAt : null,
-
-      currentSession: activeSessions.length ? activeSessions[0] : null,
+      currentSession,
     };
   }
 
@@ -136,9 +135,8 @@ export class UserSessionService {
       .find({
         userId: new Types.ObjectId(userId),
       })
-      .sort({
-        lastActiveAt: -1,
-      });
+      .sort({ lastActiveAt: -1 })
+      .limit(100);
 
     return sessions.map((session) => ({
       ...session.toObject(),
@@ -166,3 +164,4 @@ export class UserSessionService {
     );
   }
 }
+

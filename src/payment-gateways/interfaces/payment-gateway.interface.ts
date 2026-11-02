@@ -30,6 +30,9 @@ export interface VerifyPaymentResult {
   message?: string;
 
   raw: Record<string, any>;
+  /** Amount in the provider's smallest currency unit (kobo for NGN). */
+  amountMinor?: number;
+  currency?: string;
 }
 
 export interface WebhookEvent {
@@ -40,6 +43,8 @@ export interface WebhookEvent {
   status: 'success' | 'failed';
 
   raw: Record<string, any>;
+  amountMinor?: number;
+  currency?: string;
 }
 
 export interface PaymentGateway {
@@ -54,7 +59,7 @@ export interface PaymentGateway {
    * Verify payment by our internal reference.
    *
    * The provider implementation must normalize
-   * Paystack / OPay responses into the common
+   * Paystack responses into the common
    * application status:
    *
    * success
@@ -66,7 +71,7 @@ export interface PaymentGateway {
   /**
    * Validate webhook signature.
    */
-  validateWebhook(payload: any, signature?: string): Promise<boolean>;
+  validateWebhook(payload: unknown, signature?: string, rawBody?: Buffer): Promise<boolean>;
 
   /**
    * Convert the provider's webhook payload
@@ -74,3 +79,4 @@ export interface PaymentGateway {
    */
   parseWebhook(payload: any): Promise<WebhookEvent>;
 }
+

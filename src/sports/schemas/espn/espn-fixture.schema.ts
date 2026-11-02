@@ -144,6 +144,21 @@ export class EspnFixture {
   })
   payload!: EspnFixturePayload;
 
+  /** Last successful canonical fixture/scoreboard collection time. */
+  @Prop({
+    type: Date,
+    index: true,
+  })
+  fixtureCollectedAt?: Date;
+
+  /** Time at which a recent completion was first observed by collection. */
+  @Prop({
+    type: Date,
+    index: true,
+  })
+  completedAt?: Date;
+
+  /** Last provider-data write of any kind, including embedded Summary data. */
   @Prop({
     required: true,
     type: Date,
@@ -186,3 +201,48 @@ EspnFixtureSchema.index({
 EspnFixtureSchema.index({
   collectedAt: -1,
 });
+
+// Summary odds availability/freshness are queried by the Odds readiness pipeline.
+EspnFixtureSchema.index({ 'payload.summaryCollectedAt': 1, fixtureDate: 1 });
+EspnFixtureSchema.index({ 'payload.summary.meta.lastUpdatedAt': 1, fixtureDate: 1 });
+EspnFixtureSchema.index({ 'payload.summary.pickcenter': 1 });
+EspnFixtureSchema.index({ 'payload.summary.odds': 1 });
+// Indexed publication timestamps for the Football News feed.
+// The ESPN summary stores these timestamps as ISO date strings inside arrays.
+// Individual indexes let MongoDB use an indexed range for each publication field.
+EspnFixtureSchema.index({
+  'payload.summary.news.articles.published': 1,
+});
+
+EspnFixtureSchema.index({
+  'payload.summary.news.articles.lastModified': 1,
+});
+
+EspnFixtureSchema.index({
+  'payload.summary.news.news.articles.published': 1,
+});
+
+EspnFixtureSchema.index({
+  'payload.summary.news.news.articles.lastModified': 1,
+});
+
+EspnFixtureSchema.index({
+  'payload.summary.videos.originalPublishDate': -1,
+});
+
+EspnFixtureSchema.index({
+  'payload.summary.videos.lastModified': -1,
+});
+
+EspnFixtureSchema.index({
+  completed: 1,
+  completedAt: 1,
+});
+
+EspnFixtureSchema.index({
+  completed: 1,
+  fixtureDate: 1,
+  fixtureCollectedAt: 1,
+});
+
+

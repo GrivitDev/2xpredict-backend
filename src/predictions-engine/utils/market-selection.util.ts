@@ -1,135 +1,281 @@
-import { MarketCandidate } from '../interfaces/market-candidate.interface';
+import {
+  ExpandedMarketSelection,
+  MarketDefinition,
+  MarketSelectionDefinition,
+} from '../interfaces/market-catalog.interface';
+import { PredictionMatchContext } from '../interfaces/espn-prediction-context.interface';
+import { EspnPayloadUtil } from './espn-payload.util';
 
-export class MarketSelectionUtil {
-  static selectBest(candidates: MarketCandidate[]): MarketCandidate | null {
-    if (!candidates.length) {
-      return null;
-    }
-
-    /*
-     * ----------------------------------------------------------
-     * ELIGIBILITY
-     * ----------------------------------------------------------
-     *
-     * FinalDecisionEngine is the authority that determines
-     * whether a candidate is eligible for publication.
-     *
-     * A rejected candidate must never be selected.
-     */
-    const eligibleCandidates = candidates.filter(
-      (candidate) => candidate.eligible === true,
-    );
-
-    if (!eligibleCandidates.length) {
-      return null;
-    }
-
-    /*
-     * ----------------------------------------------------------
-     * FINAL DECISION SELECTION
-     * ----------------------------------------------------------
-     *
-     * decisionScore is produced from the final decision inputs:
-     *
-     *   probability
-     *   confidence
-     *   safety
-     *   model agreement
-     *   data quality
-     *   calibration reliability
-     *   selection-aligned evidence
-     *
-     * Probability must therefore NOT bypass the final decision
-     * architecture by becoming the primary selector here.
-     *
-     * This layer chooses between already-evaluated candidates.
-     */
-    return [...eligibleCandidates].sort((a, b) => {
-      /*
-       * 1. FINAL DECISION SCORE
-       *
-       * Primary ordering signal.
-       */
-      const decisionScoreDifference =
-        this.safeNumber(b.decisionScore) - this.safeNumber(a.decisionScore);
-
-      if (decisionScoreDifference !== 0) {
-        return decisionScoreDifference;
-      }
-
-      /*
-       * 2. RISK
-       *
-       * Lower dynamic risk is preferred when final decision
-       * scores are effectively tied.
-       */
-      const riskDifference =
-        this.safeNumber(a.riskScore) - this.safeNumber(b.riskScore);
-
-      if (riskDifference !== 0) {
-        return riskDifference;
-      }
-
-      /*
-       * 3. CONFIDENCE
-       *
-       * Confidence measures trust in the probability estimate.
-       *
-       * It is deliberately NOT combined with probability here.
-       * It is only a tie-breaker because the final decision score
-       * has already incorporated both concepts independently.
-       */
-      const confidenceDifference =
-        this.safeNumber(b.confidence) - this.safeNumber(a.confidence);
-
-      if (confidenceDifference !== 0) {
-        return confidenceDifference;
-      }
-
-      /*
-       * 4. MODEL AGREEMENT
-       */
-      const agreementDifference =
-        this.safeNumber(b.modelAgreement) - this.safeNumber(a.modelAgreement);
-
-      if (agreementDifference !== 0) {
-        return agreementDifference;
-      }
-
-      /*
-       * 5. DATA QUALITY
-       */
-      const dataQualityDifference =
-        this.safeNumber(b.dataQuality) - this.safeNumber(a.dataQuality);
-
-      if (dataQualityDifference !== 0) {
-        return dataQualityDifference;
-      }
-
-      /*
-       * 6. PROBABILITY
-       *
-       * Probability is retained as the final deterministic
-       * tie-breaker, not the primary selector.
-       */
-      const probabilityDifference =
-        this.safeNumber(b.probability) - this.safeNumber(a.probability);
-
-      if (probabilityDifference !== 0) {
-        return probabilityDifference;
-      }
-
-      /*
-       * 7. CALIBRATION RELIABILITY
-       */
-      return (
-        this.safeNumber(b.calibrationReliability) -
-        this.safeNumber(a.calibrationReliability)
-      );
-    })[0];
-  }
-
-  private static safeNumber(value: number | null | undefined): number {
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-  }
+function lineSlug(line: number): string {
+  return String(line).replace('-', 'MINUS_').replace('.', '_');
 }
+function lineVariable(line: number): string {
+  return String(line).replace('-', 'Minus').replace('.', '');
+}
+function baseSelection(
+  key: string,
+  jsonVariable: string,
+  fullName: string,
+  abbreviation: string,
+): MarketSelectionDefinition {
+  return { key, jsonVariable, fullName, abbreviation };
+}
+
+export function expandMarketSelections(
+  definition: MarketDefinition,
+  context: PredictionMatchContext,
+): ExpandedMarketSelection[] {
+  if (definition.selectionMode === 'OVER_UNDER') {
+    // The Odds module is the authority for which exact line is available.
+    // Never discard a priced line because it exceeds a legacy catalog ceiling.
+    const supportedLines = (definition.lines ?? []).filter(Number.isFinite);
+    return supportedLines.flatMap((line) => [
+      {
+        ...baseSelection(
+          `OVER_${lineSlug(line)}`,
+          `over${lineVariable(line)}`,
+          `Over ${line}`,
+          `O ${line}`,
+        ),
+        line,
+      },
+      {
+        ...baseSelection(
+          `UNDER_${lineSlug(line)}`,
+          `under${lineVariable(line)}`,
+          `Under ${line}`,
+          `U ${line}`,
+        ),
+        line,
+      },
+    ]);
+  }
+
+  if (definition.selectionMode === 'EXACT_TOTAL') {
+    return definition.selections.map((selection) => ({ ...selection }));
+  }
+
+  if (definition.selectionMode === 'CORRECT_SCORE') {
+    const maximum = definition.period === 'FULL_TIME' ? 8 : 5;
+    const selections: ExpandedMarketSelection[] = [];
+    for (let homeGoals = 0; homeGoals <= maximum; homeGoals += 1) {
+      for (let awayGoals = 0; awayGoals <= maximum; awayGoals += 1) {
+        selections.push({
+          ...baseSelection(
+            `SCORE_${homeGoals}_${awayGoals}`,
+            `score${homeGoals}${awayGoals}`,
+            `${homeGoals}-${awayGoals}`,
+            `${homeGoals}:${awayGoals}`,
+          ),
+          homeGoals,
+          awayGoals,
+        });
+      }
+    }
+    return selections;
+  }
+
+  if (definition.selectionMode === 'ASIAN_HANDICAP') {
+    return (definition.lines ?? []).flatMap((handicap) => [
+      {
+        ...baseSelection(
+          `HOME_${lineSlug(handicap)}`,
+          `homeHandicap${lineVariable(handicap)}`,
+          `${context.homeTeam.name} (${handicap > 0 ? '+' : ''}${handicap})`,
+          `1 ${handicap > 0 ? '+' : ''}${handicap}`,
+        ),
+        side: 'HOME' as const,
+        handicap,
+        line: handicap,
+      },
+      {
+        ...baseSelection(
+          `AWAY_${lineSlug(handicap)}`,
+          `awayHandicap${lineVariable(handicap)}`,
+          `${context.awayTeam.name} (${handicap > 0 ? '+' : ''}${handicap})`,
+          `2 ${handicap > 0 ? '+' : ''}${handicap}`,
+        ),
+        side: 'AWAY' as const,
+        handicap,
+        line: handicap,
+      },
+    ]);
+  }
+
+  if (definition.selectionMode === 'EUROPEAN_HANDICAP') {
+    return (definition.lines ?? []).flatMap((handicap) => [
+      {
+        ...baseSelection(
+          `HOME_${lineSlug(handicap)}`,
+          `home${lineVariable(handicap)}`,
+          `${context.homeTeam.name} (handicap ${handicap > 0 ? '+' : ''}${handicap})`,
+          '1',
+        ),
+        side: 'HOME' as const,
+        handicap,
+        line: handicap,
+      },
+      {
+        ...baseSelection(
+          `DRAW_${lineSlug(handicap)}`,
+          `draw${lineVariable(handicap)}`,
+          `Draw (home handicap ${handicap > 0 ? '+' : ''}${handicap})`,
+          'X',
+        ),
+        handicap,
+        line: handicap,
+      },
+      {
+        ...baseSelection(
+          `AWAY_${lineSlug(handicap)}`,
+          `away${lineVariable(handicap)}`,
+          `${context.awayTeam.name} (home handicap ${handicap > 0 ? '+' : ''}${handicap})`,
+          '2',
+        ),
+        side: 'AWAY' as const,
+        handicap,
+        line: handicap,
+      },
+    ]);
+  }
+
+  if (definition.selectionMode === 'BTTS_TOTAL') {
+    return (definition.lines ?? []).flatMap((line) => {
+      const selections: ExpandedMarketSelection[] = [
+        {
+          ...baseSelection(
+            `YES_OVER_${lineSlug(line)}`,
+            `yesAndOver${lineVariable(line)}`,
+            `BTTS Yes & Over ${line}`,
+            `GG + O${line}`,
+          ),
+          line,
+        },
+        {
+          ...baseSelection(
+            `NO_OVER_${lineSlug(line)}`,
+            `noAndOver${lineVariable(line)}`,
+            `BTTS No & Over ${line}`,
+            `NG + O${line}`,
+          ),
+          line,
+        },
+        {
+          ...baseSelection(
+            `NO_UNDER_${lineSlug(line)}`,
+            `noAndUnder${lineVariable(line)}`,
+            `BTTS No & Under ${line}`,
+            `NG + U${line}`,
+          ),
+          line,
+        },
+      ];
+      // Both teams need to score at least one goal, so BTTS Yes and Under 1.5
+      // cannot occur together and should not be generated as a market selection.
+      if (line > 1.5) {
+        selections.push({
+          ...baseSelection(
+            `YES_UNDER_${lineSlug(line)}`,
+            `yesAndUnder${lineVariable(line)}`,
+            `BTTS Yes & Under ${line}`,
+            `GG + U${line}`,
+          ),
+          line,
+        });
+      }
+      return selections;
+    });
+  }
+
+  if (definition.selectionMode === 'POSSESSION') {
+    return (definition.lines ?? []).flatMap((line) => [
+      {
+        ...baseSelection(
+          `OVER_${lineSlug(line)}`,
+          `over${lineVariable(line)}`,
+          `Home Possession Over ${line}%`,
+          `O ${line}%`,
+        ),
+        line,
+      },
+      {
+        ...baseSelection(
+          `UNDER_${lineSlug(line)}`,
+          `under${lineVariable(line)}`,
+          `Home Possession Under ${line}%`,
+          `U ${line}%`,
+        ),
+        line,
+      },
+    ]);
+  }
+
+  if (definition.selectionMode === 'PLAYER') {
+    const summary = EspnPayloadUtil.asRecord(context.summary);
+    const rosterTeams = EspnPayloadUtil.asArray(summary.rosters);
+    const selections: ExpandedMarketSelection[] = [];
+    const seen = new Set<string>();
+    for (const teamRoster of rosterTeams) {
+      const team = EspnPayloadUtil.asRecord(teamRoster);
+      const roster = EspnPayloadUtil.asArray(team.roster);
+      const teamId = String(EspnPayloadUtil.asRecord(team.team).id ?? '');
+      for (const rawPlayer of roster) {
+        const player = EspnPayloadUtil.asRecord(rawPlayer);
+        const athlete = EspnPayloadUtil.asRecord(player.athlete);
+        const athleteId = String(athlete.id ?? '');
+        const athleteName = EspnPayloadUtil.firstNonEmpty(
+          athlete.displayName,
+          athlete.fullName,
+          athlete.name,
+        );
+        if (!athleteId || !athleteName || seen.has(athleteId)) continue;
+        if (player.active === false) continue;
+        seen.add(athleteId);
+        const shortName = String(athlete.shortName ?? athleteName);
+        if (definition.lines?.length) {
+          for (const line of definition.lines) {
+            selections.push({
+              key: `PLAYER_${athleteId}_OVER_${lineSlug(line)}`,
+              jsonVariable: `player${athleteId}Over${lineVariable(line)}`,
+              fullName: `${athleteName} Over ${line}`,
+              abbreviation: `${shortName} O${line}`,
+              line,
+              subjectId: athleteId,
+              subjectName: athleteName,
+              subjectAbbreviation: shortName,
+              subjectTeamId: teamId,
+            });
+            selections.push({
+              key: `PLAYER_${athleteId}_UNDER_${lineSlug(line)}`,
+              jsonVariable: `player${athleteId}Under${lineVariable(line)}`,
+              fullName: `${athleteName} Under ${line}`,
+              abbreviation: `${shortName} U${line}`,
+              line,
+              subjectId: athleteId,
+              subjectName: athleteName,
+              subjectAbbreviation: shortName,
+              subjectTeamId: teamId,
+            });
+          }
+        } else {
+          selections.push({
+            key: `PLAYER_${athleteId}`,
+            jsonVariable: `player${athleteId}`,
+            fullName: athleteName,
+            abbreviation: shortName,
+            subjectId: athleteId,
+            subjectName: athleteName,
+            subjectAbbreviation: shortName,
+            subjectTeamId: teamId,
+          });
+        }
+      }
+    }
+    return selections;
+  }
+
+  return definition.selections.map((selection) => ({ ...selection }));
+}
+
+
+

@@ -31,8 +31,9 @@ import {
 } from './schemas/promo-participant.schema';
 import { PromoCampaignType } from './constants/promo-campaign-type';
 import { PromoRequirement } from './constants/promo-requirements';
+import { PromoPromotionKind } from './constants/promo-promotion-kind';
 import { PromosService } from './promos.service';
-import { TelegramService } from 'src/telegram/telegram.service';
+import { BetLabWalletService } from '../bet-lab/services/bet-lab-wallet.service';
 
 @Injectable()
 export class PromoEngineService {
@@ -53,7 +54,7 @@ export class PromoEngineService {
     private readonly usersService: UsersService,
 
     private readonly promosService: PromosService,
-    private readonly telegramService: TelegramService,
+    private readonly walletService: BetLabWalletService,
 
     @InjectModel(PromoParticipant.name)
     private readonly participantModel: Model<PromoParticipantDocument>,
@@ -101,6 +102,7 @@ export class PromoEngineService {
     if (!promo) {
       return null;
     }
+    if (promo.promotionKind !== PromoPromotionKind.REWARD || (promo.rewardType as string) === 'cash') return promo;
 
     const claims = await this.rewardModel.countDocuments({
       promoId: promo._id.toString(),
@@ -121,8 +123,6 @@ export class PromoEngineService {
   // ==============================
 
   async joinReferralCampaign(promoId: string, userId: string) {
-    const now = new Date();
-
     const promo = await this.promosService.findActiveReferralPromo(promoId);
 
     if (!promo) {
@@ -173,6 +173,7 @@ export class PromoEngineService {
   // ==============================
 
   private async processPromo(promo: PromoDocument, userId: string) {
+    if (promo.promotionKind !== PromoPromotionKind.REWARD || (promo.rewardType as string) === 'cash') return;
     // ==============================
     // DIRECT REGISTER CAMPAIGN
     // ==============================
@@ -234,21 +235,18 @@ export class PromoEngineService {
     userId: string,
     claimNumber: number,
   ) {
-    const exists = await this.rewardModel.findOne({
-      promoId: promo._id.toString(),
-      userId,
-      claimNumber,
-    });
-
+    const exists = await this.rewardModel.findOne({ promoId: promo._id.toString(), userId, claimNumber });
     if (exists) {
+      if (exists.type === RewardType.BET_LAB_POINTS && exists.status !== PromoRewardStatus.PAID) {
+        await this.walletService.grantAdminBonusPoints(String(exists.userId), Number(exists.points), `Promotion reward: ${promo.name}`, String(exists._id));
+        exists.status = PromoRewardStatus.PAID;
+        exists.paidAt = new Date();
+        await exists.save();
+      }
       return exists;
     }
-
-    if (promo.rewardType === RewardType.SUBSCRIPTION) {
-      return this.grantSubscriptionReward(promo, userId, claimNumber);
-    }
-
-    return this.grantCashReward(promo, userId, claimNumber);
+    if (promo.rewardType === RewardType.SUBSCRIPTION) return this.grantSubscriptionReward(promo, userId, claimNumber);
+    return this.grantPointsReward(promo, userId, claimNumber);
   }
 
   // ==============================
@@ -275,7 +273,7 @@ export class PromoEngineService {
 
       plan: promo.rewardPlan,
 
-      durationDays: promo.rewardDurationDays,
+      durationDays: promo.rewardDurationDays ?? 30,
 
       status: PromoRewardStatus.APPROVED,
     });
@@ -289,7 +287,7 @@ export class PromoEngineService {
 
       amount: 0,
 
-      durationDays: promo.rewardDurationDays!,
+      durationDays: promo.rewardDurationDays ?? 30,
     });
 
     reward.status = PromoRewardStatus.PAID;
@@ -302,88 +300,23 @@ export class PromoEngineService {
   }
 
   // ==============================
-  // CASH REWARD
+  // BET LAB POINTS REWARD
   // ==============================
 
-  private async grantCashReward(
-    promo: PromoDocument,
-    userId: string,
-    claimNumber: number,
-  ) {
-    return this.rewardModel.create({
-      promoId: promo._id.toString(),
-
-      userId,
-
-      claimNumber,
-
-      type: RewardType.CASH,
-
-      amount: promo.rewardAmount,
-
-      status: PromoRewardStatus.PENDING,
-    });
-  }
-
-  async submitCashRewardDetails(rewardId: string, userId: string, data: any) {
-    const reward = await this.rewardModel.findOne({
-      _id: rewardId,
-      userId,
-      type: RewardType.CASH,
-      status: PromoRewardStatus.PENDING,
-    });
-
-    if (!reward) {
-      throw new BadRequestException('Cash reward not available');
+  private async grantPointsReward(promo: PromoDocument, userId: string, claimNumber: number) {
+    const points = Number(promo.pointsAmount ?? 0);
+    if (!Number.isSafeInteger(points) || points < 1) {
+      throw new BadRequestException('Promotion points reward is not configured correctly.');
     }
-
-    reward.bankName = data.bankName;
-
-    reward.accountName = data.accountName;
-
-    reward.accountNumber = data.accountNumber;
-
-    reward.claimedAt = new Date();
-
-    await reward.save();
-
-    const user = await this.usersService.findById(userId);
-
-    const promo = await this.promoModel.findById(reward.promoId);
-
-    await this.telegramService.notifyCashRewardRequest({
-      fullName: user?.fullName || user?.username || '',
-
-      email: user?.email || '',
-
-      campaign: promo?.name || '',
-
-      amount: reward.amount || 0,
-
-      bankName: reward.bankName || '',
-      accountName: reward.accountName || '',
-      accountNumber: reward.accountNumber || '',
+    const reward = await this.rewardModel.create({
+      promoId: promo._id.toString(), userId, claimNumber,
+      type: RewardType.BET_LAB_POINTS, points, status: PromoRewardStatus.APPROVED,
     });
-
-    return reward;
-  }
-
-  async markCashRewardPaid(rewardId: string) {
-    const reward = await this.rewardModel.findOne({
-      _id: rewardId,
-      type: RewardType.CASH,
-      status: PromoRewardStatus.PENDING,
-    });
-
-    if (!reward) {
-      throw new BadRequestException('Reward not found');
-    }
-
+    await this.walletService.grantAdminBonusPoints(userId, points, `Promotion reward: ${promo.name}`, String(reward._id));
     reward.status = PromoRewardStatus.PAID;
-
     reward.paidAt = new Date();
-
-    return reward.save();
+    await reward.save();
+    return reward;
   }
 
   // ==============================
@@ -410,7 +343,25 @@ export class PromoEngineService {
             endDate: { $gte: now },
           });
 
-    const result: any[] = [];
+    const result: {
+      promoId: PromoDocument['_id'];
+      name: PromoDocument['name'];
+      description: PromoDocument['description'];
+      requirement: PromoDocument['requirement'];
+      rewardType: PromoDocument['rewardType'];
+      rewardPlan: PromoDocument['rewardPlan'];
+      pointsAmount: PromoDocument['pointsAmount'];
+      rewardDurationDays: PromoDocument['rewardDurationDays'];
+      targetCount: PromoDocument['targetCount'];
+      maxClaims: PromoDocument['maxClaims'];
+      qualifiedReferrals: number;
+      currentProgress: number;
+      remainingToNextReward: number;
+      completedClaims: number;
+      remainingClaims: number | null;
+      completed: boolean;
+      unlimited: boolean;
+    }[] = [];
 
     for (const promo of promos) {
       const qualified = await this.referralsService.countQualifiedReferrals(
@@ -441,7 +392,7 @@ export class PromoEngineService {
 
         rewardPlan: promo.rewardPlan,
 
-        rewardAmount: promo.rewardAmount,
+        pointsAmount: promo.pointsAmount,
 
         rewardDurationDays: promo.rewardDurationDays,
 
@@ -476,9 +427,7 @@ export class PromoEngineService {
 
   async getPromoRewards(promoId: string) {
     return this.rewardModel
-      .find({
-        promoId,
-      })
+      .find({ promoId, type: { $in: [RewardType.SUBSCRIPTION, RewardType.BET_LAB_POINTS] } })
       .populate('userId', 'username email')
       .sort({
         createdAt: -1,
@@ -491,144 +440,68 @@ export class PromoEngineService {
 
   async getUserRewards(userId: string) {
     return this.rewardModel
-      .find({
-        userId,
-      })
+      .find({ userId, type: { $in: [RewardType.SUBSCRIPTION, RewardType.BET_LAB_POINTS] } })
       .populate('promoId', 'name description')
       .sort({
         createdAt: -1,
       });
   }
 
+  async getUserRewardsPaginated(userId: string, pageValue = 1, limitValue = 10) {
+    const page = Math.max(1, Math.floor(Number(pageValue) || 1));
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(limitValue) || 10)));
+    const filter = { userId, type: { $in: [RewardType.SUBSCRIPTION, RewardType.BET_LAB_POINTS] } };
+    const [items, total] = await Promise.all([
+      this.rewardModel.find(filter).populate('promoId', 'name description').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean().exec(),
+      this.rewardModel.countDocuments(filter).exec(),
+    ]);
+    return { items, pagination: { page, limit, total, pages: Math.ceil(total / limit) } };
+  }
+
   // ==============================
-  // ADMIN - ALL PAID REWARDS
+  // ADMIN - ALL AWARDED REWARDS
   // ==============================
 
   async getAllAwardedRewards() {
-    const rewards = await this.rewardModel
-      .find({
-        status: {
-          $in: [PromoRewardStatus.PENDING, PromoRewardStatus.PAID],
-        },
-      })
+    const rewards = await this.rewardModel.find({ type: { $in: [RewardType.SUBSCRIPTION, RewardType.BET_LAB_POINTS] }, status: { $in: [PromoRewardStatus.PENDING, PromoRewardStatus.APPROVED, PromoRewardStatus.PAID] } })
       .populate('userId', 'fullName username email')
-      .populate(
-        'promoId',
-        `
-      name
-      campaignType
-      requirement
-      rewardType
-      rewardPlan
-      rewardAmount
-      rewardDurationDays
-      targetCount
-      `,
-      )
-      .sort({
-        paidAt: -1,
-      });
-
-    const formattedRewards = rewards.map((reward: any) => {
+      .populate('promoId', 'name campaignType requirement rewardType rewardPlan pointsAmount rewardDurationDays targetCount')
+      .sort({ paidAt: -1, createdAt: -1 });
+    const formatted = rewards.map((reward: any) => {
       const promo = reward.promoId;
-
-      let activity = '';
-
+      let activity = 'Completed campaign requirement';
       switch (promo?.requirement) {
-        case PromoRequirement.REGISTER:
-          activity = 'Registered a new account';
-          break;
-
-        case PromoRequirement.REGULAR_SUBSCRIPTION:
-          activity = `Referred ${promo.targetCount} Regular Subscribers`;
-          break;
-
-        case PromoRequirement.VIP_SUBSCRIPTION:
-          activity = `Referred ${promo.targetCount} VIP Subscribers`;
-          break;
-
-        case PromoRequirement.ANY_SUBSCRIPTION:
-          activity = `Referred ${promo.targetCount} Paying Subscribers`;
-          break;
-
-        case PromoRequirement.PREDICTION_PURCHASE:
-          activity = `Referred ${promo.targetCount} Prediction Purchases`;
-          break;
-
-        default:
-          activity = 'Completed campaign requirement';
+        case PromoRequirement.REGISTER: activity = 'Registered a new account'; break;
+        case PromoRequirement.REGULAR_SUBSCRIPTION: activity = `Referred ${promo.targetCount} Regular Subscribers`; break;
+        case PromoRequirement.VIP_SUBSCRIPTION: activity = `Referred ${promo.targetCount} VIP Subscribers`; break;
+        case PromoRequirement.PREMIUM_SUBSCRIPTION: activity = `Referred ${promo.targetCount} Premium Subscribers`; break;
+        case PromoRequirement.ANY_SUBSCRIPTION: activity = `Referred ${promo.targetCount} Paying Subscribers`; break;
       }
-
       return {
-        id: reward._id,
-
-        rewardTitle:
-          promo?.rewardType === RewardType.SUBSCRIPTION
-            ? `${promo.rewardPlan} Subscription (${promo.rewardDurationDays} Days)`
-            : `Cash Reward ₦${promo.rewardAmount}`,
-
-        rewardType: reward.type,
-
-        dateReceived: reward.paidAt || reward.createdAt,
-
-        campaignType: promo?.campaignType,
-
-        userName: reward.userId?.fullName || reward.userId?.username,
-
-        email: reward.userId?.email,
-
-        activity,
-
-        claimNumber: reward.claimNumber,
+        id: String(reward._id),
+        rewardTitle: reward.type === RewardType.SUBSCRIPTION ? `${reward.plan ?? promo?.rewardPlan} Subscription (${reward.durationDays ?? 30} Days)` : `${reward.points ?? 0} Bet Lab Points`,
+        rewardType: reward.type, points: reward.points ?? 0,
+        dateReceived: reward.paidAt || reward.createdAt, campaignType: promo?.campaignType,
+        userName: reward.userId?.fullName || reward.userId?.username, email: reward.userId?.email,
+        activity, claimNumber: reward.claimNumber, status: reward.status,
       };
     });
-
     return {
-      summary: {
-        totalRewardsAwarded: formattedRewards.length,
-
-        subscriptionRewards: formattedRewards.filter(
-          (r) => r.rewardType === RewardType.SUBSCRIPTION,
-        ).length,
-
-        cashRewards: formattedRewards.filter(
-          (r) => r.rewardType === RewardType.CASH,
-        ).length,
-
-        totalCashAwarded: formattedRewards
-          .filter((r) => r.rewardType === RewardType.CASH)
-          .reduce((sum, r: any) => sum + (r.amount || 0), 0),
-      },
-
-      rewards: formattedRewards,
+      summary: { totalRewardsAwarded: formatted.length, subscriptionRewards: formatted.filter((r) => r.rewardType === RewardType.SUBSCRIPTION).length, pointsRewards: formatted.filter((r) => r.rewardType === RewardType.BET_LAB_POINTS).length, totalPointsAwarded: formatted.reduce((sum, r) => sum + (r.points || 0), 0) },
+      rewards: formatted,
     };
   }
   async getAllClaimedRewards() {
     return this.rewardModel
-      .find()
+      .find({ type: { $in: [RewardType.SUBSCRIPTION, RewardType.BET_LAB_POINTS] } })
       .populate('userId', 'fullName username email')
       .populate(
         'promoId',
-        'name campaignType rewardType rewardPlan rewardAmount rewardDurationDays',
+        'name campaignType rewardType rewardPlan pointsAmount rewardDurationDays',
       )
       .sort({
         createdAt: -1,
       });
   }
 
-  async getPendingCashRewards() {
-    return this.rewardModel
-      .find({
-        type: RewardType.CASH,
-        status: PromoRewardStatus.PENDING,
-        accountNumber: {
-          $exists: true,
-        },
-      })
-      .populate('userId', 'fullName username email')
-      .populate('promoId', 'name')
-      .sort({
-        createdAt: -1,
-      });
-  }
 }

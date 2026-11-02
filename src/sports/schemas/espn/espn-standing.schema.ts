@@ -1,124 +1,46 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-
-import { HydratedDocument } from 'mongoose';
+import { HydratedDocument, Schema as MongooseSchema } from 'mongoose';
+import type { EspnStandingsPayload } from '../../providers/espn.interfaces';
 
 export type EspnStandingDocument = HydratedDocument<EspnStanding>;
 
+/** One untouched ESPN standings response per competition and season. */
 @Schema({
   timestamps: true,
   collection: 'sports_espn_standings',
 })
 export class EspnStanding {
-  @Prop({
-    required: true,
-    index: true,
-    trim: true,
-    lowercase: true,
-  })
+  @Prop({ required: true, trim: true, lowercase: true, index: true })
   leagueId!: string;
 
-  @Prop({
-    required: true,
-    index: true,
-  })
+  @Prop({ required: true, index: true })
   season!: number;
 
-  @Prop({
-    required: true,
-    index: true,
-    trim: true,
-  })
-  teamId!: string;
+  @Prop({ required: true, trim: true })
+  leagueName!: string;
 
-  @Prop({
-    required: true,
-  })
-  rank!: number;
+  /** Complete response body returned by ESPN; do not flatten or transform it. */
+  @Prop({ type: MongooseSchema.Types.Mixed, required: true })
+  payload!: EspnStandingsPayload;
 
-  @Prop({
-    required: false,
-  })
-  points?: number;
-
-  @Prop({
-    required: false,
-  })
-  played?: number;
-
-  @Prop({
-    required: false,
-  })
-  wins?: number;
-
-  @Prop({
-    required: false,
-  })
-  draws?: number;
-
-  @Prop({
-    required: false,
-  })
-  losses?: number;
-
-  @Prop({
-    required: false,
-  })
-  goalsFor?: number;
-
-  @Prop({
-    required: false,
-  })
-  goalsAgainst?: number;
-
-  @Prop({
-    required: false,
-  })
-  goalDifference?: number;
-
-  @Prop({
-    required: false,
-  })
-  form?: string;
-
-  @Prop({
-    required: false,
-  })
-  description?: string;
-
-  @Prop({
-    type: Object,
-    required: true,
-  })
-  payload!: Record<string, unknown>;
-
-  @Prop({
-    required: true,
-    type: Date,
-    index: true,
-  })
-  collectedAt!: Date;
+  @Prop({ required: true, type: Date, index: true })
+  fetchedAt!: Date;
 }
 
 export const EspnStandingSchema = SchemaFactory.createForClass(EspnStanding);
 
+// One document per ESPN competition and season, including cup group tables.
 EspnStandingSchema.index(
+  { leagueId: 1, season: 1 },
   {
-    leagueId: 1,
-    season: 1,
-    teamId: 1,
-  },
-  {
+    name: 'uniq_espn_standings_league_season_snapshot',
     unique: true,
+    // Existing installations contain legacy per-team rows. They are excluded
+    // until a successful ESPN refresh upgrades one row and removes its siblings.
+    partialFilterExpression: {
+      leagueName: { $type: 'string' },
+      fetchedAt: { $type: 'date' },
+    },
   },
 );
-
-EspnStandingSchema.index({
-  leagueId: 1,
-  season: 1,
-  rank: 1,
-});
-
-EspnStandingSchema.index({
-  teamId: 1,
-  collectedAt: -1,
-});
+EspnStandingSchema.index({ fetchedAt: -1 });

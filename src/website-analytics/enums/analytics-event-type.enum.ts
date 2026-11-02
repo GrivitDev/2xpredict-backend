@@ -71,8 +71,6 @@ export enum AnalyticsEventType {
 
   PREDICTION_VIEW = 'prediction_view',
 
-  PREDICTION_PURCHASE = 'prediction_purchase',
-
   SUBSCRIPTION_VIEW = 'subscription_view',
 
   SUBSCRIPTION_PURCHASE = 'subscription_purchase',
@@ -109,3 +107,4 @@ export enum AnalyticsEventType {
 
   CUSTOM = 'custom',
 }
+

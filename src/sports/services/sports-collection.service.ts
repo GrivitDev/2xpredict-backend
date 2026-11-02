@@ -1,6 +1,8 @@
 // backend/src/sports/services/sports-collection.service.ts
 
 import { Injectable, Logger } from '@nestjs/common';
+import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
+import { createHash } from 'node:crypto';
 
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -11,16 +13,6 @@ import {
   EspnFixture,
   EspnFixtureDocument,
 } from '../schemas/espn/espn-fixture.schema';
-
-import {
-  EspnLeague,
-  EspnLeagueDocument,
-} from '../schemas/espn/espn-league.schema';
-
-import {
-  EspnStanding,
-  EspnStandingDocument,
-} from '../schemas/espn/espn-standing.schema';
 
 import { EspnTeam, EspnTeamDocument } from '../schemas/espn/espn-team.schema';
 
@@ -66,33 +58,136 @@ import {
   OddsApiEventOdds,
 } from '../providers/the-odds-api.interfaces';
 
-import {
-  EspnLeague as EspnLeaguePayload,
-  EspnNewsResponse,
-  EspnStandingEntry,
-  EspnStandingsResponse,
-} from '../providers/espn.interfaces';
-
-import { EspnQueueService } from './espn-queue.service';
-
-import { CompetitionPriority } from '../enums/competition-priority.enum';
-
-import { CompetitionRegion } from '../enums/competition-region.enum';
-
-import { CompetitionType } from '../enums/competition-type.enum';
-
 import { ActiveCompetitionService } from './active-competition.service';
 
-import { PriorityCompetitionService } from './priority-competition.service';
-
 import { EspnNews, EspnNewsDocument } from '../schemas/espn/espn-news.schema';
+import {
+  SportsSyncState,
+  SportsSyncStateDocument,
+  SportsSyncStateKind,
+  SportsSyncStateStatus,
+} from '../schemas/sports-sync-state.schema';
+
+import { EspnStandingsService } from './espn-standings.service';
+import { EspnQueueBuilderService } from './espn-queue-builder.service';
+import { EspnQueueService } from './espn-queue.service';
+import { EspnQueueJobType } from '../interfaces/espn-queue.interface';
+
+interface SummaryNewsUpsert {
+  contentId: string;
+  articleId: string;
+  normalizedHeadline: string;
+  kind: 'NEWS' | 'VIDEO';
+  leagueId: string;
+  leagueIds: string[];
+  eventIds: string[];
+  teamIds: string[];
+  eventId: string;
+  homeTeamId?: string;
+  awayTeamId?: string;
+  fixtureDate?: Date;
+  headline: string;
+  description?: string;
+  published?: Date;
+  lastModified?: Date;
+  feedPublishedAt: Date;
+  link?: string;
+  imageUrl?: string;
+  type?: string;
+  author?: string;
+  sourceArticleId?: string;
+  payload: Record<string, unknown>;
+  collectedAt: Date;
+}
+
+
+function mergeSummaryRecords(existingValue: unknown, incomingValue: unknown): Record<string, unknown> {
+  const asObject = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const existing = asObject(existingValue) ?? {};
+  const incoming = asObject(incomingValue) ?? {};
+  const merged: Record<string, unknown> = { ...existing };
+
+  for (const [key, incomingValue] of Object.entries(incoming)) {
+    if (incomingValue === undefined || incomingValue === null) continue;
+    const currentValue = existing[key];
+    const incomingObject = asObject(incomingValue);
+    if (incomingObject) {
+      const nested = mergeSummaryRecords(currentValue, incomingValue);
+      if (Object.keys(nested).length > 0) merged[key] = nested;
+      continue;
+    }
+    if (Array.isArray(incomingValue)) {
+      // An empty partial response must not erase a previously collected section.
+      if (incomingValue.length > 0 || currentValue === undefined) merged[key] = incomingValue;
+      continue;
+    }
+    if (typeof incomingValue === 'string' && incomingValue.trim() === '') continue;
+    merged[key] = incomingValue;
+  }
+  return merged;
+}
+
+interface SummaryNewsSource {
+  leagueId: string;
+  eventId: string;
+  summary: unknown;
+  fixtureDate?: unknown;
+  homeTeamId?: unknown;
+  awayTeamId?: unknown;
+}
+
+type EspnScoreSource =
+  | 'SUMMARY_COMPETITORS'
+  | 'SUMMARY_BOXSCORE'
+  | 'FIXTURE_PAYLOAD'
+  | 'ROOT_FIXTURE';
+
+interface EspnScorePair {
+  homeScore: number;
+  awayScore: number;
+}
+
+interface EspnSummaryFinalResult {
+  status: string;
+  statusDetail?: string;
+  statusShortDetail?: string;
+  homeScore?: number;
+  awayScore?: number;
+  scoreSource?: 'SUMMARY_COMPETITORS' | 'SUMMARY_BOXSCORE';
+  scoreConflict?: boolean;
+}
+
+interface StoredFixtureResultResolution {
+  homeScore?: number;
+  awayScore?: number;
+  source?: EspnScoreSource;
+  conflict?: boolean;
+  shouldRefreshSummary: boolean;
+}
+
+export interface EspnSummaryReconciliationResult {
+  isFinal: true;
+  hasScores: boolean;
+  homeScore?: number;
+  awayScore?: number;
+  rootChanged: boolean;
+}
 
 @Injectable()
 export class SportsCollectionService {
   private readonly logger = new Logger(SportsCollectionService.name);
 
   /**
-   * Full season/live-discovery collection window.
+   * Keep Mongo write batches small and bounded when an ESPN scoreboard
+   * response contains a large number of events.
+   */
+  private readonly mongoBulkChunkSize = 50;
+
+  /**
+   * Full-season startup fixture collection window.
    *
    * season start
    *      ->
@@ -116,7 +211,9 @@ export class SportsCollectionService {
 
     private readonly activeCompetitionService: ActiveCompetitionService,
 
-    private readonly priorityCompetitionService: PriorityCompetitionService,
+    private readonly espnStandingsService: EspnStandingsService,
+
+    private readonly espnQueueBuilderService: EspnQueueBuilderService,
 
     private readonly espnQueueService: EspnQueueService,
 
@@ -127,17 +224,14 @@ export class SportsCollectionService {
     @InjectModel(EspnFixture.name)
     private readonly espnFixtureModel: Model<EspnFixtureDocument>,
 
-    @InjectModel(EspnLeague.name)
-    private readonly espnLeagueModel: Model<EspnLeagueDocument>,
-
-    @InjectModel(EspnStanding.name)
-    private readonly espnStandingModel: Model<EspnStandingDocument>,
-
     @InjectModel(EspnTeam.name)
     private readonly espnTeamModel: Model<EspnTeamDocument>,
 
     @InjectModel(EspnNews.name)
     private readonly espnNewsModel: Model<EspnNewsDocument>,
+
+    @InjectModel(SportsSyncState.name)
+    private readonly sportsSyncStateModel: Model<SportsSyncStateDocument>,
 
     // ----------------------------------------------------------
     // Football-Data
@@ -164,6 +258,9 @@ export class SportsCollectionService {
 
     @InjectModel(SportsOddsSnapshot.name)
     private readonly sportsOddsSnapshotModel: Model<SportsOddsSnapshotDocument>,
+
+    // Settlement is triggered only after the canonical ESPN Summary write succeeds.
+    private readonly settlementTriggerService: SettlementTriggerService,
   ) {}
 
   // ============================================================
@@ -371,71 +468,13 @@ export class SportsCollectionService {
 
     const events = this.extractArray(response, ['events', 'items']);
 
-    const eventIds = events
-      .map((event) => {
-        if (!event || typeof event !== 'object') {
-          return undefined;
-        }
-
-        return this.toStringValue((event as { id?: unknown }).id);
-      })
-      .filter((eventId): eventId is string => Boolean(eventId));
-
-    const existingFixtures =
-      eventIds.length > 0
-        ? await this.espnFixtureModel
-            .find({
-              eventId: {
-                $in: eventIds,
-              },
-            })
-            .select({
-              eventId: 1,
-              'payload.summary': 1,
-              'payload.summaryCollectedAt': 1,
-            })
-            .lean()
-            .exec()
-        : [];
-
-    const existingSummaryMap = new Map<
-      string,
-      {
-        summary?: unknown;
-        summaryCollectedAt?: Date;
-      }
-    >();
-
-    for (const fixture of existingFixtures) {
-      if (!fixture.eventId) {
-        continue;
-      }
-
-      const payload =
-        fixture.payload && typeof fixture.payload === 'object'
-          ? fixture.payload
-          : undefined;
-
-      if (!payload) {
-        continue;
-      }
-
-      existingSummaryMap.set(fixture.eventId, {
-        summary: payload.summary,
-        summaryCollectedAt:
-          payload.summaryCollectedAt instanceof Date
-            ? payload.summaryCollectedAt
-            : undefined,
-      });
-    }
-
     const fixtureIds: string[] = [];
 
-    const fixtureOperations: Parameters<
+    let fixtureOperations: Parameters<
       Model<EspnFixtureDocument>['bulkWrite']
     >[0] = [];
 
-    const teamOperations: Parameters<Model<EspnTeamDocument>['bulkWrite']>[0] =
+    let teamOperations: Parameters<Model<EspnTeamDocument>['bulkWrite']>[0] =
       [];
 
     const collectedAt = new Date();
@@ -498,25 +537,69 @@ export class SportsCollectionService {
       const status = this.extractStatus(event);
 
       const completed = this.isCompleted(event);
+      const incomingLive = this.isLiveEvent(event);
+      // Scores are always handled as a complete home/away pair. Never update
+      // only one side from a partial or malformed scoreboard snapshot.
+      const incomingScorePair = this.scorePair(home?.score, away?.score);
+      const incomingHomeScore = incomingScorePair?.homeScore;
+      const incomingAwayScore = incomingScorePair?.awayScore;
+
+      /*
+       * Do not let a partial or conflicting scoreboard snapshot overwrite a
+       * previously completed canonical result. A complete, matching pair may
+       * still refresh the row; a missing side or changed score pair is held
+       * until the detailed Summary can arbitrate it. Mongo evaluates this
+       * expression against the pre-update row.
+       */
+      const incomingScorePairMissing =
+        incomingHomeScore === undefined || incomingAwayScore === undefined;
+      const incomingScorePairConflictsWithStored =
+        incomingHomeScore !== undefined && incomingAwayScore !== undefined
+          ? {
+              $and: [
+                { $isNumber: '$homeScore' },
+                { $isNumber: '$awayScore' },
+                {
+                  $or: [
+                    { $ne: ['$homeScore', { $literal: incomingHomeScore }] },
+                    { $ne: ['$awayScore', { $literal: incomingAwayScore }] },
+                  ],
+                },
+              ],
+            }
+          : false;
+      const preserveCompletedFixture = {
+        $and: [
+          { $eq: ['$completed', true] },
+          {
+            $or: [
+              { $eq: [{ $literal: completed }, false] },
+              { $eq: ['$payload.resultScoreUnresolved', true] },
+              { $literal: incomingScorePairMissing },
+              incomingScorePairConflictsWithStored,
+            ],
+          },
+        ],
+      };
 
       const eventPayload = event as Record<string, unknown>;
 
-      const existingSummary = existingSummaryMap.get(eventId);
-
+      /*
+       * The incoming ESPN fixture event supplies canonical fixture fields.
+       * Summary fields are excluded because they are collected independently.
+       * Existing payload fields (including the latest stored Summary) are
+       * preserved by MongoDB through $mergeObjects.
+       * Node therefore never loads the existing Summary payload just to
+       * merge it back into the fixture.
+       */
       const payload: Record<string, unknown> = {
         ...eventPayload,
       };
 
-      if (
-        existingSummary &&
-        Object.prototype.hasOwnProperty.call(existingSummary, 'summary')
-      ) {
-        payload.summary = existingSummary.summary;
-
-        if (existingSummary.summaryCollectedAt) {
-          payload.summaryCollectedAt = existingSummary.summaryCollectedAt;
-        }
-      }
+      // Summary is collected independently. Do not let a scoreboard snapshot
+      // replace a newer embedded summary during the atomic Mongo merge.
+      delete payload.summary;
+      delete payload.summaryCollectedAt;
 
       fixtureOperations.push({
         updateOne: {
@@ -524,59 +607,156 @@ export class SportsCollectionService {
             eventId,
           },
 
-          update: {
-            $set: {
-              eventId,
+          update: [
+            {
+              $set: {
+                eventId,
 
-              leagueId: normalizedLeagueId,
+                leagueId: normalizedLeagueId,
 
-              season,
+                season,
 
-              fixtureDate,
+                fixtureDate,
 
-              status,
+                status: {
+                  $cond: [
+                    preserveCompletedFixture,
+                    '$status',
+                    { $literal: status },
+                  ],
+                },
 
-              statusDetail: this.getNestedString(competition, [
-                'status',
-                'type',
-                'description',
-              ]),
+                statusDetail: {
+                  $cond: [
+                    preserveCompletedFixture,
+                    '$statusDetail',
+                    {
+                      $literal: this.getNestedString(competition, [
+                        'status',
+                        'type',
+                        'description',
+                      ]),
+                    },
+                  ],
+                },
 
-              statusShortDetail: this.getNestedString(competition, [
-                'status',
-                'type',
-                'shortDetail',
-              ]),
+                statusShortDetail: {
+                  $cond: [
+                    preserveCompletedFixture,
+                    '$statusShortDetail',
+                    {
+                      $literal: this.getNestedString(competition, [
+                        'status',
+                        'type',
+                        'shortDetail',
+                      ]),
+                    },
+                  ],
+                },
 
-              period: this.toNumber(competition?.status?.period),
+                period: {
+                  $cond: [
+                    preserveCompletedFixture,
+                    '$period',
+                    { $literal: this.toNumber(competition?.status?.period) },
+                  ],
+                },
 
-              completed,
+                completed: {
+                  $or: ['$completed', { $literal: completed }],
+                },
 
-              live: this.isLiveEvent(event),
+                live: {
+                  $cond: [
+                    { $eq: ['$completed', true] },
+                    false,
+                    { $literal: incomingLive },
+                  ],
+                },
 
-              displayClock:
-                this.getNestedString(event, ['status', 'displayClock']) ??
-                this.getNestedString(competition, ['status', 'displayClock']),
+                displayClock: {
+                  $cond: [
+                    preserveCompletedFixture,
+                    '$displayClock',
+                    {
+                      $literal:
+                        this.getNestedString(event, ['status', 'displayClock']) ??
+                        this.getNestedString(competition, ['status', 'displayClock']),
+                    },
+                  ],
+                },
 
-              homeTeamId: this.getTeamId(home),
+                homeTeamId: {
+                  $ifNull: [
+                    { $literal: this.getTeamId(home) || null },
+                    '$homeTeamId',
+                  ],
+                },
 
-              awayTeamId: this.getTeamId(away),
+                awayTeamId: {
+                  $ifNull: [
+                    { $literal: this.getTeamId(away) || null },
+                    '$awayTeamId',
+                  ],
+                },
 
-              homeScore: this.toNumber(home?.score),
+                homeScore:
+                  incomingHomeScore === undefined
+                    ? '$homeScore'
+                    : {
+                        $cond: [
+                          preserveCompletedFixture,
+                          '$homeScore',
+                          { $literal: incomingHomeScore },
+                        ],
+                      },
 
-              awayScore: this.toNumber(away?.score),
+                awayScore:
+                  incomingAwayScore === undefined
+                    ? '$awayScore'
+                    : {
+                        $cond: [
+                          preserveCompletedFixture,
+                          '$awayScore',
+                          { $literal: incomingAwayScore },
+                        ],
+                      },
 
-              venueId: this.toStringValue(competition?.venue?.id),
+                venueId: this.toStringValue(competition?.venue?.id),
 
-              venueName:
-                this.getNestedString(competition, ['venue', 'fullName']) ??
-                this.getNestedString(competition, ['venue', 'name']),
+                venueName:
+                  this.getNestedString(competition, ['venue', 'fullName']) ??
+                  this.getNestedString(competition, ['venue', 'name']),
 
-              payload,
+                payload: {
+                  $cond: [
+                    preserveCompletedFixture,
+                    { $ifNull: ['$payload', {}] },
+                    {
+                      $mergeObjects: [
+                        { $ifNull: ['$payload', {}] },
+                        { $literal: payload },
+                      ],
+                    },
+                  ],
+                },
 
-              collectedAt,
+                fixtureCollectedAt: collectedAt,
+                // Capture the transition to completed, not the kickoff age.
+                // This lets a delayed post-match scoreboard confirm completion
+                // after 48 hours while avoiding reclassifying legacy completed
+                // fixtures as newly finished on every subsequent refresh.
+                completedAt: {
+                  $cond: [
+                    { $or: ['$completed', { $literal: completed }] },
+                    { $ifNull: ['$completedAt', { $literal: collectedAt }] },
+                    '$completedAt',
+                  ],
+                },
+                collectedAt,
+              },
             },
-          },
+          ],
 
           upsert: true,
         },
@@ -590,19 +770,34 @@ export class SportsCollectionService {
       );
 
       fixtureIds.push(eventId);
+
+      /*
+       * Flush completed Mongo batches immediately. We deliberately do not
+       * retain all operations for the entire month in Node memory.
+       */
+      if (fixtureOperations.length >= this.mongoBulkChunkSize) {
+        await this.bulkWriteFixtureChunks(fixtureOperations);
+        fixtureOperations = [];
+      }
+
+      if (teamOperations.length >= this.mongoBulkChunkSize) {
+        await this.bulkWriteTeamChunks(teamOperations);
+        teamOperations = [];
+      }
     }
 
     if (fixtureOperations.length > 0) {
-      await this.espnFixtureModel.bulkWrite(fixtureOperations, {
-        ordered: false,
-      });
+      await this.bulkWriteFixtureChunks(fixtureOperations);
     }
 
     if (teamOperations.length > 0) {
-      await this.espnTeamModel.bulkWrite(teamOperations, {
-        ordered: false,
-      });
+      await this.bulkWriteTeamChunks(teamOperations);
     }
+
+    // Do not mark the enclosing fixture-refresh job successful until the
+    // durable follow-up jobs have been written. If Mongo queue insertion fails,
+    // the fixture-refresh job itself retries; event keys make the replay safe.
+    await this.espnQueueBuilderService.onFixturesCollected(fixtureIds);
 
     return {
       fixtureIds,
@@ -620,13 +815,27 @@ export class SportsCollectionService {
    * Live processing can also receive a just-finished event while
    * ESPN still exposes that event in the live scoreboard. Such an
    * event is persisted as completed and returned through
-   * newlyFinished so the scheduler can immediately trigger:
+   * newlyFinished so the event-triggered queue can immediately trigger:
    *
    * 1. affected-league fixture refresh;
    * 2. event Summary refresh.
    *
-   * This method does not directly collect Summary, standings,
-   * odds, YouTube, or derived data.
+   * This method does not directly collect Summary or derived table data.
+   * Persisted fixture updates only schedule background standings work.
+   */
+  /**
+   * Synchronize ESPN's global live scoreboard against fixtures already
+   * collected by the canonical league/day fixture pipeline.
+   *
+   * This is deliberately an update-only path:
+   * - It never discovers leagues or refreshes the full league catalogue.
+   * - It never creates an unknown event/league from the global scoreboard.
+   * - A finished event is processed only when its stored fixture was
+   *   previously marked live, so stale completed events in ESPN's global
+   *   scoreboard are not treated as newly discovered matches.
+   *
+   * Regular fixture and catalogue synchronization remain responsible for
+   * discovering new events and leagues.
    */
   async collectEspnLiveMatches(response: unknown): Promise<{
     received: number;
@@ -640,8 +849,6 @@ export class SportsCollectionService {
   }> {
     const events = this.extractArray(response, ['events', 'items']);
 
-    const leagueMap = this.buildLiveLeagueMap(response);
-
     const liveEventIds = new Set<string>();
 
     const newlyFinished: Array<{
@@ -649,6 +856,8 @@ export class SportsCollectionService {
       leagueId: string;
       season: number;
     }> = [];
+
+    const affectedLeagueIds = new Set<string>();
 
     let updated = 0;
 
@@ -658,7 +867,6 @@ export class SportsCollectionService {
       }
 
       const eventRecord = event as Record<string, unknown>;
-
       const eventId = this.toStringValue(eventRecord.id);
 
       if (!eventId) {
@@ -666,91 +874,79 @@ export class SportsCollectionService {
       }
 
       const isLive = this.isLiveEvent(event);
-
       const completed = this.isCompleted(event);
 
-      /*
-       * ESPN can expose a just-finished event briefly in the
-       * global live scoreboard. Accept both live and completed
-       * events so the transition can be detected.
-       */
       if (!isLive && !completed) {
         continue;
       }
 
-      const fixtureDate = this.parseDate(eventRecord.date);
+      /*
+       * For active events, find the canonical fixture by event ID.
+       * For completed events, only fetch a row that was previously live
+       * and has not already been marked completed. The latter condition is
+       * crucial because ESPN's global scoreboard can also include older
+       * completed events on every poll.
+       */
+      const storedFixture = await this.espnFixtureModel
+        .findOne(
+          completed
+            ? {
+                eventId,
+                live: true,
+                completed: { $ne: true },
+              }
+            : {
+                eventId,
+              },
+        )
+        .select({
+          leagueId: 1,
+          season: 1,
+          completed: 1,
+          live: 1,
+          completedAt: 1,
+          fixtureDate: 1,
+          homeScore: 1,
+          awayScore: 1,
+          homeTeamId: 1,
+          awayTeamId: 1,
+          'payload.summary': 1,
+        })
+        .lean()
+        .exec();
+
+      /*
+       * The global live scoreboard is not the source of truth for league
+       * discovery. If the regular fixture collector has not stored the
+       * event, leave it for that pipeline rather than trying to interpret
+       * ESPN's numeric league UID and downloading the complete catalogue.
+       */
+      if (!storedFixture?.leagueId) {
+        continue;
+      }
+
+      // The global live board can temporarily contain a stale in-progress
+      // snapshot for an event already stored as final. Never downgrade that
+      // canonical completed result from the live path.
+      if (storedFixture.completed === true && !completed) {
+        continue;
+      }
+
+      const normalizedLeagueId = this.normalizeLeagueId(storedFixture.leagueId);
+
+      if (!normalizedLeagueId) {
+        continue;
+      }
+
+      const fixtureDate =
+        this.parseDate(eventRecord.date) ??
+        this.parseDate(storedFixture.fixtureDate);
 
       if (!fixtureDate) {
         continue;
       }
 
-      const leagueReference = this.resolveLiveEventLeagueId(event, leagueMap);
-
-      let leagueId: string | undefined;
-
-      if (leagueReference) {
-        try {
-          leagueId = await this.resolveLiveLeague(leagueReference, fixtureDate);
-        } catch (error) {
-          this.logger.warn(
-            `Live ESPN league resolution failed for event ${eventId} ` +
-              `(${leagueReference}): ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-          );
-        }
-      }
-
-      let storedFixture: {
-        leagueId?: string;
-        season?: number;
-        completed?: boolean;
-        live?: boolean;
-      } | null = null;
-
-      if (!leagueId) {
-        storedFixture = await this.espnFixtureModel
-          .findOne({
-            eventId,
-          })
-          .select({
-            leagueId: 1,
-            season: 1,
-            completed: 1,
-            live: 1,
-          })
-          .lean()
-          .exec();
-
-        if (storedFixture?.leagueId) {
-          try {
-            leagueId = await this.resolveLiveLeague(
-              storedFixture.leagueId,
-              fixtureDate,
-            );
-          } catch (error) {
-            this.logger.debug(
-              `Stored ESPN league resolution failed for event ${eventId}: ` +
-                `${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-
-        if (!leagueId) {
-          leagueId = storedFixture?.leagueId;
-        }
-      }
-
-      if (!leagueId) {
-        this.logger.debug(
-          `Skipping live ESPN event ${eventId}: unable to resolve ESPN league`,
-        );
-
-        continue;
-      }
-
       const competition = this.getFirstCompetition(event);
-
       const competitors = this.extractArray(competition, ['competitors']);
 
       const home =
@@ -766,7 +962,7 @@ export class SportsCollectionService {
       const season =
         this.toNumber(this.getNestedString(event, ['season', 'year'])) ??
         this.toNumber(this.getNestedString(competition, ['season', 'year'])) ??
-        storedFixture?.season ??
+        storedFixture.season ??
         fixtureDate.getUTCFullYear();
 
       const status = this.extractStatus(event);
@@ -775,117 +971,131 @@ export class SportsCollectionService {
         this.getNestedString(event, ['status', 'displayClock']) ??
         this.getNestedString(competition, ['status', 'displayClock']);
 
-      const normalizedLeagueId = this.normalizeLeagueId(leagueId);
+      affectedLeagueIds.add(normalizedLeagueId);
 
-      const existingPayloadFixture = await this.espnFixtureModel
-        .findOne({
-          eventId,
-        })
-        .select({
-          completed: 1,
-          live: 1,
-          'payload.summary': 1,
-          'payload.summaryCollectedAt': 1,
-        })
-        .lean()
-        .exec();
+      const wasCompleted = Boolean(storedFixture.completed);
+      const wasLive = Boolean(storedFixture.live);
+      const completedAt =
+        storedFixture.completedAt ??
+        (completed && !wasCompleted && wasLive ? new Date() : undefined);
 
-      const wasCompleted = Boolean(
-        existingPayloadFixture?.completed || storedFixture?.completed,
+      const incomingScorePair = this.extractCompetitorScorePair(competition);
+      const storedPayload = this.asRecord(storedFixture.payload) ?? {};
+      const storedSummaryResult = this.extractSummaryFinalResult(
+        storedPayload.summary,
+        {
+          homeTeamId: storedFixture.homeTeamId,
+          awayTeamId: storedFixture.awayTeamId,
+        },
       );
-
-      const wasLive = Boolean(
-        existingPayloadFixture?.live || storedFixture?.live,
+      const storedSummaryPair = storedSummaryResult &&
+        storedSummaryResult.homeScore !== undefined &&
+        storedSummaryResult.awayScore !== undefined
+        ? this.scorePair(storedSummaryResult.homeScore, storedSummaryResult.awayScore)
+        : undefined;
+      const summaryHasScoreConflict = storedSummaryResult?.scoreConflict === true;
+      const existingScorePair = this.scorePair(
+        storedFixture.homeScore,
+        storedFixture.awayScore,
       );
-
-      const existingPayload =
-        existingPayloadFixture?.payload &&
-        typeof existingPayloadFixture.payload === 'object'
-          ? existingPayloadFixture.payload
-          : undefined;
+      const resolvedScorePair = completed
+        ? summaryHasScoreConflict
+          ? undefined
+          : storedSummaryPair ?? incomingScorePair
+        : incomingScorePair ?? existingScorePair;
+      const clearFinalScores = completed && !resolvedScorePair;
 
       const livePayload: Record<string, unknown> = {
         ...eventRecord,
       };
 
-      /*
-       * Preserve an already collected Summary.
-       */
-      if (
-        existingPayload &&
-        Object.prototype.hasOwnProperty.call(existingPayload, 'summary')
-      ) {
-        livePayload.summary = existingPayload.summary;
-
-        if (existingPayload.summaryCollectedAt) {
-          livePayload.summaryCollectedAt = existingPayload.summaryCollectedAt;
-        }
-      }
+      // Summary is owned by the summary collector. Omitting these properties
+      // lets the Mongo update pipeline preserve the latest stored values.
+      delete livePayload.summary;
+      delete livePayload.summaryCollectedAt;
 
       await this.espnFixtureModel
         .updateOne(
           {
             eventId,
           },
-          {
-            $set: {
-              eventId,
+          [
+            {
+              $set: {
+                eventId,
 
-              leagueId: normalizedLeagueId,
+                // Keep the canonical league ID from the stored fixture.
+                leagueId: normalizedLeagueId,
 
-              season,
+                season,
 
-              fixtureDate,
+                fixtureDate,
 
-              status,
+                status,
 
-              statusDetail: this.getNestedString(competition, [
-                'status',
-                'type',
-                'description',
-              ]),
+                statusDetail: this.getNestedString(competition, [
+                  'status',
+                  'type',
+                  'description',
+                ]),
 
-              statusShortDetail: this.getNestedString(competition, [
-                'status',
-                'type',
-                'shortDetail',
-              ]),
+                statusShortDetail: this.getNestedString(competition, [
+                  'status',
+                  'type',
+                  'shortDetail',
+                ]),
 
-              period:
-                this.toNumber(
-                  this.getNestedString(event, ['status', 'period']),
-                ) ??
-                this.toNumber(
-                  this.getNestedString(competition, ['status', 'period']),
-                ),
+                period:
+                  this.toNumber(
+                    this.getNestedString(event, ['status', 'period']),
+                  ) ??
+                  this.toNumber(
+                    this.getNestedString(competition, ['status', 'period']),
+                  ),
 
-              displayClock,
+                displayClock,
 
-              completed,
+                completed,
 
-              live: isLive,
+                completedAt: completedAt
+                  ? { $ifNull: ['$completedAt', { $literal: completedAt }] }
+                  : '$completedAt',
 
-              homeTeamId: this.getTeamId(home),
+                live: isLive,
 
-              awayTeamId: this.getTeamId(away),
+                homeTeamId: this.getTeamId(home),
 
-              homeScore: this.toNumber(this.getNestedString(home, ['score'])),
+                awayTeamId: this.getTeamId(away),
 
-              awayScore: this.toNumber(this.getNestedString(away, ['score'])),
+                homeScore: resolvedScorePair
+                  ? { $literal: resolvedScorePair.homeScore }
+                  : '$homeScore',
 
-              venueId: this.getNestedString(competition, ['venue', 'id']),
+                awayScore: resolvedScorePair
+                  ? { $literal: resolvedScorePair.awayScore }
+                  : '$awayScore',
 
-              venueName:
-                this.getNestedString(competition, ['venue', 'fullName']) ??
-                this.getNestedString(competition, ['venue', 'name']),
+                venueId: this.getNestedString(competition, ['venue', 'id']),
 
-              payload: livePayload,
+                venueName:
+                  this.getNestedString(competition, ['venue', 'fullName']) ??
+                  this.getNestedString(competition, ['venue', 'name']),
 
-              collectedAt: new Date(),
+                payload: {
+                  $mergeObjects: [
+                    { $ifNull: ['$payload', {}] },
+                    { $literal: livePayload },
+                  ],
+                },
+
+                collectedAt: new Date(),
+              },
             },
-          },
+            ...(clearFinalScores ? [{ $unset: ['homeScore', 'awayScore'] }] : []),
+          ],
           {
-            upsert: true,
+            upsert: false,
+            updatePipeline: true,
           },
         )
         .exec();
@@ -899,9 +1109,7 @@ export class SportsCollectionService {
       if (completed && !wasCompleted && wasLive) {
         newlyFinished.push({
           eventId,
-
           leagueId: normalizedLeagueId,
-
           season,
         });
       }
@@ -927,733 +1135,23 @@ export class SportsCollectionService {
         {
           $set: {
             live: false,
-
             collectedAt: new Date(),
           },
         },
       )
       .exec();
 
+    // Derived tables are opportunistic background work, never startup gates.
+    for (const affectedLeagueId of affectedLeagueIds) {
+      void this.scheduleDerivedRefreshForLeague(affectedLeagueId);
+    }
+
     return {
       received: events.length,
-
       updated,
-
       cleared: clearedResult.modifiedCount,
-
       newlyFinished,
     };
-  }
-
-  // ============================================================
-  // LIVE LEAGUE RESOLUTION
-  // ============================================================
-
-  /**
-   * Resolve an ESPN league for a live scoreboard event.
-   *
-   * Order:
-   *
-   * 1. ActiveCompetition by ESPN league slug.
-   * 2. Existing ESPN catalogue by slug/id.
-   * 3. Refresh ESPN's complete league catalogue.
-   * 4. Check the refreshed catalogue again.
-   * 5. Get authoritative ESPN league detail.
-   * 6. Update sports_espn_leagues.
-   * 7. Synchronize ActiveCompetition when the current season
-   *    is active.
-   * 8. Queue a fixture refresh for newly discovered active
-   *    leagues.
-   *
-   * Standings are intentionally not requested here.
-   */
-  private async resolveLiveLeague(
-    leagueReference: string,
-    fixtureDate: Date,
-  ): Promise<string | undefined> {
-    const normalizedReference = this.normalizeLeagueId(leagueReference);
-
-    if (!normalizedReference) {
-      return undefined;
-    }
-
-    /*
-     * ============================================================
-     * 1. ACTIVE COMPETITION
-     * ============================================================
-     */
-
-    const activeCompetition =
-      await this.activeCompetitionService.getByEspnLeagueSlug(
-        normalizedReference,
-      );
-
-    if (activeCompetition?.espnLeagueSlug) {
-      return this.normalizeLeagueId(activeCompetition.espnLeagueSlug);
-    }
-
-    /*
-     * ============================================================
-     * 2. COMPLETE ESPN CATALOGUE
-     * ============================================================
-     */
-
-    let catalogueLeague =
-      (await this.espnLeagueModel
-        .findOne({
-          slug: normalizedReference,
-        })
-        .lean()
-        .exec()) ??
-      (await this.espnLeagueModel
-        .findOne({
-          leagueId: normalizedReference,
-        })
-        .lean()
-        .exec());
-
-    /*
-     * ============================================================
-     * 3. UNKNOWN TO OUR CATALOGUE
-     * ============================================================
-     */
-
-    if (!catalogueLeague) {
-      const leagues = await this.espnService.getLeagues();
-
-      await this.storeEspnLeagueCatalogue(leagues);
-
-      /*
-       * ==========================================================
-       * 4. CHECK THE CATALOGUE AGAIN
-       * ==========================================================
-       */
-
-      catalogueLeague =
-        (await this.espnLeagueModel
-          .findOne({
-            slug: normalizedReference,
-          })
-          .lean()
-          .exec()) ??
-        (await this.espnLeagueModel
-          .findOne({
-            leagueId: normalizedReference,
-          })
-          .lean()
-          .exec());
-    }
-
-    if (!catalogueLeague) {
-      this.logger.debug(
-        `ESPN live league ${normalizedReference} was not found ` +
-          `after catalogue refresh`,
-      );
-
-      return undefined;
-    }
-
-    /*
-     * ============================================================
-     * 5. AUTHORITATIVE ESPN LEAGUE DETAIL
-     * ============================================================
-     */
-
-    const detailReference =
-      this.normalizeLeagueId(catalogueLeague.slug) ||
-      this.normalizeLeagueId(catalogueLeague.leagueId);
-
-    if (!detailReference) {
-      return undefined;
-    }
-
-    const detail = await this.espnService.getLeague(detailReference);
-
-    /*
-     * ============================================================
-     * 6 + 7. UPDATE CATALOGUE / ACTIVE COMPETITION
-     * ============================================================
-     */
-
-    const synchronizedLeague = await this.updateEspnLeagueFromDetail(
-      catalogueLeague,
-      detail,
-      fixtureDate,
-    );
-
-    /*
-     * ============================================================
-     * 8. IMMEDIATE FIXTURE REFRESH
-     * ============================================================
-     */
-
-    if (
-      synchronizedLeague.isActive &&
-      typeof synchronizedLeague.season === 'number'
-    ) {
-      const priority = this.getQueuePriority(
-        this.getStoredPriority(catalogueLeague),
-      );
-
-      try {
-        await this.espnQueueService.addFixtureRefreshJob({
-          leagueId: synchronizedLeague.slug || synchronizedLeague.leagueId,
-
-          season: synchronizedLeague.season,
-
-          priority,
-
-          scheduledFor: new Date(),
-
-          triggerEventId: `LIVE_DISCOVERY:${synchronizedLeague.slug}`,
-        });
-
-        this.logger.debug(
-          `Queued ESPN fixture refresh for newly discovered ` +
-            `active league ${synchronizedLeague.slug}: ` +
-            `season=${synchronizedLeague.season}`,
-        );
-      } catch (error) {
-        this.logger.warn(
-          `Failed to queue ESPN fixture refresh for newly discovered ` +
-            `league ${synchronizedLeague.slug}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-        );
-      }
-    }
-
-    return synchronizedLeague.slug;
-  }
-
-  private getQueuePriority(priority: CompetitionPriority): number {
-    switch (priority) {
-      case CompetitionPriority.ELITE:
-        return 1;
-
-      case CompetitionPriority.HIGH:
-        return 2;
-
-      case CompetitionPriority.REGIONAL:
-        return 3;
-
-      case CompetitionPriority.SELECTIVE:
-      default:
-        return 4;
-    }
-  }
-
-  // ============================================================
-  // ESPN — CATALOGUE
-  // ============================================================
-
-  /**
-   * Persist ESPN's complete catalogue.
-   *
-   * Catalogue discovery does NOT decide whether a league is
-   * currently active. That decision belongs to league detail.
-   */
-  private async storeEspnLeagueCatalogue(
-    leagues: EspnLeaguePayload[],
-  ): Promise<void> {
-    const now = new Date();
-
-    const operations: Parameters<Model<EspnLeagueDocument>['bulkWrite']>[0] =
-      [];
-
-    let stored = 0;
-
-    for (const league of leagues) {
-      const leagueId =
-        this.normalizeLeagueId(league.id) ||
-        this.normalizeLeagueId(league.slug);
-
-      const slug = this.normalizeLeagueId(league.slug) || leagueId;
-
-      if (!leagueId || !slug) {
-        continue;
-      }
-
-      const priorityConfig = this.findPriorityCompetition(leagueId, slug);
-
-      const priority =
-        priorityConfig?.priority ?? CompetitionPriority.SELECTIVE;
-
-      const name =
-        this.getStringValue(league.name) ??
-        this.getStringValue(league.displayName) ??
-        this.getStringValue(league.shortName) ??
-        slug;
-
-      const country = this.extractCountryFromLeague(league);
-
-      operations.push({
-        updateOne: {
-          filter: {
-            $or: [
-              {
-                leagueId,
-              },
-              {
-                slug,
-              },
-            ],
-          },
-
-          update: {
-            $set: {
-              leagueId,
-
-              slug,
-
-              name,
-
-              abbreviation: this.getStringValue(league.abbreviation),
-
-              country,
-
-              priority,
-
-              isPriority: Boolean(priorityConfig),
-
-              payload: league as unknown as Record<string, unknown>,
-
-              lastSyncedAt: now,
-            },
-
-            $setOnInsert: {
-              isActive: false,
-            },
-          },
-
-          upsert: true,
-        },
-      });
-
-      stored += 1;
-    }
-
-    if (operations.length > 0) {
-      await this.espnLeagueModel.bulkWrite(operations, {
-        ordered: false,
-      });
-    }
-
-    this.logger.log(`ESPN live catalogue refresh stored ${stored} leagues`);
-  }
-
-  /**
-   * Replace catalogue metadata with authoritative ESPN
-   * league-detail information.
-   *
-   * Only an active current season enters ActiveCompetition.
-   */
-  private async updateEspnLeagueFromDetail(
-    catalogueLeague: EspnLeagueDocument,
-    detail: EspnLeaguePayload,
-    fixtureDate: Date,
-  ): Promise<{
-    leagueId: string;
-    slug: string;
-    name: string;
-    isActive: boolean;
-    season?: number;
-  }> {
-    const normalizedSlug =
-      this.normalizeLeagueId(detail.slug) ||
-      this.normalizeLeagueId(catalogueLeague.slug) ||
-      this.normalizeLeagueId(detail.id) ||
-      this.normalizeLeagueId(catalogueLeague.leagueId);
-
-    const canonicalLeagueId =
-      this.normalizeLeagueId(detail.id) ||
-      this.normalizeLeagueId(catalogueLeague.leagueId) ||
-      normalizedSlug;
-
-    if (!normalizedSlug || !canonicalLeagueId) {
-      throw new Error(
-        'ESPN league detail did not contain a usable league identity',
-      );
-    }
-
-    const season = this.extractEspnLeagueSeason(detail);
-
-    const priorityConfig = this.findPriorityCompetition(
-      normalizedSlug,
-      canonicalLeagueId,
-    );
-
-    const priority =
-      priorityConfig?.priority ?? this.getStoredPriority(catalogueLeague);
-
-    const name =
-      this.getStringValue(detail.name) ??
-      this.getStringValue(detail.displayName) ??
-      this.getStringValue(detail.shortName) ??
-      catalogueLeague.name;
-
-    const abbreviation =
-      this.getStringValue(detail.abbreviation) ?? catalogueLeague.abbreviation;
-
-    const country =
-      this.extractCountryFromLeague(detail) ?? catalogueLeague.country;
-
-    const now = new Date();
-
-    const isActive = season
-      ? this.isSeasonActive(season.startDate, season.endDate, now)
-      : false;
-
-    const update: Record<string, unknown> = {
-      leagueId: canonicalLeagueId,
-
-      slug: normalizedSlug,
-
-      name,
-
-      abbreviation,
-
-      country,
-
-      priority,
-
-      isPriority: Boolean(priorityConfig),
-
-      isActive,
-
-      lastFixtureDate: fixtureDate,
-
-      payload: detail,
-
-      lastSyncedAt: now,
-    };
-
-    if (season) {
-      update.season = season.season;
-
-      update.seasonStartDate = season.startDate;
-
-      update.seasonEndDate = season.endDate;
-    } else {
-      update.isActive = false;
-    }
-
-    await this.espnLeagueModel
-      .updateOne(
-        {
-          _id: catalogueLeague._id,
-        },
-        {
-          $set: update,
-        },
-      )
-      .exec();
-
-    /*
-     * ============================================================
-     * ACTIVE COMPETITION
-     * ============================================================
-     */
-
-    if (season && isActive) {
-      await this.activeCompetitionService.syncLeague({
-        competitionId: canonicalLeagueId,
-
-        espnLeagueSlug: normalizedSlug,
-
-        name,
-
-        type: priorityConfig?.type ?? CompetitionType.LEAGUE,
-
-        region:
-          priorityConfig?.region ?? this.getDefaultCompetitionRegion(detail),
-
-        priority,
-
-        footballDataCode: priorityConfig?.providers?.footballDataCode,
-
-        oddsApiSportKey: priorityConfig?.providers?.oddsApiSportKey,
-
-        season: season.season,
-
-        seasonStartDate: season.startDate,
-
-        seasonEndDate: season.endDate,
-
-        lastFixtureDate: fixtureDate,
-
-        espnPayload: detail,
-      });
-    } else {
-      await this.activeCompetitionService.removeByCompetitionId(
-        canonicalLeagueId,
-      );
-    }
-
-    const refreshed = await this.espnLeagueModel
-      .findOne({
-        _id: catalogueLeague._id,
-      })
-      .lean()
-      .exec();
-
-    return {
-      leagueId:
-        this.normalizeLeagueId(refreshed?.leagueId) || canonicalLeagueId,
-
-      slug: this.normalizeLeagueId(refreshed?.slug) || normalizedSlug,
-
-      name: refreshed?.name || name,
-
-      isActive,
-
-      season: season?.season,
-    };
-  }
-
-  // ============================================================
-  // LIVE EVENT HELPERS
-  // ============================================================
-
-  private isLiveEvent(event: unknown): boolean {
-    if (!event || typeof event !== 'object') {
-      return false;
-    }
-
-    const eventRecord = event as Record<string, unknown>;
-
-    const status =
-      eventRecord.status && typeof eventRecord.status === 'object'
-        ? (eventRecord.status as Record<string, unknown>)
-        : undefined;
-
-    const statusType =
-      status?.type && typeof status.type === 'object'
-        ? (status.type as Record<string, unknown>)
-        : undefined;
-
-    if (status?.completed === true || statusType?.completed === true) {
-      return false;
-    }
-
-    const state = this.toStringValue(
-      statusType?.state ?? status?.state,
-    )?.toLowerCase();
-
-    if (
-      state &&
-      ['post', 'final', 'completed', 'complete', 'finished'].includes(state)
-    ) {
-      return false;
-    }
-
-    return Boolean(
-      state && ['in', 'live', 'inprogress', 'in_progress'].includes(state),
-    );
-  }
-
-  /**
-   * Builds the canonical league lookup from response.leagues[].
-   */
-  private buildLiveLeagueMap(response: unknown): Map<string, string> {
-    const map = new Map<string, string>();
-
-    if (!response || typeof response !== 'object') {
-      return map;
-    }
-
-    const responseRecord = response as Record<string, unknown>;
-
-    const leagues = Array.isArray(responseRecord.leagues)
-      ? responseRecord.leagues
-      : [];
-
-    for (const league of leagues) {
-      const leagueRecord = this.asRecord(league);
-
-      if (!leagueRecord) {
-        continue;
-      }
-
-      const id = this.toStringValue(leagueRecord.id);
-
-      const slug = this.toStringValue(
-        leagueRecord.slug ??
-          this.getNestedString(leagueRecord, ['league', 'slug']),
-      );
-
-      const uid = this.toStringValue(leagueRecord.uid);
-
-      const reference = this.toStringValue(leagueRecord.$ref);
-
-      const referenceSlug = reference
-        ? this.extractLeagueSlugFromReference(reference)
-        : undefined;
-
-      const canonicalSlug =
-        slug?.trim().toLowerCase() ?? referenceSlug?.trim().toLowerCase();
-
-      if (!canonicalSlug) {
-        continue;
-      }
-
-      if (id) {
-        map.set(id.trim().toLowerCase(), canonicalSlug);
-      }
-
-      map.set(canonicalSlug, canonicalSlug);
-
-      if (uid) {
-        map.set(uid.trim().toLowerCase(), canonicalSlug);
-      }
-
-      if (referenceSlug) {
-        map.set(referenceSlug.trim().toLowerCase(), canonicalSlug);
-      }
-    }
-
-    return map;
-  }
-
-  private resolveLiveEventLeagueId(
-    event: unknown,
-    leagueMap: Map<string, string>,
-  ): string | undefined {
-    const eventRecord = this.asRecord(event);
-
-    if (!eventRecord) {
-      return undefined;
-    }
-
-    const competition = this.getFirstCompetition(event);
-
-    const directCandidates: unknown[] = [
-      this.getNestedString(event, ['league', 'slug']),
-
-      this.getNestedString(event, ['league', 'id']),
-
-      this.getNestedString(competition, ['league', 'slug']),
-
-      this.getNestedString(competition, ['league', 'id']),
-
-      this.getNestedString(event, ['sport', 'league', 'slug']),
-
-      this.getNestedString(event, ['sport', 'league', 'id']),
-
-      this.getNestedString(event, ['leagueId']),
-
-      this.getNestedString(competition, ['leagueId']),
-    ];
-
-    for (const candidate of directCandidates) {
-      const value = this.toStringValue(candidate);
-
-      if (!value) {
-        continue;
-      }
-
-      const normalized = value.trim().toLowerCase();
-
-      const mapped = leagueMap.get(normalized);
-
-      if (mapped) {
-        return mapped;
-      }
-
-      return normalized;
-    }
-
-    const uidCandidates = [
-      this.toStringValue(eventRecord.uid),
-
-      this.getNestedString(competition, ['uid']),
-    ];
-
-    for (const uid of uidCandidates) {
-      if (!uid) {
-        continue;
-      }
-
-      const leagueMatch = uid.match(/(?:^|~)l:([^~]+)/i);
-
-      if (!leagueMatch?.[1]) {
-        continue;
-      }
-
-      const encodedLeagueId = leagueMatch[1].trim().toLowerCase();
-
-      const mappedLeague = leagueMap.get(encodedLeagueId);
-
-      if (mappedLeague) {
-        return mappedLeague;
-      }
-
-      return encodedLeagueId;
-    }
-
-    const referenceCandidates: unknown[] = [
-      this.getNestedValue(event, ['league', '$ref']),
-
-      this.getNestedValue(competition, ['league', '$ref']),
-
-      this.getNestedValue(event, ['sport', 'league', '$ref']),
-    ];
-
-    for (const candidate of referenceCandidates) {
-      const reference = this.toStringValue(candidate);
-
-      if (!reference) {
-        continue;
-      }
-
-      const leagueSlug = this.extractLeagueSlugFromReference(reference);
-
-      if (!leagueSlug) {
-        continue;
-      }
-
-      const mapped = leagueMap.get(leagueSlug);
-
-      return mapped ?? leagueSlug;
-    }
-
-    return undefined;
-  }
-
-  private extractLeagueSlugFromReference(
-    reference: string,
-  ): string | undefined {
-    try {
-      const url = new URL(reference);
-
-      const pathSegments = url.pathname.split('/').filter(Boolean);
-
-      const leagueIndex = pathSegments.findIndex(
-        (segment) => segment.toLowerCase() === 'leagues',
-      );
-
-      if (leagueIndex < 0) {
-        return undefined;
-      }
-
-      const slug = pathSegments[leagueIndex + 1];
-
-      if (!slug) {
-        return undefined;
-      }
-
-      return decodeURIComponent(slug).trim().toLowerCase() || undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private getUtcStartOfDay(date: Date): Date {
-    const result = new Date(date);
-
-    result.setUTCHours(0, 0, 0, 0);
-
-    return result;
   }
 
   // ============================================================
@@ -1732,485 +1230,459 @@ export class SportsCollectionService {
     return operations.length;
   }
 
-  // ============================================================
-  // ESPN — STANDINGS FALLBACK
-  // ============================================================
-
   /**
-   * Emergency/manual standings persistence only.
+   * Extract news and videos from saved ESPN Summary payloads and persist them
+   * into sports_espn_news. The feed never needs to reopen fixture summaries.
    *
-   * Normal startup and queue operations do not call this method.
+   * Content is deduplicated by normalized headline plus kind. A deterministic
+   * hash is used as the unique content ID, so duplicate titles arriving from
+   * different fixtures or concurrent Summary jobs upsert the same document.
    */
-  async collectEspnStandings(
-    leagueId: string,
-    response: unknown,
-    season?: number,
-  ): Promise<number> {
-    const entries = this.extractStandingEntries(
-      response as Record<string, unknown> | null | undefined,
+  private async persistSummaryNewsBatch(
+    sources: SummaryNewsSource[],
+  ): Promise<{ examined: number; upserted: number }> {
+    if (sources.length === 0) return { examined: 0, upserted: 0 };
+
+    const eventIds = [
+      ...new Set(
+        sources
+          .filter(
+            (source) =>
+              source.fixtureDate === undefined ||
+              source.homeTeamId === undefined ||
+              source.awayTeamId === undefined,
+          )
+          .map((source) => String(source.eventId ?? '').trim())
+          .filter(Boolean),
+      ),
+    ];
+
+    const fixtures = eventIds.length
+      ? await this.espnFixtureModel
+          .find({ eventId: { $in: eventIds } })
+          .select({
+            _id: 0,
+            eventId: 1,
+            fixtureDate: 1,
+            homeTeamId: 1,
+            awayTeamId: 1,
+          })
+          .lean()
+          .exec()
+      : [];
+
+    const fixtureByEventId = new Map(
+      fixtures.map((fixture) => [String(fixture.eventId), fixture]),
     );
 
-    if (!entries.length) {
-      return 0;
-    }
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    const deduplicated = new Map<string, SummaryNewsUpsert>();
+    let examined = 0;
 
-    const resolvedSeason =
-      season ??
-      this.toNumber(
-        (
-          response as {
-            season?: {
-              year?: unknown;
-            };
-          } | null
-        )?.season?.year,
-      ) ??
-      new Date().getUTCFullYear();
+    const readString = (
+      record: Record<string, unknown>,
+      ...keys: string[]
+    ): string | undefined => {
+      for (const key of keys) {
+        const value = record[key];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return String(value);
+        }
+      }
+      return undefined;
+    };
 
-    const normalizedLeagueId = this.normalizeLeagueId(leagueId);
+    const normalizeHeadline = (headline: string): string =>
+      headline
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/&/g, ' and ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim()
+        .replace(/\s+/g, ' ');
 
-    const activeTeamIds = new Set<string>();
+    const extractLink = (item: Record<string, unknown>): string | undefined => {
+      const direct = readString(item, 'link', 'url', 'href');
+      if (direct) return direct;
+      const links = this.asRecord(item.links);
+      const web = this.asRecord(links?.web);
+      return readString(web ?? links ?? {}, 'href', 'url');
+    };
 
-    const operations: Parameters<Model<EspnStandingDocument>['bulkWrite']>[0] =
-      [];
+    const extractImage = (
+      item: Record<string, unknown>,
+    ): string | undefined => {
+      const direct = readString(item, 'imageUrl', 'image');
+      if (direct) return direct;
 
-    const collectedAt = new Date();
-
-    for (const entry of entries) {
-      const entryRecord = this.asRecord(entry);
-
-      const teamRecord = this.asRecord(entryRecord?.team);
-
-      const teamId = this.toStringValue(teamRecord?.id ?? entryRecord?.teamId);
-
-      if (!teamId) {
-        continue;
+      for (const rawImage of Array.isArray(item.images) ? item.images : []) {
+        const image = this.asRecord(rawImage);
+        if (!image) continue;
+        const url = image.url;
+        if (typeof url === 'string' && url.trim()) return url.trim();
+        if (Array.isArray(url)) {
+          const candidate = url.find(
+            (value: unknown): value is string =>
+              typeof value === 'string' && value.trim().length > 0,
+          );
+          if (typeof candidate === 'string') return candidate.trim();
+        }
+        const href = readString(image, 'href');
+        if (href) return href;
       }
 
-      activeTeamIds.add(teamId);
+      const thumbnail = this.asRecord(item.thumbnail);
+      return readString(thumbnail ?? {}, 'href', 'url');
+    };
 
-      const statistics = Array.isArray(entryRecord?.stats)
-        ? (entryRecord.stats as unknown[])
-        : [];
+    const addItem = (
+      rawItem: unknown,
+      kind: 'NEWS' | 'VIDEO',
+      source: SummaryNewsSource,
+    ): void => {
+      if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+        return;
+      }
 
-      const value = (name: string): number | undefined =>
-        this.getStatisticNumber(statistics, name);
+      examined += 1;
+      const item = rawItem as Record<string, unknown>;
+      const headline = readString(item, 'headline', 'title', 'name');
+      if (!headline) return;
 
-      const form = this.getStatisticDisplayValue(statistics, ['form']);
+      const normalizedHeadline = normalizeHeadline(headline);
+      if (!normalizedHeadline) return;
+
+      const rawPublished =
+        kind === 'VIDEO'
+          ? (item.originalPublishDate ?? item.published)
+          : (item.published ?? item.originalPublishDate);
+      const published = this.parseDate(rawPublished);
+      const lastModified = this.parseDate(item.lastModified);
+      const hasOriginalPublication =
+        rawPublished !== undefined &&
+        rawPublished !== null &&
+        !(typeof rawPublished === 'string' && !rawPublished.trim());
+      const feedPublishedAt = hasOriginalPublication ? published : lastModified;
+
+      if (
+        !feedPublishedAt ||
+        feedPublishedAt.getTime() < cutoff.getTime() ||
+        feedPublishedAt.getTime() > now.getTime()
+      ) {
+        return;
+      }
+
+      const eventId = String(source.eventId ?? '').trim();
+      const leagueId = this.normalizeLeagueId(source.leagueId);
+      if (!eventId || !leagueId) return;
+
+      const fixture = fixtureByEventId.get(eventId);
+      const fixtureDate =
+        this.parseDate(source.fixtureDate) ??
+        this.parseDate(fixture?.fixtureDate);
+      const homeTeamId =
+        this.toStringValue(source.homeTeamId) ??
+        this.toStringValue(fixture?.homeTeamId);
+      const awayTeamId =
+        this.toStringValue(source.awayTeamId) ??
+        this.toStringValue(fixture?.awayTeamId);
+      const teamIds = [homeTeamId, awayTeamId].filter(
+        (value): value is string => Boolean(value),
+      );
+
+      const contentId = createHash('sha256')
+        .update(`${kind}:${normalizedHeadline}`)
+        .digest('hex');
+      const description = readString(item, 'description', 'summary');
+      const authorValue = item.author ?? item.byline;
+      const author =
+        typeof authorValue === 'string'
+          ? authorValue.trim() || undefined
+          : readString(this.asRecord(authorValue) ?? {}, 'name', 'displayName');
+
+      const candidate: SummaryNewsUpsert = {
+        contentId,
+        articleId: contentId,
+        normalizedHeadline,
+        kind,
+        leagueId,
+        leagueIds: [leagueId],
+        eventIds: [eventId],
+        teamIds,
+        eventId,
+        homeTeamId,
+        awayTeamId,
+        fixtureDate,
+        headline,
+        description,
+        published,
+        lastModified,
+        feedPublishedAt,
+        link: extractLink(item),
+        imageUrl: extractImage(item),
+        type: readString(item, 'type', 'contentType') ?? kind,
+        author,
+        sourceArticleId: readString(item, 'id', 'articleId', 'uid'),
+        payload: item,
+        collectedAt: now,
+      };
+
+      const existing = deduplicated.get(contentId);
+      if (!existing) {
+        deduplicated.set(contentId, candidate);
+        return;
+      }
+
+      existing.eventIds = [...new Set([...existing.eventIds, eventId])];
+      existing.leagueIds = [...new Set([...existing.leagueIds, leagueId])];
+      existing.teamIds = [...new Set([...existing.teamIds, ...teamIds])];
+
+      if (feedPublishedAt.getTime() > existing.feedPublishedAt.getTime()) {
+        candidate.eventIds = existing.eventIds;
+        candidate.leagueIds = existing.leagueIds;
+        candidate.teamIds = existing.teamIds;
+        deduplicated.set(contentId, candidate);
+      }
+    };
+
+    for (const source of sources) {
+      const summary = this.asRecord(source.summary);
+      if (!summary) continue;
+
+      const news = this.asRecord(summary.news);
+      const nestedNews = this.asRecord(news?.news);
+
+      for (const article of [
+        ...(Array.isArray(news?.articles) ? (news.articles as unknown[]) : []),
+        ...(Array.isArray(nestedNews?.articles)
+          ? (nestedNews.articles as unknown[])
+          : []),
+      ]) {
+        addItem(article, 'NEWS', source);
+      }
+
+      for (const video of Array.isArray(summary.videos) ? summary.videos : []) {
+        addItem(video, 'VIDEO', source);
+      }
+    }
+
+    if (deduplicated.size === 0) return { examined, upserted: 0 };
+
+    const operations: Parameters<Model<EspnNewsDocument>['bulkWrite']>[0] = [];
+    const contentIds = [...deduplicated.keys()];
+    const existingDocuments = await this.espnNewsModel
+      .find({ contentId: { $in: contentIds } })
+      .select({ _id: 0, contentId: 1, feedPublishedAt: 1 })
+      .lean()
+      .exec();
+    const existingPublishedAt = new Map(
+      existingDocuments.map((document) => [
+        String(document.contentId),
+        this.parseDate(document.feedPublishedAt),
+      ]),
+    );
+
+    for (const item of deduplicated.values()) {
+      const existingDate = existingPublishedAt.get(item.contentId);
+      const shouldUpdateContent =
+        !existingDate ||
+        existingDate.getTime() <= item.feedPublishedAt.getTime();
+
+      const update = {
+        $addToSet: {
+          leagueIds: { $each: item.leagueIds },
+          eventIds: { $each: item.eventIds },
+          teamIds: { $each: item.teamIds },
+        },
+        ...(shouldUpdateContent
+          ? {
+              $set: {
+                contentId: item.contentId,
+                articleId: item.articleId,
+                normalizedHeadline: item.normalizedHeadline,
+                kind: item.kind,
+                leagueId: item.leagueId,
+                eventId: item.eventId,
+                homeTeamId: item.homeTeamId,
+                awayTeamId: item.awayTeamId,
+                fixtureDate: item.fixtureDate,
+                headline: item.headline,
+                description: item.description,
+                published: item.published,
+                lastModified: item.lastModified,
+                feedPublishedAt: item.feedPublishedAt,
+                link: item.link,
+                imageUrl: item.imageUrl,
+                type: item.type,
+                author: item.author,
+                sourceArticleId: item.sourceArticleId,
+                payload: item.payload,
+                collectedAt: item.collectedAt,
+              },
+            }
+          : {}),
+      };
 
       operations.push({
         updateOne: {
-          filter: {
-            leagueId: normalizedLeagueId,
-
-            season: resolvedSeason,
-
-            teamId,
-          },
-
-          update: {
-            $set: {
-              leagueId: normalizedLeagueId,
-
-              season: resolvedSeason,
-
-              teamId,
-
-              rank:
-                value('rank') ??
-                this.toNumber(entryRecord?.rank ?? entryRecord?.position) ??
-                0,
-
-              points: value('points'),
-
-              played: value('gamesPlayed') ?? value('played'),
-
-              wins: value('wins'),
-
-              draws: value('ties') ?? value('draws'),
-
-              losses: value('losses'),
-
-              goalsFor: value('pointsFor') ?? value('goalsFor'),
-
-              goalsAgainst: value('pointsAgainst') ?? value('goalsAgainst'),
-
-              goalDifference: value('goalDifference'),
-
-              form,
-
-              description: this.getStatisticDisplayValue(statistics, [
-                'description',
-              ]),
-
-              payload: entry,
-
-              collectedAt,
-            },
-          },
-
+          filter: { contentId: item.contentId },
+          update,
           upsert: true,
         },
       });
     }
 
-    if (operations.length > 0) {
-      await this.espnStandingModel.bulkWrite(operations, {
+    let upserted = 0;
+    for (const chunk of this.chunkOperations(
+      operations,
+      this.mongoBulkChunkSize,
+    )) {
+      const result = await this.espnNewsModel.bulkWrite(chunk, {
         ordered: false,
       });
+      upserted += result.upsertedCount ?? 0;
     }
 
-    await this.espnStandingModel
-      .deleteMany({
-        leagueId: normalizedLeagueId,
-
-        season: resolvedSeason,
-
-        teamId: {
-          $nin: [...activeTeamIds],
-        },
-      })
-      .exec();
-
-    return operations.length;
+    return { examined, upserted };
   }
 
-  // ============================================================
-  // ESPN — NEWS FALLBACK
-  // ============================================================
-
   /**
-   * Emergency/manual news persistence only.
-   *
-   * No scheduled job calls this method.
+   * One-time backfill for installations that already have ESPN Summary payloads.
+   * It is skipped after normalized content has been stored at least once.
    */
-  async collectEspnNews(response: EspnNewsResponse): Promise<{
-    received: number;
-    created: number;
-    updated: number;
-    skipped: number;
+  async backfillSummaryNewsFromStoredFixtures(): Promise<{
+    skipped: boolean;
+    scanned: number;
+    upserted: number;
   }> {
-    const articles = Array.isArray(response.headlines)
-      ? response.headlines
-      : [];
+    const stateKey = 'MAINTENANCE:ESPN_SUMMARY_NEWS_BACKFILL_V1';
+    const existingState = await this.sportsSyncStateModel
+      .findOne({ stateKey })
+      .select({ status: 1 })
+      .lean()
+      .exec();
 
-    let created = 0;
+    if (existingState?.status === SportsSyncStateStatus.SUCCESS) {
+      return { skipped: true, scanned: 0, upserted: 0 };
+    }
 
-    let updated = 0;
-
-    let skipped = 0;
-
-    for (const article of articles) {
-      const payload = article as Record<string, unknown>;
-
-      const articleId = this.extractString(payload, 'id', 'articleId', 'uid');
-
-      if (!articleId) {
-        skipped++;
-        continue;
-      }
-
-      const leagueId = this.extractNewsLeagueId(payload);
-
-      if (!leagueId) {
-        skipped++;
-        continue;
-      }
-
-      const headline = this.extractString(payload, 'headline', 'title');
-
-      const description = this.extractString(payload, 'description', 'summary');
-
-      const published = this.parseDate(
-        this.extractString(payload, 'published', 'publishedAt'),
-      );
-
-      const lastModified = this.parseDate(
-        this.extractString(payload, 'lastModified', 'updated', 'updatedAt'),
-      );
-
-      const link = this.extractNewsLink(payload);
-
-      const imageUrl = this.extractNewsImage(payload);
-
-      const type = this.extractString(payload, 'type', 'contentType');
-
-      const author = this.extractNewsAuthor(payload);
-
-      const collectedAt = new Date();
-
-      const existing = await this.espnNewsModel
-        .findOne({
-          articleId,
-        })
-        .select({
-          _id: 1,
-        })
-        .lean()
-        .exec();
-
-      await this.espnNewsModel
-        .updateOne(
-          {
-            articleId,
+    const startedAt = new Date();
+    await this.sportsSyncStateModel
+      .updateOne(
+        { stateKey },
+        {
+          $set: {
+            stateKey,
+            kind: SportsSyncStateKind.CRON,
+            status: SportsSyncStateStatus.PROCESSING,
+            trackingMode: 'WINDOW',
+            fixtureGranularity: 'DAY',
+            jobType: 'NEWS_SUMMARY_BACKFILL',
+            lastStartedAt: startedAt,
+            lastError: undefined,
           },
+          $setOnInsert: {
+            units: [],
+            consecutiveFailures: 0,
+          },
+        },
+        { upsert: true },
+      )
+      .exec();
+
+    const cursor = this.espnFixtureModel
+      .find({ 'payload.summary': { $type: 'object' } })
+      .select({
+        _id: 0,
+        eventId: 1,
+        leagueId: 1,
+        fixtureDate: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        'payload.summary': 1,
+      })
+      .lean()
+      .cursor({ batchSize: 50 });
+
+    let scanned = 0;
+    let upserted = 0;
+    let batch: SummaryNewsSource[] = [];
+
+    try {
+      for await (const rawFixture of cursor) {
+        const fixture = rawFixture as {
+          eventId?: unknown;
+          leagueId?: unknown;
+          fixtureDate?: unknown;
+          homeTeamId?: unknown;
+          awayTeamId?: unknown;
+          payload?: { summary?: unknown };
+        };
+
+        const eventId = this.toStringValue(fixture.eventId);
+        const leagueId = this.toStringValue(fixture.leagueId);
+        if (!eventId || !leagueId) continue;
+
+        scanned += 1;
+        batch.push({
+          eventId,
+          leagueId,
+          summary: fixture.payload?.summary,
+          fixtureDate: fixture.fixtureDate,
+          homeTeamId: fixture.homeTeamId,
+          awayTeamId: fixture.awayTeamId,
+        });
+
+        if (batch.length >= 50) {
+          const result = await this.persistSummaryNewsBatch(batch);
+          upserted += result.upserted;
+          batch = [];
+        }
+      }
+
+      if (batch.length > 0) {
+        const result = await this.persistSummaryNewsBatch(batch);
+        upserted += result.upserted;
+      }
+
+      await this.sportsSyncStateModel
+        .updateOne(
+          { stateKey },
           {
             $set: {
-              articleId,
-
-              leagueId,
-
-              headline,
-
-              description,
-
-              published,
-
-              lastModified,
-
-              link,
-
-              imageUrl,
-
-              type,
-
-              author,
-
-              payload,
-
-              collectedAt,
+              status: SportsSyncStateStatus.SUCCESS,
+              lastSuccessfulAt: new Date(),
+              consecutiveFailures: 0,
             },
-          },
-          {
-            upsert: true,
+            $unset: {
+              lastError: 1,
+            },
           },
         )
         .exec();
 
-      if (existing) {
-        updated++;
-      } else {
-        created++;
-      }
+      return { skipped: false, scanned, upserted };
+    } catch (error) {
+      await this.sportsSyncStateModel
+        .updateOne(
+          { stateKey },
+          {
+            $set: {
+              status: SportsSyncStateStatus.FAILED,
+              lastError: error instanceof Error ? error.message : String(error),
+              consecutiveFailures: 1,
+            },
+          },
+        )
+        .exec();
+
+      throw error;
+    } finally {
+      await cursor.close();
     }
-
-    return {
-      received: articles.length,
-
-      created,
-
-      updated,
-
-      skipped,
-    };
-  }
-
-  private extractNewsLeagueId(
-    payload: Record<string, unknown>,
-  ): string | undefined {
-    const directLeagueId = this.extractString(payload, 'leagueId');
-
-    if (directLeagueId) {
-      return directLeagueId.trim().toLowerCase();
-    }
-
-    const league = payload['league'];
-
-    if (league && typeof league === 'object' && !Array.isArray(league)) {
-      const leagueObject = league as Record<string, unknown>;
-
-      const leagueId = this.extractString(
-        leagueObject,
-        'slug',
-        'abbreviation',
-        'id',
-      );
-
-      if (leagueId) {
-        return leagueId.trim().toLowerCase();
-      }
-    }
-
-    const categories = payload['categories'];
-
-    if (!Array.isArray(categories)) {
-      return undefined;
-    }
-
-    for (const category of categories) {
-      if (
-        !category ||
-        typeof category !== 'object' ||
-        Array.isArray(category)
-      ) {
-        continue;
-      }
-
-      const categoryObject = category as Record<string, unknown>;
-
-      if (
-        this.extractString(categoryObject, 'type')?.toLowerCase() !== 'league'
-      ) {
-        continue;
-      }
-
-      const leagueObject = categoryObject['league'];
-
-      if (
-        leagueObject &&
-        typeof leagueObject === 'object' &&
-        !Array.isArray(leagueObject)
-      ) {
-        const leagueRecord = leagueObject as Record<string, unknown>;
-
-        const leagueSlug = this.extractString(leagueRecord, 'slug');
-
-        if (leagueSlug) {
-          return leagueSlug.trim().toLowerCase();
-        }
-
-        const abbreviation = this.extractString(leagueRecord, 'abbreviation');
-
-        if (abbreviation) {
-          return abbreviation.trim().toLowerCase();
-        }
-
-        const leagueId = this.extractString(leagueRecord, 'id');
-
-        if (leagueId) {
-          return leagueId.trim().toLowerCase();
-        }
-      }
-
-      const leagueId = this.extractString(categoryObject, 'leagueId');
-
-      if (leagueId) {
-        return leagueId.trim().toLowerCase();
-      }
-    }
-
-    return undefined;
-  }
-
-  private extractNewsLink(
-    payload: Record<string, unknown>,
-  ): string | undefined {
-    const directLink = this.extractString(payload, 'link', 'url');
-
-    if (directLink) {
-      return directLink;
-    }
-
-    const links = payload['links'];
-
-    if (links && typeof links === 'object' && !Array.isArray(links)) {
-      const linksObject = links as Record<string, unknown>;
-
-      const web = linksObject['web'];
-
-      if (web && typeof web === 'object' && !Array.isArray(web)) {
-        return this.extractString(
-          web as Record<string, unknown>,
-          'href',
-          'url',
-        );
-      }
-
-      return this.extractString(linksObject, 'href', 'url');
-    }
-
-    return undefined;
-  }
-
-  private extractNewsImage(
-    payload: Record<string, unknown>,
-  ): string | undefined {
-    const directImage = this.extractString(payload, 'imageUrl', 'image');
-
-    if (directImage) {
-      return directImage;
-    }
-
-    const images = payload['images'];
-
-    if (!Array.isArray(images)) {
-      return undefined;
-    }
-
-    for (const image of images) {
-      if (!image || typeof image !== 'object' || Array.isArray(image)) {
-        continue;
-      }
-
-      const imageObject = image as Record<string, unknown>;
-
-      const url = imageObject['url'];
-
-      if (typeof url === 'string' && url.trim()) {
-        return url.trim();
-      }
-
-      if (Array.isArray(url)) {
-        for (const item of url) {
-          if (typeof item === 'string' && item.trim()) {
-            return item.trim();
-          }
-        }
-      }
-
-      const href = imageObject['href'];
-
-      if (typeof href === 'string' && href.trim()) {
-        return href.trim();
-      }
-    }
-
-    return undefined;
-  }
-
-  private extractNewsAuthor(
-    payload: Record<string, unknown>,
-  ): string | undefined {
-    const directAuthor = this.extractString(payload, 'author', 'byline');
-
-    if (directAuthor) {
-      return directAuthor;
-    }
-
-    const authorObject = payload['author'];
-
-    if (
-      authorObject &&
-      typeof authorObject === 'object' &&
-      !Array.isArray(authorObject)
-    ) {
-      return this.extractString(
-        authorObject as Record<string, unknown>,
-        'name',
-        'displayName',
-      );
-    }
-
-    return undefined;
-  }
-
-  private extractString(
-    payload: Record<string, unknown>,
-    ...keys: string[]
-  ): string | undefined {
-    for (const key of keys) {
-      const value = payload[key];
-
-      if (typeof value === 'string' && value.trim()) {
-        return value.trim();
-      }
-
-      if (typeof value === 'number' || typeof value === 'boolean') {
-        return String(value);
-      }
-    }
-
-    return undefined;
   }
 
   // ============================================================
@@ -2268,124 +1740,176 @@ export class SportsCollectionService {
 
     const completed = this.isCompleted(event);
 
+    const normalizedLeagueId = this.normalizeLeagueId(params.leagueId);
     const existingFixture = await this.espnFixtureModel
-      .findOne({
-        eventId,
-      })
+      .findOne({ eventId })
       .select({
-        'payload.summary': 1,
-        'payload.summaryCollectedAt': 1,
+        status: 1,
+        statusDetail: 1,
+        statusShortDetail: 1,
+        completed: 1,
+        live: 1,
+        completedAt: 1,
+        fixtureDate: 1,
+        homeScore: 1,
+        awayScore: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        payload: 1,
       })
       .lean()
       .exec();
 
-    const existingPayload =
-      existingFixture?.payload && typeof existingFixture.payload === 'object'
-        ? existingFixture.payload
-        : undefined;
+    const existingPayload = this.asRecord(existingFixture?.payload) ?? {};
+    const existingSummaryResult = this.extractSummaryFinalResult(
+      existingPayload.summary,
+      {
+        homeTeamId: existingFixture?.homeTeamId,
+        awayTeamId: existingFixture?.awayTeamId,
+      },
+    );
+    const summaryScorePair = existingSummaryResult &&
+      existingSummaryResult.homeScore !== undefined &&
+      existingSummaryResult.awayScore !== undefined
+      ? this.scorePair(existingSummaryResult.homeScore, existingSummaryResult.awayScore)
+      : undefined;
+    const incomingScorePair = this.extractCompetitorScorePair(competition);
+    const existingScorePair = this.scorePair(
+      existingFixture?.homeScore,
+      existingFixture?.awayScore,
+    );
+    const summaryHasScoreConflict = existingSummaryResult?.scoreConflict === true;
+    const incomingConflictsWithExisting = Boolean(
+      incomingScorePair && existingScorePair &&
+      (incomingScorePair.homeScore !== existingScorePair.homeScore ||
+        incomingScorePair.awayScore !== existingScorePair.awayScore),
+    );
+    const existingOrIncomingZeroZero = Boolean(
+      (existingScorePair?.homeScore === 0 && existingScorePair.awayScore === 0) ||
+      (incomingScorePair?.homeScore === 0 && incomingScorePair.awayScore === 0),
+    );
+    const unresolvedFinalResult = completed && !summaryScorePair && (
+      summaryHasScoreConflict ||
+      existingPayload.resultScoreUnresolved === true ||
+      incomingConflictsWithExisting ||
+      existingOrIncomingZeroZero ||
+      (!existingScorePair && !incomingScorePair)
+    );
+    const preserveCompletedFixture = existingFixture?.completed === true && (
+      !completed ||
+      existingPayload.resultScoreUnresolved === true ||
+      summaryHasScoreConflict ||
+      (!summaryScorePair && (!incomingScorePair || incomingConflictsWithExisting))
+    );
+    const resolvedScorePair = unresolvedFinalResult
+      ? undefined
+      : summaryScorePair ?? (
+          preserveCompletedFixture
+            ? existingScorePair
+            : incomingScorePair ?? (completed ? undefined : existingScorePair)
+        );
+    const clearCompletedScores = completed && !resolvedScorePair;
 
-    const detailPayload: Record<string, unknown> = {
-      ...event,
-    };
+    const detailPayload: Record<string, unknown> = preserveCompletedFixture
+      ? { ...existingPayload }
+      : { ...event };
 
-    if (
-      existingPayload &&
-      Object.prototype.hasOwnProperty.call(existingPayload, 'summary')
-    ) {
+    // Summary is stored independently and must survive every fixture/detail refresh.
+    if (Object.prototype.hasOwnProperty.call(existingPayload, 'summary')) {
       detailPayload.summary = existingPayload.summary;
-
       if (existingPayload.summaryCollectedAt) {
         detailPayload.summaryCollectedAt = existingPayload.summaryCollectedAt;
       }
     }
+    if (unresolvedFinalResult) {
+      detailPayload.resultScoreUnresolved = true;
+    } else if (resolvedScorePair) {
+      delete detailPayload.resultScoreUnresolved;
+    }
+
+    const now = new Date();
+    const effectiveCompleted = preserveCompletedFixture || completed;
+    const set: Record<string, unknown> = {
+      eventId,
+      leagueId: normalizedLeagueId,
+      season,
+      fixtureDate: preserveCompletedFixture
+        ? existingFixture?.fixtureDate ?? fixtureDate
+        : fixtureDate,
+      status: preserveCompletedFixture
+        ? existingFixture?.status ?? status
+        : status,
+      statusDetail: preserveCompletedFixture
+        ? existingFixture?.statusDetail
+        : this.getNestedString(competition, [
+            'status',
+            'type',
+            'description',
+          ]),
+      statusShortDetail: preserveCompletedFixture
+        ? existingFixture?.statusShortDetail
+        : this.getNestedString(competition, [
+            'status',
+            'type',
+            'shortDetail',
+          ]),
+      period: preserveCompletedFixture
+        ? undefined
+        : this.toNumber(this.getNestedString(competition, ['status', 'period'])),
+      completed: effectiveCompleted,
+      live: effectiveCompleted ? false : this.isLiveEvent(event),
+      homeTeamId: this.getTeamId(home) ?? existingFixture?.homeTeamId,
+      awayTeamId: this.getTeamId(away) ?? existingFixture?.awayTeamId,
+      venueId: this.getNestedString(competition, ['venue', 'id']),
+      venueName:
+        this.getNestedString(competition, ['venue', 'fullName']) ??
+        this.getNestedString(competition, ['venue', 'name']),
+      payload: detailPayload,
+      collectedAt: now,
+    };
+    if (resolvedScorePair) {
+      set.homeScore = resolvedScorePair.homeScore;
+      set.awayScore = resolvedScorePair.awayScore;
+    }
+    if (effectiveCompleted) {
+      set.completedAt = existingFixture?.completedAt ?? now;
+    }
+    for (const [key, value] of Object.entries(set)) {
+      if (value === undefined) delete set[key];
+    }
 
     await this.espnFixtureModel
       .updateOne(
+        { eventId },
         {
-          eventId,
+          $set: set,
+          ...(clearCompletedScores ? { $unset: { homeScore: 1, awayScore: 1 } } : {}),
         },
-        {
-          $set: {
-            eventId,
-
-            leagueId: this.normalizeLeagueId(params.leagueId),
-
-            season,
-
-            fixtureDate,
-
-            status,
-
-            statusDetail: this.getNestedString(competition, [
-              'status',
-              'type',
-              'description',
-            ]),
-
-            statusShortDetail: this.getNestedString(competition, [
-              'status',
-              'type',
-              'shortDetail',
-            ]),
-
-            period: this.toNumber(
-              this.getNestedString(competition, ['status', 'period']),
-            ),
-
-            completed,
-
-            live: this.isLiveEvent(event),
-
-            homeTeamId: this.getTeamId(home),
-
-            awayTeamId: this.getTeamId(away),
-
-            homeScore: this.toNumber(homeCompetitor?.score),
-
-            awayScore: this.toNumber(awayCompetitor?.score),
-
-            venueId: this.getNestedString(competition, ['venue', 'id']),
-
-            venueName:
-              this.getNestedString(competition, ['venue', 'fullName']) ??
-              this.getNestedString(competition, ['venue', 'name']),
-
-            payload: detailPayload,
-
-            collectedAt: new Date(),
-          },
-        },
-        {
-          upsert: true,
-        },
+        { upsert: true },
       )
       .exec();
 
+    // If the stored final record conflicts with the fresh event snapshot, let
+    // the event-specific Summary queue arbitrate instead of overwriting either
+    // score with the numerically larger value.
+    if (
+      effectiveCompleted &&
+      (!summaryScorePair || summaryHasScoreConflict || incomingConflictsWithExisting)
+    ) {
+      try {
+        await this.espnQueueService.addSummaryRefreshJob({
+          leagueId: normalizedLeagueId,
+          eventId,
+          season,
+          priority: 4,
+          scheduledFor: new Date(),
+        });
+      } catch (error) {
+        this.logger.warn(`Could not queue Summary verification for fixture details ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
     await this.collectEspnTeams(params.leagueId, competitors);
-  }
-
-  // ============================================================
-  // ESPN — CHECK STORED MATCH SUMMARY
-  // ============================================================
-
-  async hasEspnMatchSummary(eventId: string): Promise<boolean> {
-    const fixture = await this.espnFixtureModel
-      .findOne({
-        eventId: eventId.trim(),
-      })
-      .select({
-        'payload.summary': 1,
-      })
-      .lean()
-      .exec();
-
-    return Boolean(
-      fixture?.payload &&
-      typeof fixture.payload === 'object' &&
-      fixture.payload.summary &&
-      typeof fixture.payload.summary === 'object' &&
-      Object.keys(fixture.payload.summary).length > 0,
-    );
   }
 
   // ============================================================
@@ -2403,47 +1927,994 @@ export class SportsCollectionService {
     leagueId: string;
     eventId: string;
     summary: unknown;
-  }): Promise<void> {
-    const fixture = await this.espnFixtureModel
-      .findOne({
-        eventId: params.eventId,
+  }): Promise<Record<string, unknown>> {
+    const leagueId = this.normalizeLeagueId(params.leagueId);
+    const eventId = String(params.eventId ?? '').trim();
+    if (!eventId) throw new Error('ESPN Summary eventId cannot be empty');
+
+    const existing = await this.espnFixtureModel
+      .findOne({ eventId, leagueId })
+      .select({
+        eventId: 1, payload: 1, homeTeamId: 1, awayTeamId: 1,
+        homeScore: 1, awayScore: 1, status: 1, statusDetail: 1,
+        statusShortDetail: 1, completed: 1, live: 1,
       })
       .lean()
       .exec();
-
-    if (!fixture) {
+    if (!existing) {
       throw new Error(
-        `ESPN fixture ${params.eventId} not found while storing Summary`,
+        `ESPN fixture ${eventId} not found while storing Summary`,
       );
     }
 
-    const existingPayload =
-      fixture.payload && typeof fixture.payload === 'object'
-        ? fixture.payload
-        : {};
+    const existingPayload = this.asRecord(existing.payload) ?? {};
+    const storedSummary = existingPayload.summary;
+    const mergedSummary = this.mergeSummaryPreservingFinalResult(
+      storedSummary,
+      params.summary,
+    );
+    const summaryHash = this.summaryContentHash(mergedSummary);
+    const storedHash = this.toStringValue(existingPayload.summaryContentHash);
+    const unchanged =
+      storedHash === summaryHash ||
+      (!storedHash &&
+        this.hasUsableSummaryForHash(storedSummary) &&
+        this.summaryContentHash(storedSummary) === summaryHash);
+    const collectedAt = new Date();
 
-    await this.espnFixtureModel
+    const set: Record<string, unknown> = {
+      'payload.summaryCollectedAt': collectedAt,
+      'payload.summaryContentHash': summaryHash,
+      collectedAt,
+    };
+    if (!unchanged) set['payload.summary'] = mergedSummary;
+
+    const result = await this.espnFixtureModel
+      .updateOne({ eventId, leagueId }, { $set: set })
+      .exec();
+    if (result.matchedCount === 0) {
+      throw new Error(
+        `ESPN fixture ${eventId} not found while storing Summary`,
+      );
+    }
+
+    // ESPN Summary has the authoritative final header/score when the scoreboard
+    // root fields were missed or stale. Reconcile those canonical fields even
+    // when Summary content itself was unchanged.
+    const reconciliation = await this.reconcileFixtureResultFromSummary({
+      leagueId,
+      eventId,
+      summary: mergedSummary,
+      homeTeamId: existing.homeTeamId,
+      awayTeamId: existing.awayTeamId,
+      homeScore: existing.homeScore,
+      awayScore: existing.awayScore,
+      resultScoreUnresolved: existingPayload.resultScoreUnresolved === true,
+      fixturePayload: existingPayload,
+      status: existing.status,
+      statusDetail: existing.statusDetail,
+      statusShortDetail: existing.statusShortDetail,
+      completed: existing.completed,
+      live: existing.live,
+    });
+
+    // News normalization, deduplication and feed writes only run when the
+    // canonical Summary content actually changes.
+    if (!unchanged) {
+      await this.persistSummaryNewsBatch([
+        { leagueId, eventId, summary: mergedSummary },
+      ]);
+    }
+
+    if (!unchanged || reconciliation?.rootChanged) {
+      void this.scheduleDerivedRefreshForLeague(leagueId);
+    }
+
+    // Only a meaningful Summary or canonical-result change should trigger an immediate follow-up.
+    // Unchanged refreshes must not mark an active settlement job for a redundant
+    // rerun; the discovery scan remains the safety net for missed root-status changes.
+    if (
+      reconciliation?.hasScores &&
+      (!unchanged || reconciliation.rootChanged)
+    ) {
+      try {
+        await this.settlementTriggerService.onSummaryUpdated(eventId, leagueId);
+      } catch (error) {
+        this.logger.warn(`Could not enqueue settlement for Summary ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return mergedSummary;
+  }
+
+  /**
+   * Repairs canonical fixture status/scores from an already-stored ESPN
+   * Summary without another provider request. Only an explicit final Summary
+   * state is accepted; kickoff age alone never marks a fixture completed.
+   */
+  async reconcileFixtureResultFromSummary(params: {
+    leagueId: string;
+    eventId: string;
+    summary: unknown;
+    homeTeamId?: unknown;
+    awayTeamId?: unknown;
+    homeScore?: unknown;
+    awayScore?: unknown;
+    resultScoreUnresolved?: boolean;
+    fixturePayload?: unknown;
+    status?: unknown;
+    statusDetail?: unknown;
+    statusShortDetail?: unknown;
+    completed?: unknown;
+    live?: unknown;
+  }): Promise<EspnSummaryReconciliationResult | undefined> {
+    const leagueId = this.normalizeLeagueId(params.leagueId);
+    const eventId = String(params.eventId ?? '').trim();
+    if (!leagueId || !eventId) return undefined;
+
+    const finalResult = this.extractSummaryFinalResult(params.summary, {
+      homeTeamId: params.homeTeamId,
+      awayTeamId: params.awayTeamId,
+    });
+    if (!finalResult) return undefined;
+
+    // Resolve all three stored representations as a complete score pair. A
+    // terminal Summary pair wins when internally consistent. If Summary has no
+    // score, root and fixture-payload pairs can still recover it, but conflicting
+    // pairs and an unverified 0-0 are quarantined instead of being settled.
+    const fixturePayload = this.asRecord(params.fixturePayload) ?? {};
+    const normalizedPayload: Record<string, unknown> = {
+      ...fixturePayload,
+      summary: params.summary,
+      ...(params.resultScoreUnresolved === true
+        ? { resultScoreUnresolved: true }
+        : {}),
+    };
+    const resolution = this.resolveStoredFixtureResult({
+      completed: true,
+      status: finalResult.status,
+      statusDetail: finalResult.statusDetail,
+      statusShortDetail: finalResult.statusShortDetail,
+      homeScore: params.homeScore,
+      awayScore: params.awayScore,
+      homeTeamId: params.homeTeamId,
+      awayTeamId: params.awayTeamId,
+      payload: normalizedPayload,
+    });
+    const hasScores =
+      !resolution.conflict &&
+      !resolution.shouldRefreshSummary &&
+      typeof resolution.homeScore === 'number' &&
+      Number.isInteger(resolution.homeScore) &&
+      resolution.homeScore >= 0 &&
+      typeof resolution.awayScore === 'number' &&
+      Number.isInteger(resolution.awayScore) &&
+      resolution.awayScore >= 0;
+    const quarantineScores = !hasScores;
+    const existingRootPair = this.scorePair(params.homeScore, params.awayScore);
+    const collectedAt = new Date();
+    const finalStatusDetail = finalResult.statusDetail ?? 'Final';
+    const finalStatusShortDetail =
+      finalResult.statusShortDetail ?? finalResult.statusDetail ?? 'FT';
+    const scoreChanged = hasScores
+      ? !existingRootPair ||
+        existingRootPair.homeScore !== resolution.homeScore ||
+        existingRootPair.awayScore !== resolution.awayScore
+      : Boolean(quarantineScores && existingRootPair);
+    const statusChanged =
+      params.completed !== true ||
+      params.live === true ||
+      String(params.status ?? '') !== finalResult.status ||
+      String(params.statusDetail ?? '') !== finalStatusDetail ||
+      String(params.statusShortDetail ?? '') !== finalStatusShortDetail;
+    const markerChanged = hasScores
+      ? params.resultScoreUnresolved === true
+      : quarantineScores && params.resultScoreUnresolved !== true;
+    const payloadScoreUpdates = hasScores
+      ? this.buildPayloadScoreNormalizationUpdates(
+          params.fixturePayload,
+          { homeScore: resolution.homeScore!, awayScore: resolution.awayScore! },
+        )
+      : {};
+    const rootChanged =
+      scoreChanged || statusChanged || markerChanged ||
+      Object.keys(payloadScoreUpdates).length > 0;
+    const set: Record<string, unknown> = {
+      status: { $literal: finalResult.status },
+      statusDetail: { $literal: finalStatusDetail },
+      statusShortDetail: { $literal: finalStatusShortDetail },
+      completed: true,
+      live: false,
+      completedAt: { $ifNull: ['$completedAt', { $literal: collectedAt }] },
+      collectedAt: { $literal: collectedAt },
+    };
+    if (hasScores) {
+      set.homeScore = { $literal: resolution.homeScore };
+      set.awayScore = { $literal: resolution.awayScore };
+      for (const [path, value] of Object.entries(payloadScoreUpdates)) {
+        set[path] = { $literal: value };
+      }
+    }
+    if (quarantineScores) {
+      set['payload.resultScoreUnresolved'] = true;
+    }
+
+    const updatePipeline: Array<Record<string, unknown>> = [{ $set: set }];
+    if (quarantineScores) {
+      // An unverified 0-0 or internally conflicting Summary must not remain a
+      // numeric final result that another consumer can settle against.
+      updatePipeline.push({ $unset: ['homeScore', 'awayScore'] });
+    } else if (hasScores) {
+      updatePipeline.push({ $unset: ['payload.resultScoreUnresolved'] });
+    }
+
+    const update = await this.espnFixtureModel
       .updateOne(
-        {
-          eventId: params.eventId,
-        },
-        {
-          $set: {
-            leagueId: this.normalizeLeagueId(params.leagueId),
-
-            payload: {
-              ...existingPayload,
-
-              summary: params.summary,
-
-              summaryCollectedAt: new Date(),
-            },
-
-            collectedAt: new Date(),
-          },
-        },
+        { eventId, leagueId },
+        updatePipeline,
+        { updatePipeline: true },
       )
       .exec();
+    if (update.matchedCount === 0) return undefined;
+
+    return {
+      isFinal: true,
+      hasScores,
+      homeScore: hasScores ? resolution.homeScore : undefined,
+      awayScore: hasScores ? resolution.awayScore : undefined,
+      rootChanged,
+    };
+  }
+
+  private mergeSummaryPreservingFinalResult(
+    existingValue: unknown,
+    incomingValue: unknown,
+  ): Record<string, unknown> {
+    const existing = this.asRecord(existingValue) ?? {};
+    const incoming = this.asRecord(incomingValue) ?? {};
+    const merged = mergeSummaryRecords(existing, incoming);
+    const existingFinal = this.extractSummaryFinalResult(existing);
+    const incomingFinal = this.extractSummaryFinalResult(incoming);
+
+    // Summary sections such as header.competitions are arrays, and a shallow
+    // replacement with an empty/stale PRE response can erase the final score.
+    // Preserve only the existing sections that demonstrably contain the final
+    // result; other Summary sections continue to merge normally.
+    if (existingFinal && !incomingFinal) {
+      for (const key of ['header', 'competitions', 'event']) {
+        const existingSection = existing[key];
+        const incomingSection = incoming[key];
+        if (
+          existingSection !== undefined &&
+          this.extractSummaryFinalResult({ [key]: existingSection }) &&
+          !this.extractSummaryFinalResult({ [key]: incomingSection })
+        ) {
+          merged[key] = existingSection;
+        }
+      }
+    }
+
+    return merged;
+  }
+
+  private extractSummaryFinalResult(
+    value: unknown,
+    teamIds: { homeTeamId?: unknown; awayTeamId?: unknown } = {},
+  ): EspnSummaryFinalResult | undefined {
+    const summary = this.asRecord(value);
+    if (!summary) return undefined;
+
+    const header = this.asRecord(summary.header);
+    const event = this.asRecord(summary.event);
+    const competitions = [
+      ...(Array.isArray(header?.competitions) ? header.competitions : []),
+      ...(Array.isArray(summary.competitions) ? summary.competitions : []),
+      ...(Array.isArray(event?.competitions) ? event.competitions : []),
+    ].map((item) => this.asRecord(item)).filter(
+      (item): item is Record<string, unknown> => Boolean(item),
+    );
+
+    // Prefer a competition that explicitly reports a final state rather than
+    // assuming the first array entry is always the relevant/final competition.
+    const competition = competitions.find((item) =>
+      this.isTerminalStatusRecord(item.status ?? item),
+    ) ?? competitions[0];
+
+    const status =
+      this.asRecord(competition?.status) ??
+      this.asRecord(header?.status) ??
+      this.asRecord(summary.status) ??
+      this.asRecord(event?.status);
+    const statusType = this.asRecord(status?.type);
+    const statusName = (
+      this.toStringValue(statusType?.name ?? status?.name) ?? ''
+    ).toUpperCase();
+    const statusState = (
+      this.toStringValue(statusType?.state ?? status?.state) ?? ''
+    ).toLowerCase();
+    const statusDetail =
+      this.toStringValue(statusType?.detail ?? status?.detail) ??
+      this.toStringValue(statusType?.description ?? status?.description) ??
+      undefined;
+    const statusShortDetail =
+      this.toStringValue(statusType?.shortDetail ?? status?.shortDetail) ??
+      this.toStringValue(statusType?.detail ?? status?.detail) ??
+      undefined;
+    const statusAbbreviation = (
+      this.toStringValue(statusType?.abbreviation) ?? ''
+    ).toUpperCase();
+    const allStatusText = `${statusName} ${statusState} ${statusDetail ?? ''} ${statusShortDetail ?? ''} ${statusAbbreviation}`;
+    if (/CANCEL|POSTPON|ABANDON|VOID|NO[_ ]?CONTEST/.test(allStatusText)) {
+      return undefined;
+    }
+
+    const explicitlyCompleted =
+      competition?.isFinal === true ||
+      statusType?.completed === true ||
+      status?.completed === true;
+    const finalStatusName =
+      /(^|_)FINAL($|_)|FULL[_ ]?TIME|FINISHED|COMPLETED/.test(statusName);
+    const finalAbbreviation = ['FT', 'AET', 'PEN'].includes(statusAbbreviation);
+    const finalStatusDetail = /\bFT\b|AFTER EXTRA TIME|AFTER PENALTIES/.test(allStatusText);
+    const finalState = ['post', 'final', 'complete', 'completed', 'finished'].includes(
+      statusState,
+    );
+    if (
+      !explicitlyCompleted &&
+      !finalStatusName &&
+      !finalAbbreviation &&
+      !finalStatusDetail &&
+      !finalState
+    ) {
+      return undefined;
+    }
+
+    // Primary score source: the completed competition's explicit home/away
+    // competitors. Score orientation is always based on ESPN's homeAway marker.
+    const competitorPair = this.extractCompetitorScorePair(competition);
+    const boxscorePair = this.extractSummaryBoxscoreScorePair(
+      summary,
+      competition,
+      teamIds,
+    );
+    const scoreConflict = Boolean(
+      competitorPair && boxscorePair &&
+      (competitorPair.homeScore !== boxscorePair.homeScore ||
+        competitorPair.awayScore !== boxscorePair.awayScore),
+    );
+    // The Summary's own result header and its team goal totals should agree.
+    // If they do not, do not settle from either value; let the refresh/recovery
+    // path retry rather than selecting a numerically larger score.
+    const scorePair = scoreConflict ? undefined : competitorPair ?? boxscorePair;
+
+    return {
+      status: statusName || 'STATUS_FINAL',
+      statusDetail,
+      statusShortDetail,
+      ...(scoreConflict ? { scoreConflict: true } : {}),
+      ...(scorePair
+        ? {
+            homeScore: scorePair.homeScore,
+            awayScore: scorePair.awayScore,
+            scoreSource: competitorPair
+              ? 'SUMMARY_COMPETITORS' as const
+              : 'SUMMARY_BOXSCORE' as const,
+          }
+        : {}),
+    };
+  }
+
+  private isTerminalStatusRecord(value: unknown): boolean {
+    const record = this.asRecord(value);
+    if (!record) return false;
+    const statusType = this.asRecord(record.type);
+    const name = String(statusType?.name ?? record.name ?? '').toUpperCase();
+    const state = String(statusType?.state ?? record.state ?? '').toLowerCase();
+    const detail = String(
+      statusType?.detail ?? statusType?.shortDetail ?? record.detail ?? record.shortDetail ?? '',
+    ).toUpperCase();
+    const abbreviation = String(statusType?.abbreviation ?? '').toUpperCase();
+    const all = `${name} ${state} ${detail} ${abbreviation}`;
+    if (/CANCEL|POSTPON|ABANDON|VOID|NO[_ ]?CONTEST/.test(all)) return false;
+    return Boolean(
+      statusType?.completed === true ||
+      record.completed === true ||
+      /(^|_)FINAL($|_)|FULL[_ ]?TIME|FINISHED|COMPLETED/.test(name) ||
+      ['post', 'final', 'complete', 'completed', 'finished'].includes(state) ||
+      ['FT', 'AET', 'PEN'].includes(abbreviation) ||
+      /\bFT\b|AFTER EXTRA TIME|AFTER PENALTIES/.test(detail),
+    );
+  }
+
+  private validScore(value: unknown): number | undefined {
+    const number = this.toNumber(value);
+    return number !== undefined && Number.isInteger(number) && number >= 0
+      ? number
+      : undefined;
+  }
+
+  private scorePair(homeValue: unknown, awayValue: unknown): EspnScorePair | undefined {
+    const homeScore = this.validScore(homeValue);
+    const awayScore = this.validScore(awayValue);
+    if (homeScore === undefined || awayScore === undefined) return undefined;
+    return { homeScore, awayScore };
+  }
+
+  /**
+   * Rewrite only explicit ESPN home/away competitor score fields from a
+   * verified final score pair. The embedded Summary itself remains untouched
+   * so the original provider response is retained as source evidence.
+   */
+  private normalizeCompetitorScoreArray(
+    value: unknown,
+    scores: EspnScorePair,
+  ): unknown[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    let changed = false;
+    const normalized = value.map((item) => {
+      const competitor = this.asRecord(item);
+      if (!competitor) return item;
+      const homeAway = String(competitor.homeAway ?? '').toLowerCase();
+      const isHome = homeAway === 'home' || competitor.isHome === true;
+      const isAway = homeAway === 'away' || competitor.isAway === true;
+      if (!isHome && !isAway) return item;
+      const score = isHome ? scores.homeScore : scores.awayScore;
+      const existingScore = this.validScore(competitor.score);
+      if (existingScore === score) return item;
+      changed = true;
+      return {
+        ...competitor,
+        // ESPN competitor scores are usually strings. Preserve the existing
+        // field's primitive representation where possible.
+        score: typeof competitor.score === 'string' ? String(score) : score,
+      };
+    });
+    return changed ? normalized : undefined;
+  }
+
+  /** Returns field-level updates; never replaces the whole payload document. */
+  private buildPayloadScoreNormalizationUpdates(
+    payloadValue: unknown,
+    scores: EspnScorePair,
+  ): Record<string, unknown> {
+    const payload = this.asRecord(payloadValue) ?? {};
+    const updates: Record<string, unknown> = {};
+    const rootCompetitions = this.normalizeCompetitionArrayScores(payload.competitions, scores);
+    if (rootCompetitions) updates['payload.competitions'] = rootCompetitions;
+
+    for (const [homeKey, awayKey] of [
+      ['homeScore', 'awayScore'],
+      ['homeTeamScore', 'awayTeamScore'],
+    ] as const) {
+      if (
+        Object.prototype.hasOwnProperty.call(payload, homeKey) ||
+        Object.prototype.hasOwnProperty.call(payload, awayKey)
+      ) {
+        const homeCurrent = this.validScore(payload[homeKey]);
+        const awayCurrent = this.validScore(payload[awayKey]);
+        if (homeCurrent !== scores.homeScore || awayCurrent !== scores.awayScore) {
+          updates[`payload.${homeKey}`] = typeof payload[homeKey] === 'string'
+            ? String(scores.homeScore)
+            : scores.homeScore;
+          updates[`payload.${awayKey}`] = typeof payload[awayKey] === 'string'
+            ? String(scores.awayScore)
+            : scores.awayScore;
+        }
+      }
+    }
+
+    const rootCompetitors = this.normalizeCompetitorScoreArray(payload.competitors, scores);
+    if (rootCompetitors) updates['payload.competitors'] = rootCompetitors;
+
+    const header = this.asRecord(payload.header) ?? {};
+    const headerCompetitions = this.normalizeCompetitionArrayScores(header.competitions, scores);
+    if (headerCompetitions) updates['payload.header.competitions'] = headerCompetitions;
+
+    const event = this.asRecord(payload.event) ?? {};
+    const eventCompetitions = this.normalizeCompetitionArrayScores(event.competitions, scores);
+    if (eventCompetitions) updates['payload.event.competitions'] = eventCompetitions;
+    return updates;
+  }
+
+  private normalizeCompetitionArrayScores(
+    value: unknown,
+    scores: EspnScorePair,
+  ): unknown[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    let changed = false;
+    const normalized = value.map((item) => {
+      const competition = this.asRecord(item);
+      if (!competition) return item;
+      const competitors = this.normalizeCompetitorScoreArray(competition.competitors, scores);
+      if (!competitors) return item;
+      changed = true;
+      return { ...competition, competitors };
+    });
+    return changed ? normalized : undefined;
+  }
+
+  private extractCompetitorScorePair(
+    competitionValue: unknown,
+  ): EspnScorePair | undefined {
+    const competition = this.asRecord(competitionValue);
+    if (!competition) return undefined;
+    const competitors = Array.isArray(competition.competitors)
+      ? competition.competitors
+      : [];
+    const home = competitors.find((item) => {
+      const record = this.asRecord(item);
+      return record?.homeAway === 'home' || record?.isHome === true;
+    });
+    const away = competitors.find((item) => {
+      const record = this.asRecord(item);
+      return record?.homeAway === 'away' || record?.isAway === true;
+    });
+    const homeRecord = this.asRecord(home);
+    const awayRecord = this.asRecord(away);
+    return this.scorePair(homeRecord?.score, awayRecord?.score);
+  }
+
+  private extractSummaryBoxscoreScorePair(
+    summaryValue: unknown,
+    competitionValue: unknown,
+    teamIds: { homeTeamId?: unknown; awayTeamId?: unknown } = {},
+  ): EspnScorePair | undefined {
+    const summary = this.asRecord(summaryValue);
+    const boxscore = this.asRecord(summary?.boxscore);
+    const teams = Array.isArray(boxscore?.teams) ? boxscore.teams : [];
+    if (teams.length < 2) return undefined;
+
+    const competition = this.asRecord(competitionValue);
+    const competitors = Array.isArray(competition?.competitors)
+      ? competition.competitors.map((item) => this.asRecord(item))
+      : [];
+    const homeCompetitor = competitors.find(
+      (item) => item?.homeAway === 'home' || item?.isHome === true,
+    );
+    const awayCompetitor = competitors.find(
+      (item) => item?.homeAway === 'away' || item?.isAway === true,
+    );
+    const teamIdsOf = (value: unknown): string[] => {
+      const record = this.asRecord(value);
+      const nested = this.asRecord(record?.team);
+      return [record?.id, record?.teamId, nested?.id, nested?.teamId]
+        .filter((id) => id !== undefined && id !== null && String(id).trim() !== '')
+        .map(String);
+    };
+    const expectedHomeIds = new Set(
+      [teamIds.homeTeamId, ...teamIdsOf(homeCompetitor)]
+        .filter((id) => id !== undefined && id !== null && String(id).trim() !== '')
+        .map((id) => String(id)),
+    );
+    const expectedAwayIds = new Set(
+      [teamIds.awayTeamId, ...teamIdsOf(awayCompetitor)]
+        .filter((id) => id !== undefined && id !== null && String(id).trim() !== '')
+        .map((id) => String(id)),
+    );
+
+    const goalTotal = (teamValue: unknown): number | undefined => {
+      const teamRecord = this.asRecord(teamValue);
+      if (!teamRecord) return undefined;
+      const stats = Array.isArray(teamRecord.statistics)
+        ? teamRecord.statistics
+        : [];
+      for (const item of stats) {
+        const stat = this.asRecord(item);
+        const normalizedName = String(
+          stat?.name ?? stat?.abbreviation ?? stat?.displayName ?? '',
+        ).toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (normalizedName !== 'totalgoals') continue;
+        const value = this.validScore(stat?.value) ?? this.validScore(stat?.displayValue);
+        if (value !== undefined) return value;
+      }
+      const nestedTeam = this.asRecord(teamRecord.team);
+      return this.validScore(teamRecord.score ?? nestedTeam?.score);
+    };
+
+    let homeTeam: Record<string, unknown> | undefined;
+    let awayTeam: Record<string, unknown> | undefined;
+    for (const item of teams) {
+      const entry = this.asRecord(item);
+      if (!entry) continue;
+      const nestedTeam = this.asRecord(entry.team);
+      const homeAway = String(entry.homeAway ?? nestedTeam?.homeAway ?? '').toLowerCase();
+      const ids = teamIdsOf(entry);
+      if (
+        homeAway === 'home' ||
+        entry.isHome === true ||
+        ids.some((id) => expectedHomeIds.has(id))
+      ) homeTeam = entry;
+      if (
+        homeAway === 'away' ||
+        entry.isAway === true ||
+        ids.some((id) => expectedAwayIds.has(id))
+      ) awayTeam = entry;
+    }
+
+    if (!homeTeam || !awayTeam || homeTeam === awayTeam) return undefined;
+    return this.scorePair(goalTotal(homeTeam), goalTotal(awayTeam));
+  }
+
+  private extractStoredPayloadFinalResult(
+    fixtureValue: unknown,
+    teamIds: { homeTeamId?: unknown; awayTeamId?: unknown } = {},
+  ): EspnSummaryFinalResult | undefined {
+    const fixture = this.asRecord(fixtureValue);
+    const payload = this.asRecord(fixture?.payload);
+    return this.extractSummaryFinalResult(payload, teamIds);
+  }
+
+  private isCompletedFixtureRecord(fixtureValue: unknown): boolean {
+    const fixture = this.asRecord(fixtureValue);
+    if (!fixture) return false;
+    const text = `${fixture.status ?? ''} ${fixture.statusDetail ?? ''} ${fixture.statusShortDetail ?? ''}`.toUpperCase();
+    if (/CANCEL|POSTPON|ABANDON|VOID|NO[_ ]?CONTEST/.test(text)) return false;
+    return fixture.completed === true || this.isTerminalStatusRecord({
+      name: fixture.status,
+      detail: fixture.statusDetail,
+      shortDetail: fixture.statusShortDetail,
+      completed: fixture.completed,
+    });
+  }
+
+  private resolveStoredFixtureResult(
+    fixtureValue: unknown,
+  ): StoredFixtureResultResolution {
+    const fixture = this.asRecord(fixtureValue);
+    if (!fixture) return { shouldRefreshSummary: false };
+    const teamIds = {
+      homeTeamId: fixture.homeTeamId,
+      awayTeamId: fixture.awayTeamId,
+    };
+    const summary = this.asRecord(fixture.payload)?.summary;
+    const payloadRecord = this.asRecord(fixture.payload) ?? {};
+    const summaryResult = this.extractSummaryFinalResult(summary, teamIds);
+    const payloadResult = this.extractStoredPayloadFinalResult(fixture, teamIds);
+    const rootPair = this.scorePair(fixture.homeScore, fixture.awayScore);
+
+    const isFinal = this.isCompletedFixtureRecord(fixture) ||
+      Boolean(summaryResult) || Boolean(payloadResult);
+    if (!isFinal) return { shouldRefreshSummary: false };
+
+    if (summaryResult?.homeScore !== undefined && summaryResult.awayScore !== undefined) {
+      return {
+        homeScore: summaryResult.homeScore,
+        awayScore: summaryResult.awayScore,
+        source: summaryResult.scoreSource ?? 'SUMMARY_COMPETITORS',
+        shouldRefreshSummary: false,
+      };
+    }
+
+    if (
+      summaryResult?.scoreConflict === true ||
+      payloadRecord.resultScoreUnresolved === true
+    ) {
+      return { conflict: true, shouldRefreshSummary: true };
+    }
+
+    const payloadPair = payloadResult &&
+      payloadResult.homeScore !== undefined &&
+      payloadResult.awayScore !== undefined
+      ? this.scorePair(payloadResult.homeScore, payloadResult.awayScore)
+      : undefined;
+    const summaryHasScores = Boolean(
+      summaryResult &&
+      summaryResult.homeScore !== undefined &&
+      summaryResult.awayScore !== undefined,
+    );
+    // Historical 0-0 rows deserve an explicit Summary verification when there
+    // is no complete Summary score pair. Root and fixture payload are usually
+    // derived from the same scoreboard response, so their agreement alone is
+    // not enough to rule out a stale/defaulted 0-0 result.
+    const suspiciousZeroZero = !summaryHasScores && Boolean(
+      (rootPair?.homeScore === 0 && rootPair.awayScore === 0) ||
+      (payloadPair?.homeScore === 0 && payloadPair.awayScore === 0),
+    );
+
+    if (payloadPair && rootPair) {
+      if (
+        payloadPair.homeScore !== rootPair.homeScore ||
+        payloadPair.awayScore !== rootPair.awayScore
+      ) {
+        // Do not choose the numerically larger score. The two stored ESPN
+        // representations disagree, so ask Summary to arbitrate the pair.
+        return {
+          homeScore: rootPair.homeScore,
+          awayScore: rootPair.awayScore,
+          source: 'ROOT_FIXTURE',
+          conflict: true,
+          shouldRefreshSummary: true,
+        };
+      }
+      if (suspiciousZeroZero) {
+        return { conflict: true, shouldRefreshSummary: true };
+      }
+      return {
+        homeScore: payloadPair.homeScore,
+        awayScore: payloadPair.awayScore,
+        source: 'FIXTURE_PAYLOAD',
+        shouldRefreshSummary: false,
+      };
+    }
+
+    if (payloadPair) {
+      if (suspiciousZeroZero) {
+        return { conflict: true, shouldRefreshSummary: true };
+      }
+      return {
+        homeScore: payloadPair.homeScore,
+        awayScore: payloadPair.awayScore,
+        source: 'FIXTURE_PAYLOAD',
+        shouldRefreshSummary: false,
+      };
+    }
+
+    if (rootPair) {
+      if (suspiciousZeroZero) {
+        return { conflict: true, shouldRefreshSummary: true };
+      }
+      return {
+        homeScore: rootPair.homeScore,
+        awayScore: rootPair.awayScore,
+        source: 'ROOT_FIXTURE',
+        shouldRefreshSummary: false,
+      };
+    }
+
+    return {
+      conflict: true,
+      shouldRefreshSummary: true,
+    };
+  }
+
+  /**
+   * One-time, resumable-style historical reconciliation. The scan is idempotent:
+   * score pairs are only changed when a higher-quality complete source exists,
+   * and unresolved finished fixtures are put back onto the durable Summary queue.
+   */
+  async repairHistoricalFixtureResults(): Promise<{
+    skipped: boolean;
+    scanned: number;
+    repaired: number;
+    summaryRefreshQueued: number;
+    conflicts: number;
+  }> {
+    const stateKey = 'MAINTENANCE:ESPN_FIXTURE_RESULT_RECONCILIATION_V3';
+    const existingState = await this.sportsSyncStateModel
+      .findOne({ stateKey })
+      .select({ status: 1 })
+      .lean()
+      .exec();
+    if (existingState?.status === SportsSyncStateStatus.SUCCESS) {
+      return { skipped: true, scanned: 0, repaired: 0, summaryRefreshQueued: 0, conflicts: 0 };
+    }
+
+    const startedAt = new Date();
+    await this.sportsSyncStateModel.updateOne(
+      { stateKey },
+      {
+        $set: {
+          stateKey,
+          kind: SportsSyncStateKind.QUEUE,
+          status: SportsSyncStateStatus.PROCESSING,
+          trackingMode: 'HISTORY',
+          fixtureGranularity: 'MONTH',
+          jobType: 'FIXTURE_RESULT_RECONCILIATION',
+          lastStartedAt: startedAt,
+          consecutiveFailures: 0,
+        },
+        $setOnInsert: { units: [] },
+        $unset: { lastError: 1 },
+      },
+      { upsert: true },
+    ).exec();
+
+    const cursor = this.espnFixtureModel
+      .find({})
+      .select({
+        eventId: 1, leagueId: 1, season: 1, fixtureDate: 1,
+        status: 1, statusDetail: 1, statusShortDetail: 1,
+        completed: 1, live: 1, homeScore: 1, awayScore: 1,
+        homeTeamId: 1, awayTeamId: 1, completedAt: 1, collectedAt: 1,
+        'payload.header': 1,
+        'payload.competitions': 1,
+        'payload.competitors': 1,
+        'payload.status': 1,
+        'payload.event': 1,
+        'payload.summary.header': 1,
+        'payload.summary.competitions': 1,
+        'payload.summary.status': 1,
+        'payload.summary.event': 1,
+        'payload.summary.boxscore.teams': 1,
+        'payload.resultScoreUnresolved': 1,
+      })
+      .lean()
+      .cursor({ batchSize: 50 });
+
+    let scanned = 0;
+    let repaired = 0;
+    let summaryRefreshQueued = 0;
+    let conflicts = 0;
+    const operations: Parameters<Model<EspnFixtureDocument>['bulkWrite']>[0] = [];
+    const summaryRequests: Array<{ eventId: string; leagueId: string; season: number }> = [];
+
+    const flushWrites = async (): Promise<void> => {
+      if (operations.length === 0) return;
+      const chunk = operations.splice(0, operations.length);
+      const writeResult = await this.espnFixtureModel.bulkWrite(chunk, { ordered: false });
+      repaired += typeof writeResult.modifiedCount === 'number' ? writeResult.modifiedCount : 0;
+    };
+
+    // Historical fixtures may belong to seasons no longer listed as active.
+    // Queue their Summary refresh directly through the existing durable queue;
+    // the worker still enforces the usual kickoff timing and retry protocol.
+    const queueHistoricalSummaryRequests = async (): Promise<void> => {
+      const requests = summaryRequests.splice(0, summaryRequests.length);
+      for (const request of requests) {
+        const triggerEventId = `HISTORICAL_RESULT_REPAIR:${request.eventId}`;
+        const jobParams = {
+          jobType: EspnQueueJobType.SUMMARY_REFRESH,
+          leagueId: request.leagueId,
+          eventId: request.eventId,
+          season: request.season,
+          triggerEventId,
+        };
+        if (await this.espnQueueService.hasJob(jobParams)) continue;
+        await this.espnQueueService.addSummaryRefreshJob({
+          leagueId: request.leagueId,
+          eventId: request.eventId,
+          season: request.season,
+          priority: 4,
+          scheduledFor: new Date(),
+          triggerEventId,
+        });
+        summaryRefreshQueued += 1;
+      }
+    };
+
+    try {
+      for await (const raw of cursor) {
+        const fixture = raw as unknown as Record<string, unknown>;
+        scanned += 1;
+        const eventId = this.toStringValue(fixture.eventId);
+        const leagueId = this.normalizeLeagueId(this.toStringValue(fixture.leagueId));
+        const season = this.toNumber(fixture.season);
+        if (!eventId || !leagueId) continue;
+
+        const snapshotCollectedAt = fixture.collectedAt;
+        const snapshotFilter: Record<string, unknown> = {
+          eventId,
+          leagueId,
+          ...(snapshotCollectedAt !== undefined && snapshotCollectedAt !== null
+            ? { collectedAt: snapshotCollectedAt }
+            : { collectedAt: { $exists: false } }),
+        };
+        const resolution = this.resolveStoredFixtureResult(fixture);
+        const isFinal = this.isCompletedFixtureRecord(fixture) ||
+          Boolean(this.extractSummaryFinalResult(this.asRecord(fixture.payload)?.summary, {
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+          })) ||
+          Boolean(this.extractStoredPayloadFinalResult(fixture, {
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+          }));
+
+        if (resolution.conflict) conflicts += 1;
+        if (resolution.shouldRefreshSummary && isFinal && season !== undefined && Number.isInteger(season)) {
+          summaryRequests.push({ eventId, leagueId, season });
+        }
+
+        if (
+          resolution.homeScore === undefined ||
+          resolution.awayScore === undefined ||
+          resolution.conflict
+        ) {
+          if (isFinal && (resolution.conflict || resolution.shouldRefreshSummary)) {
+            const rootPair = this.scorePair(fixture.homeScore, fixture.awayScore);
+            const payloadRecord = this.asRecord(fixture.payload) ?? {};
+            if (rootPair || payloadRecord.resultScoreUnresolved !== true) {
+              operations.push({
+                updateOne: {
+                  filter: snapshotFilter,
+                  update: {
+                    $set: {
+                      'payload.resultScoreUnresolved': true,
+                      collectedAt: new Date(),
+                    },
+                    $unset: { homeScore: 1, awayScore: 1 },
+                  },
+                  upsert: false,
+                },
+              });
+            }
+          }
+          if (operations.length >= this.mongoBulkChunkSize) await flushWrites();
+          if (summaryRequests.length >= 25) {
+            await flushWrites();
+            await queueHistoricalSummaryRequests();
+          }
+          continue;
+        }
+
+        const rootPair = this.scorePair(fixture.homeScore, fixture.awayScore);
+        const completed = this.isCompletedFixtureRecord(fixture);
+        const storedPayload = this.asRecord(fixture.payload) ?? {};
+        const hasUnresolvedMarker = storedPayload.resultScoreUnresolved === true;
+        const shouldUpdateScores = hasUnresolvedMarker || !rootPair ||
+          rootPair.homeScore !== resolution.homeScore ||
+          rootPair.awayScore !== resolution.awayScore;
+        const summaryResult = this.extractSummaryFinalResult(
+          this.asRecord(fixture.payload)?.summary,
+          { homeTeamId: fixture.homeTeamId, awayTeamId: fixture.awayTeamId },
+        );
+        const resultStatus = summaryResult ?? this.extractStoredPayloadFinalResult(fixture, {
+          homeTeamId: fixture.homeTeamId,
+          awayTeamId: fixture.awayTeamId,
+        });
+        const shouldUpdateStatus = !completed || Boolean(resultStatus && (
+          String(fixture.status ?? '') !== resultStatus.status ||
+          String(fixture.statusDetail ?? '') !== String(resultStatus.statusDetail ?? 'Final') ||
+          String(fixture.statusShortDetail ?? '') !== String(resultStatus.statusShortDetail ?? resultStatus.statusDetail ?? 'FT')
+        ));
+        const payloadScoreUpdates = this.buildPayloadScoreNormalizationUpdates(
+          fixture.payload,
+          { homeScore: resolution.homeScore, awayScore: resolution.awayScore },
+        );
+        const shouldUpdatePayloadScores = Object.keys(payloadScoreUpdates).length > 0;
+
+        if (shouldUpdateScores || shouldUpdateStatus || shouldUpdatePayloadScores) {
+          const collectedAt = new Date();
+          const set: Record<string, unknown> = { collectedAt, ...payloadScoreUpdates };
+          if (shouldUpdateScores) {
+            set.homeScore = resolution.homeScore;
+            set.awayScore = resolution.awayScore;
+          }
+          if (shouldUpdateStatus) {
+            set.completed = true;
+            set.live = false;
+            set.status = resultStatus?.status ?? 'STATUS_FULL_TIME';
+            set.statusDetail = resultStatus?.statusDetail ?? 'Final';
+            set.statusShortDetail = resultStatus?.statusShortDetail ?? resultStatus?.statusDetail ?? 'FT';
+            set.completedAt = fixture.completedAt ?? collectedAt;
+          }
+          operations.push({
+            updateOne: {
+              filter: snapshotFilter,
+              update: {
+                $set: set,
+                $unset: { 'payload.resultScoreUnresolved': 1 },
+              },
+              upsert: false,
+            },
+          });
+        }
+
+        if (operations.length >= this.mongoBulkChunkSize) await flushWrites();
+        if (summaryRequests.length >= 25) {
+          await queueHistoricalSummaryRequests();
+        }
+      }
+
+      await flushWrites();
+      if (summaryRequests.length > 0) {
+        await queueHistoricalSummaryRequests();
+      }
+      await this.sportsSyncStateModel.updateOne(
+        { stateKey },
+        { $set: { status: SportsSyncStateStatus.SUCCESS, lastSuccessfulAt: new Date(), consecutiveFailures: 0 }, $unset: { lastError: 1 } },
+      ).exec();
+
+      this.logger.log(`Historical ESPN result reconciliation completed: scanned=${scanned}, repaired=${repaired}, summaryRefreshQueued=${summaryRefreshQueued}, conflicts=${conflicts}`);
+      return { skipped: false, scanned, repaired, summaryRefreshQueued, conflicts };
+    } catch (error) {
+      await this.sportsSyncStateModel.updateOne(
+        { stateKey },
+        { $set: { status: SportsSyncStateStatus.FAILED, lastError: error instanceof Error ? error.message : String(error), consecutiveFailures: 1 } },
+      ).exec();
+      throw error;
+    } finally {
+      await cursor.close();
+    }
   }
 
   // ============================================================
@@ -2466,134 +2937,290 @@ export class SportsCollectionService {
    * belong to an already collected ESPN fixture.
    */
   async collectEspnMatchSummariesBulk(
-    summaries: Array<{
-      leagueId: string;
-      eventId: string;
-      summary: unknown;
-    }>,
-  ): Promise<{
-    requested: number;
-    matched: number;
-    modified: number;
-  }> {
-    if (summaries.length === 0) {
-      return {
-        requested: 0,
-        matched: 0,
-        modified: 0,
-      };
-    }
-
-    const collectedAt = new Date();
+    summaries: Array<{ leagueId: string; eventId: string; summary: unknown }>,
+  ): Promise<{ requested: number; matched: number; modified: number }> {
+    if (summaries.length === 0)
+      return { requested: 0, matched: 0, modified: 0 };
 
     const uniqueSummaries = new Map<
       string,
-      {
-        leagueId: string;
-        eventId: string;
-        summary: unknown;
-      }
+      { leagueId: string; eventId: string; summary: unknown }
     >();
-
     for (const item of summaries) {
       const eventId = String(item.eventId ?? '').trim();
-
-      if (!eventId) {
-        continue;
-      }
-
+      if (!eventId) continue;
       uniqueSummaries.set(eventId, {
         leagueId: this.normalizeLeagueId(item.leagueId),
-
         eventId,
-
         summary: item.summary,
       });
     }
+    if (uniqueSummaries.size === 0)
+      return { requested: summaries.length, matched: 0, modified: 0 };
 
+    const existingFixtures = await this.espnFixtureModel
+      .find({ eventId: { $in: [...uniqueSummaries.keys()] } })
+      .select({
+        eventId: 1, leagueId: 1, payload: 1, homeTeamId: 1, awayTeamId: 1,
+        homeScore: 1, awayScore: 1, status: 1, statusDetail: 1,
+        statusShortDetail: 1, completed: 1, live: 1,
+      })
+      .lean()
+      .exec();
+    const existingByEventId = new Map<string, Record<string, unknown>>();
+    for (const fixture of existingFixtures as unknown as Array<
+      Record<string, unknown>
+    >) {
+      const id = this.toStringValue(fixture.eventId) ?? '';
+      if (id) existingByEventId.set(id, fixture);
+    }
+
+    const collectedAt = new Date();
     const operations: Parameters<Model<EspnFixtureDocument>['bulkWrite']>[0] =
       [];
+    const changedSummaries: Array<{
+      leagueId: string;
+      eventId: string;
+      summary: unknown;
+      homeTeamId?: unknown;
+      awayTeamId?: unknown;
+      homeScore?: unknown;
+      awayScore?: unknown;
+      resultScoreUnresolved?: boolean;
+      fixturePayload?: unknown;
+      status?: unknown;
+      statusDetail?: unknown;
+      statusShortDetail?: unknown;
+      completed?: unknown;
+      live?: unknown;
+    }> = [];
+    const persistedSummaries: Array<{
+      leagueId: string;
+      eventId: string;
+      summary: unknown;
+      homeTeamId?: unknown;
+      awayTeamId?: unknown;
+      homeScore?: unknown;
+      awayScore?: unknown;
+      resultScoreUnresolved?: boolean;
+      fixturePayload?: unknown;
+      status?: unknown;
+      statusDetail?: unknown;
+      statusShortDetail?: unknown;
+      completed?: unknown;
+      live?: unknown;
+    }> = [];
 
     for (const item of uniqueSummaries.values()) {
+      const existing = existingByEventId.get(item.eventId);
+      if (!existing) continue;
+      const payload = this.asRecord(existing.payload) ?? {};
+      const oldSummary = payload.summary;
+      const mergedSummary = this.mergeSummaryPreservingFinalResult(
+        oldSummary,
+        item.summary,
+      );
+      const hash = this.summaryContentHash(mergedSummary);
+      const oldHash = this.toStringValue(payload.summaryContentHash);
+      const unchanged =
+        oldHash === hash ||
+        (!oldHash &&
+          this.hasUsableSummaryForHash(oldSummary) &&
+          this.summaryContentHash(oldSummary) === hash);
+      const set: Record<string, unknown> = {
+        leagueId: item.leagueId,
+        'payload.summaryCollectedAt': collectedAt,
+        'payload.summaryContentHash': hash,
+        collectedAt,
+      };
+      if (!unchanged) {
+        set['payload.summary'] = mergedSummary;
+        changedSummaries.push({
+          ...item,
+          summary: mergedSummary,
+          homeTeamId: existing.homeTeamId,
+          awayTeamId: existing.awayTeamId,
+          homeScore: existing.homeScore,
+          awayScore: existing.awayScore,
+          resultScoreUnresolved: payload.resultScoreUnresolved === true,
+          fixturePayload: payload,
+          status: existing.status,
+          statusDetail: existing.statusDetail,
+          statusShortDetail: existing.statusShortDetail,
+          completed: existing.completed,
+          live: existing.live,
+        });
+      }
+      persistedSummaries.push({
+        ...item,
+        summary: mergedSummary,
+        homeTeamId: existing.homeTeamId,
+        awayTeamId: existing.awayTeamId,
+        homeScore: existing.homeScore,
+        awayScore: existing.awayScore,
+        resultScoreUnresolved: payload.resultScoreUnresolved === true,
+        fixturePayload: payload,
+        status: existing.status,
+        statusDetail: existing.statusDetail,
+        statusShortDetail: existing.statusShortDetail,
+        completed: existing.completed,
+        live: existing.live,
+      });
       operations.push({
         updateOne: {
-          filter: {
-            eventId: item.eventId,
-          },
-
-          update: {
-            $set: {
-              leagueId: item.leagueId,
-
-              'payload.summary': item.summary,
-
-              'payload.summaryCollectedAt': collectedAt,
-
-              collectedAt,
-            },
-          },
-
-          /*
-           * The fixture must already exist.
-           *
-           * We deliberately do not use upsert here because a Summary
-           * response must never create a fixture that was not already
-           * collected by the fixture pipeline.
-           */
+          filter: { eventId: item.eventId, leagueId: item.leagueId },
+          update: { $set: set },
           upsert: false,
         },
       });
     }
 
     if (operations.length === 0) {
-      return {
-        requested: summaries.length,
-
-        matched: 0,
-
-        modified: 0,
-      };
+      return { requested: summaries.length, matched: 0, modified: 0 };
     }
-
-    /*
-     * Unordered bulk writes allow MongoDB to process independent
-     * fixture updates efficiently.
-     *
-     * A thrown BulkWriteError means the batch persistence did not
-     * complete successfully. The caller is responsible for moving
-     * the corresponding synchronization units back to FAILED.
-     */
-    const result = await this.espnFixtureModel.bulkWrite(operations, {
-      ordered: false,
-    });
-
-    const matched =
-      typeof result.matchedCount === 'number' ? result.matchedCount : 0;
-
-    const modified =
-      typeof result.modifiedCount === 'number' ? result.modifiedCount : 0;
-
-    /*
-     * Because upsert=false is intentional, every requested summary
-     * must have matched an existing fixture.
-     *
-     * A mismatch means that at least one summary could not be
-     * persisted to its canonical fixture document.
-     */
+    let matched = 0;
+    let modified = 0;
+    for (const chunk of this.chunkOperations(
+      operations,
+      this.mongoBulkChunkSize,
+    )) {
+      const result = await this.espnFixtureModel.bulkWrite(chunk, {
+        ordered: false,
+      });
+      matched +=
+        typeof result.matchedCount === 'number' ? result.matchedCount : 0;
+      modified +=
+        typeof result.modifiedCount === 'number' ? result.modifiedCount : 0;
+    }
     if (matched !== operations.length) {
       throw new Error(
-        `ESPN summary bulk persistence matched ${matched} of ` +
-          `${operations.length} requested fixtures`,
+        `ESPN summary bulk persistence matched ${matched} of ${operations.length} requested fixtures`,
       );
     }
 
-    return {
-      requested: operations.length,
+    if (changedSummaries.length > 0) {
+      await this.persistSummaryNewsBatch(changedSummaries);
+    }
 
-      matched,
+    // Reconcile canonical result fields for every persisted Summary, including
+    // unchanged content whose root fixture status or score may still be stale.
+    const reconciliations = await Promise.all(
+      persistedSummaries.map(async (item) => ({
+        item,
+        result: await this.reconcileFixtureResultFromSummary(item),
+      })),
+    );
+    const settlementItems = new Map<string, { leagueId: string; eventId: string }>();
+    for (const item of changedSummaries) {
+      settlementItems.set(item.eventId, {
+        leagueId: item.leagueId,
+        eventId: item.eventId,
+      });
+    }
+    for (const entry of reconciliations) {
+      if (entry.result?.rootChanged) {
+        settlementItems.set(entry.item.eventId, {
+          leagueId: entry.item.leagueId,
+          eventId: entry.item.eventId,
+        });
+      }
+    }
 
-      modified,
+    for (const leagueId of new Set(
+      [...changedSummaries.map((item) => item.leagueId),
+       ...reconciliations
+         .filter((entry) => entry.result?.rootChanged)
+         .map((entry) => entry.item.leagueId)],
+    )) {
+      void this.scheduleDerivedRefreshForLeague(leagueId);
+    }
+
+    // Unchanged Summary refreshes do not trigger settlement unless result
+    // reconciliation actually changed the canonical fixture fields.
+    await Promise.all([...settlementItems.values()].map(async (item) => {
+      try {
+        await this.settlementTriggerService.onSummaryUpdated(item.eventId, item.leagueId);
+      } catch (error) {
+        this.logger.warn(`Could not enqueue settlement for Summary ${item.eventId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }));
+
+    return { requested: operations.length, matched, modified };
+  }
+
+  private summaryContentHash(value: unknown): string {
+    const canonicalize = (input: unknown): unknown => {
+      if (Array.isArray(input)) return input.map(canonicalize);
+      if (input !== null && typeof input === 'object') {
+        const record = input as Record<string, unknown>;
+        return Object.fromEntries(
+          Object.keys(record)
+            .sort()
+            .map((key) => [key, canonicalize(record[key])]),
+        );
+      }
+      return input;
     };
+    return createHash('sha256')
+      .update(JSON.stringify(canonicalize(value)) ?? 'null')
+      .digest('hex');
+  }
+
+  private hasUsableSummaryForHash(value: unknown): boolean {
+    return (
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      Object.keys(value).length > 0
+    );
+  }
+
+  /**
+   * Trigger summary-derived data refreshes for the currently active season.
+   * The refreshers coalesce requests and run in the background; their failures
+   * cannot fail fixture or Summary persistence or delay the startup barrier.
+   */
+  private async scheduleDerivedRefreshForLeague(
+    leagueIdValue: string,
+  ): Promise<void> {
+    const leagueId = this.normalizeLeagueId(leagueIdValue);
+    if (!leagueId) return;
+
+    try {
+      const activeCompetition =
+        await this.activeCompetitionService.getByCompetitionId(leagueId);
+      let season =
+        typeof activeCompetition?.season === 'number'
+          ? activeCompetition.season
+          : undefined;
+
+      if (season === undefined) {
+        const latestCompleted = await this.espnFixtureModel
+          .findOne({
+            leagueId,
+            completed: true,
+            'payload.summary': { $type: 'object' },
+          })
+          .sort({ fixtureDate: -1 })
+          .select({ season: 1 })
+          .lean()
+          .exec();
+        season =
+          typeof latestCompleted?.season === 'number'
+            ? latestCompleted.season
+            : undefined;
+      }
+      if (season === undefined) return;
+
+      // The persistent queue rebuilds standings from stored Summary snapshots
+      // or completed fixture results, including before a Summary exists.
+      this.espnStandingsService.scheduleRefresh({ leagueId, season });
+    } catch (error) {
+      this.logger.warn(
+        `Unable to schedule standings refresh for ${leagueId}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   // ============================================================
@@ -2931,128 +3558,6 @@ export class SportsCollectionService {
   }
 
   // ============================================================
-  // ESPN LEAGUE HELPERS
-  // ============================================================
-
-  private extractEspnLeagueSeason(league: EspnLeaguePayload): {
-    season: number;
-    startDate?: Date;
-    endDate?: Date;
-  } | null {
-    const candidate = league.season;
-
-    if (!candidate || typeof candidate !== 'object') {
-      return null;
-    }
-
-    const seasonValue =
-      typeof candidate.year === 'number'
-        ? candidate.year
-        : this.toNumber(candidate.year);
-
-    if (seasonValue === undefined) {
-      return null;
-    }
-
-    return {
-      season: seasonValue,
-
-      startDate: this.parseDate(candidate.startDate),
-
-      endDate: this.parseDate(candidate.endDate),
-    };
-  }
-
-  private isSeasonActive(
-    startDate?: Date,
-    endDate?: Date,
-    now = new Date(),
-  ): boolean {
-    if (!startDate) {
-      return false;
-    }
-
-    if (now.getTime() < startDate.getTime()) {
-      return false;
-    }
-
-    if (endDate && now.getTime() > endDate.getTime()) {
-      return false;
-    }
-
-    return true;
-  }
-
-  private findPriorityCompetition(...identifiers: string[]) {
-    const normalizedIdentifiers = identifiers
-      .map((value) => this.normalizeLeagueId(value))
-      .filter(Boolean);
-
-    if (normalizedIdentifiers.length === 0) {
-      return undefined;
-    }
-
-    return this.priorityCompetitionService.getAll().find((competition) => {
-      const competitionId = this.normalizeLeagueId(competition.id);
-
-      const espnSlug = this.normalizeLeagueId(
-        competition.providers?.espnLeagueSlug,
-      );
-
-      return (
-        normalizedIdentifiers.includes(competitionId) ||
-        normalizedIdentifiers.includes(espnSlug)
-      );
-    });
-  }
-
-  private getStoredPriority(league: unknown): CompetitionPriority {
-    const value = this.asRecord(league)?.priority;
-
-    if (
-      Object.values(CompetitionPriority).includes(value as CompetitionPriority)
-    ) {
-      return value as CompetitionPriority;
-    }
-
-    return CompetitionPriority.SELECTIVE;
-  }
-
-  private extractCountryFromLeague(
-    league: EspnLeaguePayload,
-  ): string | undefined {
-    const country: unknown = league.country;
-
-    if (typeof country === 'string') {
-      return this.getStringValue(country);
-    }
-
-    if (country && typeof country === 'object') {
-      const value = country as Record<string, unknown>;
-
-      return (
-        this.getStringValue(value.name) ??
-        this.getStringValue(value.displayName) ??
-        this.getStringValue(value.abbreviation)
-      );
-    }
-
-    return undefined;
-  }
-
-  private getDefaultCompetitionRegion(
-    league: EspnLeaguePayload,
-  ): CompetitionRegion {
-    const country = this.extractCountryFromLeague(league);
-
-    if (country && country.toLowerCase() === 'nigeria') {
-      return CompetitionRegion.NIGERIA;
-    }
-
-    return CompetitionRegion.EUROPE;
-  }
-
-  // ============================================================
   // HELPERS
   // ============================================================
 
@@ -3134,141 +3639,6 @@ export class SportsCollectionService {
     }
 
     return [];
-  }
-
-  private extractStandingEntries(
-    response:
-      EspnStandingsResponse | Record<string, unknown> | null | undefined,
-  ): EspnStandingEntry[] {
-    if (!response || typeof response !== 'object') {
-      return [];
-    }
-
-    const root = this.asRecord(response);
-
-    if (!root) {
-      return [];
-    }
-
-    const directStandings = this.asRecord(root.standings);
-
-    if (Array.isArray(directStandings?.entries)) {
-      return directStandings.entries as EspnStandingEntry[];
-    }
-
-    const children = Array.isArray(root.children)
-      ? (root.children as unknown[])
-      : [];
-
-    const entries: EspnStandingEntry[] = [];
-
-    for (const child of children) {
-      this.collectStandingEntriesFromGroup(child, entries);
-    }
-
-    if (entries.length > 0) {
-      return entries;
-    }
-
-    if (Array.isArray(root.standings)) {
-      for (const group of root.standings as unknown[]) {
-        this.collectStandingEntriesFromGroup(group, entries);
-      }
-
-      if (entries.length > 0) {
-        return entries;
-      }
-    }
-
-    const groups = Array.isArray(root.groups) ? (root.groups as unknown[]) : [];
-
-    for (const group of groups) {
-      this.collectStandingEntriesFromGroup(group, entries);
-    }
-
-    return entries;
-  }
-
-  private collectStandingEntriesFromGroup(
-    value: unknown,
-    output: EspnStandingEntry[],
-  ): void {
-    const group = this.asRecord(value);
-
-    if (!group) {
-      return;
-    }
-
-    const standings = this.asRecord(group.standings);
-
-    if (Array.isArray(standings?.entries)) {
-      output.push(...(standings.entries as EspnStandingEntry[]));
-    }
-
-    if (Array.isArray(group.entries)) {
-      output.push(...(group.entries as EspnStandingEntry[]));
-    }
-
-    if (Array.isArray(group.children)) {
-      for (const child of group.children as unknown[]) {
-        this.collectStandingEntriesFromGroup(child, output);
-      }
-    }
-  }
-
-  private getStatisticNumber(
-    stats: unknown[],
-    ...names: string[]
-  ): number | undefined {
-    for (const item of stats) {
-      const statistic =
-        item !== null && typeof item === 'object'
-          ? (item as Record<string, unknown>)
-          : undefined;
-
-      const nameValue =
-        statistic?.name ?? statistic?.type ?? statistic?.key ?? '';
-
-      const name =
-        typeof nameValue === 'string' || typeof nameValue === 'number'
-          ? String(nameValue).toLowerCase()
-          : '';
-
-      if (names.some((candidate) => name === candidate.toLowerCase())) {
-        return (
-          this.toNumber(statistic?.value) ??
-          this.toNumber(statistic?.displayValue)
-        );
-      }
-    }
-
-    return undefined;
-  }
-
-  private getStatisticDisplayValue(
-    stats: unknown[],
-    names: string[],
-  ): string | undefined {
-    for (const item of stats) {
-      const statistic =
-        item !== null && typeof item === 'object'
-          ? (item as Record<string, unknown>)
-          : undefined;
-
-      const nameValue =
-        statistic?.name ?? statistic?.type ?? statistic?.key ?? '';
-
-      const name =
-        typeof nameValue === 'string' || typeof nameValue === 'number'
-          ? String(nameValue).toLowerCase()
-          : '';
-
-      if (names.some((candidate) => name === candidate.toLowerCase())) {
-        return this.toStringValue(statistic?.displayValue ?? statistic?.value);
-      }
-    }
-
-    return undefined;
   }
 
   private getNestedString(value: unknown, path: string[]): string | undefined {
@@ -3389,20 +3759,50 @@ export class SportsCollectionService {
     );
   }
 
-  private getSeasonFromFixtures(response: unknown): number | undefined {
-    const events = this.extractArray(response, ['events', 'items']);
-
-    for (const event of events) {
-      const season = this.toNumber(
-        this.getNestedString(event, ['season', 'year']),
-      );
-
-      if (season !== undefined) {
-        return season;
-      }
+  /**
+   * Returns true only while ESPN reports the event as in progress.
+   * Completed and post-match states must not be treated as live.
+   */
+  private isLiveEvent(event: unknown): boolean {
+    if (!event || typeof event !== 'object') {
+      return false;
     }
 
-    return undefined;
+    const eventRecord = event as Record<string, unknown>;
+    const status =
+      eventRecord.status && typeof eventRecord.status === 'object'
+        ? (eventRecord.status as Record<string, unknown>)
+        : undefined;
+    const statusType =
+      status?.type && typeof status.type === 'object'
+        ? (status.type as Record<string, unknown>)
+        : undefined;
+
+    if (status?.completed === true || statusType?.completed === true) {
+      return false;
+    }
+
+    const state = this.toStringValue(
+      statusType?.state ?? status?.state,
+    )?.toLowerCase();
+
+    if (
+      state &&
+      ['post', 'final', 'completed', 'complete', 'finished'].includes(state)
+    ) {
+      return false;
+    }
+
+    return Boolean(
+      state && ['in', 'live', 'inprogress', 'in_progress'].includes(state),
+    );
+  }
+
+  /** Returns midnight UTC for date-window queries. */
+  private getUtcStartOfDay(date: Date): Date {
+    const result = new Date(date);
+    result.setUTCHours(0, 0, 0, 0);
+    return result;
   }
 
   private parseDate(value: unknown): Date | undefined {
@@ -3439,10 +3839,6 @@ export class SportsCollectionService {
     return result ? result : undefined;
   }
 
-  private getStringValue(value: unknown): string | undefined {
-    return this.toStringValue(value);
-  }
-
   private normalizeLeagueId(value?: string): string {
     return typeof value === 'string' ? value.trim().toLowerCase() : '';
   }
@@ -3477,6 +3873,42 @@ export class SportsCollectionService {
    *
    * YYYY-MM-DD
    */
+  private chunkOperations<T>(operations: T[], size: number): T[][] {
+    const chunks: T[][] = [];
+
+    for (let index = 0; index < operations.length; index += size) {
+      chunks.push(operations.slice(index, index + size));
+    }
+
+    return chunks;
+  }
+
+  private async bulkWriteFixtureChunks(
+    operations: Parameters<Model<EspnFixtureDocument>['bulkWrite']>[0],
+  ): Promise<void> {
+    for (const chunk of this.chunkOperations(
+      operations,
+      this.mongoBulkChunkSize,
+    )) {
+      await this.espnFixtureModel.bulkWrite(chunk, {
+        ordered: false,
+      });
+    }
+  }
+
+  private async bulkWriteTeamChunks(
+    operations: Parameters<Model<EspnTeamDocument>['bulkWrite']>[0],
+  ): Promise<void> {
+    for (const chunk of this.chunkOperations(
+      operations,
+      this.mongoBulkChunkSize,
+    )) {
+      await this.espnTeamModel.bulkWrite(chunk, {
+        ordered: false,
+      });
+    }
+  }
+
   private toUtcDateOnly(value: Date): string {
     const date = new Date(value);
 
@@ -3489,3 +3921,4 @@ export class SportsCollectionService {
     return `${year}-${month}-${day}`;
   }
 }
+

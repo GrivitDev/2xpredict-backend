@@ -1,40 +1,40 @@
-import { Injectable, Logger } from '@nestjs/common';
-
-import { PredictionTriggerResult } from '../interfaces/prediction-trigger-result.interface';
-
+import { Injectable } from '@nestjs/common';
+import { PredictionEngineService } from './prediction-engine.service';
 import { PredictionQueueService } from './prediction-queue.service';
-
-import { PredictionWorkerService } from './prediction-worker.service';
+import { PredictionQueueWorkerService } from './prediction-queue-worker.service';
+import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 
 @Injectable()
 export class PredictionTriggerService {
-  private readonly logger = new Logger(PredictionTriggerService.name);
-
   constructor(
-    private readonly predictionQueueService: PredictionQueueService,
-
-    private readonly predictionWorkerService: PredictionWorkerService,
+    private readonly engine: PredictionEngineService,
+    private readonly queue: PredictionQueueService,
+    private readonly worker: PredictionQueueWorkerService,
+    private readonly monitor: PredictionEngineMonitorService,
   ) {}
 
-  async trigger(): Promise<PredictionTriggerResult> {
-    const queueResult = await this.predictionQueueService.trigger();
+  async generateFixture(eventId: string): Promise<unknown> {
+    const result: unknown = await this.engine.generateForFixture(eventId);
+    await this.monitor.recordEvent({
+      type: 'ADMIN_ACTION',
+      level: 'INFO',
+      eventId,
+      message: `Prediction generation manually triggered for event ${eventId}.`,
+    });
+    return result;
+  }
 
-    if (queueResult.total <= 0) {
-      return {
-        ...queueResult,
-        workerStarted: false,
-      };
-    }
+  async synchronizeQueue(force = false): Promise<unknown> {
+    return this.queue.syncUpcomingFixtures(force);
+  }
 
-    const workerStarted = await this.predictionWorkerService.start();
+  async recoverStaleQueueItems(): Promise<{ recovered: number }> {
+    const recovered = await this.queue.recoverStaleProcessing();
+    return { recovered };
+  }
 
-    this.logger.log(
-      `Prediction trigger completed: queued=${queueResult.queued} alreadyQueued=${queueResult.alreadyQueued} skipped=${queueResult.skipped} workerStarted=${workerStarted}`,
-    );
-
-    return {
-      ...queueResult,
-      workerStarted,
-    };
+  async runNextQueueItem(): Promise<{ processed: boolean; eventId?: string }> {
+    return this.worker.runOneNow();
   }
 }
+

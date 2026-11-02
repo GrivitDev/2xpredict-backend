@@ -1,9 +1,13 @@
 import { Controller, Get, UseGuards } from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
+import { Roles } from '../common/decorators/roles.decorator';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { SubscriptionsMonitorService } from './subscriptions-monitor.service';
 import { SubscriptionsService } from './subscriptions.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { GetUser } from '../common/decorators/get-user.decorator';
-import { PlanConfigService } from 'src/plan-config/plan-config.service';
-import { UsersService } from 'src/users/users.service';
+import { PlanConfigService } from '../plan-config/plan-config.service';
+import { UsersService } from '../users/users.service';
 
 @Controller('subscriptions')
 export class SubscriptionsController {
@@ -11,17 +15,25 @@ export class SubscriptionsController {
     private readonly service: SubscriptionsService,
     private readonly planConfigService: PlanConfigService,
     private readonly usersService: UsersService,
+    private readonly monitor: SubscriptionsMonitorService,
   ) {}
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  @Get('admin/monitor')
+  getModuleMonitor() {
+    return this.monitor.getOverview();
+  }
 
   @UseGuards(JwtAuthGuard)
   @Get('me')
-  getMySubscription(@GetUser() user: any) {
+  getMySubscription(@GetUser() user: { _id: string }) {
     return this.service.getActiveSubscription(user._id);
   }
 
   @UseGuards(JwtAuthGuard)
   @Get('status')
-  async getStatus(@GetUser() user: any) {
+  async getStatus(@GetUser() user: { _id: string }) {
     const subscription = await this.service.getActiveSubscription(user._id);
 
     const plan = await this.service.getUserPlan(user._id);
@@ -34,7 +46,7 @@ export class SubscriptionsController {
 
   @UseGuards(JwtAuthGuard)
   @Get('upgrade-price')
-  async getUpgradePrice(@GetUser() user: any) {
+  async getUpgradePrice(@GetUser() user: { _id: string }) {
     const config = await this.planConfigService.get();
 
     const dbUser = await this.usersService.findById(user._id);
@@ -43,18 +55,40 @@ export class SubscriptionsController {
       throw new Error('User not found');
     }
 
-    const regularPrice =
-      dbUser.currency === 'USD' ? config.regularPriceUSD : config.regularPrice;
+    const prices = {
+      regular:
+        dbUser.currency === 'USD'
+          ? config.regularPriceUSD
+          : config.regularPrice,
+      vip: dbUser.currency === 'USD' ? config.vipPriceUSD : config.vipPrice,
+      premium:
+        dbUser.currency === 'USD'
+          ? config.premiumPriceUSD
+          : config.premiumPrice,
+    };
 
-    const vipPrice =
-      dbUser.currency === 'USD' ? config.vipPriceUSD : config.vipPrice;
+    const [vipUpgrade, premiumUpgrade] = await Promise.all([
+      this.service.calculatePlanUpgradePrice(
+        user._id,
+        prices,
+        'vip',
+        30,
+        dbUser.currency,
+      ),
+      this.service.calculatePlanUpgradePrice(
+        user._id,
+        prices,
+        'premium',
+        30,
+        dbUser.currency,
+      ),
+    ]);
 
-    return this.service.calculateUpgradePrice(
-      user._id,
-      regularPrice,
-      vipPrice,
-      config.subscriptionDurationDays,
-      dbUser.currency,
-    );
+    // Preserve the former top-level VIP quote fields while exposing both tiers.
+    return {
+      ...vipUpgrade,
+      vipUpgrade,
+      premiumUpgrade,
+    };
   }
 }

@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -9,107 +10,66 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-
+import type { RawBodyRequest } from '@nestjs/common';
+import type { Request } from 'express';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { EmailVerifiedGuard } from '../common/guards/email-verified.guard';
 import { GetUser } from '../common/decorators/get-user.decorator';
-
 import { PaymentGatewaysService } from './payment-gateways.service';
+import { InitializePaymentDto } from './dto/initialize-payment.dto';
 
 @Controller('payment-gateways')
 export class PaymentGatewaysController {
-  constructor(
-    private readonly paymentGatewaysService: PaymentGatewaysService,
-  ) {}
+  constructor(private readonly paymentGatewaysService: PaymentGatewaysService) {}
 
-  // =====================================================
-  // INITIALIZE PAYMENT
-  //
-  // User must be authenticated.
-  //
-  // IMPORTANT:
-  // The frontend does NOT send amount or currency.
-  //
-  // The backend determines:
-  // - user's currency
-  // - actual price
-  // - exchange rate
-  // - NGN gateway amount
-  // =====================================================
   @UseGuards(JwtAuthGuard)
-  @Post('initialize')
-  initializePayment(
-    @GetUser() user: any,
-
-    @Body()
-    body: {
-      gateway: 'paystack' | 'opay';
-
-      type: 'subscription' | 'prediction' | 'vip_upgrade';
-
-      target: string;
-    },
+  @Post('quote')
+  quotePayment(
+    @GetUser() user: { _id: string },
+    @Body() body: { type: 'subscription' | 'vip_upgrade' | 'premium_upgrade'; target: string; promoCode?: string },
   ) {
-    return this.paymentGatewaysService.initializePayment({
-      userId: user._id,
-
-      email: user.email,
-
-      gateway: body.gateway,
-
-      type: body.type,
-
-      target: body.target,
+    return this.paymentGatewaysService.quotePayment({
+      userId: user._id, type: body.type, target: body.target, promoCode: body.promoCode,
     });
   }
 
-  // =====================================================
-  // VERIFY PAYMENT
-  // =====================================================
-
-  @Get(':gateway/verify')
-  verifyPayment(
-    @Param('gateway')
-    gateway: 'paystack' | 'opay',
-
-    @Query('reference')
-    reference: string,
+  @UseGuards(JwtAuthGuard, EmailVerifiedGuard)
+  @Post('initialize')
+  initializePayment(
+    @GetUser() user: { _id: string; email: string },
+    @Body() body: InitializePaymentDto,
   ) {
-    return this.paymentGatewaysService.verifyPayment(gateway, reference);
+    return this.paymentGatewaysService.initializePayment({
+      userId: user._id,
+      email: user.email,
+      gateway: 'paystack',
+      type: body.type,
+      target: body.target,
+      promoCode: body.promoCode,
+    });
   }
 
-  // =====================================================
-  // PAYSTACK WEBHOOK
-  // =====================================================
+  @Get('paystack/verify')
+  @UseGuards(JwtAuthGuard)
+  verifyPayment(
+    @GetUser() user: { _id: string },
+    @Query('reference') reference: string,
+  ) {
+    if (!reference || reference.length > 120) {
+      throw new BadRequestException('A valid payment reference is required.');
+    }
+    return this.paymentGatewaysService.verifyPayment('paystack', reference, user._id);
+  }
 
   @Post('paystack/webhook')
   paystackWebhook(
-    @Req() req: any,
-
-    @Headers('x-paystack-signature')
-    signature: string,
+    @Req() req: RawBodyRequest<Request>,
+    @Headers('x-paystack-signature') signature?: string,
   ) {
     return this.paymentGatewaysService.handleWebhook(
-      'paystack',
-      req.body,
+      req.body as unknown,
       signature,
-    );
-  }
-
-  // =====================================================
-  // OPAY WEBHOOK
-  // =====================================================
-
-  @Post('opay/webhook')
-  opayWebhook(
-    @Req() req: any,
-
-    @Headers('authorization')
-    signature: string,
-  ) {
-    return this.paymentGatewaysService.handleWebhook(
-      'opay',
-      req.body,
-      signature,
+      req.rawBody,
     );
   }
 }

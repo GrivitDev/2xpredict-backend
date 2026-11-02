@@ -64,6 +64,7 @@ export class User {
   countryCode!: string;
 
   @Prop({
+    type: String,
     enum: ['NGN', 'USD'],
     default: 'USD',
     uppercase: true,
@@ -82,12 +83,9 @@ export class User {
   @Prop({ default: false })
   isVerified!: boolean;
 
-  @Prop({
-    default: () => new Date(Date.now() + 30 * 60 * 1000),
-    expires: 0,
-    index: true,
-  })
-  verificationExpiresAt?: Date;
+  // Retained for backwards compatibility only. Unverified registrations do not expire.
+  @Prop({ type: Date, default: null })
+  verificationExpiresAt?: Date | null;
 
   // ======================
   // ROLE

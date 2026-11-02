@@ -4,8 +4,17 @@ import { Model } from 'mongoose';
 import {
   Subscription,
   SubscriptionDocument,
+  PaidPlanType,
+  PlanType,
 } from './schemas/subscription.schema';
 import { EmailService } from '../notifications/email.service';
+import { BonusGrant } from '../bonuses/schemas/bonus-grant.schema';
+import { BonusStatus } from '../bonuses/enums/bonus-status.enum';
+import { BonusType } from '../bonuses/enums/bonus-type.enum';
+import { UsersService } from '../users/users.service';
+import { SystemMonitorService } from '../system-monitor/system-monitor.service';
+
+const PAID_SUBSCRIPTION_DURATION_DAYS = 30;
 
 @Injectable()
 export class SubscriptionsService {
@@ -13,6 +22,10 @@ export class SubscriptionsService {
     @InjectModel(Subscription.name)
     private subscriptionModel: Model<SubscriptionDocument>,
     private emailService: EmailService,
+    @InjectModel(BonusGrant.name)
+    private readonly bonusGrantModel: Model<BonusGrant>,
+    private readonly usersService: UsersService,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   // =====================================
@@ -27,16 +40,76 @@ export class SubscriptionsService {
   // =====================================
   async getActiveSubscription(userId: string) {
     const now = new Date();
-
-    return this.subscriptionModel
+    const active = await this.subscriptionModel
       .findOne({
         userId,
+        isActive: true,
         startDate: { $lte: now },
         expiryDate: { $gt: now },
       })
-      .sort({
-        startDate: -1,
-      });
+      .sort({ startDate: -1 })
+      .exec();
+    if (active) return active;
+
+    // Paid renewals and lower-tier purchases are queued with isActive=false.
+    // Activate a due queued term on demand instead of relying on the daily
+    // notification scheduler to grant access at the exact transition time.
+    const queued = await this.subscriptionModel
+      .findOne({
+        userId,
+        isActive: false,
+        startDate: { $lte: now },
+        expiryDate: { $gt: now },
+      })
+      .sort({ startDate: 1 })
+      .exec();
+    if (!queued) return null;
+
+    const activated = await this.subscriptionModel
+      .findOneAndUpdate(
+        {
+          _id: queued._id,
+          isActive: false,
+          startDate: { $lte: now },
+          expiryDate: { $gt: now },
+        },
+        { $set: { isActive: true } },
+        { returnDocument: 'after' },
+      )
+      .exec();
+    if (activated) return activated;
+
+    // Another request may have activated this term concurrently.
+    return this.subscriptionModel
+      .findOne({
+        userId,
+        isActive: true,
+        startDate: { $lte: now },
+        expiryDate: { $gt: now },
+      })
+      .sort({ startDate: -1 })
+      .exec();
+  }
+
+  private async latestQueuedExpiry(
+    userId: string,
+    baseDate: Date,
+  ): Promise<Date> {
+    const now = new Date();
+    const queued = await this.subscriptionModel
+      .findOne({
+        userId,
+        isActive: false,
+        startDate: { $gte: baseDate },
+        expiryDate: { $gt: now },
+      })
+      .sort({ expiryDate: -1 })
+      .select({ expiryDate: 1 })
+      .lean()
+      .exec();
+    return queued?.expiryDate && queued.expiryDate > baseDate
+      ? new Date(queued.expiryDate)
+      : baseDate;
   }
 
   // =====================================
@@ -45,217 +118,91 @@ export class SubscriptionsService {
   async createSubscription(data: {
     userId: string;
     email: string;
-    plan: 'regular' | 'vip';
+    plan: PaidPlanType;
     amount: number;
     durationDays: number;
   }) {
-    const now = new Date();
-
-    const existing = await this.getActiveSubscription(data.userId);
-
-    // =====================================
-    // NO ACTIVE SUBSCRIPTION
-    // =====================================
-    if (!existing) {
-      const startDate = now;
-
-      const expiryDate = this.addDays(startDate, data.durationDays);
-
-      return this.subscriptionModel.create({
-        userId: data.userId,
-        email: data.email,
-        plan: data.plan,
-        amount: data.amount,
-        startDate,
-        expiryDate,
-        isActive: true,
-        expiringReminderSent: false,
-        expiredNotificationSent: false,
-      });
-    }
-
-    // =====================================
-    // SAME PLAN
-    //
-    // Extend from current expiry date.
-    //
-    // Regular -> Regular
-    // VIP -> VIP
-    // =====================================
-    if (existing.plan === data.plan) {
-      const startDate = existing.expiryDate;
-
-      const expiryDate = this.addDays(startDate, data.durationDays);
-
-      return this.subscriptionModel.create({
-        userId: data.userId,
-        email: data.email,
-        plan: data.plan,
-        amount: data.amount,
-        startDate,
-        expiryDate,
-        isActive: false,
-        expiringReminderSent: false,
-        expiredNotificationSent: false,
-      });
-    }
-
-    // =====================================
-    // DIFFERENT PLAN
-    //
-    // Current plan remains active.
-    // New plan starts after current plan expires.
-    //
-    // Regular -> VIP
-    // VIP -> Regular
-    // =====================================
-    const startDate = existing.expiryDate;
-
-    const expiryDate = this.addDays(startDate, data.durationDays);
-
-    return this.subscriptionModel.create({
-      userId: data.userId,
-      email: data.email,
-      plan: data.plan,
-      amount: data.amount,
-      startDate,
-      expiryDate,
-      isActive: false,
-      expiringReminderSent: false,
-      expiredNotificationSent: false,
-    });
+    return this.activatePlan(data);
   }
 
   // =====================================
-  // CALCULATE VIP UPGRADE PRICE
+  // CALCULATE PLAN UPGRADE PRICE
   // =====================================
+  async calculatePlanUpgradePrice(
+    userId: string,
+    prices: { regular: number; vip: number; premium: number },
+    targetPlan: Exclude<PaidPlanType, 'regular'>,
+    _subscriptionDurationDays: number,
+    currency: 'NGN' | 'USD',
+  ) {
+    const subscription = await this.getActiveSubscription(userId);
+    const durationDays = PAID_SUBSCRIPTION_DURATION_DAYS;
+    const currentPlan: PlanType = subscription?.plan ?? 'free';
+    const planRank: Record<PaidPlanType, number> = {
+      regular: 1,
+      vip: 2,
+      premium: 3,
+    };
+    const targetPrice = prices[targetPlan];
+    const currentPrice = subscription ? prices[subscription.plan] : 0;
+    const millisecondsRemaining = subscription
+      ? Math.max(0, subscription.expiryDate.getTime() - Date.now())
+      : 0;
+    const daysRemaining = Math.min(
+      durationDays,
+      Math.ceil(millisecondsRemaining / (1000 * 60 * 60 * 24)),
+    );
+    const currentDailyPrice = currentPrice / durationDays;
+    const targetDailyPrice = targetPrice / durationDays;
+    const credit =
+      subscription && currentPlan !== 'free'
+        ? currentDailyPrice * daysRemaining
+        : 0;
+    const amount = Math.round(Math.max(0, targetPrice - credit) * 100) / 100;
+    const canUpgrade = Boolean(
+      subscription && planRank[subscription.plan] < planRank[targetPlan],
+    );
+
+    return {
+      currentPlan,
+      targetPlan,
+      currency,
+      regularPrice: prices.regular,
+      vipPrice: prices.vip,
+      premiumPrice: prices.premium,
+      subscriptionDurationDays: durationDays,
+      daysRemaining,
+      regularDailyPrice: prices.regular / durationDays,
+      vipDailyPrice: prices.vip / durationDays,
+      premiumDailyPrice: prices.premium / durationDays,
+      currentDailyPrice,
+      targetDailyPrice,
+      upgradeDailyPrice: targetDailyPrice - currentDailyPrice,
+      credit: Math.round(credit * 100) / 100,
+      upgradeCost: amount,
+      amount,
+      canUpgrade,
+    };
+  }
+
+  // Backwards-compatible VIP upgrade quote for existing callers.
   async calculateUpgradePrice(
     userId: string,
     regularPrice: number,
     vipPrice: number,
     subscriptionDurationDays: number,
     currency: 'NGN' | 'USD',
+    premiumPrice = 0,
   ) {
-    const subscription = await this.getActiveSubscription(userId);
-
-    // =====================================
-    // NO SUBSCRIPTION
-    // =====================================
-    if (!subscription) {
-      return {
-        currentPlan: 'free',
-
-        currency,
-
-        regularPrice,
-
-        vipPrice,
-
-        subscriptionDurationDays,
-
-        daysRemaining: 0,
-
-        regularDailyPrice: 0,
-
-        vipDailyPrice: 0,
-
-        upgradeDailyPrice: 0,
-
-        credit: 0,
-
-        upgradeCost: vipPrice,
-
-        amount: vipPrice,
-
-        canUpgrade: false,
-      };
-    }
-
-    // =====================================
-    // ALREADY VIP
-    // =====================================
-    if (subscription.plan === 'vip') {
-      return {
-        currentPlan: 'vip',
-
-        currency,
-
-        regularPrice,
-
-        vipPrice,
-
-        subscriptionDurationDays,
-
-        daysRemaining: 0,
-
-        regularDailyPrice: 0,
-
-        vipDailyPrice: 0,
-
-        upgradeDailyPrice: 0,
-
-        credit: 0,
-
-        upgradeCost: 0,
-
-        amount: 0,
-
-        canUpgrade: false,
-      };
-    }
-
-    const now = new Date();
-
-    const millisecondsRemaining =
-      subscription.expiryDate.getTime() - now.getTime();
-
-    const daysRemaining = Math.max(
-      0,
-      Math.ceil(millisecondsRemaining / (1000 * 60 * 60 * 24)),
-    );
-
-    // Daily values in the selected currency
-    const regularDailyPrice = regularPrice / subscriptionDurationDays;
-
-    const vipDailyPrice = vipPrice / subscriptionDurationDays;
-
-    // Difference per remaining day
-    const upgradeDailyPrice = vipDailyPrice - regularDailyPrice;
-
-    // Credit for unused Regular subscription
-    const credit = regularDailyPrice * daysRemaining;
-
-    // Final amount to pay
-    const amount = Math.max(0, vipPrice - credit);
-
-    return {
-      currentPlan: subscription.plan,
-
-      currency,
-
-      regularPrice,
-
-      vipPrice,
-
+    return this.calculatePlanUpgradePrice(
+      userId,
+      { regular: regularPrice, vip: vipPrice, premium: premiumPrice },
+      'vip',
       subscriptionDurationDays,
-
-      daysRemaining,
-
-      regularDailyPrice,
-
-      vipDailyPrice,
-
-      upgradeDailyPrice,
-
-      credit,
-
-      upgradeCost: amount,
-
-      amount,
-
-      canUpgrade: subscription.plan === 'regular',
-    };
+      currency,
+    );
   }
+
   // =====================================
   // ACTIVATE PLAN
   //
@@ -263,23 +210,60 @@ export class SubscriptionsService {
   //
   // Free -> Regular      = activate now
   // Free -> VIP          = activate now
+  // Free -> Premium      = activate now
   //
   // Regular -> Regular   = extend
   // VIP -> VIP           = extend
+  // Premium -> Premium   = extend
   //
   // VIP -> Regular       = queue after expiry
   //
-  // Regular -> VIP       = activate immediately
+  // Regular/VIP -> higher paid tier = activate immediately
   //                        (current regular ends now)
   // =====================================
-  async activatePlan(data: {
+  activatePlan(data: {
     userId: string;
     email: string;
-    plan: 'regular' | 'vip';
+    plan: PaidPlanType;
     amount: number;
     durationDays: number;
+    sourceReference?: string;
+  }) {
+    return this.systemMonitor.trackOperation(
+      'subscriptions',
+      'subscriptions.service',
+      'activate-plan',
+      () => this.activatePlanInternal(data),
+      {
+        logSuccess: true,
+        referenceKey: data.sourceReference,
+        isExpectedFailure: (error) => {
+          const status = typeof (error as any)?.getStatus === 'function'
+            ? Number((error as any).getStatus())
+            : 500;
+          return status >= 400 && status < 500;
+        },
+      },
+    );
+  }
+
+  private async activatePlanInternal(data: {
+    userId: string;
+    email: string;
+    plan: PaidPlanType;
+    amount: number;
+    durationDays: number;
+    sourceReference?: string;
   }) {
     const now = new Date();
+    const durationDays = PAID_SUBSCRIPTION_DURATION_DAYS;
+
+    if (data.sourceReference) {
+      const existingGrant = await this.subscriptionModel
+        .findOne({ sourceReference: data.sourceReference })
+        .exec();
+      if (existingGrant) return existingGrant;
+    }
 
     const existing = await this.getActiveSubscription(data.userId);
 
@@ -287,7 +271,7 @@ export class SubscriptionsService {
     // NO ACTIVE SUBSCRIPTION
     // =====================================
     if (!existing) {
-      return this.subscriptionModel.create({
+      return this.createIdempotentSubscription({
         userId: data.userId,
         email: data.email,
 
@@ -295,113 +279,189 @@ export class SubscriptionsService {
         amount: data.amount,
 
         startDate: now,
-        expiryDate: this.addDays(now, data.durationDays),
+        expiryDate: this.addDays(now, durationDays),
 
         isActive: true,
+        ...(data.sourceReference
+          ? { sourceReference: data.sourceReference }
+          : {}),
 
         expiringReminderSent: false,
         expiredNotificationSent: false,
       });
     }
 
-    // =====================================
-    // SAME PLAN
-    //
-    // Extend subscription
-    // =====================================
+    // Same-plan purchases extend the current term. A higher tier upgrades
+    // immediately; a lower tier is queued to begin after the current term.
+    const planRank: Record<PaidPlanType, number> = {
+      regular: 1,
+      vip: 2,
+      premium: 3,
+    };
+
     if (existing.plan === data.plan) {
-      return this.subscriptionModel.create({
+      const startDate = await this.latestQueuedExpiry(
+        data.userId,
+        existing.expiryDate,
+      );
+      return this.createIdempotentSubscription({
         userId: data.userId,
         email: data.email,
-
         plan: data.plan,
         amount: data.amount,
-
-        startDate: existing.expiryDate,
-        expiryDate: this.addDays(existing.expiryDate, data.durationDays),
-
+        startDate,
+        expiryDate: this.addDays(startDate, durationDays),
         isActive: false,
-
+        ...(data.sourceReference
+          ? { sourceReference: data.sourceReference }
+          : {}),
         expiringReminderSent: false,
         expiredNotificationSent: false,
       });
     }
 
-    // =====================================
-    // REGULAR -> VIP
-    //
-    // Upgrade immediately.
-    //
-    // End current subscription now.
-    // VIP starts immediately.
-    // =====================================
-    if (existing.plan === 'regular' && data.plan === 'vip') {
+    if (planRank[data.plan] > planRank[existing.plan]) {
+      const upgradedSubscription = await this.createIdempotentSubscription({
+        userId: data.userId,
+        email: data.email,
+        plan: data.plan,
+        amount: data.amount,
+        startDate: now,
+        expiryDate: this.addDays(now, durationDays),
+        isActive: true,
+        ...(data.sourceReference
+          ? { sourceReference: data.sourceReference }
+          : {}),
+        expiringReminderSent: false,
+        expiredNotificationSent: false,
+      });
       existing.expiryDate = now;
       existing.isActive = false;
-
       await existing.save();
-
-      return this.subscriptionModel.create({
-        userId: data.userId,
-        email: data.email,
-
-        plan: 'vip',
-        amount: data.amount,
-
-        startDate: now,
-        expiryDate: this.addDays(now, data.durationDays),
-
-        isActive: true,
-
-        expiringReminderSent: false,
-        expiredNotificationSent: false,
-      });
+      return upgradedSubscription;
     }
 
-    // =====================================
-    // VIP -> REGULAR
-    //
-    // Never downgrade immediately.
-    //
-    // Queue Regular subscription
-    // after VIP expires.
-    // =====================================
-    return this.subscriptionModel.create({
+    const startDate = await this.latestQueuedExpiry(
+      data.userId,
+      existing.expiryDate,
+    );
+    return this.createIdempotentSubscription({
       userId: data.userId,
       email: data.email,
-
-      plan: 'regular',
+      plan: data.plan,
       amount: data.amount,
-
-      startDate: existing.expiryDate,
-      expiryDate: this.addDays(existing.expiryDate, data.durationDays),
-
+      startDate,
+      expiryDate: this.addDays(startDate, durationDays),
       isActive: false,
-
+      ...(data.sourceReference
+        ? { sourceReference: data.sourceReference }
+        : {}),
       expiringReminderSent: false,
       expiredNotificationSent: false,
     });
   }
 
+  private async createIdempotentSubscription(data: {
+    userId: string;
+    email: string;
+    plan: PaidPlanType;
+    amount: number;
+    startDate: Date;
+    expiryDate: Date;
+    isActive: boolean;
+    sourceReference?: string;
+    expiringReminderSent: boolean;
+    expiredNotificationSent: boolean;
+  }) {
+    try {
+      return await this.subscriptionModel.create(data);
+    } catch (error) {
+      if (data.sourceReference && this.isDuplicateKey(error)) {
+        const existing = await this.subscriptionModel
+          .findOne({ sourceReference: data.sourceReference })
+          .exec();
+        if (existing) return existing;
+      }
+      throw error;
+    }
+  }
+
+  private isDuplicateKey(error: unknown): boolean {
+    return Boolean(
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: unknown }).code === 11000,
+    );
+  }
+
   // =====================================
   // USER PLAN CHECK
   // =====================================
-  async getUserPlan(userId: string): Promise<'free' | 'regular' | 'vip'> {
-    const sub = await this.getActiveSubscription(userId);
+  async getActiveSubscriptionBonus(userId: string): Promise<{
+    plan: PaidPlanType;
+    startsAt: Date;
+    expiresAt: Date;
+  } | null> {
+    const now = new Date();
+    const commonFilter = {
+      userId,
+      type: BonusType.SUBSCRIPTION,
+      status: BonusStatus.GRANTED,
+      startsAt: { $lte: now },
+      expiresAt: { $gt: now },
+    };
 
-    if (!sub) return 'free';
-    if (sub.plan === 'vip') return 'vip';
+    // At most three indexed existence lookups. Avoid loading every active
+    // bonus for an account just to determine its effective subscription tier.
+    for (const plan of ['premium', 'vip', 'regular'] as const) {
+      const grant = await this.bonusGrantModel
+        .findOne({ ...commonFilter, plan })
+        .sort({ expiresAt: -1 })
+        .select({ plan: 1, startsAt: 1, expiresAt: 1 })
+        .lean()
+        .exec();
+      if (grant?.plan && grant.expiresAt) {
+        // Bonus subscription entitlements are recorded immediately, including
+        // for unverified accounts, but they cannot become effective until the
+        // account verifies its current email address.
+        const user = await this.usersService.findById(userId);
+        if (!user?.isVerified) return null;
+        return {
+          plan: grant.plan,
+          startsAt: new Date(grant.startsAt),
+          expiresAt: new Date(grant.expiresAt),
+        };
+      }
+    }
+    return null;
+  }
 
-    return 'regular';
+  async getUserPlan(userId: string): Promise<PlanType> {
+    const [subscription, bonus] = await Promise.all([
+      this.getActiveSubscription(userId),
+      this.getActiveSubscriptionBonus(userId),
+    ]);
+    const rank: Record<PlanType, number> = {
+      free: 0,
+      regular: 1,
+      vip: 2,
+      premium: 3,
+    };
+    const paidPlan: PlanType = subscription?.plan ?? 'free';
+    if (bonus && rank[bonus.plan] > rank[paidPlan]) return bonus.plan;
+    return paidPlan;
   }
 
   // =====================================
   // VIP CHECK
   // =====================================
   async isVip(userId: string) {
-    const sub = await this.getActiveSubscription(userId);
+    return (await this.getUserPlan(userId)) === 'vip';
+  }
 
-    return !!sub && sub.plan === 'vip';
+  async isPremium(userId: string) {
+    return (await this.getUserPlan(userId)) === 'premium';
   }
 
   // =====================================
@@ -441,19 +501,23 @@ export class SubscriptionsService {
       });
 
     if (!subscription) {
+      const lastExpiredSubscription = await this.subscriptionModel
+        .findOne({
+          userId,
+          startDate: { $lte: now },
+          expiryDate: { $lte: now },
+        })
+        .sort({ expiryDate: -1 });
+
       return {
         hasSubscription: false,
-
         currentPlan: 'free',
-
-        status: 'inactive',
-
+        status: lastExpiredSubscription ? 'expired' : 'free',
         subscription: null,
-
         daysRemaining: 0,
-
-        expired: true,
-
+        // Free access does not expire. This flag only describes a previous
+        // paid subscription, not the user's current Free plan.
+        expired: Boolean(lastExpiredSubscription),
         pendingSubscription,
       };
     }
@@ -486,6 +550,63 @@ export class SubscriptionsService {
   // =====================================
   // GET VIP USERS
   // =====================================
+  // Admin profile history: bounded, paginated subscription records.
+  async getUserSubscriptionHistory(
+    userId: string,
+    pageValue = 1,
+    limitValue = 10,
+  ) {
+    const page = Math.max(1, Math.floor(Number(pageValue) || 1));
+    const limit = Math.min(
+      100,
+      Math.max(1, Math.floor(Number(limitValue) || 10)),
+    );
+    const filter = { userId };
+    const [items, total] = await Promise.all([
+      this.subscriptionModel
+        .find(filter)
+        .sort({ startDate: -1, createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean()
+        .exec(),
+      this.subscriptionModel.countDocuments(filter).exec(),
+    ]);
+    return {
+      items,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    };
+  }
+
+  // Resolve account IDs for the admin directory's membership filter.
+  // Free means no currently active paid subscription, not an expired subscription.
+  async getUserIdFilterForPlan(
+    plan: string,
+  ): Promise<{ includeUserIds?: string[]; excludeUserIds?: string[] }> {
+    const now = new Date();
+    const activeFilter = {
+      isActive: true,
+      startDate: { $lte: now },
+      expiryDate: { $gt: now },
+    };
+    if (plan !== 'free') {
+      const active = await this.subscriptionModel
+        .find({ ...activeFilter, plan: plan as PaidPlanType })
+        .select({ userId: 1 })
+        .lean()
+        .exec();
+      const ids = active.map((item) => String(item.userId));
+      return { includeUserIds: [...new Set<string>(ids)] };
+    }
+    const active = await this.subscriptionModel
+      .find(activeFilter)
+      .select({ userId: 1 })
+      .lean()
+      .exec();
+    const ids = active.map((item) => String(item.userId));
+    return { excludeUserIds: [...new Set<string>(ids)] };
+  }
+
   async getVipUsers() {
     const now = new Date();
 
@@ -499,6 +620,16 @@ export class SubscriptionsService {
       expiryDate: {
         $gt: now,
       },
+    });
+  }
+
+  async getPremiumUsers() {
+    const now = new Date();
+
+    return this.subscriptionModel.find({
+      plan: 'premium',
+      startDate: { $lte: now },
+      expiryDate: { $gt: now },
     });
   }
 
@@ -556,7 +687,7 @@ export class SubscriptionsService {
   // =====================================
   // SEND EXPIRING EMAIL
   // =====================================
-  async sendExpiringEmail(subscription: any) {
+  async sendExpiringEmail(subscription: SubscriptionDocument) {
     await this.emailService.sendSubscriptionExpiringEmail({
       email: subscription.email,
 
@@ -575,7 +706,7 @@ export class SubscriptionsService {
   // =====================================
   // SEND EXPIRED EMAIL
   // =====================================
-  async sendExpiredEmail(subscription: any) {
+  async sendExpiredEmail(subscription: SubscriptionDocument) {
     await this.emailService.sendSubscriptionExpiredEmail({
       email: subscription.email,
 
@@ -591,3 +722,4 @@ export class SubscriptionsService {
     await subscription.save();
   }
 }
+

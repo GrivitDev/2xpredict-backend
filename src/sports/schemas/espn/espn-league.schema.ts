@@ -140,6 +140,28 @@ export class EspnLeague {
     index: true,
   })
   detailLastSyncedAt?: Date;
+
+  /** The current season whose complete fixture catalogue was collected. */
+  @Prop({ type: Number, index: true })
+  fixturesCollectedSeason?: number;
+
+  /** Season and timestamp of the last successfully completed but empty catalogue attempt. */
+  @Prop({ type: Number, index: true })
+  fixtureCollectionAttemptSeason?: number;
+
+  @Prop({ type: Date, index: true })
+  fixtureCollectionAttemptedAt?: Date;
+
+  /** Prior season retained until its ended-season data can be safely cleaned. */
+  @Prop({ type: Number, index: true })
+  previousSeason?: number;
+
+  @Prop({ type: Date })
+  previousSeasonEndDate?: Date;
+
+  /** Last ended season cleaned for this ESPN league. */
+  @Prop({ type: Number, index: true })
+  lastCleanedSeason?: number;
 }
 
 export const EspnLeagueSchema = SchemaFactory.createForClass(EspnLeague);

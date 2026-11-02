@@ -1,4 +1,6 @@
 import { Module } from '@nestjs/common';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
 import { MongooseModule } from '@nestjs/mongoose';
 
@@ -23,8 +25,13 @@ import { UploadsModule } from '../uploads/uploads.module';
 
   controllers: [InternalAdsController],
 
-  providers: [InternalAdsService],
+  providers: [
+    InternalAdsService,
+    JwtAuthGuard,
+    RolesGuard,
+  ],
 
   exports: [InternalAdsService],
 })
 export class InternalAdsModule {}
+

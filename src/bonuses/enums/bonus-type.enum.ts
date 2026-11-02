@@ -1,0 +1,4 @@
+export enum BonusType {
+  BET_LAB_POINTS = 'BET_LAB_POINTS',
+  SUBSCRIPTION = 'SUBSCRIPTION',
+}

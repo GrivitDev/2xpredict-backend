@@ -1,18 +1,28 @@
+import {
+  IsBoolean,
+  IsEnum,
+  IsInt,
+  IsObject,
+  IsOptional,
+  Max,
+  Min,
+} from 'class-validator';
+import { AdType } from '../enums/ad-type.enum';
 import { ExternalAdFrequency } from '../enums/external-ad-frequency.enum';
 
 export class ExternalAdPolicyDto {
-  enabled: boolean = true;
-
-  frequency: ExternalAdFrequency = ExternalAdFrequency.NORMAL;
-
-  aggressive: boolean = true;
-
-  // Seconds before external ads may refresh (0 = never)
-  refreshInterval: number = 60;
-
-  allowPopup: boolean = true;
-
-  allowInterstitial: boolean = true;
-
-  allowRewarded: boolean = true;
+  @IsOptional() @IsBoolean() enabled?: boolean;
+  @IsOptional() @IsObject() audiences?: Record<string, boolean>;
+  @IsOptional() @IsEnum(ExternalAdFrequency) frequency?: ExternalAdFrequency;
+  @IsOptional() @IsInt() @Min(0) @Max(3600) refreshIntervalSeconds?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(20) maxImpressionsPerSession?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(100) maxImpressionsPerDay?: number;
+  @IsOptional() @IsObject() allowedTypes?: Partial<Record<AdType, boolean>>;
+  @IsOptional() @IsBoolean() allowBanner?: boolean;
+  @IsOptional() @IsBoolean() allowNative?: boolean;
+  @IsOptional() @IsBoolean() allowInterstitial?: boolean;
+  @IsOptional() @IsBoolean() allowPopup?: boolean;
+  @IsOptional() @IsBoolean() allowRewarded?: boolean;
+  @IsOptional() @IsBoolean() allowSticky?: boolean;
+  @IsOptional() @IsBoolean() allowVideo?: boolean;
 }

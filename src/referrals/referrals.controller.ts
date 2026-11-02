@@ -3,6 +3,7 @@ import { Controller, Get, Req, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 
 import { ReferralsService } from './referrals.service';
+import { ReferralsMonitorService } from './referrals-monitor.service';
 
 import { UsersService } from '../users/users.service';
 
@@ -16,6 +17,7 @@ export class ReferralsController {
     private readonly referralsService: ReferralsService,
 
     private readonly usersService: UsersService,
+    private readonly monitor: ReferralsMonitorService,
   ) {}
 
   // =====================================
@@ -75,8 +77,8 @@ export class ReferralsController {
       (referral) => referral.vipSubscription,
     ).length;
 
-    const predictions = referrals.filter(
-      (referral) => referral.predictionPurchased,
+    const premiumSubscribers = referrals.filter(
+      (referral) => referral.premiumSubscription,
     ).length;
 
     return {
@@ -88,7 +90,7 @@ export class ReferralsController {
 
       vipSubscribers,
 
-      predictionPurchases: predictions,
+      premiumSubscribers,
     };
   }
 
@@ -112,6 +114,13 @@ export class ReferralsController {
   @Roles('admin')
   async getAdminReferralStats() {
     return this.referralsService.getAdminReferralStats();
+  }
+
+  @Get('admin/monitor')
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles('admin')
+  getModuleMonitor() {
+    return this.monitor.getOverview();
   }
 
   // =====================================

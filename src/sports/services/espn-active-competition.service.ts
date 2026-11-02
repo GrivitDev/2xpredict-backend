@@ -2,16 +2,21 @@
 
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { AnyBulkWriteOperation, Model } from 'mongoose';
 
 import {
   EspnLeague,
   EspnLeagueDocument,
 } from '../schemas/espn/espn-league.schema';
+import {
+  EspnFixture,
+  EspnFixtureDocument,
+} from '../schemas/espn/espn-fixture.schema';
 
 import { EspnService } from '../providers/espn.service';
 import { ActiveCompetitionService } from './active-competition.service';
 import { PriorityCompetitionService } from './priority-competition.service';
+import { EspnSeasonDataService } from './espn-season-data.service';
 
 import { CompetitionPriority } from '../enums/competition-priority.enum';
 import { CompetitionRegion } from '../enums/competition-region.enum';
@@ -40,8 +45,13 @@ export class EspnActiveCompetitionService {
 
     private readonly priorityCompetitionService: PriorityCompetitionService,
 
+    private readonly espnSeasonDataService: EspnSeasonDataService,
+
     @InjectModel(EspnLeague.name)
     private readonly espnLeagueModel: Model<EspnLeagueDocument>,
+
+    @InjectModel(EspnFixture.name)
+    private readonly espnFixtureModel: Model<EspnFixtureDocument>,
   ) {}
 
   // ============================================================
@@ -59,10 +69,13 @@ export class EspnActiveCompetitionService {
 
     const operations = leagues
       .map((league) => this.buildCatalogueOperation(league, now))
-      .filter(Boolean);
+      .filter(
+        (operation): operation is AnyBulkWriteOperation<EspnLeagueDocument> =>
+          operation !== null,
+      );
 
     if (operations.length > 0) {
-      await this.espnLeagueModel.bulkWrite(operations as any[], {
+      await this.espnLeagueModel.bulkWrite(operations, {
         ordered: false,
       });
     }
@@ -304,6 +317,57 @@ export class EspnActiveCompetitionService {
 
     const now = new Date();
 
+    // Clean an ended season before replacing its current-season metadata.
+    let previousSeasonCleaned = false;
+    if (
+      typeof league.previousSeason === 'number' &&
+      league.previousSeason !== league.season &&
+      league.previousSeasonEndDate
+    ) {
+      const previousCleanup =
+        await this.espnSeasonDataService.cleanupLeagueSeason({
+          leagueId: canonicalLeagueId,
+          season: league.previousSeason,
+          seasonEndDate: new Date(league.previousSeasonEndDate),
+        });
+      previousSeasonCleaned = previousCleanup.cleaned;
+    }
+
+    let currentSeasonCleaned = false;
+    if (typeof league.season === 'number' && league.seasonEndDate) {
+      const currentCleanup =
+        await this.espnSeasonDataService.cleanupLeagueSeason({
+          leagueId: canonicalLeagueId,
+          season: league.season,
+          seasonEndDate: new Date(league.seasonEndDate),
+        });
+      currentSeasonCleaned = currentCleanup.cleaned;
+    }
+
+    const seasonChanged =
+      typeof league.season === 'number' &&
+      typeof season?.season === 'number' &&
+      league.season !== season.season;
+    const previousSeasonStillPending =
+      typeof league.previousSeason === 'number' &&
+      Boolean(league.previousSeasonEndDate) &&
+      league.lastCleanedSeason !== league.previousSeason &&
+      !previousSeasonCleaned;
+    const currentSeasonStillNeedsCleanup =
+      typeof league.season === 'number' &&
+      league.lastCleanedSeason !== league.season &&
+      !currentSeasonCleaned;
+
+    if (seasonChanged && previousSeasonStillPending) {
+      this.logger.warn(
+        `Deferring ESPN season switch for ${canonicalLeagueId}: previous season ${league.previousSeason} cleanup is still pending`,
+      );
+      return {
+        isActive: league.isActive,
+        season: league.season,
+      };
+    }
+
     const isActive = season
       ? this.isSeasonActive(season.startDate, season.endDate, now)
       : false;
@@ -320,6 +384,16 @@ export class EspnActiveCompetitionService {
       payload: detail,
       detailLastSyncedAt: now,
     };
+
+    if (
+      seasonChanged &&
+      currentSeasonStillNeedsCleanup &&
+      !previousSeasonStillPending &&
+      league.seasonEndDate
+    ) {
+      update.previousSeason = league.season;
+      update.previousSeasonEndDate = league.seasonEndDate;
+    }
 
     if (season) {
       update.season = season.season;
@@ -373,6 +447,77 @@ export class EspnActiveCompetitionService {
       isActive,
       season: season.season,
     };
+  }
+
+  // ============================================================
+  // SEASON FIXTURE-CATALOGUE STATE
+  // ============================================================
+
+  async markSeasonFixturesCollected(
+    leagueId: string,
+    season: number,
+  ): Promise<boolean> {
+    const normalizedLeagueId = this.normalizeLeagueId(leagueId);
+    if (!normalizedLeagueId || !Number.isInteger(season)) {
+      throw new Error(
+        'Season fixture completion requires a valid league ID and season',
+      );
+    }
+
+    const fixtureCount = await this.espnFixtureModel.countDocuments({
+      leagueId: normalizedLeagueId,
+      season,
+    });
+
+    if (fixtureCount === 0) {
+      await this.espnLeagueModel
+        .updateOne(
+          {
+            season,
+            $or: [
+              { leagueId: normalizedLeagueId },
+              { slug: normalizedLeagueId },
+            ],
+          },
+          {
+            $unset: { fixturesCollectedSeason: 1 },
+            $set: {
+              fixtureCollectionAttemptSeason: season,
+              fixtureCollectionAttemptedAt: new Date(),
+            },
+          },
+        )
+        .exec();
+
+      this.logger.warn(
+        `ESPN fixture catalogue remains incomplete for ${normalizedLeagueId}/${season}: no fixture documents are stored yet`,
+      );
+      return false;
+    }
+
+    const result = await this.espnLeagueModel
+      .updateOne(
+        {
+          season,
+          $or: [{ leagueId: normalizedLeagueId }, { slug: normalizedLeagueId }],
+        },
+        {
+          $set: { fixturesCollectedSeason: season },
+          $unset: {
+            fixtureCollectionAttemptSeason: 1,
+            fixtureCollectionAttemptedAt: 1,
+          },
+        },
+      )
+      .exec();
+
+    if (result.matchedCount === 0) {
+      throw new Error(
+        `Cannot mark fixture catalogue complete for ${normalizedLeagueId}/${season}: league record not found`,
+      );
+    }
+
+    return true;
   }
 
   // ============================================================
@@ -501,7 +646,7 @@ export class EspnActiveCompetitionService {
   private buildCatalogueOperation(
     league: EspnLeaguePayload,
     now: Date,
-  ): Record<string, unknown> | null {
+  ): AnyBulkWriteOperation<EspnLeagueDocument> | null {
     const leagueId =
       this.normalizeLeagueId(league.id) || this.normalizeLeagueId(league.slug);
 
@@ -602,19 +747,37 @@ export class EspnActiveCompetitionService {
     endDate?: Date,
     now = new Date(),
   ): boolean {
-    if (!startDate) {
+    if (!(startDate instanceof Date) || Number.isNaN(startDate.getTime())) {
       return false;
     }
 
-    if (now.getTime() < startDate.getTime()) {
+    // ESPN season bounds are calendar dates; treat the end date as inclusive
+    // in Africa/Lagos instead of expiring seasons at midnight UTC.
+    const currentDateKey = this.getLagosDateKey(now);
+    if (currentDateKey < this.getLagosDateKey(startDate)) {
       return false;
     }
 
-    if (endDate && now.getTime() > endDate.getTime()) {
+    if (
+      endDate instanceof Date &&
+      !Number.isNaN(endDate.getTime()) &&
+      currentDateKey > this.getLagosDateKey(endDate)
+    ) {
       return false;
     }
 
     return true;
+  }
+
+  private getLagosDateKey(date: Date): string {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Africa/Lagos',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const values = new Map(parts.map((part) => [part.type, part.value]));
+    return `${values.get('year')}-${values.get('month')}-${values.get('day')}`;
   }
 
   // ============================================================
@@ -661,9 +824,9 @@ export class EspnActiveCompetitionService {
     }
   }
 
-  private sortLeaguesByPriority<T extends Record<string, any>>(
-    leagues: T[],
-  ): T[] {
+  private sortLeaguesByPriority<
+    T extends { isActive?: unknown; name?: unknown; priority?: unknown },
+  >(leagues: T[]): T[] {
     return [...leagues].sort((a, b) => {
       const priorityA = this.getPriorityRank(this.getStoredPriority(a));
       const priorityB = this.getPriorityRank(this.getStoredPriority(b));
@@ -686,12 +849,14 @@ export class EspnActiveCompetitionService {
     });
   }
 
-  private getStoredPriority(league: Record<string, any>): CompetitionPriority {
-    if (Object.values(CompetitionPriority).includes(league.priority)) {
-      return league.priority as CompetitionPriority;
-    }
-
-    return CompetitionPriority.SELECTIVE;
+  private getStoredPriority(league: {
+    priority?: unknown;
+  }): CompetitionPriority {
+    return (
+      Object.values(CompetitionPriority).find(
+        (priority) => priority === league.priority,
+      ) ?? CompetitionPriority.SELECTIVE
+    );
   }
 
   // ============================================================
@@ -761,7 +926,24 @@ export class EspnActiveCompetitionService {
   }
 
   private normalizeLeagueId(value?: string): string {
-    return typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (typeof value !== 'string') {
+      return '';
+    }
+
+    const normalized = value.trim().toLowerCase();
+
+    /*
+     * ESPN's canonical slug for the UEFA Women's Nations League is
+     * `uefa.w.nations`. Some previously stored catalogue records may
+     * contain the malformed alias `uefa.wnations`, which ESPN rejects
+     * with HTTP 400. Normalize that legacy value before API requests,
+     * database updates, and active-competition synchronization.
+     */
+    if (normalized === 'uefa.wnations') {
+      return 'uefa.w.nations';
+    }
+
+    return normalized;
   }
 
   // ============================================================

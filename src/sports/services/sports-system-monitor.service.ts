@@ -1,6 +1,7 @@
 // backend/src/sports/services/sports-system-monitor.service.ts
 
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { AdminGateway } from '../../realtime/admin.gateway';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
@@ -69,6 +70,9 @@ import {
 } from '../schemas/sports-provider-rate-limit.schema';
 
 import { SportsProviderRateLimitService } from './sports-provider-rate-limit.service';
+import { EspnQueueWorkerService } from './espn-queue-worker.service';
+
+import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 
 // ============================================================
 // YOUTUBE
@@ -137,6 +141,9 @@ import {
   MonitorUpcomingSummary,
   SportsSystemMonitorQuery,
   SportsSystemMonitorResponse,
+  SportsRuntimeMonitor,
+  SportsMonitorAlert,
+  SportsMonitorHealthStatus,
 } from '../interfaces/sports-system-monitor.interface';
 
 // ============================================================
@@ -155,9 +162,12 @@ interface FixtureAggregate {
   upcoming: number;
   live: number;
   finished: number;
+  finishedWithSummary: number;
   withSummary: number;
   missingSummary: number;
   finishedMissingSummary: number;
+  postMatchMissingFinalResult: number;
+  staleUpcomingStatus: number;
   summaryCoveragePercent: number;
   latestCollectedAt?: Date;
   latestSummaryCollectedAt?: Date;
@@ -167,6 +177,19 @@ interface FixtureAggregate {
 interface TeamAggregate {
   documents: number;
   teamIds: Set<string>;
+  latestCollectedAt?: Date;
+}
+
+interface StandingAggregate {
+  rows: number;
+  teamIds: Set<string>;
+  latestCollectedAt?: Date;
+}
+
+interface NewsAggregate {
+  total: number;
+  last24Hours: number;
+  latestPublishedAt?: Date;
   latestCollectedAt?: Date;
 }
 
@@ -188,6 +211,7 @@ interface SyncAggregate {
 
   unitProgress: {
     total: number;
+    monthUnits: number;
     success: number;
     processing: number;
     pending: number;
@@ -244,7 +268,8 @@ const QUEUE_COMPLETED_RETENTION_DAYS = 7;
 
 const STALE_PROCESSING_MINUTES = 5;
 
-const UPCOMING_WINDOW_DAYS = 4;
+const UPCOMING_WINDOW_HOURS =
+  SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.upcomingWindowHours;
 
 const STALE_ACTIVE_LEAGUE_HOURS = 48;
 
@@ -254,7 +279,8 @@ type ConfiguredSportsProvider = Parameters<
 
 const PROVIDER_CONFIG: Record<ConfiguredSportsProvider, ProviderConfig> = {
   espn: {
-    minIntervalSeconds: 2,
+    minIntervalSeconds:
+      SPORTS_DATA_COLLECTION_CONFIG.ESPN.rateLimit.minIntervalSeconds,
     dailyRequestLimit: null,
     monthlyRequestLimit: null,
   },
@@ -268,7 +294,7 @@ const PROVIDER_CONFIG: Record<ConfiguredSportsProvider, ProviderConfig> = {
   'odds-api': {
     minIntervalSeconds: 60,
     dailyRequestLimit: null,
-    monthlyRequestLimit: 500,
+    monthlyRequestLimit: 450,
   },
 
   youtube: {
@@ -282,8 +308,53 @@ const PROVIDER_CONFIG: Record<ConfiguredSportsProvider, ProviderConfig> = {
 // SERVICE
 // ============================================================
 
+type MonitorSyncUnitRecord = {
+  key: string;
+  type: string;
+  monthKey?: string;
+  dateKey?: string;
+  stepKey?: string;
+  status: SportsSyncUnitStatus;
+  startedAt?: Date;
+  completedAt?: Date;
+};
+
+type MonitorSyncStateRecord = {
+  stateKey: string;
+  kind: SportsSyncStateKind;
+  jobType?: string;
+  taskKey?: string;
+  cronExpression?: string;
+  timeZone?: string;
+  leagueId?: string;
+  season?: number;
+  eventId?: string;
+  status: SportsSyncStateStatus;
+  trackingMode?: string;
+  fixtureGranularity?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  lastStartedAt?: Date;
+  lastSuccessfulAt?: Date;
+  lastCompletedAt?: Date;
+  nextRunAt?: Date;
+  consecutiveFailures?: number;
+  lastError?: string;
+  updatedAt?: Date;
+  units: MonitorSyncUnitRecord[];
+};
+
 @Injectable()
-export class SportsSystemMonitorService {
+export class SportsSystemMonitorService implements OnModuleInit {
+  private readonly logger = new Logger(SportsSystemMonitorService.name);
+  private readonly monitorCache = new Map<
+    string,
+    { cachedAt: number; data: SportsSystemMonitorResponse }
+  >();
+  private readonly monitorRefreshes = new Map<string, Promise<void>>();
+  private readonly monitorRefreshErrors = new Map<string, string>();
+  private readonly monitorCacheTtlMs = 5 * 60_000;
+
   constructor(
     // ----------------------------------------------------------
     // ACTIVE COMPETITIONS
@@ -366,20 +437,258 @@ export class SportsSystemMonitorService {
 
     @InjectModel(SportsOddsSnapshot.name)
     private readonly sportsOddsSnapshotModel: Model<SportsOddsSnapshotDocument>,
+    private readonly adminGateway: AdminGateway,
+    private readonly espnQueueWorker: EspnQueueWorkerService,
   ) {}
+
+  onModuleInit(): void {
+    this.adminGateway.registerModule('sports', {
+      message: 'Sports monitor initialized; queue, collection and provider snapshots are streamed to admin clients.',
+      operationalStatus: 'UNKNOWN',
+    });
+  }
 
   // ============================================================
   // PUBLIC
   // ============================================================
 
-  async getSystemMonitor(
+  getSystemMonitor(
     query: SportsSystemMonitorQuery = {},
+  ): SportsSystemMonitorResponse {
+    const cacheKey = this.getMonitorCacheKey(query);
+    const cached = this.monitorCache.get(cacheKey);
+    const cacheAge = cached
+      ? Date.now() - cached.cachedAt
+      : Number.POSITIVE_INFINITY;
+
+    const previousError = this.monitorRefreshErrors.get(cacheKey);
+    const shouldStartRefresh =
+      query.forceRefresh ||
+      (cached
+        ? cacheAge >= this.monitorCacheTtlMs && !previousError
+        : !previousError);
+
+    if (shouldStartRefresh) {
+      this.startMonitorRefresh(cacheKey, query);
+    }
+
+    if (cached) {
+      return this.attachRuntimeHealth({
+        ...cached.data,
+        snapshotReady: true,
+        refreshing: this.monitorRefreshes.has(cacheKey),
+        snapshotError: this.monitorRefreshErrors.get(cacheKey),
+      });
+    }
+
+    return this.attachRuntimeHealth(this.createLoadingSnapshot(
+      query,
+      this.monitorRefreshErrors.get(cacheKey),
+      this.monitorRefreshes.has(cacheKey),
+    ));
+  }
+
+  private attachRuntimeHealth(snapshot: SportsSystemMonitorResponse): SportsSystemMonitorResponse {
+    const checkedAt = new Date().toISOString();
+    const worker = this.espnQueueWorker.getMonitorRuntimeStatus();
+    const alerts: SportsMonitorAlert[] = [];
+    const addAlert = (code: string, severity: SportsMonitorAlert['severity'], message: string, details?: Record<string, unknown>) => {
+      alerts.push({ code, severity, message, occurredAt: checkedAt, ...(details ? { details } : {}) });
+    };
+
+    if (snapshot.snapshotError) addAlert('MONITOR_SNAPSHOT_FAILED', 'CRITICAL', 'The sports monitor could not build its database snapshot.', { error: snapshot.snapshotError });
+    if (worker.queueReadFailures >= 3) addAlert('QUEUE_READ_FAILURES', 'CRITICAL', 'The ESPN worker has repeated failures reading its next queue wake-up.', { consecutiveFailures: worker.queueReadFailures });
+    else if (worker.queueReadFailures > 0) addAlert('QUEUE_READ_FAILURES', 'WARNING', 'The ESPN worker has a queue-read failure and is retrying.', { consecutiveFailures: worker.queueReadFailures });
+    if (worker.lastWatchdogError) addAlert('QUEUE_WATCHDOG_FAILED', 'WARNING', 'The last ESPN queue watchdog check failed.', { error: worker.lastWatchdogError });
+    if (worker.draining && (worker.activeJobAgeMs ?? 0) > 10 * 60_000) addAlert('QUEUE_JOB_LONG_RUNNING', 'WARNING', 'An ESPN queue job has been running for more than ten minutes.', { jobKey: worker.activeJobKey, jobType: worker.activeJobType, activeJobAgeMs: worker.activeJobAgeMs });
+    if (snapshot.queue.staleProcessing > 0) addAlert('STALE_PROCESSING_JOBS', 'CRITICAL', 'One or more ESPN queue jobs have remained in PROCESSING beyond the stale-job threshold.', { count: snapshot.queue.staleProcessing });
+    if (snapshot.queue.failed > 0 && snapshot.queue.latestFailureAt && Date.now() - new Date(snapshot.queue.latestFailureAt).getTime() < 24 * 60 * 60_000) addAlert('RECENT_QUEUE_FAILURES', 'WARNING', 'The ESPN queue contains failed jobs from the last 24 hours.', { failedJobs: snapshot.queue.failed, latestFailure: snapshot.queue.latestFailure, latestFailureAt: snapshot.queue.latestFailureAt });
+    for (const provider of snapshot.providers) {
+      if (provider.usage.remainingDailyRequests === 0 || provider.usage.remainingMonthlyRequests === 0) addAlert('PROVIDER_QUOTA_EXHAUSTED', 'WARNING', `${provider.provider} has exhausted a configured provider request allowance.`, { provider: provider.provider, remainingDailyRequests: provider.usage.remainingDailyRequests, remainingMonthlyRequests: provider.usage.remainingMonthlyRequests });
+      if (provider.usage.activeLocks > 0) addAlert('PROVIDER_ENDPOINT_LOCKED', 'INFO', `${provider.provider} has one or more endpoint rate-limit locks active.`, { provider: provider.provider, activeLocks: provider.usage.activeLocks });
+    }
+    if (snapshot.sync.failures.length > 0) addAlert('SYNC_STATE_FAILURES', 'WARNING', 'The sports sync ledger contains recent or unresolved failed operations.', { count: snapshot.sync.failures.length, failures: snapshot.sync.failures.slice(0, 5) as unknown as Record<string, unknown> });
+    if (snapshot.expectedWork.staleActiveLeagues > 0) addAlert('STALE_ACTIVE_COMPETITIONS', 'WARNING', 'Some active competitions have stale fixture collection.', { count: snapshot.expectedWork.staleActiveLeagues });
+    if (snapshot.expectedWork.upcomingFixturesMissingSummary > 0) addAlert('UPCOMING_SUMMARIES_MISSING', 'WARNING', 'Upcoming fixtures inside the Summary window are missing summary payloads.', { count: snapshot.expectedWork.upcomingFixturesMissingSummary });
+    if (snapshot.expectedWork.upcomingFixturesMissingOdds > 0) addAlert('UPCOMING_ODDS_MISSING', 'WARNING', 'Upcoming fixtures with Odds API support do not have a matching odds snapshot.', { count: snapshot.expectedWork.upcomingFixturesMissingOdds });
+    if (snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0) addAlert('POSTMATCH_RESULTS_MISSING', 'WARNING', 'Fixtures past the post-match checkpoint still lack a verified final result and both scores.', { count: snapshot.expectedWork.postMatchFixturesMissingFinalResult });
+    if (snapshot.expectedWork.staleUpcomingStatusFixtures > 0) addAlert('STALE_UPCOMING_FIXTURE_STATUS', 'WARNING', 'Fixtures past the post-match checkpoint still have a scheduled/upcoming root status.', { count: snapshot.expectedWork.staleUpcomingStatusFixtures });
+
+    const components: SportsRuntimeMonitor['components'] = {
+      ESPN_QUEUE: { status: worker.queueReadFailures >= 3 || snapshot.queue.staleProcessing > 0 ? 'CRITICAL' : worker.lastWatchdogError || snapshot.queue.failed > 0 ? 'DEGRADED' : worker.started ? 'HEALTHY' : 'UNKNOWN', message: worker.started ? (worker.draining ? 'Queue worker is processing work.' : 'Queue worker is running and waiting for due work.') : worker.waitingForStartupRelease ? 'Worker is initialized and waiting for the startup service to release normal queue work.' : 'Worker is not currently running.', metrics: { pending: snapshot.queue.pending, processing: snapshot.queue.processing, failed: snapshot.queue.failed, staleProcessing: snapshot.queue.staleProcessing, jobsSucceeded: worker.jobsSucceeded, jobsFailed: worker.jobsFailed } },
+      ESPN_FIXTURES: { status: snapshot.expectedWork.staleActiveLeagues > 0 || snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0 || snapshot.expectedWork.staleUpcomingStatusFixtures > 0 ? 'DEGRADED' : 'HEALTHY', message: snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0 || snapshot.expectedWork.staleUpcomingStatusFixtures > 0 ? 'Fixture coverage has unresolved post-match results or stale upcoming statuses.' : snapshot.expectedWork.staleActiveLeagues > 0 ? 'Some active competition fixture collections are stale.' : 'Fixture inventory, post-match results and active competition freshness checks completed.', metrics: { storedFixtures: snapshot.inventory.espnFixtures, staleActiveLeagues: snapshot.expectedWork.staleActiveLeagues, postMatchMissingFinalResult: snapshot.expectedWork.postMatchFixturesMissingFinalResult, staleUpcomingStatus: snapshot.expectedWork.staleUpcomingStatusFixtures } },
+      ESPN_SUMMARY: { status: snapshot.expectedWork.upcomingFixturesMissingSummary > 0 || snapshot.expectedWork.finishedFixturesMissingSummary > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Summary readiness is derived from fixture payload coverage and sync-state progress.', metrics: { upcomingMissing: snapshot.expectedWork.upcomingFixturesMissingSummary, finishedMissing: snapshot.expectedWork.finishedFixturesMissingSummary } },
+      ESPN_STANDINGS: { status: snapshot.expectedWork.standingsMissingTeams > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Standings coverage is measured against teams found in current-season fixtures; some competitions may not require standings.', metrics: { missingTeams: snapshot.expectedWork.standingsMissingTeams, storedRows: snapshot.inventory.espnStandings } },
+      YOUTUBE: { status: snapshot.providers.find((p) => p.provider === 'youtube')?.usage.remainingDailyRequests === 0 ? 'DEGRADED' : 'HEALTHY', message: 'YouTube queue and provider quota telemetry are available in the queue/provider sections.', metrics: { storedHighlights: snapshot.inventory.youtubeHighlights, pendingJobs: snapshot.queue.byType['YOUTUBE_HIGHLIGHT'] ?? 0, remainingDailyRequests: snapshot.providers.find((p) => p.provider === 'youtube')?.usage.remainingDailyRequests ?? null } },
+      FOOTBALL_DATA: { status: 'UNKNOWN', message: 'Football-Data integration is disabled by current collection configuration; inventory is retained for visibility.', metrics: { enabled: SPORTS_DATA_COLLECTION_CONFIG.FOOTBALL_DATA.enabled, storedMatches: snapshot.inventory.footballDataMatches } },
+      ODDS_API: { status: snapshot.expectedWork.upcomingFixturesMissingOdds > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Odds availability is checked against exact stored event IDs for competitions with configured Odds API mappings.', metrics: { storedOddsSnapshots: snapshot.inventory.sportsOddsSnapshots, missingUpcomingOdds: snapshot.expectedWork.upcomingFixturesMissingOdds } },
+      ACTIVE_COMPETITIONS: { status: snapshot.scope.activeCompetitions > 0 ? 'HEALTHY' : 'DEGRADED', message: snapshot.scope.activeCompetitions > 0 ? 'Active competition registry is populated.' : 'No active competitions are available to the monitor.', metrics: { active: snapshot.scope.activeCompetitions, catalogue: snapshot.scope.catalogueCompetitions } },
+      SYNC_LEDGER: { status: snapshot.sync.failures.length > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Sync health is based on persisted queue/cron states and their unit progress.', metrics: { states: snapshot.sync.totalStates, failures: snapshot.sync.failures.length, completionPercent: snapshot.sync.stateCompletionPercent } },
+    };
+
+    const critical = alerts.some((a) => a.severity === 'CRITICAL');
+    const warning = alerts.some((a) => a.severity === 'WARNING') || Object.values(components).some((c) => c.status === 'DEGRADED');
+    const status: SportsMonitorHealthStatus = critical ? 'CRITICAL' : warning ? 'DEGRADED' : snapshot.snapshotReady === false ? 'UNKNOWN' : 'HEALTHY';
+    return { ...snapshot, health: { status, checkedAt, worker, components, alerts } };
+  }
+
+  private getMonitorCacheKey(query: SportsSystemMonitorQuery): string {
+    return this.normalize(query.leagueId) || '__all_competitions__';
+  }
+
+  private startMonitorRefresh(
+    cacheKey: string,
+    query: SportsSystemMonitorQuery,
+  ): void {
+    if (this.monitorRefreshes.has(cacheKey)) return;
+
+    this.monitorRefreshErrors.delete(cacheKey);
+    const refresh = this.buildSystemMonitorSnapshot(
+      { leagueId: query.leagueId },
+      (partialSnapshot) => {
+        // Publish operational queue/provider/sync state as soon as that light
+        // phase is ready; historical fixture coverage keeps calculating below.
+        this.monitorCache.set(cacheKey, {
+          cachedAt: Date.now(),
+          data: {
+            ...partialSnapshot,
+            snapshotReady: true,
+            snapshotPartial: true,
+            refreshing: true,
+          },
+        });
+        this.adminGateway.publishModuleEvent('sports', 'sports:monitor-update', { leagueId: query.leagueId ?? null, snapshotReady: true, snapshotPartial: true, refreshing: true, occurredAt: new Date().toISOString() });
+      },
+    )
+      .then((snapshot) => {
+        this.monitorCache.set(cacheKey, {
+          cachedAt: Date.now(),
+          data: {
+            ...snapshot,
+            snapshotReady: true,
+            snapshotPartial: false,
+            refreshing: false,
+          },
+        });
+        this.adminGateway.setModuleOperationalStatus('sports', 'READY', 'Sports monitor snapshot refreshed successfully.');
+        this.adminGateway.publishModuleEvent('sports', 'sports:monitor-update', { leagueId: query.leagueId ?? null, snapshotReady: true, snapshotPartial: false, refreshing: false, occurredAt: new Date().toISOString() });
+      })
+      .catch((error: unknown) => {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unable to build the sports system monitor snapshot.';
+        this.monitorRefreshErrors.set(cacheKey, message);
+        this.adminGateway.setModuleOperationalStatus('sports', 'DEGRADED', message, { leagueId: query.leagueId ?? null });
+        this.adminGateway.publishModuleEvent('sports', 'sports:error', { leagueId: query.leagueId ?? null, message, occurredAt: new Date().toISOString() });
+        this.logger.error(
+          `Sports system monitor refresh failed for ${cacheKey}: ${message}`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      })
+      .finally(() => {
+        this.monitorRefreshes.delete(cacheKey);
+      });
+
+    this.monitorRefreshes.set(cacheKey, refresh);
+  }
+
+  private createLoadingSnapshot(
+    query: SportsSystemMonitorQuery,
+    snapshotError?: string,
+    refreshing = false,
+  ): SportsSystemMonitorResponse {
+    return {
+      generatedAt: new Date().toISOString(),
+      snapshotReady: false,
+      refreshing,
+      snapshotError,
+      scope: {
+        activeLeagueFilter: query.leagueId
+          ? this.normalize(query.leagueId)
+          : undefined,
+        activeCompetitions: 0,
+        catalogueCompetitions: 0,
+        operationalSeasonScope: true,
+      },
+      inventory: {
+        activeCompetitions: 0,
+        espnCatalogue: 0,
+        espnFixtures: 0,
+        espnTeams: 0,
+        espnStandings: 0,
+        espnNews: 0,
+        espnQueue: 0,
+        sportsSyncStates: 0,
+        footballDataCompetitions: 0,
+        footballDataMatches: 0,
+        footballDataStandings: 0,
+        footballDataTeams: 0,
+        oddsApiSports: 0,
+        sportsOddsSnapshots: 0,
+        youtubeHighlights: 0,
+      },
+      queue: {
+        total: 0,
+        pending: 0,
+        processing: 0,
+        completedRetained: 0,
+        failed: 0,
+        staleProcessing: 0,
+        completedRetentionDays: QUEUE_COMPLETED_RETENTION_DAYS,
+        byType: {},
+        byTypeAndStatus: [],
+      },
+      sync: {
+        totalStates: 0,
+        queueStates: 0,
+        cronStates: 0,
+        byStatus: {},
+        unitProgress: {
+          total: 0,
+          success: 0,
+          processing: 0,
+          pending: 0,
+          failed: 0,
+          completionPercent: 0,
+        },
+        stateCompletionPercent: 0,
+        currentStages: [],
+        failures: [],
+        cron: [],
+        states: [],
+      },
+      pipeline: {},
+      providers: [],
+      expectedWork: this.emptyExpectedWork(),
+      leagues: [],
+      architectureNotes: this.getArchitectureNotes(),
+    };
+  }
+
+  private async buildSystemMonitorSnapshot(
+    query: SportsSystemMonitorQuery = {},
+    onPartialSnapshot?: (snapshot: SportsSystemMonitorResponse) => void,
   ): Promise<SportsSystemMonitorResponse> {
     const now = new Date();
 
-    const activeCompetitions = await this.getActiveCompetitions(query);
-
-    const catalogue = await this.espnLeagueModel.find({}).lean().exec();
+    const [activeCompetitions, catalogue] = await Promise.all([
+      this.getActiveCompetitions(query),
+      this.espnLeagueModel
+        .find({})
+        .select({
+          leagueId: 1,
+          slug: 1,
+          name: 1,
+          country: 1,
+          isActive: 1,
+          isPriority: 1,
+          lastSyncedAt: 1,
+          detailLastSyncedAt: 1,
+        })
+        .lean()
+        .exec(),
+    ]);
 
     const catalogueById = new Map<string, EspnLeagueDocument>();
 
@@ -412,14 +721,71 @@ export class SportsSystemMonitorService {
         typeof competition.season === 'number' ? competition.season : undefined,
     }));
 
-    const [inventory, queue, sync, providers] = await Promise.all([
+    const [inventory, queue, syncStates, providers] = await Promise.all([
       this.buildInventory(),
       this.buildQueueSummary(),
-      this.buildSyncSummary(contexts, now),
+      this.loadSyncStateSnapshot(),
       this.buildProviderSummaries(),
     ]);
+    const sync = await this.buildSyncSummary(contexts, now, syncStates);
 
     const pipeline = this.buildPipelineDefinitions(sync);
+
+    if (contexts.length && onPartialSnapshot) {
+      const emptyOperationalSeasonData: OperationalSeasonData = {
+        fixtures: new Map<string, FixtureAggregate>(),
+        expectedTeams: new Map<string, Set<string>>(),
+      };
+      const emptyTeamAggregates = new Map<string, TeamAggregate>();
+      const emptyStandingAggregates = new Map<string, StandingAggregate>();
+      const emptyNewsAggregates = new Map<string, NewsAggregate>();
+      const emptyQueueAggregates = new Map<string, QueueAggregate>();
+      const emptySyncAggregates = new Map<string, SyncAggregate>();
+      const emptyUpcomingIndexes: UpcomingIndexes = {
+        summaries: new Set<string>(),
+        odds: new Set<string>(),
+      };
+
+      const partialLeagues = contexts.map((context) => ({
+        ...this.buildLeagueSummary({
+          context,
+          catalogueById,
+          operationalSeasonData: emptyOperationalSeasonData,
+          teamAggregates: emptyTeamAggregates,
+          standingAggregates: emptyStandingAggregates,
+          newsAggregates: emptyNewsAggregates,
+          queueAggregates: emptyQueueAggregates,
+          syncAggregates: emptySyncAggregates,
+          upcomingFixtures: [],
+          upcomingIndexes: emptyUpcomingIndexes,
+        }),
+        // Do not report uncomputed work as confirmed missing work.
+        expectedWork: this.emptyExpectedWork(),
+      }));
+
+      onPartialSnapshot({
+        generatedAt: this.toIso(now) as string,
+        snapshotReady: true,
+        snapshotPartial: true,
+        refreshing: true,
+        scope: {
+          activeLeagueFilter: query.leagueId
+            ? this.normalize(query.leagueId)
+            : undefined,
+          activeCompetitions: activeCompetitions.length,
+          catalogueCompetitions: catalogue.length,
+          operationalSeasonScope: true,
+        },
+        inventory,
+        queue,
+        sync,
+        pipeline,
+        providers,
+        expectedWork: this.emptyExpectedWork(),
+        leagues: partialLeagues,
+        architectureNotes: this.getArchitectureNotes(),
+      });
+    }
 
     if (!contexts.length) {
       return {
@@ -458,20 +824,25 @@ export class SportsSystemMonitorService {
     const [
       operationalSeasonData,
       teamAggregates,
+      standingAggregates,
+      newsAggregates,
       queueAggregates,
-      syncAggregates,
       upcomingFixtures,
     ] = await Promise.all([
       this.buildOperationalSeasonData(contexts, now),
 
       this.aggregateTeams(contexts),
 
-      this.aggregateQueueData(contexts),
+      this.aggregateStandings(contexts),
 
-      this.aggregateSyncData(contexts, now),
+      this.aggregateNews(contexts, now),
+
+      this.aggregateQueueData(contexts),
 
       this.loadUpcomingFixtures(contexts, now),
     ]);
+
+    const syncAggregates = this.aggregateSyncData(contexts, now, syncStates);
 
     const upcomingIndexes = await this.buildUpcomingIndexes(upcomingFixtures);
 
@@ -481,6 +852,8 @@ export class SportsSystemMonitorService {
         catalogueById,
         operationalSeasonData,
         teamAggregates,
+        standingAggregates,
+        newsAggregates,
         queueAggregates,
         syncAggregates,
         upcomingFixtures,
@@ -581,35 +954,35 @@ export class SportsSystemMonitorService {
       sportsOddsSnapshots,
       youtubeHighlights,
     ] = await Promise.all([
-      this.activeCompetitionModel.countDocuments(),
+      this.activeCompetitionModel.estimatedDocumentCount(),
 
-      this.espnLeagueModel.countDocuments(),
+      this.espnLeagueModel.estimatedDocumentCount(),
 
-      this.espnFixtureModel.countDocuments(),
+      this.espnFixtureModel.estimatedDocumentCount(),
 
-      this.espnTeamModel.countDocuments(),
+      this.espnTeamModel.estimatedDocumentCount(),
 
-      this.espnStandingModel.countDocuments(),
+      this.espnStandingModel.estimatedDocumentCount(),
 
-      this.espnNewsModel.countDocuments(),
+      this.espnNewsModel.estimatedDocumentCount(),
 
-      this.espnQueueModel.countDocuments(),
+      this.espnQueueModel.estimatedDocumentCount(),
 
-      this.sportsSyncStateModel.countDocuments(),
+      this.sportsSyncStateModel.estimatedDocumentCount(),
 
-      this.footballDataCompetitionModel.countDocuments(),
+      this.footballDataCompetitionModel.estimatedDocumentCount(),
 
-      this.footballDataMatchModel.countDocuments(),
+      this.footballDataMatchModel.estimatedDocumentCount(),
 
-      this.footballDataStandingModel.countDocuments(),
+      this.footballDataStandingModel.estimatedDocumentCount(),
 
-      this.footballDataTeamModel.countDocuments(),
+      this.footballDataTeamModel.estimatedDocumentCount(),
 
-      this.oddsApiSportModel.countDocuments(),
+      this.oddsApiSportModel.estimatedDocumentCount(),
 
-      this.sportsOddsSnapshotModel.countDocuments(),
+      this.sportsOddsSnapshotModel.estimatedDocumentCount(),
 
-      this.youtubeHighlightModel.countDocuments(),
+      this.youtubeHighlightModel.estimatedDocumentCount(),
     ]);
 
     return {
@@ -675,6 +1048,14 @@ export class SportsSystemMonitorService {
             withSummary: number;
 
             finishedWithSummary: number;
+
+            postMatchMissingFinalResult: number;
+
+            staleUpcomingStatus: number;
+
+            homeTeamIds: Array<string | number | null | undefined>;
+
+            awayTeamIds: Array<string | number | null | undefined>;
 
             latestCollectedAt?: Date;
 
@@ -835,6 +1216,115 @@ export class SportsSystemMonitorService {
                   },
                 },
 
+                postMatchMissingFinalResult: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          {
+                            $gte: [
+                              '$fixtureDate',
+                              new Date(
+                                now.getTime() -
+                                  Math.max(1, SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.integrityRecoveryLookbackDays) *
+                                    24 * 60 * 60_000,
+                              ),
+                            ],
+                          },
+                          { $lte: ['$fixtureDate', new Date(now.getTime() - SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes * 60_000)] },
+                          { $ne: ['$live', true] },
+                          {
+                            $not: [
+                              {
+                                $regexMatch: {
+                                  input: {
+                                    $toUpper: {
+                                      $concat: [
+                                        { $ifNull: ['$status', ''] }, ' ',
+                                        { $ifNull: ['$statusDetail', ''] }, ' ',
+                                        { $ifNull: ['$statusShortDetail', ''] },
+                                      ],
+                                    },
+                                  },
+                                  regex: 'CANCEL|POSTPON|ABANDON|VOID',
+                                },
+                              },
+                            ],
+                          },
+                          {
+                            $or: [
+                              { $ne: ['$completed', true] },
+                              { $not: [{ $isNumber: '$homeScore' }] },
+                              { $not: [{ $isNumber: '$awayScore' }] },
+                            ],
+                          },
+                        ],
+                      },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+
+                staleUpcomingStatus: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          {
+                            $gte: [
+                              '$fixtureDate',
+                              new Date(
+                                now.getTime() -
+                                  Math.max(1, SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.integrityRecoveryLookbackDays) *
+                                    24 * 60 * 60_000,
+                              ),
+                            ],
+                          },
+                          { $lte: ['$fixtureDate', new Date(now.getTime() - SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes * 60_000)] },
+                          { $ne: ['$live', true] },
+                          {
+                            $regexMatch: {
+                              input: {
+                                $toUpper: { $ifNull: ['$status', ''] },
+                              },
+                              regex: 'SCHEDULED|UPCOMING|NOT[_ ]STARTED|STATUS_PRE|STATUS_SCHEDULED',
+                            },
+                          },
+                          {
+                            $not: [
+                              {
+                                $regexMatch: {
+                                  input: {
+                                    $toUpper: {
+                                      $concat: [
+                                        { $ifNull: ['$status', ''] }, ' ',
+                                        { $ifNull: ['$statusDetail', ''] }, ' ',
+                                        { $ifNull: ['$statusShortDetail', ''] },
+                                      ],
+                                    },
+                                  },
+                                  regex: 'CANCEL|POSTPON|ABANDON|VOID',
+                                },
+                              },
+                            ],
+                          },
+                        ],
+                      },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+
+                homeTeamIds: {
+                  $addToSet: '$homeTeamId',
+                },
+
+                awayTeamIds: {
+                  $addToSet: '$awayTeamId',
+                },
+
                 latestCollectedAt: {
                   $max: '$collectedAt',
                 },
@@ -849,45 +1339,6 @@ export class SportsSystemMonitorService {
       : [];
 
     const expectedTeams = new Map<string, Set<string>>();
-
-    const fixtureRowsForTeams = clauses.length
-      ? await this.espnFixtureModel
-          .find({
-            $or: clauses,
-          })
-          .select({
-            leagueId: 1,
-            season: 1,
-            homeTeamId: 1,
-            awayTeamId: 1,
-          })
-          .lean()
-          .exec()
-      : [];
-
-    for (const fixture of fixtureRowsForTeams) {
-      const context = contextByAlias.get(this.normalize(fixture.leagueId));
-
-      if (!context) {
-        continue;
-      }
-
-      if (fixture.season !== context.season) {
-        continue;
-      }
-
-      if (!expectedTeams.has(context.key)) {
-        expectedTeams.set(context.key, new Set<string>());
-      }
-
-      if (fixture.homeTeamId) {
-        expectedTeams.get(context.key)!.add(String(fixture.homeTeamId));
-      }
-
-      if (fixture.awayTeamId) {
-        expectedTeams.get(context.key)!.add(String(fixture.awayTeamId));
-      }
-    }
 
     const fixtureAggregates = new Map<string, FixtureAggregate>();
 
@@ -905,6 +1356,20 @@ export class SportsSystemMonitorService {
         row._id.season !== context.season
       ) {
         continue;
+      }
+
+      if (!expectedTeams.has(context.key)) {
+        expectedTeams.set(context.key, new Set<string>());
+      }
+
+      const teamIds = expectedTeams.get(context.key)!;
+      for (const teamId of [
+        ...(row.homeTeamIds ?? []),
+        ...(row.awayTeamIds ?? []),
+      ]) {
+        if (teamId !== null && teamId !== undefined && String(teamId)) {
+          teamIds.add(String(teamId));
+        }
       }
 
       const key = context.key;
@@ -934,11 +1399,17 @@ export class SportsSystemMonitorService {
 
         finished,
 
+        finishedWithSummary,
+
         withSummary,
 
         missingSummary: Math.max(0, total - withSummary),
 
         finishedMissingSummary: Math.max(0, finished - finishedWithSummary),
+
+        postMatchMissingFinalResult: Number(row.postMatchMissingFinalResult ?? 0),
+
+        staleUpcomingStatus: Number(row.staleUpcomingStatus ?? 0),
 
         summaryCoveragePercent:
           total > 0 ? this.percent(withSummary, total) : 0,
@@ -964,11 +1435,17 @@ export class SportsSystemMonitorService {
 
       existing.finished += incoming.finished;
 
+      existing.finishedWithSummary += incoming.finishedWithSummary;
+
       existing.withSummary += incoming.withSummary;
 
       existing.missingSummary += incoming.missingSummary;
 
       existing.finishedMissingSummary += incoming.finishedMissingSummary;
+
+      existing.postMatchMissingFinalResult += incoming.postMatchMissingFinalResult;
+
+      existing.staleUpcomingStatus += incoming.staleUpcomingStatus;
 
       if (
         incoming.latestCollectedAt &&
@@ -1118,66 +1595,40 @@ export class SportsSystemMonitorService {
       Date.now() - STALE_PROCESSING_MINUTES * 60 * 1000,
     );
 
-    const [
-      statusRows,
-      typeRows,
-      typeStatusRows,
-      latestFailure,
-      latestCompleted,
-      staleProcessing,
-    ] = await Promise.all([
-      this.espnQueueModel
-        .aggregate<{
-          _id: string;
-          count: number;
-        }>([
-          {
-            $group: {
-              _id: '$status',
-
-              count: {
-                $sum: 1,
-              },
-            },
-          },
-        ])
-        .exec(),
-
-      this.espnQueueModel
-        .aggregate<{
-          _id: string;
-          count: number;
-        }>([
-          {
-            $group: {
-              _id: '$type',
-
-              count: {
-                $sum: 1,
-              },
-            },
-          },
-        ])
-        .exec(),
-
+    // One grouped collection pass provides status, type, and type/status totals.
+    // The previous implementation scanned the queue three separate times.
+    const [statusTypeRows, latestFailure, latestCompleted] = await Promise.all([
       this.espnQueueModel
         .aggregate<{
           _id: {
-            type: string;
             status: string;
+            type: string;
           };
-
           count: number;
+          staleProcessing: number;
         }>([
           {
             $group: {
               _id: {
-                type: '$type',
                 status: '$status',
+                type: '$type',
               },
-
               count: {
                 $sum: 1,
+              },
+              staleProcessing: {
+                $sum: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $eq: ['$status', EspnQueueStatus.PROCESSING] },
+                        { $lt: ['$updatedAt', staleCutoff] },
+                      ],
+                    },
+                    1,
+                    0,
+                  ],
+                },
               },
             },
           },
@@ -1185,96 +1636,64 @@ export class SportsSystemMonitorService {
         .exec(),
 
       this.espnQueueModel
-        .findOne({
-          status: EspnQueueStatus.FAILED,
-        })
-        .sort({
-          failedAt: -1,
-          updatedAt: -1,
-        })
+        .findOne({ status: EspnQueueStatus.FAILED })
+        .sort({ failedAt: -1, updatedAt: -1 })
         .lean()
         .exec(),
 
       this.espnQueueModel
-        .findOne({
-          status: EspnQueueStatus.COMPLETED,
-        })
-        .sort({
-          completedAt: -1,
-          updatedAt: -1,
-        })
+        .findOne({ status: EspnQueueStatus.COMPLETED })
+        .sort({ completedAt: -1, updatedAt: -1 })
         .lean()
         .exec(),
-
-      this.espnQueueModel.countDocuments({
-        status: EspnQueueStatus.PROCESSING,
-
-        updatedAt: {
-          $lt: staleCutoff,
-        },
-      }),
     ]);
 
     const byStatus: Record<string, number> = {};
-
-    for (const row of statusRows) {
-      byStatus[String(row._id)] = Number(row.count ?? 0);
-    }
-
     const byType: Record<string, number> = {};
+    const byTypeAndStatus: MonitorQueueItem[] = [];
+    let staleProcessing = 0;
 
-    for (const row of typeRows) {
-      byType[String(row._id)] = Number(row.count ?? 0);
+    for (const row of statusTypeRows) {
+      const status = String(row._id.status);
+      const type = String(row._id.type);
+      const count = Number(row.count ?? 0);
+
+      byStatus[status] = (byStatus[status] ?? 0) + count;
+      byType[type] = (byType[type] ?? 0) + count;
+      staleProcessing += Number(row.staleProcessing ?? 0);
+      byTypeAndStatus.push({ type, status, count });
     }
 
-    const byTypeAndStatus: MonitorQueueItem[] = typeStatusRows.map((row) => ({
-      type: String(row._id.type),
+    const latestFailureRecord = latestFailure as unknown as {
+      failedAt?: Date;
+      updatedAt?: Date;
+      lastError?: string;
+      error?: string;
+    } | null;
 
-      status: String(row._id.status),
-
-      count: Number(row.count ?? 0),
-    }));
+    const latestCompletedRecord = latestCompleted as unknown as {
+      completedAt?: Date;
+      updatedAt?: Date;
+    } | null;
 
     return {
       total: Object.values(byStatus).reduce((sum, value) => sum + value, 0),
-
       pending: byStatus[EspnQueueStatus.PENDING] ?? 0,
-
       processing: byStatus[EspnQueueStatus.PROCESSING] ?? 0,
-
       completedRetained: byStatus[EspnQueueStatus.COMPLETED] ?? 0,
-
       failed: byStatus[EspnQueueStatus.FAILED] ?? 0,
-
       staleProcessing,
-
       completedRetentionDays: QUEUE_COMPLETED_RETENTION_DAYS,
-
       byType,
-
       byTypeAndStatus,
-
-      latestFailureAt: latestFailure?.failedAt
-        ? this.toIso(latestFailure.failedAt)
-        : undefined,
-
+      latestFailureAt: this.toIso(
+        latestFailureRecord?.failedAt ?? latestFailureRecord?.updatedAt,
+      ),
       latestFailure:
-        (
-          latestFailure as unknown as {
-            lastError?: string;
-            error?: string;
-          } | null
-        )?.lastError ??
-        (
-          latestFailure as unknown as {
-            lastError?: string;
-            error?: string;
-          } | null
-        )?.error,
-
-      latestCompletedAt: latestCompleted?.completedAt
-        ? this.toIso(latestCompleted.completedAt)
-        : undefined,
+        latestFailureRecord?.lastError ?? latestFailureRecord?.error,
+      latestCompletedAt: this.toIso(
+        latestCompletedRecord?.completedAt ?? latestCompletedRecord?.updatedAt,
+      ),
     };
   }
 
@@ -1443,12 +1862,50 @@ export class SportsSystemMonitorService {
   // SYNC SUMMARY
   // ============================================================
 
-  private async buildSyncSummary(
+  private async loadSyncStateSnapshot(): Promise<MonitorSyncStateRecord[]> {
+    const states = await this.sportsSyncStateModel
+      .find({})
+      .select({
+        stateKey: 1,
+        kind: 1,
+        jobType: 1,
+        taskKey: 1,
+        cronExpression: 1,
+        timeZone: 1,
+        leagueId: 1,
+        season: 1,
+        eventId: 1,
+        status: 1,
+        trackingMode: 1,
+        fixtureGranularity: 1,
+        dateFrom: 1,
+        dateTo: 1,
+        lastStartedAt: 1,
+        lastSuccessfulAt: 1,
+        lastCompletedAt: 1,
+        nextRunAt: 1,
+        consecutiveFailures: 1,
+        lastError: 1,
+        updatedAt: 1,
+        'units.key': 1,
+        'units.type': 1,
+        'units.monthKey': 1,
+        'units.dateKey': 1,
+        'units.stepKey': 1,
+        'units.status': 1,
+        'units.startedAt': 1,
+        'units.completedAt': 1,
+      })
+      .lean()
+      .exec();
+    return states;
+  }
+
+  private buildSyncSummary(
     contexts: LeagueContext[],
     now: Date,
-  ): Promise<MonitorSyncSummary> {
-    const states = await this.sportsSyncStateModel.find({}).lean().exec();
-
+    states: MonitorSyncStateRecord[],
+  ): MonitorSyncSummary {
     const contextByAlias = new Map<string, LeagueContext>();
 
     for (const context of contexts) {
@@ -1698,10 +2155,11 @@ export class SportsSystemMonitorService {
     };
   }
 
-  private async aggregateSyncData(
+  private aggregateSyncData(
     contexts: LeagueContext[],
     now: Date,
-  ): Promise<Map<string, SyncAggregate>> {
+    allStates: MonitorSyncStateRecord[],
+  ): Map<string, SyncAggregate> {
     const clauses = contexts.flatMap((context) =>
       context.aliases.map((leagueId) => ({
         leagueId,
@@ -1726,12 +2184,15 @@ export class SportsSystemMonitorService {
       }
     }
 
-    const states = await this.sportsSyncStateModel
-      .find({
-        $or: clauses,
-      })
-      .lean()
-      .exec();
+    // The global monitor summary already loaded these projected records.
+    // Reuse them rather than materializing a second copy of the same units.
+    const states = allStates.filter((state) =>
+      clauses.some(
+        (clause) =>
+          state.leagueId === clause.leagueId &&
+          (typeof clause.season !== 'number' || state.season === clause.season),
+      ),
+    );
 
     const result = new Map<string, SyncAggregate>();
 
@@ -1754,6 +2215,7 @@ export class SportsSystemMonitorService {
 
           unitProgress: {
             total: 0,
+            monthUnits: 0,
             success: 0,
             processing: 0,
             pending: 0,
@@ -1952,26 +2414,25 @@ export class SportsSystemMonitorService {
     }
 
     const until = new Date(
-      now.getTime() + UPCOMING_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+      now.getTime() + UPCOMING_WINDOW_HOURS * 60 * 60_000,
     );
 
     return this.espnFixtureModel
       .find({
         $or: clauses,
-
-        fixtureDate: {
-          $gte: now,
-
-          $lte: until,
-        },
-
-        completed: {
-          $ne: true,
-        },
+        fixtureDate: { $gte: now, $lte: until },
+        completed: { $ne: true },
       })
-      .sort({
+      .select({
+        eventId: 1,
+        leagueId: 1,
+        season: 1,
         fixtureDate: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        'payload.competitions': 1,
       })
+      .sort({ fixtureDate: 1 })
       .lean()
       .exec();
   }
@@ -1987,33 +2448,52 @@ export class SportsSystemMonitorService {
       .map((fixture) => fixture.eventId)
       .filter((eventId): eventId is string => Boolean(eventId));
 
-    for (const fixture of fixtures) {
-      if (!fixture.eventId) {
-        continue;
-      }
-
-      if (this.hasSummary(fixture)) {
-        summaries.add(fixture.eventId);
-      }
-    }
-
     if (fixtureIds.length) {
-      const oddsDocs = await this.sportsOddsSnapshotModel
-        .find({
-          eventId: {
-            $in: fixtureIds,
-          },
-        })
-        .select({
-          eventId: 1,
-        })
-        .lean()
-        .exec();
+      const [summaryDocs, oddsDocs] = await Promise.all([
+        this.espnFixtureModel
+          .aggregate<{ eventId: string }>([
+            { $match: { eventId: { $in: fixtureIds } } },
+            {
+              $project: {
+                _id: 0,
+                eventId: 1,
+                summaryNonEmpty: {
+                  $cond: [
+                    { $eq: [{ $type: '$payload.summary' }, 'object'] },
+                    {
+                      $gt: [
+                        { $size: { $objectToArray: '$payload.summary' } },
+                        0,
+                      ],
+                    },
+                    {
+                      $cond: [
+                        { $eq: [{ $type: '$payload.summary' }, 'array'] },
+                        { $gt: [{ $size: '$payload.summary' }, 0] },
+                        false,
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+            { $match: { summaryNonEmpty: true } },
+            { $project: { eventId: 1 } },
+          ])
+          .exec(),
+        this.sportsOddsSnapshotModel
+          .find({ eventId: { $in: fixtureIds } })
+          .select({ eventId: 1 })
+          .lean()
+          .exec(),
+      ]);
+
+      for (const document of summaryDocs) {
+        if (document.eventId) summaries.add(document.eventId);
+      }
 
       for (const document of oddsDocs) {
-        if (document.eventId) {
-          odds.add(document.eventId);
-        }
+        if (document.eventId) odds.add(document.eventId);
       }
     }
 
@@ -2021,6 +2501,162 @@ export class SportsSystemMonitorService {
       summaries,
       odds,
     };
+  }
+
+  // ============================================================
+  // STANDINGS
+  // ============================================================
+
+  private async aggregateStandings(
+    contexts: LeagueContext[],
+  ): Promise<Map<string, StandingAggregate>> {
+    const clauses = contexts
+      .filter((context) => typeof context.season === 'number')
+      .flatMap((context) =>
+        context.aliases.map((leagueId) => ({
+          leagueId,
+          season: context.season,
+        })),
+      );
+    if (!clauses.length) return new Map();
+
+    const contextByAlias = new Map<string, LeagueContext>();
+    for (const context of contexts) {
+      for (const alias of context.aliases) contextByAlias.set(alias, context);
+    }
+
+    const documents = await this.espnStandingModel
+      .find({ $or: clauses })
+      .select({ leagueId: 1, season: 1, payload: 1, fetchedAt: 1 })
+      .lean()
+      .exec();
+
+    const result = new Map<string, StandingAggregate>();
+    const collectTeamIds = (value: unknown, ids: Set<string>): void => {
+      if (!value || typeof value !== 'object') return;
+      if (Array.isArray(value)) {
+        for (const item of value) collectTeamIds(item, ids);
+        return;
+      }
+      const record = value as Record<string, unknown>;
+      const team = record.team;
+      if (team && typeof team === 'object' && !Array.isArray(team)) {
+        const id = (team as Record<string, unknown>).id;
+        if (typeof id === 'string' || typeof id === 'number') ids.add(String(id));
+      }
+      for (const child of Object.values(record)) collectTeamIds(child, ids);
+    };
+
+    for (const document of documents) {
+      const context = contextByAlias.get(this.normalize(document.leagueId));
+      if (!context || document.season !== context.season) continue;
+      let aggregate = result.get(context.key);
+      if (!aggregate) {
+        aggregate = { rows: 0, teamIds: new Set<string>() };
+        result.set(context.key, aggregate);
+      }
+      // One stored document represents one complete league-season response.
+      aggregate.rows += 1;
+      collectTeamIds(document.payload, aggregate.teamIds);
+      const fetchedAt = document.fetchedAt;
+      if (
+        fetchedAt &&
+        (!aggregate.latestCollectedAt ||
+          fetchedAt.getTime() > aggregate.latestCollectedAt.getTime())
+      ) {
+        aggregate.latestCollectedAt = fetchedAt;
+      }
+    }
+    return result;
+  }
+
+  // ============================================================
+  // NEWS INVENTORY BY ACTIVE LEAGUE
+  // ============================================================
+
+  private async aggregateNews(
+    contexts: LeagueContext[],
+    now: Date,
+  ): Promise<Map<string, NewsAggregate>> {
+    const aliases = [
+      ...new Set(contexts.flatMap((context) => context.aliases)),
+    ];
+    if (!aliases.length) {
+      return new Map();
+    }
+
+    const contextByAlias = new Map<string, LeagueContext>();
+    for (const context of contexts) {
+      for (const alias of context.aliases) {
+        contextByAlias.set(alias, context);
+      }
+    }
+
+    const cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const rows = await this.espnNewsModel
+      .aggregate<{
+        _id: string;
+        total: number;
+        last24Hours: number;
+        latestPublishedAt?: Date;
+        latestCollectedAt?: Date;
+      }>([
+        { $match: { leagueId: { $in: aliases } } },
+        {
+          $group: {
+            _id: '$leagueId',
+            total: { $sum: 1 },
+            last24Hours: {
+              $sum: {
+                $cond: [{ $gte: ['$feedPublishedAt', cutoff] }, 1, 0],
+              },
+            },
+            latestPublishedAt: { $max: '$feedPublishedAt' },
+            latestCollectedAt: { $max: '$collectedAt' },
+          },
+        },
+      ])
+      .exec();
+
+    const result = new Map<string, NewsAggregate>();
+    for (const row of rows) {
+      const context = contextByAlias.get(this.normalize(row._id));
+      if (!context) continue;
+
+      const incoming: NewsAggregate = {
+        total: Number(row.total ?? 0),
+        last24Hours: Number(row.last24Hours ?? 0),
+        latestPublishedAt: row.latestPublishedAt,
+        latestCollectedAt: row.latestCollectedAt,
+      };
+      const current = result.get(context.key);
+
+      if (!current) {
+        result.set(context.key, incoming);
+        continue;
+      }
+
+      current.total += incoming.total;
+      current.last24Hours += incoming.last24Hours;
+      if (
+        incoming.latestPublishedAt &&
+        (!current.latestPublishedAt ||
+          incoming.latestPublishedAt.getTime() >
+            current.latestPublishedAt.getTime())
+      ) {
+        current.latestPublishedAt = incoming.latestPublishedAt;
+      }
+      if (
+        incoming.latestCollectedAt &&
+        (!current.latestCollectedAt ||
+          incoming.latestCollectedAt.getTime() >
+            current.latestCollectedAt.getTime())
+      ) {
+        current.latestCollectedAt = incoming.latestCollectedAt;
+      }
+    }
+
+    return result;
   }
 
   // ============================================================
@@ -2036,6 +2672,10 @@ export class SportsSystemMonitorService {
 
     teamAggregates: Map<string, TeamAggregate>;
 
+    standingAggregates: Map<string, StandingAggregate>;
+
+    newsAggregates: Map<string, NewsAggregate>;
+
     queueAggregates: Map<string, QueueAggregate>;
 
     syncAggregates: Map<string, SyncAggregate>;
@@ -2049,6 +2689,8 @@ export class SportsSystemMonitorService {
       catalogueById,
       operationalSeasonData,
       teamAggregates,
+      standingAggregates,
+      newsAggregates,
       queueAggregates,
       syncAggregates,
       upcomingFixtures,
@@ -2066,9 +2708,12 @@ export class SportsSystemMonitorService {
       upcoming: 0,
       live: 0,
       finished: 0,
+      finishedWithSummary: 0,
       withSummary: 0,
       missingSummary: 0,
       finishedMissingSummary: 0,
+      postMatchMissingFinalResult: 0,
+      staleUpcomingStatus: 0,
       summaryCoveragePercent: 0,
       storedSeasons: 0,
     };
@@ -2086,6 +2731,36 @@ export class SportsSystemMonitorService {
     const teamsCovered = [...expectedTeamIds].filter((teamId) =>
       teamSummary.teamIds.has(teamId),
     ).length;
+
+    const standingAggregate = standingAggregates.get(context.key) ?? {
+      rows: 0,
+      teamIds: new Set<string>(),
+    };
+    const standingsExpectedTeams = expectedTeams || teamSummary.teamIds.size;
+    const standingTeamsCovered = expectedTeamIds.size
+      ? [...standingAggregate.teamIds].filter((teamId) =>
+          expectedTeamIds.has(teamId),
+        ).length
+      : standingAggregate.teamIds.size;
+    const standings = {
+      rows: standingAggregate.rows,
+      teams: standingAggregate.teamIds.size,
+      expectedTeams: standingsExpectedTeams,
+      missingTeams: Math.max(0, standingsExpectedTeams - standingTeamsCovered),
+      coveragePercent:
+        standingsExpectedTeams > 0
+          ? this.percent(standingTeamsCovered, standingsExpectedTeams)
+          : 0,
+      latestCollectedAt: this.toIso(standingAggregate.latestCollectedAt),
+    };
+
+    const newsAggregate = newsAggregates.get(context.key);
+    const news = {
+      total: newsAggregate?.total ?? 0,
+      last24Hours: newsAggregate?.last24Hours ?? 0,
+      latestPublishedAt: this.toIso(newsAggregate?.latestPublishedAt),
+      latestCollectedAt: this.toIso(newsAggregate?.latestCollectedAt),
+    };
 
     const upcoming = this.buildUpcomingSummary(
       context,
@@ -2117,6 +2792,12 @@ export class SportsSystemMonitorService {
       upcomingFixturesMissingOdds: upcoming.fixtures.filter(
         (fixture) => fixture.sources.oddsMatchable && !fixture.sources.odds,
       ).length,
+
+      standingsMissingTeams: standings.missingTeams,
+
+      postMatchFixturesMissingFinalResult: fixtureSummary.postMatchMissingFinalResult,
+
+      staleUpcomingStatusFixtures: fixtureSummary.staleUpcomingStatus,
     };
 
     return {
@@ -2169,6 +2850,14 @@ export class SportsSystemMonitorService {
 
         finished: fixtureSummary.finished,
 
+        finishedWithSummary: fixtureSummary.finishedWithSummary,
+
+        finishedMissingSummary: fixtureSummary.finishedMissingSummary,
+
+        postMatchMissingFinalResult: fixtureSummary.postMatchMissingFinalResult,
+
+        staleUpcomingStatus: fixtureSummary.staleUpcomingStatus,
+
         withSummary: fixtureSummary.withSummary,
 
         missingSummary: fixtureSummary.missingSummary,
@@ -2198,6 +2887,10 @@ export class SportsSystemMonitorService {
 
         latestCollectedAt: this.toIso(teamSummary.latestCollectedAt),
       },
+
+      standings,
+
+      news,
 
       upcoming,
 
@@ -2332,124 +3025,92 @@ export class SportsSystemMonitorService {
   // ============================================================
 
   private async buildProviderSummaries(): Promise<MonitorProviderSummary[]> {
-    const result: MonitorProviderSummary[] = [];
-
-    for (const provider of Object.keys(
+    const providers = Object.keys(
       PROVIDER_CONFIG,
-    ) as ConfiguredSportsProvider[]) {
-      const config = PROVIDER_CONFIG[provider];
+    ) as ConfiguredSportsProvider[];
 
-      const [
-        dailyRequests,
-        monthlyRequests,
-        remainingDailyRequests,
-        remainingMonthlyRequests,
-        providerState,
-        endpointDocuments,
-      ] = await Promise.all([
-        this.providerRateLimitService.getDailyUsage(provider),
+    // Providers are independent; do not wait for one provider's telemetry before
+    // starting the next provider's queries.
+    return Promise.all(
+      providers.map(async (provider): Promise<MonitorProviderSummary> => {
+        const config = PROVIDER_CONFIG[provider];
+        const [
+          dailyRequests,
+          monthlyRequests,
+          remainingDailyRequests,
+          remainingMonthlyRequests,
+          providerState,
+          endpointDocuments,
+        ] = await Promise.all([
+          this.providerRateLimitService.getDailyUsage(provider),
+          this.providerRateLimitService.getMonthlyUsage(provider),
+          this.providerRateLimitService.getRemainingDailyRequests(provider),
+          this.providerRateLimitService.getRemainingMonthlyRequests(provider),
+          this.providerRateLimitService.getProviderState(provider),
+          this.sportsProviderRateLimitModel
+            .find({ provider, endpoint: { $ne: '__provider_quota__' } })
+            .sort({ endpoint: 1 })
+            .lean()
+            .exec(),
+        ]);
 
-        this.providerRateLimitService.getMonthlyUsage(provider),
+        const periods = providerState as unknown as
+          ProviderStatePeriods | null | undefined;
 
-        this.providerRateLimitService.getRemainingDailyRequests(provider),
+        const endpoints = endpointDocuments.map((document) => ({
+          endpoint: document.endpoint,
+          dailyRequests: Number(document.dailyRequests ?? 0),
+          monthlyRequests: Number(document.monthlyRequests ?? 0),
+          lastRequestAt: this.toIso(document.lastRequestAt),
+          lockedUntil: this.toIso(document.lockedUntil),
+        }));
 
-        this.providerRateLimitService.getRemainingMonthlyRequests(provider),
+        const activeLocks = endpoints.filter(
+          (endpoint) =>
+            endpoint.lockedUntil &&
+            new Date(endpoint.lockedUntil).getTime() > Date.now(),
+        ).length;
 
-        this.providerRateLimitService.getProviderState(provider),
+        const latestEndpointRequest = endpoints
+          .map((endpoint) =>
+            endpoint.lastRequestAt
+              ? new Date(endpoint.lastRequestAt)
+              : undefined,
+          )
+          .filter((value): value is Date => Boolean(value))
+          .sort((a, b) => b.getTime() - a.getTime())[0];
 
-        this.sportsProviderRateLimitModel
-          .find({
-            provider,
-
-            endpoint: {
-              $ne: '__provider_quota__',
-            },
-          })
-          .sort({
-            endpoint: 1,
-          })
-          .lean()
-          .exec(),
-      ]);
-
-      const periods = providerState as unknown as
-        ProviderStatePeriods | null | undefined;
-
-      const endpoints = endpointDocuments.map((document) => ({
-        endpoint: document.endpoint,
-
-        dailyRequests: Number(document.dailyRequests ?? 0),
-
-        monthlyRequests: Number(document.monthlyRequests ?? 0),
-
-        lastRequestAt: this.toIso(document.lastRequestAt),
-
-        lockedUntil: this.toIso(document.lockedUntil),
-      }));
-
-      const activeLocks = endpoints.filter(
-        (endpoint) =>
-          endpoint.lockedUntil &&
-          new Date(endpoint.lockedUntil).getTime() > Date.now(),
-      ).length;
-
-      const latestEndpointRequest = endpoints
-        .map((endpoint) =>
-          endpoint.lastRequestAt ? new Date(endpoint.lastRequestAt) : undefined,
-        )
-        .filter((value): value is Date => Boolean(value))
-        .sort((a, b) => b.getTime() - a.getTime())[0];
-
-      result.push({
-        provider,
-
-        limits: {
-          minIntervalSeconds: config.minIntervalSeconds,
-
-          dailyRequestLimit: config.dailyRequestLimit,
-
-          monthlyRequestLimit: config.monthlyRequestLimit,
-        },
-
-        usage: {
-          dailyRequests: Number(dailyRequests ?? 0),
-
-          monthlyRequests: Number(monthlyRequests ?? 0),
-
-          remainingDailyRequests: remainingDailyRequests ?? null,
-
-          remainingMonthlyRequests: remainingMonthlyRequests ?? null,
-
-          dailyPeriod: this.toIso(periods?.dailyPeriod),
-
-          monthlyPeriod: this.toIso(periods?.monthlyPeriod),
-
-          lastRequestAt: latestEndpointRequest
-            ? latestEndpointRequest.toISOString()
-            : undefined,
-
-          activeLocks,
-        },
-
-        endpoints,
-
-        telemetry: {
-          historicalRequestEventsAvailable: false,
-
-          historicalRateByHourAvailable: false,
-
-          historicalRateByLeagueAvailable: false,
-
-          note: 'The current rate-limit collection stores current-period aggregate usage, endpoint usage, last request and lock state. It does not store immutable outbound request events.',
-        },
-      });
-    }
-
-    return result;
+        return {
+          provider,
+          limits: {
+            minIntervalSeconds: config.minIntervalSeconds,
+            dailyRequestLimit: config.dailyRequestLimit,
+            monthlyRequestLimit: config.monthlyRequestLimit,
+          },
+          usage: {
+            dailyRequests: Number(dailyRequests ?? 0),
+            monthlyRequests: Number(monthlyRequests ?? 0),
+            remainingDailyRequests: remainingDailyRequests ?? null,
+            remainingMonthlyRequests: remainingMonthlyRequests ?? null,
+            dailyPeriod: this.toIso(periods?.dailyPeriod),
+            monthlyPeriod: this.toIso(periods?.monthlyPeriod),
+            lastRequestAt: latestEndpointRequest?.toISOString(),
+            activeLocks,
+          },
+          endpoints,
+          telemetry: {
+            historicalRequestEventsAvailable: false,
+            historicalRateByHourAvailable: false,
+            historicalRateByLeagueAvailable: false,
+            note: 'Provider telemetry is read directly from the current rate-limit records.',
+          },
+        };
+      }),
+    );
   }
 
   // ============================================================
-  // PIPELINE
+  // EXPECTED WORK
   // ============================================================
 
   private buildPipelineDefinitions(
@@ -2694,7 +3355,7 @@ export class SportsSystemMonitorService {
   // ============================================================
 
   private buildSyncStateDetail(
-    state: SportsSyncStateDocument,
+    state: MonitorSyncStateRecord,
     leagueName: string | undefined,
     now: Date,
   ): MonitorSyncStateDetail {
@@ -2708,6 +3369,8 @@ export class SportsSystemMonitorService {
 
     let failed = 0;
 
+    let monthUnits = 0;
+
     let dateUnits = 0;
 
     let stepUnits = 0;
@@ -2718,6 +3381,10 @@ export class SportsSystemMonitorService {
 
     for (const unit of units) {
       const unitType = String(unit.type).toUpperCase();
+
+      if (unitType === 'MONTH') {
+        monthUnits += 1;
+      }
 
       if (unitType === 'DATE') {
         dateUnits += 1;
@@ -2827,12 +3494,16 @@ export class SportsSystemMonitorService {
 
       trackingMode: state.trackingMode,
 
+      fixtureGranularity: state.fixtureGranularity,
+
       dateFrom: state.dateFrom,
 
       dateTo: state.dateTo,
 
       unitProgress: {
         total,
+
+        monthUnits,
 
         dateUnits,
 
@@ -2922,6 +3593,15 @@ export class SportsSystemMonitorService {
 
         upcomingFixturesMissingOdds:
           total.upcomingFixturesMissingOdds + item.upcomingFixturesMissingOdds,
+
+        standingsMissingTeams:
+          total.standingsMissingTeams + item.standingsMissingTeams,
+
+        postMatchFixturesMissingFinalResult:
+          total.postMatchFixturesMissingFinalResult + item.postMatchFixturesMissingFinalResult,
+
+        staleUpcomingStatusFixtures:
+          total.staleUpcomingStatusFixtures + item.staleUpcomingStatusFixtures,
       }),
 
       this.emptyExpectedWork(),
@@ -2937,6 +3617,12 @@ export class SportsSystemMonitorService {
       staleActiveLeagues: 0,
 
       upcomingFixturesMissingOdds: 0,
+
+      standingsMissingTeams: 0,
+
+      postMatchFixturesMissingFinalResult: 0,
+
+      staleUpcomingStatusFixtures: 0,
     };
   }
 
@@ -2962,7 +3648,7 @@ export class SportsSystemMonitorService {
         'FIXTURE_REFRESH is responsible only for the rolling ESPN fixture window. Normal collection covers today through today+8 days. Stale active leagues are refreshed when fixture collection is older than 48 hours.',
 
       summaryRefreshModel:
-        'SUMMARY_REFRESH is event-specific. Continuous processing covers fixtures within the next four days and newly finished fixtures. A Summary job is not created when payload.summary already exists.',
+        'SUMMARY_REFRESH is event-specific. Upcoming Summary refreshes use the configured rolling window; post-match checks run at kickoff +160 minutes and at bounded +4h, +6h, +12h and +24h checkpoints while the canonical result remains incomplete. A rotating indexed integrity scan checks recent fixtures and queues only missing/inconsistent records.',
 
       queueHistoryWindow:
         'Completed ESPN queue documents are retained as operational history for seven days before cleanup.',

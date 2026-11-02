@@ -12,8 +12,6 @@ import { UsersModule } from './users/users.module';
 
 import { OtpModule } from './otp/otp.module';
 
-import { PredictionsModule } from './predictions/predictions.module';
-
 import { PaymentsModule } from './payments/payments.module';
 
 import { SubscriptionsModule } from './subscriptions/subscriptions.module';
@@ -27,22 +25,22 @@ import { UserSessionModule } from './user-session/user-session.module';
 
 import { AdminUsersModule } from './admin-users/admin-users.module';
 
-import { CronModule } from './cron/cron.module';
-import { PredictionPurchasesModule } from './prediction-purchases/prediction-purchases.module';
 import { TelegramModule } from './telegram/telegram.module';
 import { PlanConfigModule } from './plan-config/plan-config.module';
-import { AdminGateway } from './realtime/admin.gateway';
 import { AdsModule } from './ads/ads.module';
 import { InternalAdsModule } from './internal-ads/internal-ads.module';
 import { ReferralsModule } from './referrals/referrals.module';
 import { EmailModule } from './notifications/email.module';
-import { CommunityModule } from './community/community.module';
 import { PaymentGatewaysModule } from './payment-gateways/payment-gateways.module';
 
 import { WebsiteAnalyticsModule } from './website-analytics/website-analytics.module';
 
-import { AiModule } from './ai/ai.module';
 import { PredictionsEngineModule } from './predictions-engine/predictions-engine.module';
+import { BetLabModule } from './bet-lab/bet-lab.module';
+import { SystemMonitorModule } from './system-monitor/system-monitor.module';
+import { RealtimeModule } from './realtime/realtime.module';
+import { BonusesModule } from './bonuses/bonuses.module';
+import { CustomerCareModule } from './customer-care/customer-care.module';
 
 @Module({
   imports: [
@@ -57,8 +55,9 @@ import { PredictionsEngineModule } from './predictions-engine/predictions-engine
 
       inject: [ConfigService],
 
-      useFactory: async (configService: ConfigService) => ({
-        uri: configService.get<string>('MONGODB_URI'),
+      useFactory: (configService: ConfigService) => ({
+        uri: configService.getOrThrow<string>('MONGODB_URI'),
+        monitorCommands: true,
       }),
     }),
 
@@ -68,8 +67,6 @@ import { PredictionsEngineModule } from './predictions-engine/predictions-engine
 
     OtpModule,
 
-    PredictionsModule,
-
     PaymentsModule,
 
     SubscriptionsModule,
@@ -77,30 +74,32 @@ import { PredictionsEngineModule } from './predictions-engine/predictions-engine
     UploadsModule,
 
     AnalyticsModule,
-
-    CronModule,
     AdminUsersModule,
 
     UserSessionModule,
     TelegramModule,
     PlanConfigModule,
 
-    PredictionPurchasesModule,
     SportsModule,
 
     AdsModule,
     EmailModule,
     InternalAdsModule,
-    CommunityModule,
     PaymentGatewaysModule,
 
     ReferralsModule,
 
-    AiModule,
     PredictionsEngineModule,
 
+    BetLabModule,
+
     WebsiteAnalyticsModule,
+
+    // Central in-memory monitoring, MongoDB command telemetry, and storage snapshots.
+    SystemMonitorModule,
+    RealtimeModule,
+    BonusesModule,
+    CustomerCareModule,
   ],
-  providers: [AdminGateway],
 })
 export class AppModule {}

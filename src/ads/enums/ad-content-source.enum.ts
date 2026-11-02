@@ -1,0 +1,11 @@
+export enum AdContentSource {
+  CUSTOM = 'CUSTOM',
+  PREDICTION = 'PREDICTION',
+  SLIP = 'SLIP',
+  SURE_ODDS = 'SURE_ODDS',
+  PROMO = 'PROMO',
+  BONUS = 'BONUS',
+  REFERRAL = 'REFERRAL',
+  SUBSCRIPTION = 'SUBSCRIPTION',
+  BET_LAB = 'BET_LAB',
+}

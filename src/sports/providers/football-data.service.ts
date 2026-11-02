@@ -17,6 +17,7 @@ import {
 } from './football-data.interfaces';
 
 import { SportsProviderRateLimitService } from '../services/sports-provider-rate-limit.service';
+import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 
 export interface FootballDataMatchQuery {
   competitions?: string;
@@ -70,6 +71,12 @@ export class FootballDataService implements OnModuleInit {
   }
 
   onModuleInit(): void {
+    if (!this.isEnabled()) {
+      this.logger.log(
+        'Football-Data.org disabled by default; set SPORTS_ENABLE_FOOTBALL_DATA=true for emergency use',
+      );
+      return;
+    }
     if (!this.apiKey) {
       this.logger.warn('FOOTBALL_DATA_API_KEY is not configured');
 
@@ -248,6 +255,13 @@ export class FootballDataService implements OnModuleInit {
     );
   }
 
+  private isEnabled(): boolean {
+    return (
+      SPORTS_DATA_COLLECTION_CONFIG.FOOTBALL_DATA.enabled ||
+      process.env.SPORTS_ENABLE_FOOTBALL_DATA === 'true'
+    );
+  }
+
   // ============================================================
   // REQUEST
   // ============================================================
@@ -259,6 +273,11 @@ export class FootballDataService implements OnModuleInit {
       params?: Record<string, string | number>;
     } = {},
   ): Promise<T> {
+    if (!this.isEnabled()) {
+      throw new ServiceUnavailableException(
+        'Football-Data.org is disabled; set SPORTS_ENABLE_FOOTBALL_DATA=true for emergency use',
+      );
+    }
     if (!this.apiKey) {
       throw new ServiceUnavailableException(
         'Football-Data.org API key is not configured',

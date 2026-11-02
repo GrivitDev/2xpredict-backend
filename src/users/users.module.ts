@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { MongooseModule } from '@nestjs/mongoose';
 import { User, UserSchema } from './schemas/user.schema';
 import { UsersService } from './users.service';
 import { UsersController } from './users.controller';
-import { UserSessionModule } from 'src/user-session/user-session.module';
+import { UserSessionModule } from '../user-session/user-session.module';
 
 @Module({
   imports: [
@@ -16,7 +17,11 @@ import { UserSessionModule } from 'src/user-session/user-session.module';
     UserSessionModule,
   ],
   controllers: [UsersController],
-  providers: [UsersService],
+  providers: [
+    UsersService,
+    JwtAuthGuard,
+  ],
   exports: [UsersService],
 })
 export class UsersModule {}
+

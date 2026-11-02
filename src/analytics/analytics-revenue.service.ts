@@ -5,6 +5,12 @@ import { Model } from 'mongoose';
 import { Payment, PaymentDocument } from '../payments/schemas/payment.schema';
 import { RevenueBreakdown } from './interfaces/revenue-breakdown.interface';
 
+const VALID_PAYMENT_TYPES = [
+  'subscription',
+  'vip_upgrade',
+  'premium_upgrade',
+] as const;
+
 @Injectable()
 export class AnalyticsRevenueService {
   constructor(
@@ -13,109 +19,60 @@ export class AnalyticsRevenueService {
   ) {}
 
   async getRevenue() {
-    const approvedPayments = {
-      status: 'approved',
-    };
-
+    const approved = { status: 'approved', type: { $in: VALID_PAYMENT_TYPES } };
     const [
       totalRevenue,
-
       vipRevenue,
-
       regularRevenue,
-
-      predictionRevenue,
-
+      premiumRevenue,
       totalPayments,
-
-      approvedPaymentCount,
-
+      approvedPayments,
       pendingPayments,
-
       rejectedPayments,
     ] = await Promise.all([
-      // ==========================================
-      // TOTAL REVENUE
-      // ==========================================
-      this.sumRevenue(approvedPayments),
-
-      // ==========================================
-      // VIP REVENUE
-      // ==========================================
+      this.sumRevenue(approved),
       this.sumRevenue({
-        ...approvedPayments,
-
-        $or: [
-          {
-            type: 'vip_upgrade',
-          },
-          {
-            type: 'subscription',
-            target: 'vip',
-          },
-        ],
+        status: 'approved',
+        $or: [{ type: 'vip_upgrade' }, { type: 'subscription', target: 'vip' }],
       }),
-
-      // ==========================================
-      // REGULAR REVENUE
-      // ==========================================
       this.sumRevenue({
-        ...approvedPayments,
-
+        status: 'approved',
         type: 'subscription',
-
         target: 'regular',
       }),
-
-      // ==========================================
-      // PREDICTION REVENUE
-      // ==========================================
       this.sumRevenue({
-        ...approvedPayments,
-
-        type: 'prediction',
+        status: 'approved',
+        $or: [
+          { type: 'premium_upgrade' },
+          { type: 'subscription', target: 'premium' },
+        ],
       }),
-
-      // ==========================================
-      // PAYMENT COUNTS
-      // ==========================================
-      this.paymentModel.countDocuments(),
-
+      this.paymentModel.countDocuments({ type: { $in: VALID_PAYMENT_TYPES } }),
       this.paymentModel.countDocuments({
         status: 'approved',
+        type: { $in: VALID_PAYMENT_TYPES },
       }),
-
       this.paymentModel.countDocuments({
         status: 'pending',
+        type: { $in: VALID_PAYMENT_TYPES },
       }),
-
       this.paymentModel.countDocuments({
         status: 'rejected',
+        type: { $in: VALID_PAYMENT_TYPES },
       }),
     ]);
 
     return {
       totalRevenue,
-
-      vipRevenue,
-
       regularRevenue,
-
-      predictionRevenue,
-
+      vipRevenue,
+      premiumRevenue,
       totalPayments,
-
-      approvedPayments: approvedPaymentCount,
-
+      approvedPayments,
       pendingPayments,
-
       rejectedPayments,
     };
   }
-
-  // ==========================================
-  // SUM REVENUE BY CURRENCY
-  // ==========================================
 
   private async sumRevenue(
     match: Record<string, unknown>,
@@ -124,30 +81,12 @@ export class AnalyticsRevenueService {
       _id: 'NGN' | 'USD';
       total: number;
     }>([
-      {
-        $match: match,
-      },
-
-      {
-        $group: {
-          _id: '$currency',
-
-          total: {
-            $sum: '$amount',
-          },
-        },
-      },
+      { $match: match },
+      { $group: { _id: '$currency', total: { $sum: '$amount' } } },
     ]);
 
-    const revenue: RevenueBreakdown = {
-      NGN: 0,
-      USD: 0,
-    };
-
-    for (const item of result) {
-      revenue[item._id] = item.total;
-    }
-
+    const revenue: RevenueBreakdown = { NGN: 0, USD: 0 };
+    for (const item of result) revenue[item._id] = item.total;
     return revenue;
   }
 }

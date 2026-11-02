@@ -1,10 +1,13 @@
 import { Module } from '@nestjs/common';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
 
 import { MongooseModule } from '@nestjs/mongoose';
 
 import { SubscriptionsController } from './subscriptions.controller';
 
 import { SubscriptionsService } from './subscriptions.service';
+import { SubscriptionsMonitorService } from './subscriptions-monitor.service';
 
 import {
   Subscription,
@@ -13,9 +16,11 @@ import {
 
 import { UsersModule } from '../users/users.module';
 import { SubscriptionsScheduler } from './subscriptions.scheduler';
-import { EmailModule } from 'src/notifications/email.module';
-import { PlanConfigModule } from 'src/plan-config/plan-config.module';
+import { EmailModule } from '../notifications/email.module';
+import { PlanConfigModule } from '../plan-config/plan-config.module';
+import { BonusGrant, BonusGrantSchema } from '../bonuses/schemas/bonus-grant.schema';
 
+import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
 @Module({
   imports: [
     MongooseModule.forFeature([
@@ -23,6 +28,7 @@ import { PlanConfigModule } from 'src/plan-config/plan-config.module';
         name: Subscription.name,
         schema: SubscriptionSchema,
       },
+      { name: BonusGrant.name, schema: BonusGrantSchema },
     ]),
 
     UsersModule,
@@ -32,7 +38,14 @@ import { PlanConfigModule } from 'src/plan-config/plan-config.module';
 
   controllers: [SubscriptionsController],
 
-  providers: [SubscriptionsService, SubscriptionsScheduler],
+  providers: [
+    adminRealtimeRegistrationProvider('subscriptions', 'Subscriptions: subscription lifecycle and renewal operations.'),
+    SubscriptionsService,
+    SubscriptionsMonitorService,
+    SubscriptionsScheduler,
+    JwtAuthGuard,
+    RolesGuard,
+  ],
 
   exports: [SubscriptionsService],
 })

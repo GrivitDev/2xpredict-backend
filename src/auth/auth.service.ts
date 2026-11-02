@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -13,14 +14,15 @@ import { UserSessionService } from '../user-session/user-session.service';
 
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { RequestEmailChangeDto } from './dto/request-email-change.dto';
 
 import { OtpService } from '../otp/otp.service';
 import { EmailService } from '../notifications/email.service';
-import { PromosService } from 'src/promos/promos.service';
+import { PromosService } from '../promos/promos.service';
 
-import { UserStatus } from 'src/users/schemas/user.schema';
-import { TelegramService } from 'src/telegram/telegram.service';
-import { GeoLocationService } from 'src/common/services/geo-location.service';
+import { UserStatus } from '../users/schemas/user.schema';
+import { TelegramService } from '../telegram/telegram.service';
+import { GeoLocationService } from '../common/services/geo-location.service';
 
 @Injectable()
 export class AuthService {
@@ -50,11 +52,6 @@ export class AuthService {
     } = registerDto;
 
     const normalizedUsername = username.trim().toLowerCase();
-
-    await this.usersService.deleteExpiredUnverifiedRegistration(
-      email,
-      normalizedUsername,
-    );
 
     const existingEmail = await this.usersService.findByEmail(email);
     if (existingEmail) {
@@ -147,16 +144,16 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // ACCOUNT CHECKS
-    if (!user.isVerified) {
-      throw new UnauthorizedException('Please verify your account');
-    }
-
+    // Unverified registrations remain PENDING but may authenticate so users can
+    // browse, view their welcome package, and complete email verification later.
     if (user.isDeleted) {
       throw new UnauthorizedException('Account has been deleted');
     }
 
-    if (user.status !== UserStatus.ACTIVE) {
+    const allowedStatus =
+      user.status === UserStatus.ACTIVE ||
+      (!user.isVerified && user.status === UserStatus.PENDING);
+    if (!allowedStatus) {
       throw new UnauthorizedException('Account is not active');
     }
 
@@ -182,9 +179,6 @@ export class AuthService {
 
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     });
-
-    console.log('SESSION CREATED');
-    console.log(session);
 
     // CREATE JWT
     const token = this.jwtService.sign({
@@ -218,8 +212,44 @@ export class AuthService {
         country: user.country,
         countryCode: user.countryCode,
         currency: user.currency,
+        isVerified: user.isVerified,
       },
     };
+  }
+
+  // ======================
+  // EMAIL CHANGE: VERIFY CURRENT IDENTITY, THEN NEW ADDRESS
+  // ======================
+  async requestEmailChange(userId: string, dto: RequestEmailChangeDto) {
+    const user = await this.usersService.findByIdWithPassword(userId);
+    if (!user) throw new UnauthorizedException('Account not found.');
+
+    const passwordMatches = await bcrypt.compare(dto.currentPassword, user.password);
+    if (!passwordMatches) throw new UnauthorizedException('Current password is incorrect.');
+
+    const newEmail = dto.newEmail.trim().toLowerCase();
+    if (newEmail === user.email.trim().toLowerCase()) {
+      throw new BadRequestException('The new email must be different from your current email.');
+    }
+
+    const existing = await this.usersService.findByEmail(newEmail);
+    if (existing && String(existing._id) !== String(user._id)) {
+      throw new ConflictException('This email address is already in use.');
+    }
+
+    return this.otpService.createEmailChangeIdentityOtp(
+      String(user._id),
+      user.email,
+      newEmail,
+    );
+  }
+
+  async verifyEmailChangeIdentity(userId: string, code: string) {
+    return this.otpService.verifyEmailChangeIdentity(userId, code);
+  }
+
+  async verifyNewEmail(userId: string, code: string) {
+    return this.otpService.verifyEmailChangeNewEmail(userId, code);
   }
 
   // ======================

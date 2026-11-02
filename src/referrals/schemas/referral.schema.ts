@@ -64,7 +64,7 @@ export class Referral {
   @Prop({
     default: false,
   })
-  predictionPurchased!: boolean;
+  premiumSubscription!: boolean;
 
   // ======================
   // REWARD STATUS
@@ -80,3 +80,4 @@ export class Referral {
 }
 
 export const ReferralSchema = SchemaFactory.createForClass(Referral);
+

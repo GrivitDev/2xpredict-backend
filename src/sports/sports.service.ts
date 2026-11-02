@@ -1,33 +1,30 @@
 import { Injectable } from '@nestjs/common';
 
+import { SportsDataFilter } from './interfaces/sports-data-filter.interface';
 import { SportsDataReadService } from './services/sports-data-read.service';
 
 @Injectable()
 export class SportsService {
   constructor(private readonly sportsDataReadService: SportsDataReadService) {}
 
-  async getLive() {
-    return this.sportsDataReadService.getLiveFixtures();
+  async getLive(filters: SportsDataFilter = {}) {
+    return this.sportsDataReadService.getLiveFixtures(filters);
   }
 
-  async getFixtures(competitionId?: string) {
-    return this.sportsDataReadService.getUpcomingFixtures(
-      undefined,
-      undefined,
+  async getFixtures(filters: SportsDataFilter = {}) {
+    return this.sportsDataReadService.getUpcomingFixtures(filters);
+  }
+
+  async getResults(filters: SportsDataFilter = {}) {
+    return this.sportsDataReadService.getFinishedFixtures(filters);
+  }
+
+  async getStandings(competitionId: string, teamId?: string, groupId?: string) {
+    return this.sportsDataReadService.getLeagueTable(
       competitionId,
+      teamId,
+      groupId,
     );
-  }
-
-  async getResults(competitionId?: string) {
-    return this.sportsDataReadService.getFinishedFixtures(
-      undefined,
-      undefined,
-      competitionId,
-    );
-  }
-
-  async getStandings(competitionId: string, season?: number) {
-    return this.sportsDataReadService.getLeagueTable(competitionId, season);
   }
 
   async getCompetitions(options?: {
@@ -37,8 +34,8 @@ export class SportsService {
     return this.sportsDataReadService.getCompetitions(options);
   }
 
-  async getTeams(competitionId: string) {
-    return this.sportsDataReadService.getTeams(competitionId);
+  async getTeams(competitionId: string, teamId?: string) {
+    return this.sportsDataReadService.getTeams(competitionId, teamId);
   }
 
   async getActiveCompetitions() {

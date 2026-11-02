@@ -1,4 +1,6 @@
 import { Module } from '@nestjs/common';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { MongooseModule } from '@nestjs/mongoose';
 
 import { PlanConfigService } from './plan-config.service';
@@ -13,7 +15,12 @@ import { PlanConfig, PlanConfigSchema } from './schemas/plan-config.schema';
     ]),
   ],
   controllers: [PlanConfigController],
-  providers: [PlanConfigService],
+  providers: [
+    PlanConfigService,
+    JwtAuthGuard,
+    RolesGuard,
+  ],
   exports: [PlanConfigService],
 })
 export class PlanConfigModule {}
+

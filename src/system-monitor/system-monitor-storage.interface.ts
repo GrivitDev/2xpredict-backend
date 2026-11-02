@@ -71,3 +71,4 @@ export interface SystemMonitorStorageHistoryItem {
 
   totals: SystemMonitorStorageTotals;
 }
+

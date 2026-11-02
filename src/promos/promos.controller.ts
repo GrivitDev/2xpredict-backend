@@ -6,6 +6,7 @@ import {
   Patch,
   Post,
   Req,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 
@@ -16,12 +17,14 @@ import { PromosService } from './promos.service';
 import { CreatePromoDto } from './dto/create-promo.dto';
 
 import { UpdatePromoDto } from './dto/update-promo.dto';
+import { ClaimPromoDto } from './dto/claim-promo.dto';
 
 import { PromoEngineService } from './promo-engine.service';
+import { PromosMonitorService } from './promos-monitor.service';
 
-import { Roles } from 'src/common/decorators/roles.decorator';
+import { Roles } from '../common/decorators/roles.decorator';
 
-import { RolesGuard } from 'src/common/guards/roles.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
 
 @Controller('promos')
 export class PromosController {
@@ -29,6 +32,7 @@ export class PromosController {
     private readonly promosService: PromosService,
 
     private readonly promoEngineService: PromoEngineService,
+    private readonly monitor: PromosMonitorService,
   ) {}
 
   // ============================================================
@@ -87,6 +91,18 @@ export class PromosController {
     );
   }
 
+  @Post('claim')
+  @UseGuards(AuthGuard('jwt'))
+  claimPromo(@Req() req: any, @Body() body: ClaimPromoDto) {
+    return this.promosService.claimPromo(req.user._id.toString(), body.promoCode);
+  }
+
+  @Get('my-redemptions')
+  @UseGuards(AuthGuard('jwt'))
+  getMyRedemptions(@Req() req: any) {
+    return this.promosService.getUserRedemptions(req.user._id.toString());
+  }
+
   // ------------------------------------------------------------
   // MY REWARDS
   // ------------------------------------------------------------
@@ -134,15 +150,26 @@ export class PromosController {
     return this.promoEngineService.getAllClaimedRewards();
   }
 
-  // ------------------------------------------------------------
-  // ADMIN - PENDING CASH
-  // ------------------------------------------------------------
 
-  @Get('admin/pending-cash')
+  @Get('admin/redemptions')
   @UseGuards(AuthGuard('jwt'), RolesGuard)
   @Roles('admin')
-  getPendingCashRewards() {
-    return this.promoEngineService.getPendingCashRewards();
+  getRedemptions() {
+    return this.promosService.getRedemptions();
+  }
+
+  @Get('admin/monitor')
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles('admin')
+  getModuleMonitor() {
+    return this.monitor.getOverview();
+  }
+
+  @Get('admin/analytics')
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles('admin')
+  getPromotionAnalytics(@Query('promoId') promoId?: string) {
+    return this.promosService.getPromotionAnalytics(promoId);
   }
 
   // ============================================================
@@ -235,14 +262,4 @@ export class PromosController {
     return this.promoEngineService.getPromoRewards(promoId);
   }
 
-  // ------------------------------------------------------------
-  // ADMIN - PAY CASH REWARD
-  // ------------------------------------------------------------
-
-  @Patch('rewards/:id/pay')
-  @UseGuards(AuthGuard('jwt'), RolesGuard)
-  @Roles('admin')
-  markCashRewardPaid(@Param('id') id: string) {
-    return this.promoEngineService.markCashRewardPaid(id);
-  }
 }

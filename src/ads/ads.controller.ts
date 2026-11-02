@@ -8,73 +8,88 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-
 import type { Request } from 'express';
-
 import { AdsService } from './ads.service';
-
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
+import { AdDeliveryQueryDto } from './dto/ad-delivery-query.dto';
+import { TrackAdEventDto } from './dto/track-ad-event.dto';
 
-import { AdPage } from './enums/ad-page.enum';
-
-import { AdDevice } from './enums/ad-device.enum';
+function getUserId(request: Request): string | undefined {
+  const id = (request as Request & { user?: { _id?: unknown } }).user?._id;
+  if (typeof id === 'string') return id || undefined;
+  if (typeof id === 'number' || typeof id === 'bigint') {
+    return String(id) || undefined;
+  }
+  if (
+    typeof id === 'object' &&
+    id !== null &&
+    'toHexString' in id &&
+    typeof id.toHexString === 'function'
+  ) {
+    const hexId = id as { toHexString: () => string };
+    return hexId.toHexString() || undefined;
+  }
+  return undefined;
+}
 
 @Controller('ads')
 export class AdsController {
-  constructor(private readonly adsService: AdsService) {}
+  constructor(private readonly ads: AdsService) {}
 
-  // =====================================================
-  // EXTERNAL ADS POLICY
-  // Determines who sees external ads
-  // =====================================================
-
+  /** External-provider policy only. It never disables in-app campaigns or InternalAdsModule content. */
   @Get('policy')
   @UseGuards(OptionalJwtAuthGuard)
-  async getPolicy(@Req() req: Request) {
-    const user = req.user as any;
-
-    return this.adsService.getPolicy(user?._id?.toString());
+  getPolicy(@Req() request: Request) {
+    return this.ads.getPolicy(getUserId(request));
   }
-
-  // =====================================================
-  // GET INTERNAL ADS FOR PAGE
-  // =====================================================
 
   @Get()
   @UseGuards(OptionalJwtAuthGuard)
-  async getAds(
-    @Query('page') page: AdPage,
-
-    @Query('device') device: AdDevice,
-
-    @Req() req: Request,
-  ) {
-    const user = req.user as any;
-
-    return this.adsService.getPageAds(page, device, user?._id?.toString());
+  getAds(@Query() query: AdDeliveryQueryDto, @Req() request: Request) {
+    return this.ads.getPageAds(query, getUserId(request));
   }
 
-  // =====================================================
-  // RECORD IMPRESSION
-  // =====================================================
+  @Post(':id/events')
+  @UseGuards(OptionalJwtAuthGuard)
+  track(
+    @Param('id') id: string,
+    @Body() dto: TrackAdEventDto,
+    @Req() request: Request,
+  ) {
+    return this.ads.trackEvent(id, dto, getUserId(request));
+  }
 
+  /** Backward-compatible endpoint for existing clients. */
   @Post(':id/impression')
-  async recordImpression(
-    @Param('id')
-    id: string,
+  @UseGuards(OptionalJwtAuthGuard)
+  impression(
+    @Param('id') id: string,
+    @Body() body: Partial<TrackAdEventDto>,
+    @Req() request: Request,
   ) {
-    return this.adsService.recordImpression(id);
+    return this.ads.recordImpression(
+      id,
+      body.eventKey,
+      body.visitorKey,
+      getUserId(request),
+      body.sessionKey,
+    );
   }
 
-  // =====================================================
-  // RECORD CLICK
-  // =====================================================
-
+  /** Backward-compatible endpoint for existing clients. */
   @Post(':id/click')
-  async recordClick(
-    @Param('id')
-    id: string,
+  @UseGuards(OptionalJwtAuthGuard)
+  click(
+    @Param('id') id: string,
+    @Body() body: Partial<TrackAdEventDto>,
+    @Req() request: Request,
   ) {
-    return this.adsService.recordClick(id);
+    return this.ads.recordClick(
+      id,
+      body.eventKey,
+      body.visitorKey,
+      getUserId(request),
+      body.sessionKey,
+    );
   }
 }

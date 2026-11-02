@@ -5,6 +5,8 @@ import type { Request } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { RequestEmailChangeDto } from './dto/request-email-change.dto';
+import { VerifyEmailChangeDto } from './dto/verify-email-change.dto';
 
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { GetUser } from '../common/decorators/get-user.decorator';
@@ -39,12 +41,6 @@ export class AuthController {
       '';
 
     const userAgent = req.headers['user-agent'] || '';
-
-    console.log({
-      ip: req.ip,
-      forwarded: req.headers['x-forwarded-for'],
-      remote: req.socket.remoteAddress,
-    });
 
     return this.authService.login(loginDto, ip.toString(), userAgent);
   }
@@ -84,6 +80,33 @@ export class AuthController {
       body.newPassword,
     );
   }
+  @UseGuards(JwtAuthGuard)
+  @Post('email-change/request')
+  requestEmailChange(
+    @GetUser() user: { _id: string },
+    @Body() dto: RequestEmailChangeDto,
+  ) {
+    return this.authService.requestEmailChange(user._id, dto);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('email-change/verify-current')
+  verifyCurrentEmailForChange(
+    @GetUser() user: { _id: string },
+    @Body() dto: VerifyEmailChangeDto,
+  ) {
+    return this.authService.verifyEmailChangeIdentity(user._id, dto.code);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('email-change/verify-new')
+  verifyNewEmailForChange(
+    @GetUser() user: { _id: string },
+    @Body() dto: VerifyEmailChangeDto,
+  ) {
+    return this.authService.verifyNewEmail(user._id, dto.code);
+  }
+
   @UseGuards(JwtAuthGuard)
   @Post('change-password')
   changePassword(

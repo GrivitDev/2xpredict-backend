@@ -1,5 +1,6 @@
 export interface SportsSystemMonitorQuery {
   leagueId?: string;
+  forceRefresh?: boolean;
 }
 
 // ============================================================
@@ -14,6 +15,16 @@ export interface MonitorFixtureSummary {
   live: number;
 
   finished: number;
+
+  finishedWithSummary: number;
+
+  finishedMissingSummary: number;
+
+  /** Matured post-kickoff fixtures that lack a verified final result and both scores. */
+  postMatchMissingFinalResult: number;
+
+  /** Matured fixtures whose stored root status still says upcoming/scheduled. */
+  staleUpcomingStatus: number;
 
   withSummary: number;
 
@@ -42,6 +53,38 @@ export interface MonitorTeamSummary {
   missingCurrentSeasonTeams: number;
 
   coveragePercent: number;
+
+  latestCollectedAt?: string;
+}
+
+// ============================================================
+// STANDINGS
+// ============================================================
+
+export interface MonitorStandingSummary {
+  rows: number;
+
+  teams: number;
+
+  expectedTeams: number;
+
+  missingTeams: number;
+
+  coveragePercent: number;
+
+  latestCollectedAt?: string;
+}
+
+// ============================================================
+// NEWS
+// ============================================================
+
+export interface MonitorNewsSummary {
+  total: number;
+
+  last24Hours: number;
+
+  latestPublishedAt?: string;
 
   latestCollectedAt?: string;
 }
@@ -159,12 +202,16 @@ export interface MonitorSyncStateDetail {
 
   trackingMode?: string;
 
+  fixtureGranularity?: string;
+
   dateFrom?: string;
 
   dateTo?: string;
 
   unitProgress: {
     total: number;
+
+    monthUnits: number;
 
     dateUnits: number;
 
@@ -256,7 +303,7 @@ export interface MonitorExpectedWork {
   finishedFixturesMissingSummary: number;
 
   /**
-   * Upcoming fixtures inside the normal four-day Summary
+   * Upcoming fixtures inside the normal eight-day Summary
    * window that do not yet contain payload.summary.
    */
   upcomingFixturesMissingSummary: number;
@@ -272,6 +319,15 @@ export interface MonitorExpectedWork {
    * record where odds collection is enabled.
    */
   upcomingFixturesMissingOdds: number;
+
+  /** Current-season teams that do not have a stored standings row. */
+  standingsMissingTeams: number;
+
+  /** Fixtures beyond the first post-match checkpoint without a verified result. */
+  postMatchFixturesMissingFinalResult: number;
+
+  /** Fixtures beyond the first post-match checkpoint still marked scheduled/upcoming. */
+  staleUpcomingStatusFixtures: number;
 }
 
 // ============================================================
@@ -508,6 +564,10 @@ export interface MonitorLeagueSummary {
 
   teams: MonitorTeamSummary;
 
+  standings: MonitorStandingSummary;
+
+  news: MonitorNewsSummary;
+
   upcoming: MonitorUpcomingSummary;
 
   queue: MonitorQueueSummary;
@@ -517,12 +577,66 @@ export interface MonitorLeagueSummary {
   expectedWork: MonitorExpectedWork;
 }
 
+
+// ============================================================
+// LIVE RUNTIME / HEALTH
+// ============================================================
+
+export type SportsMonitorHealthStatus = 'HEALTHY' | 'DEGRADED' | 'CRITICAL' | 'UNKNOWN';
+export type SportsMonitorAlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+
+export interface SportsMonitorAlert {
+  code: string;
+  severity: SportsMonitorAlertSeverity;
+  message: string;
+  occurredAt: string;
+  details?: Record<string, unknown>;
+}
+
+export interface SportsWorkerRuntimeStatus {
+  initialized: boolean;
+  started: boolean;
+  waitingForStartupRelease: boolean;
+  youtubeQueuePrepared: boolean;
+  draining: boolean;
+  activeJobKey?: string;
+  activeJobType?: string;
+  activeJobAgeMs?: number;
+  queueReadFailures: number;
+  drainCycles: number;
+  drainFailures: number;
+  jobsSucceeded: number;
+  jobsFailed: number;
+  lastDrainStartedAt?: string;
+  lastDrainCompletedAt?: string;
+  lastJobAt?: string;
+  lastJobType?: string;
+  lastJobStatus?: 'SUCCEEDED' | 'FAILED' | 'DEFERRED';
+  lastJobDurationMs?: number;
+  lastJobError?: string;
+  lastWatchdogAt?: string;
+  lastWatchdogError?: string;
+}
+
+export interface SportsRuntimeMonitor {
+  status: SportsMonitorHealthStatus;
+  checkedAt: string;
+  worker: SportsWorkerRuntimeStatus;
+  components: Record<string, { status: SportsMonitorHealthStatus; message: string; metrics?: Record<string, number | string | boolean | null> }>;
+  alerts: SportsMonitorAlert[];
+}
+
 // ============================================================
 // SYSTEM RESPONSE
 // ============================================================
 
 export interface SportsSystemMonitorResponse {
   generatedAt: string;
+  snapshotReady?: boolean;
+  snapshotPartial?: boolean;
+  refreshing?: boolean;
+  snapshotError?: string;
+  health?: SportsRuntimeMonitor;
 
   scope: {
     activeLeagueFilter?: string;

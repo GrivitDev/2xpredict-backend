@@ -1,0 +1,10 @@
+export enum SettlementJobStatus {
+  QUEUED = 'QUEUED',
+  PROCESSING = 'PROCESSING',
+  RETRY = 'RETRY',
+  COMPLETED = 'COMPLETED',
+  PARTIAL = 'PARTIAL',
+  FAILED = 'FAILED',
+  SKIPPED = 'SKIPPED',
+}
+

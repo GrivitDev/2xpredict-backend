@@ -1,6 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { User, UserStatus } from './schemas/user.schema';
 
 @Injectable()
@@ -11,15 +11,18 @@ export class UsersService {
   ) {}
 
   async findAll(query: any) {
-    const search = query.search || '';
-    const page = Number(query.page || 1);
-    const limit = Number(query.limit || 20);
-
+    const rawSearch = typeof query.search === 'string' ? query.search.trim().slice(0, 100) : '';
+    const search = rawSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const requestedPage = Number(query.page);
+    const requestedLimit = Number(query.limit);
+    const page = Number.isFinite(requestedPage) ? Math.max(1, Math.floor(requestedPage)) : 1;
+    const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(100, Math.floor(requestedLimit))) : 20;
     const skip = (page - 1) * limit;
 
+    // Admin user management includes unverified registrations so they can be
+    // helped with email verification and can receive administrative bonuses.
     const filter: any = {
       isDeleted: false,
-      isVerified: true,
     };
 
     if (search) {
@@ -53,14 +56,42 @@ export class UsersService {
       filter.role = query.role;
     }
 
+    if (Array.isArray(query.includeUserIds)) {
+      filter._id = { ...(filter._id ?? {}), $in: query.includeUserIds };
+    }
+    if (Array.isArray(query.excludeUserIds) && query.excludeUserIds.length) {
+      filter._id = { ...(filter._id ?? {}), $nin: query.excludeUserIds };
+    }
+
+    if (typeof query.isVerified === 'boolean') {
+      filter.isVerified = query.isVerified;
+    }
+
+    const createdAt: Record<string, Date> = {};
+    if (query.createdFrom) {
+      const from = new Date(query.createdFrom);
+      if (Number.isFinite(from.getTime())) createdAt.$gte = from;
+    }
+    if (query.createdTo) {
+      const to = new Date(query.createdTo);
+      if (Number.isFinite(to.getTime())) {
+        to.setHours(23, 59, 59, 999);
+        createdAt.$lte = to;
+      }
+    }
+    if (Object.keys(createdAt).length) filter.createdAt = createdAt;
+
     const [users, total] = await Promise.all([
       this.userModel
         .find(filter)
+        .select('-passwordResetToken -passwordResetExpires')
         .skip(skip)
         .limit(limit)
-        .sort({ createdAt: -1 }),
+        .sort({ createdAt: -1 })
+        .lean()
+        .exec(),
 
-      this.userModel.countDocuments(filter),
+      this.userModel.countDocuments(filter).exec(),
     ]);
 
     return {
@@ -98,10 +129,76 @@ export class UsersService {
   }
 
   async findById(userId: string) {
-    return this.userModel.findOne({
-      _id: userId,
-      isDeleted: false,
-    });
+    if (!Types.ObjectId.isValid(userId)) return null;
+    return this.userModel
+      .findOne({ _id: userId, isDeleted: false })
+      .select('-passwordResetToken -passwordResetExpires')
+      .exec();
+  }
+
+  async findByIdWithPassword(userId: string) {
+    return this.userModel
+      .findOne({ _id: userId, isDeleted: false })
+      .select('+password');
+  }
+
+  /** Changes email only after the caller has verified the current and new addresses. */
+  async changeEmailAndVerify(userId: string, email: string) {
+    return this.userModel.findOneAndUpdate(
+      { _id: userId, isDeleted: false },
+      {
+        $set: {
+          email: email.trim().toLowerCase(),
+          isVerified: true,
+          status: UserStatus.ACTIVE,
+        },
+        $unset: { verificationExpiresAt: 1 },
+      },
+      { returnDocument: 'after', runValidators: true },
+    ).exec();
+  }
+
+  async clearPendingPromoCode(userId: string) {
+    await this.userModel.updateOne(
+      { _id: userId, isDeleted: false },
+      { $unset: { pendingPromoCode: 1 } },
+    ).exec();
+  }
+
+  /** Recipient selection intentionally includes active and pending accounts, including unverified users. */
+  async countBonusRecipients(): Promise<number> {
+    return this.userModel.countDocuments({ isDeleted: false }).exec();
+  }
+
+  async getLastBonusRecipientId(): Promise<string | null> {
+    const user = await this.userModel
+      .findOne({ isDeleted: false })
+      .sort({ _id: -1 })
+      .select({ _id: 1 })
+      .lean()
+      .exec();
+    return user?._id ? String(user._id) : null;
+  }
+
+  async getBonusRecipientIds(
+    afterId: string | null | undefined,
+    throughId: string | null | undefined,
+    limit = 25,
+  ): Promise<string[]> {
+    // Includes pending/unverified and suspended accounts, but never soft-deleted users.
+    const filter: Record<string, unknown> = { isDeleted: false };
+    const idRange: Record<string, Types.ObjectId> = {};
+    if (afterId && Types.ObjectId.isValid(afterId)) idRange.$gt = new Types.ObjectId(afterId);
+    if (throughId && Types.ObjectId.isValid(throughId)) idRange.$lte = new Types.ObjectId(throughId);
+    if (Object.keys(idRange).length) filter._id = idRange;
+    const docs = await this.userModel
+      .find(filter)
+      .select({ _id: 1 })
+      .sort({ _id: 1 })
+      .limit(Math.max(1, Math.min(100, Math.floor(limit))))
+      .lean()
+      .exec();
+    return docs.map((doc) => String(doc._id));
   }
 
   // =========================
@@ -127,9 +224,6 @@ export class UsersService {
         email: email.trim().toLowerCase(),
         isDeleted: false,
         isVerified: false,
-        verificationExpiresAt: {
-          $gt: new Date(),
-        },
       },
       {
         $set: {
@@ -174,18 +268,24 @@ export class UsersService {
 
   async suspendUser(
     userId: string,
-    data: { reason?: string; bannedUntil?: Date; adminId?: string },
+    data: { reason?: string; bannedUntil?: Date },
+    adminId: string,
   ) {
-    return this.userModel.findByIdAndUpdate(
-      userId,
-      {
-        $set: {
-          status: UserStatus.SUSPENDED,
-          banReason: data.reason,
-          bannedUntil: data.bannedUntil,
-          bannedBy: data.adminId,
-        },
+    if (data.bannedUntil && data.bannedUntil.getTime() <= Date.now()) {
+      throw new BadRequestException('The suspension end date must be in the future.');
+    }
+    const update: Record<string, any> = {
+      $set: {
+        status: UserStatus.SUSPENDED,
+        banReason: data.reason?.trim() || 'Suspended by administrator',
+        bannedBy: adminId,
+        ...(data.bannedUntil ? { bannedUntil: data.bannedUntil } : {}),
       },
+      ...(!data.bannedUntil ? { $unset: { bannedUntil: 1 } } : {}),
+    };
+    return this.userModel.findOneAndUpdate(
+      { _id: userId, isDeleted: false },
+      update,
       { returnDocument: 'after' },
     );
   }
@@ -208,8 +308,8 @@ export class UsersService {
   }
 
   async softDeleteUser(userId: string, adminId?: string) {
-    return this.userModel.findByIdAndUpdate(
-      userId,
+    return this.userModel.findOneAndUpdate(
+      { _id: userId, isDeleted: false },
       {
         $set: {
           status: UserStatus.DELETED,
@@ -314,35 +414,5 @@ export class UsersService {
       },
       { returnDocument: 'after' },
     );
-  }
-  // =========================
-  // CLEANUP
-  // =========================
-  async deleteExpiredUnverifiedUsers() {
-    return this.userModel.deleteMany({
-      isVerified: false,
-      isDeleted: false,
-      verificationExpiresAt: {
-        $lt: new Date(),
-      },
-    });
-  }
-
-  async deleteExpiredUnverifiedRegistration(email: string, username: string) {
-    return this.userModel.deleteMany({
-      isVerified: false,
-      isDeleted: false,
-      verificationExpiresAt: {
-        $lte: new Date(),
-      },
-      $or: [
-        {
-          email: email.trim().toLowerCase(),
-        },
-        {
-          username: username.trim().toLowerCase(),
-        },
-      ],
-    });
   }
 }

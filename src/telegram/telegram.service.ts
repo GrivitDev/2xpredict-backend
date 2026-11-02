@@ -10,8 +10,6 @@ import { UserHandler } from './handlers/user.handler';
 
 import { PaymentHandler } from './handlers/payment.handler';
 
-import { RewardHandler } from './handlers/reward.handler';
-
 @Injectable()
 export class TelegramService {
   private readonly logger = new Logger(TelegramService.name);
@@ -20,21 +18,71 @@ export class TelegramService {
 
   private readonly adminGroupId: string;
 
+  /** Public channel destination; kept separate from the existing admin group. */
+  private readonly infoGroupId: string;
+
   constructor(
     private readonly config: ConfigService,
 
     private readonly userHandler: UserHandler,
 
     private readonly paymentHandler: PaymentHandler,
-
-    private readonly rewardHandler: RewardHandler,
   ) {
     const token = this.config.get<string>('TELEGRAM_BOT_TOKEN');
 
     this.adminGroupId =
       this.config.get<string>('TELEGRAM_ADMIN_GROUP_ID') || '';
 
+    this.infoGroupId = this.config.get<string>('TELEGRAM_INFO_GROUP_ID') || '';
+
     this.bot = new Telegraf(token || '');
+  }
+
+  /**
+   * Send a public broadcast without changing the destination of the existing
+   * sendMessage() method. Customer-specific support details must never use this.
+   */
+  async sendPublicChannelMessage(message: string): Promise<{
+    success: boolean;
+    messageId?: number;
+    deliveryUnknown?: boolean;
+  }> {
+    if (!this.infoGroupId) {
+      this.logger.warn(
+        'Public Telegram channel is not configured (TELEGRAM_INFO_GROUP_ID).',
+      );
+      return { success: false };
+    }
+
+    if (!this.config.get<string>('TELEGRAM_BOT_TOKEN')) {
+      this.logger.error('Telegram bot token is not configured.');
+      return { success: false };
+    }
+
+    try {
+      const sent = await this.bot.telegram.sendMessage(
+        this.infoGroupId,
+        message,
+        {
+          link_preview_options: { is_disabled: false },
+        },
+      );
+      return { success: true, messageId: sent.message_id };
+    } catch (error) {
+      this.logger.error(
+        `Public Telegram channel delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const apiError = error as {
+        response?: { error_code?: number; statusCode?: number };
+      };
+      const httpCode = Number(
+        apiError?.response?.error_code ?? apiError?.response?.statusCode,
+      );
+      // A network timeout may occur after Telegram accepted the message. Avoid
+      // an automatic duplicate in that ambiguous case; make an administrator verify.
+      const deliveryUnknown = !Number.isFinite(httpCode) || httpCode >= 500;
+      return { success: false, deliveryUnknown };
+    }
   }
 
   // ==========================================================
@@ -212,35 +260,11 @@ export class TelegramService {
   }
 
   // ==========================================================
-  // CASH REWARD
-  // ==========================================================
-
-  async notifyCashRewardRequest(data: {
-    fullName: string;
-
-    email: string;
-
-    campaign: string;
-
-    amount: number;
-
-    bankName: string;
-
-    accountName: string;
-
-    accountNumber: string;
-  }) {
-    const message = this.rewardHandler.buildCashRewardMessage(data);
-
-    return this.sendMessage(message);
-  }
-
-  // ==========================================================
   // GATEWAY PAYMENT
   // ==========================================================
 
   async notifyGatewayPaymentReceived(data: {
-    gateway: 'paystack' | 'opay';
+    gateway: 'paystack';
 
     fullName: string;
 
@@ -250,7 +274,7 @@ export class TelegramService {
 
     currency: string;
 
-    type: 'subscription' | 'prediction' | 'vip_upgrade';
+    type: 'subscription' | 'vip_upgrade' | 'premium_upgrade';
 
     target: string;
 

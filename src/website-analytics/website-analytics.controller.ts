@@ -85,12 +85,14 @@ export class WebsiteAnalyticsController {
     @Body()
     payload: {
       sessionId: string;
+      visitorId?: string;
       timestamp?: string;
       path?: string;
       durationMs?: number;
       activeTimeMs?: number;
       pageViews?: number;
       eventCount?: number;
+      bounced?: boolean;
     },
 
     @Req()
@@ -98,7 +100,7 @@ export class WebsiteAnalyticsController {
   ) {
     const userId = (request as any).user?._id ?? undefined;
 
-    return this.sessionService.endSession(payload.sessionId, payload, userId);
+    return this.sessionService.endSession(payload.sessionId, payload, userId, payload.visitorId);
   }
 
   // =========================================================
@@ -660,3 +662,4 @@ export class WebsiteAnalyticsController {
     return Math.min(Math.max(Math.floor(parsed), 1), 100);
   }
 }
+

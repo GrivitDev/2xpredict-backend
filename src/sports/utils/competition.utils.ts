@@ -247,3 +247,4 @@ export function getCompetitionCounts(
     oddsApi: competitions.filter(hasOddsApiMapping).length,
   };
 }
+
