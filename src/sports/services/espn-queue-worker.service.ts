@@ -18,7 +18,10 @@ import { EspnActiveCompetitionService } from './espn-active-competition.service'
 import { EspnStandingsService } from './espn-standings.service';
 import { SportsSyncStateService } from './sports-sync-state.service';
 
-import { EspnQueueJobType } from '../interfaces/espn-queue.interface';
+import {
+  EspnQueueJobType,
+  EspnQueueStatus,
+} from '../interfaces/espn-queue.interface';
 import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 import { YOUTUBE_CONFIG } from '../config/youtube.config';
 import { getYoutubeHighlightSearchPlan } from '../enums/official-youtube-channel.enum';
@@ -566,6 +569,130 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     return { succeeded, failed, unavailable };
   }
 
+  /**
+   * Runs startup-seeded Summary jobs while normal queue processing is still
+   * gated. Queue records remain the source of truth, but startup waits for
+   * the provider call and persisted Summary state before it can continue.
+   */
+  async runStartupSummaryPhase(
+    contexts: Array<{
+      leagueId: string;
+      eventId: string;
+      season: number;
+      summaryStateKey: string;
+    }>,
+  ): Promise<{ succeeded: number; failed: number }> {
+    const pending = new Map(
+      contexts.map((context) => [
+        `${context.leagueId}/${context.season}/${context.eventId}`,
+        context,
+      ]),
+    );
+    let succeeded = 0;
+    let failed = 0;
+
+    this.logger.log(
+      `ESPN SUMMARY STARTUP WORKER started: fixtures=${pending.size}`,
+    );
+
+    const recovered = await this.espnQueueService.recoverStaleJobs(
+      SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.staleProcessingMinutes,
+    );
+    const orphaned = await this.espnQueueService.recoverOrphanedFailedJobs();
+    if (recovered > 0 || orphaned > 0) {
+      this.logger.warn(
+        `Recovered queue work before Summary startup: stale=${recovered}, orphanedFailed=${orphaned}`,
+      );
+    }
+
+    while (pending.size > 0) {
+      let processed = false;
+      let earliestNextRunAt: Date | undefined;
+
+      for (const [key, context] of pending) {
+        const stepKey = this.sportsSyncStateService.getSummaryStepKey(
+          context.eventId,
+        );
+        const successful = await this.sportsSyncStateService.isUnitSuccessful(
+          context.summaryStateKey,
+          `STEP:${stepKey}`,
+        );
+
+        if (successful) {
+          succeeded += 1;
+          pending.delete(key);
+          continue;
+        }
+
+        const processedJob = await this.processNextJob({
+          jobTypes: [EspnQueueJobType.SUMMARY_REFRESH],
+          includeFailed: true,
+          leagueId: context.leagueId,
+          season: context.season,
+          eventId: context.eventId,
+        });
+
+        if (processedJob) {
+          processed = true;
+          break;
+        }
+
+        const work = await this.espnQueueService.getSummaryRefreshWorkStatus({
+          leagueId: context.leagueId,
+          eventId: context.eventId,
+          season: context.season,
+        });
+
+        if (
+          work?.status === EspnQueueStatus.FAILED &&
+          work.attempts >= work.maxAttempts &&
+          !work.nextRunAt
+        ) {
+          failed += 1;
+          pending.delete(key);
+          this.logger.error(
+            `Startup Summary failed for ${context.leagueId}/${context.season}/${context.eventId}: ` +
+              `${work.lastError ?? 'retry budget exhausted without an error message'}`,
+          );
+          continue;
+        }
+
+        if (!work) {
+          failed += 1;
+          pending.delete(key);
+          this.logger.error(
+            `Startup Summary has no outstanding queue work for ${context.leagueId}/${context.season}/${context.eventId}`,
+          );
+          continue;
+        }
+
+        const nextRunAt = work.nextRunAt ?? new Date(Date.now() + 1_000);
+        if (
+          !earliestNextRunAt ||
+          nextRunAt.getTime() < earliestNextRunAt.getTime()
+        ) {
+          earliestNextRunAt = nextRunAt;
+        }
+      }
+
+      if (pending.size === 0 || processed) {
+        continue;
+      }
+
+      const waitMs = earliestNextRunAt
+        ? Math.max(1_000, earliestNextRunAt.getTime() - Date.now())
+        : 1_000;
+      await this.wait(waitMs);
+    }
+
+    this.logger.log(
+      `ESPN SUMMARY STARTUP WORKER completed: total=${contexts.length}, ` +
+        `succeeded=${succeeded}, failed=${failed}`,
+    );
+
+    return { succeeded, failed };
+  }
+
   // ============================================================
   // JOB EXECUTION
   // ============================================================
@@ -574,6 +701,9 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     jobTypes?: EspnQueueJobType[];
     includeFailed?: boolean;
     triggerEventIdPrefix?: string;
+    leagueId?: string;
+    season?: number;
+    eventId?: string;
   }): Promise<boolean> {
     const job = await this.espnQueueService.getNextJob(params);
 
@@ -1994,7 +2124,9 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     const nowMs = Date.now();
     const triggerEventId = String(job.triggerEventId ?? '');
     // Keep recognizing the legacy trigger prefix because pending jobs survive deployments.
-    const startupJob = triggerEventId.startsWith('STARTUP_SUMMARY_66H:');
+    const startupJob =
+      triggerEventId.startsWith('STARTUP_SUMMARY:') ||
+      triggerEventId.startsWith('STARTUP_SUMMARY_66H:');
     const upcomingDelayMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.upcomingWindowHours * 60 * 60_000;
     const startupDelayMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours * 60 * 60_000;
     const finishedDelayMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes * 60_000;
@@ -2410,6 +2542,12 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async wait(milliseconds: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.max(1_000, milliseconds));
+    });
+  }
+
   // ============================================================
   // STATE KEY
   // ============================================================
@@ -2508,4 +2646,3 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 }
-

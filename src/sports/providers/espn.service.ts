@@ -23,6 +23,7 @@ import {
 } from '../services/sports-provider-rate-limit.service';
 
 import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
+import { getEspnStandingsPolicy } from '../config/priority-competitions.config';
 
 @Injectable()
 export class EspnService {
@@ -393,6 +394,22 @@ export class EspnService {
       ...(mergedChildren.length ? { children: mergedChildren } : {}),
     };
     const tableCount = this.countStandingsTables(mergedTableView);
+    const standingsPolicy = getEspnStandingsPolicy(normalizedLeague);
+
+    if (
+      tableCount > 0 &&
+      standingsPolicy === 'REQUIRED' &&
+      missingStageIds.length > 0
+    ) {
+      const reason =
+        `ESPN standings incomplete for ${normalizedLeague}/${season ?? 'current'}: ` +
+        `required stages are missing (${missingStageIds.join(', ')}); ` +
+        `retrievedStages=${retrievedStageIds.length}/${discoveredStages.length}; ` +
+        `tables=${tableCount}`;
+
+      this.logger.warn(reason);
+      throw new ServiceUnavailableException(reason);
+    }
 
     const merged: EspnStandingsPayload = {
       ...base,

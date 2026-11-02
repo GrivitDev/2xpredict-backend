@@ -268,6 +268,117 @@ export class EspnQueueService {
     };
   }
 
+  /**
+   * Returns the next outstanding Summary job for one fixture. Startup uses
+   * this to wait for persisted provider work rather than treating queue
+   * insertion as Summary completion.
+   */
+  async getSummaryRefreshWorkStatus(params: {
+    leagueId: string;
+    eventId: string;
+    season: number;
+  }): Promise<{
+    status: EspnQueueStatus;
+    attempts: number;
+    maxAttempts: number;
+    nextRunAt?: Date;
+    lastError?: string | null;
+  } | null> {
+    const leagueId = String(params.leagueId ?? '')
+      .trim()
+      .toLowerCase();
+    const eventId = String(params.eventId ?? '').trim();
+
+    if (!leagueId || !eventId || !Number.isInteger(params.season)) {
+      throw new Error(
+        'Summary work status lookup requires leagueId, eventId, and integer season',
+      );
+    }
+
+    const scope = {
+      type: EspnQueueJobType.SUMMARY_REFRESH,
+      leagueId,
+      eventId,
+      season: params.season,
+    };
+
+    const active = await this.queueModel
+      .aggregate<{
+        status: EspnQueueStatus;
+        attempts: number;
+        maxAttempts: number;
+        nextRunAt?: Date;
+        lastError?: string | null;
+      }>([
+        {
+          $match: {
+            ...scope,
+            $or: [
+              { status: EspnQueueStatus.PENDING },
+              { status: EspnQueueStatus.PROCESSING },
+              {
+                status: EspnQueueStatus.FAILED,
+                nextAttemptAt: { $type: 'date' },
+              },
+            ],
+          },
+        },
+        {
+          $addFields: {
+            nextRunAt: {
+              $ifNull: ['$nextAttemptAt', '$scheduledFor'],
+            },
+          },
+        },
+        { $sort: { nextRunAt: 1, createdAt: 1 } },
+        { $limit: 1 },
+        {
+          $project: {
+            _id: 0,
+            status: 1,
+            attempts: 1,
+            maxAttempts: 1,
+            nextRunAt: 1,
+            lastError: 1,
+          },
+        },
+      ])
+      .exec();
+
+    if (active[0]) {
+      return active[0];
+    }
+
+    const terminal = await this.queueModel
+      .findOne({
+        ...scope,
+        status: EspnQueueStatus.FAILED,
+        nextAttemptAt: { $exists: false },
+        $expr: { $gte: ['$attempts', '$maxAttempts'] },
+      })
+      .sort({ failedAt: -1, updatedAt: -1 })
+      .select({
+        _id: 0,
+        status: 1,
+        attempts: 1,
+        maxAttempts: 1,
+        lastError: 1,
+      })
+      .lean()
+      .exec();
+
+    if (!terminal) {
+      return null;
+    }
+
+    return {
+      status: terminal.status,
+      attempts: terminal.attempts,
+      maxAttempts: terminal.maxAttempts,
+      lastError: terminal.lastError ?? null,
+    };
+  }
+
   async addLeagueCatalogueRefreshJob(params: {
     priority: number;
     scheduledFor?: Date;
@@ -1016,6 +1127,9 @@ export class EspnQueueService {
     jobTypes?: EspnQueueJobType[];
     includeFailed?: boolean;
     triggerEventIdPrefix?: string;
+    leagueId?: string;
+    season?: number;
+    eventId?: string;
   }): Promise<EspnQueueDocument | null> {
     const now = new Date();
 
@@ -1070,6 +1184,18 @@ export class EspnQueueService {
       query.type = {
         $in: params.jobTypes,
       };
+    }
+
+    if (params?.leagueId?.trim()) {
+      query.leagueId = params.leagueId.trim().toLowerCase();
+    }
+
+    if (typeof params?.season === 'number') {
+      query.season = params.season;
+    }
+
+    if (params?.eventId?.trim()) {
+      query.eventId = params.eventId.trim();
     }
 
     if (params?.triggerEventIdPrefix?.trim()) {
@@ -1744,4 +1870,3 @@ export class EspnQueueService {
     return result.deletedCount ?? 0;
   }
 }
-

@@ -232,9 +232,13 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       // SUMMARY COLLECTION
       // --------------------------------------------------------
 
-      await this.runStartupSummaryPhase(leagueContexts);
+      const summaryResult = await this.runStartupSummaryPhase(leagueContexts);
 
-      this.logger.log('ESPN Summary startup phase completed');
+      this.logger.log(
+        `ESPN Summary startup phase completed: checked=${summaryResult.checked}, ` +
+          `missing=${summaryResult.missingSummary}, processed=${summaryResult.processed}, ` +
+          `failed=${summaryResult.failedAttempts}`,
+      );
 
       // --------------------------------------------------------
       // PHASE 5
@@ -950,6 +954,12 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     let checked = 0;
     let missingSummary = 0;
     let queued = 0;
+    const startupSummaryContexts: Array<{
+      leagueId: string;
+      eventId: string;
+      season: number;
+      summaryStateKey: string;
+    }> = [];
 
     const startupWindowStart = new Date();
     const startupWindowEnd = new Date(
@@ -986,7 +996,7 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
 
     for (const context of contexts) {
       // The initial Summary phase covers the season from its first calendar
-      // day through the rolling 66-hour-ahead boundary. It must include past,
+      // day through the configured startup-window boundary. It must include past,
       // live and completed fixtures too; completed matches are still useful
       // Summary/history evidence for downstream systems.
       const seasonStartDate = new Date(
@@ -1047,6 +1057,19 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       checked += eligibleSummaryUnits.length;
       missingSummary += toQueue.length;
 
+      for (const [eventId, unit] of eligibleByEvent) {
+        if (unit.status === SportsSyncUnitStatus.SUCCESS) {
+          continue;
+        }
+
+        startupSummaryContexts.push({
+          leagueId: context.leagueId,
+          eventId,
+          season: context.season,
+          summaryStateKey: state.stateKey,
+        });
+      }
+
       for (const [eventId, unit] of toQueue) {
         jobs.push({
           leagueId: context.leagueId,
@@ -1059,8 +1082,8 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // Persist jobs in small concurrent writes. No ESPN HTTP calls happen in the
-    // startup critical path; normal workers execute the queued Summary requests.
+    // Persist jobs in small concurrent writes. The startup-only queue worker
+    // below executes these durable jobs before normal operations are released.
     const enqueueBatchSize = Math.max(1, this.startupSummaryBatchSize);
     for (let offset = 0; offset < jobs.length; offset += enqueueBatchSize) {
       const batch = jobs.slice(offset, offset + enqueueBatchSize);
@@ -1068,7 +1091,7 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
         batch.map((job) =>
           this.espnQueueService.addSummaryRefreshJob({
             ...job,
-            triggerEventId: `STARTUP_SUMMARY_66H:${job.eventId}`,
+            triggerEventId: `STARTUP_SUMMARY:${job.eventId}`,
           }),
         ),
       );
@@ -1081,15 +1104,30 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
+    const workerResult =
+      await this.espnQueueWorkerService.runStartupSummaryPhase(
+        startupSummaryContexts,
+      );
+
+    if (workerResult.failed > 0) {
+      throw new Error(
+        `Startup Summary collection failed for ${workerResult.failed} fixture(s); ` +
+          'normal operations remain locked until the required Summary data is collected.',
+      );
+    }
+
     this.logger.log(
-      `ESPN STARTUP SUMMARY PHASE completed: checked=${checked}, missing=${missingSummary}, queued=${queued}, seasonStart-through-${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}hAhead. Provider requests are delegated to the normal durable queue.`,
+      `ESPN STARTUP SUMMARY PHASE resolved: checked=${checked}, ` +
+        `missing=${missingSummary}, queued=${queued}, ` +
+        `processed=${workerResult.succeeded}, ` +
+        `seasonStart-through-${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}hAhead.`,
     );
 
     return {
       checked,
       missingSummary,
-      processed: 0,
-      failedAttempts: jobs.length - queued,
+      processed: workerResult.succeeded,
+      failedAttempts: workerResult.failed,
     };
   }
 
@@ -1282,4 +1320,3 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     });
   }
 }
-
