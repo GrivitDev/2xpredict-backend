@@ -115,15 +115,14 @@ export class PredictionAccessService {
           settledPredictionHistory: true,
           browseFixturesAndLeagues: true,
           activePickCenter: {
-            priorities: ['SELECTIVE'],
+            priorities: ['SELECTIVE', 'HIGH'],
             dailyLimit: null,
-            mode: 'UNLIMITED_SELECTIVE_LEAGUES',
+            mode: 'UNLIMITED_SELECTIVE_AND_HIGH_LEAGUES',
           },
           curatedPredictionCenter: {
             allowed: false,
             settledPublic: true,
-            message:
-              'Settled curated predictions are public. Register for a free account to access eligible active predictions.',
+            mode: 'COUNTS_ONLY_FOR_ACTIVE_PICKS',
           },
           slipProducts: [],
           sureOdds: [],
@@ -132,15 +131,15 @@ export class PredictionAccessService {
           settledPredictionHistory: true,
           browseFixturesAndLeagues: true,
           activePickCenter: {
-            priorities: ['SELECTIVE'],
+            priorities: ['ELITE', 'HIGH', 'SELECTIVE'],
+            excludedPriorities: ['REGIONAL'],
             dailyLimit: null,
-            mode: 'UNLIMITED_SELECTIVE_LEAGUES',
+            mode: 'ALL_SUPPORTED_EXCEPT_REGIONAL_PRIORITY',
           },
           curatedPredictionCenter: {
-            allowed: true,
-            priorities: ['SELECTIVE'],
-            dailyLimit: null,
-            mode: 'UNLIMITED_PUBLISHED_SELECTIVE_PREDICTIONS',
+            allowed: false,
+            settledPublic: true,
+            mode: 'COUNTS_ONLY_FOR_ACTIVE_PICKS',
           },
           slipProducts: [],
           sureOdds: [],
@@ -149,36 +148,38 @@ export class PredictionAccessService {
           settledPredictionHistory: true,
           browseFixturesAndLeagues: true,
           activePickCenter: 'ALL_SUPPORTED_LEAGUES_ALL_ELIGIBLE_SELECTIONS',
-          curatedPredictionCenter: 'ALL_SUPPORTED_LEAGUES',
-          slipProducts: ['ODDS_10'],
-          sureOdds: [],
+          curatedPredictionCenter: {
+            allowed: true,
+            excludedCategories: ['SELECTIVE'],
+            mode: 'ALL_EXCEPT_SELECTIVE_CATEGORY',
+          },
+          slipProducts: [],
+          sureOdds: ['SURE_2'],
         },
         vip: {
           settledPredictionHistory: true,
           browseFixturesAndLeagues: true,
           activePickCenter: 'ALL_SUPPORTED_LEAGUES_ALL_ELIGIBLE_SELECTIONS',
-          curatedPredictionCenter: 'ALL_SUPPORTED_LEAGUES',
-          slipProducts: ['ODDS_10', 'ODDS_25'],
-          sureOdds: ['SURE_2'],
+          curatedPredictionCenter: 'ALL_SUPPORTED_CATEGORIES',
+          slipProducts: [],
+          sureOdds: ['SURE_2', 'SURE_5', 'SURE_7'],
         },
         premium: {
           settledPredictionHistory: true,
           browseFixturesAndLeagues: true,
           activePickCenter: 'ALL_SUPPORTED_LEAGUES_ALL_ELIGIBLE_SELECTIONS',
-          curatedPredictionCenter: 'ALL_SUPPORTED_LEAGUES',
+          curatedPredictionCenter: 'ALL_SUPPORTED_CATEGORIES',
           slipProducts: ['ODDS_10', 'ODDS_25', 'ODDS_50'],
           sureOdds: ['SURE_2', 'SURE_5', 'SURE_7'],
         },
         settledPredictionAccess: {
           public: true,
-          sources: [
-            'CURATED_PREDICTIONS',
-            'PICK_CENTER',
-            'MARKET_PREDICTIONS',
-            'SLIP_CENTER',
-            'SURE_ODDS',
-          ],
+          sources: ['CURATED_PREDICTIONS', 'PICK_CENTER', 'MARKET_PREDICTIONS'],
           appliesTo: ['WON', 'LOST', 'VOID', 'PUSH', 'HALF_WON', 'HALF_LOST'],
+        },
+        slipAccess: {
+          settledSlipsAreNotPublicBypass: true,
+          contentsRequireProductEntitlement: true,
         },
         settlement: {
           selectionBySelection: true,
@@ -201,12 +202,28 @@ export class PredictionAccessService {
   ): Promise<Record<string, unknown>> {
     const plan = await this.getAccessPlan(user);
     const pageInfo = this.pagination(input.page, input.pageSize, 20, 100);
-    const visible = await this.getVisibleCuratedRecords(plan, input);
+    const records = await this.getCuratedRecordsForInput(input);
+    const active = records.filter((record) =>
+      this.isCurrentPublishedCurated(record),
+    );
+    const settled = records.filter((record) => this.isCuratedSettled(record));
+    // Curated documents contain selections from multiple fixtures and may span
+    // more than one competition-priority category. Filter each selection so a
+    // Regular member can see the non-Selective legs without receiving the
+    // restricted Selective legs from the same daily curated document.
+    const visibleActive = active
+      .map((record) => this.filterCuratedRecordForPlan(plan, record))
+      .filter((record): record is Record<string, any> => Boolean(record));
+    const visible = [...visibleActive, ...settled].sort(
+      (a, b) => this.curatedFixtureTime(a) - this.curatedFixtureTime(b),
+    );
     const total = visible.length;
     const items = visible.slice(
       (pageInfo.page - 1) * pageInfo.pageSize,
       pageInfo.page * pageInfo.pageSize,
     );
+    const leagueSummary = await this.buildCuratedLeagueSummary(active, plan);
+
     return {
       items,
       pagination: {
@@ -214,12 +231,14 @@ export class PredictionAccessService {
         total,
         pages: Math.ceil(total / pageInfo.pageSize),
       },
+      leagueSummary,
       accessPlan: plan,
-      ...(plan === PredictionAccessPlan.ANONYMOUS
+      ...(plan === PredictionAccessPlan.ANONYMOUS ||
+      plan === PredictionAccessPlan.FREE
         ? {
             activePredictionsLocked: true,
             message:
-              'Settled curated predictions are public. Register to access eligible active predictions.',
+              'Published Special Picks are listed with counts. A qualifying subscription is required to view their selections.',
           }
         : {}),
     };
@@ -264,13 +283,15 @@ export class PredictionAccessService {
     const visibleRecords = await this.getVisibleCuratedRecords(plan, {
       predictionId: String(prediction._id),
     });
-    const visibleIds = new Set(
-      visibleRecords.map((record: any) => String(record._id)),
+    const visiblePrediction = visibleRecords.find(
+      (record: any) => String(record._id) === String(prediction._id),
     );
-    if (!visibleIds.has(String(prediction._id))) {
+    if (!visiblePrediction) {
       throw new NotFoundException('Prediction was not found.');
     }
-    return { ...prediction, accessPlan: plan };
+    // Return the filtered object, not the original database document. This
+    // prevents a detail read from bypassing per-selection Curated entitlements.
+    return { ...visiblePrediction, accessPlan: plan };
   }
 
   // ---------------------------------------------------------------------------
@@ -292,10 +313,14 @@ export class PredictionAccessService {
 
     // No daily quota: the full eligible Pick Center selection set is filtered only
     // by league entitlements and the request's normal query filters.
-    const picks = (
-      await this.findPickCenterRecords(input, input.includePast === true)
-    ).filter((pick: any) =>
-      this.canAccessActiveLeague(plan, this.resolvePriority(pick.leagueId)),
+    const allPicks = await this.enrichPickCenterRecords(
+      await this.findPickCenterRecords(input, input.includePast === true),
+    );
+    const picks = allPicks.filter((pick: any) =>
+      this.canAccessActiveLeague(
+        plan,
+        this.resolvePriority(pick.leagueId, pick.leaguePriority),
+      ),
     );
     const allowedEventIds = [
       ...new Set(picks.map((pick: any) => String(pick.eventId))),
@@ -469,9 +494,9 @@ export class PredictionAccessService {
     const visible: Record<string, any>[] = [];
 
     for (const pick of enriched) {
-      const selectedMarkets = Array.isArray(pick.selectedMarkets)
-        ? pick.selectedMarkets
-        : [];
+      const selectedMarkets = this.oneSelectionPerMarket(
+        Array.isArray(pick.selectedMarkets) ? pick.selectedMarkets : [],
+      );
       const targetSelections = selectedMarkets.filter((selection: any) => {
         const outcome = String(
           selection.actualOutcome ?? selection.settlementStatus ?? 'PENDING',
@@ -481,7 +506,7 @@ export class PredictionAccessService {
       });
       if (!targetSelections.length) continue;
 
-      const priority = this.resolvePriority(pick.leagueId);
+      const priority = this.resolvePriority(pick.leagueId, pick.leaguePriority);
       if (settledOnly) {
         // Settled Pick Center outcomes are public at every subscription level.
         // Keep the fixture and its original selected-market records intact so
@@ -603,14 +628,7 @@ export class PredictionAccessService {
         .trim()
         .toLowerCase();
       const league = leagueMap.get(leagueId) ?? {};
-      const resolvedLeagueName = this.resolveLeagueDisplayName(
-        league,
-        leagueId,
-      );
-      const leagueName =
-        resolvedLeagueName !== 'League name unavailable'
-          ? resolvedLeagueName
-          : String(record.leagueName ?? leagueId ?? 'Football competition');
+      const rawLeagueName = String(record.leagueName ?? '').trim();
       const competition = (PRIORITY_COMPETITIONS as any[]).find((item) => {
         const identifiers = [
           item.id,
@@ -621,13 +639,17 @@ export class PredictionAccessService {
         ]
           .filter(Boolean)
           .map((value: string) => this.normalizeIdentifier(value));
-        const candidates = [leagueId, leagueName, String(league.slug ?? '')]
+        const candidates = [leagueId, rawLeagueName, String(league.slug ?? '')]
           .filter(Boolean)
           .map((value) => this.normalizeIdentifier(value));
         return identifiers.some((identifier: string) =>
           candidates.includes(identifier),
         );
       });
+      const resolvedLeagueName = this.resolveLeagueDisplayName(league, leagueId);
+      const leagueName = resolvedLeagueName !== 'League name unavailable'
+        ? resolvedLeagueName
+        : String(competition?.name ?? competition?.displayName ?? (rawLeagueName && !this.isLeagueCode(rawLeagueName, leagueId) ? rawLeagueName : 'Football competition'));
       const payload = league.payload ?? {};
       const region = String(
         competition?.region ??
@@ -646,7 +668,7 @@ export class PredictionAccessService {
           '',
       ).trim();
       const countryName = this.predictionCountryGroup(region, type, country);
-      const priority = this.resolvePriority(leagueId);
+      const priority = this.resolvePriority(leagueId, competition?.priority, league.priority);
       const locked = settledOnly
         ? false
         : !this.canAccessActiveLeague(plan, priority);
@@ -679,6 +701,9 @@ export class PredictionAccessService {
             logo: league.logo,
             priority: league.priority,
             locked: league.locked,
+            requiredPlan: league.locked
+              ? this.activePriorityRequiredPlan(league.priority)
+              : null,
             count: league.eventIds.size,
           }))
           .filter((league) => league.count > 0)
@@ -686,12 +711,21 @@ export class PredictionAccessService {
         const lockedLeagueCount = leagues.filter(
           (league) => league.locked,
         ).length;
+        const lockedRequiredPlans = leagues
+          .filter((league) => league.locked)
+          .map((league) => String(league.requiredPlan ?? 'regular'));
+        const requiredPlan = lockedRequiredPlans.includes('regular')
+          ? 'regular'
+          : lockedRequiredPlans.includes('free')
+            ? 'free'
+            : null;
         return {
           name,
           count: leagues.reduce((sum, league) => sum + league.count, 0),
           predictionLeagueCount: leagues.length,
           locked: leagues.length > 0 && lockedLeagueCount === leagues.length,
           lockedLeagueCount,
+          requiredPlan,
           leagues,
         };
       })
@@ -751,7 +785,7 @@ export class PredictionAccessService {
           access: {
             allowed: true,
             plan: 'admin',
-            priority: this.resolvePriority(pick.leagueId),
+            priority: this.resolvePriority(pick.leagueId, pick.leaguePriority),
             marketLimit: null,
           },
         })),
@@ -796,7 +830,7 @@ export class PredictionAccessService {
       Number.isFinite(fixtureTime) && fixtureTime >= Date.now();
     const activeLeagueAllowed = this.canAccessActiveLeague(
       plan,
-      this.resolvePriority(enriched.leagueId),
+      this.resolvePriority(enriched.leagueId, enriched.leaguePriority),
     );
 
     if (activeDateAllowed && activeLeagueAllowed) return enriched;
@@ -809,7 +843,7 @@ export class PredictionAccessService {
         access: {
           allowed: true,
           plan,
-          priority: this.resolvePriority(enriched.leagueId),
+          priority: this.resolvePriority(enriched.leagueId, enriched.leaguePriority),
           marketLimit: null,
           mode: 'SETTLED_PUBLIC',
         },
@@ -1096,10 +1130,10 @@ export class PredictionAccessService {
     const plan = await this.getAccessPlan(user);
     const pageInfo = this.pagination(input.page, input.pageSize, 20, 100);
     const query: Record<string, any> = { status: SlipStatus.PUBLISHED };
-    // Keep Sure Odds on its dedicated route so active daily quotas remain intact.
-    // The default route still includes settled legacy product records.
+    // Public Slip Center exposes only the current product families. Legacy
+    // persisted product identifiers remain available to administrative reads.
     query.productType = requestedType ?? {
-      $ne: PredictionProductType.SURE_ODDS,
+      $in: Object.keys(PREDICTION_ACCESS_CONFIG.slipProducts),
     };
     this.applyDateRange(query, 'fixtureDateFrom', input.from, input.to, true);
 
@@ -1120,23 +1154,27 @@ export class PredictionAccessService {
             : 'PROVIDER'
           : null,
     }));
-    const enriched = await this.enrichSlipRecords(normalized);
+    const allowed = normalized.filter((slip) => this.canAccessSlip(plan, slip));
+    const enrichedAllowed = await this.enrichSlipRecords(allowed);
+    const enrichedById = new Map(
+      enrichedAllowed.map((slip: any) => [String(slip._id), slip]),
+    );
 
-    // A completed slip is public regardless of product tier. Unsettled slips
-    // continue to obey the existing product and subscription entitlements.
-    const visible = enriched.filter((slip: any) => {
-      if (
-        slip.sureOdds === true ||
-        String(slip.productType ?? '').toUpperCase() ===
-          PredictionProductType.SURE_ODDS
-      )
-        return false;
-      return (
-        SETTLED_OUTCOMES.has(
-          String(slip.settlementStatus ?? '').toUpperCase(),
-        ) || this.canAccessSlip(plan, slip)
-      );
+    const visible = normalized.map((slip) => {
+      const full = enrichedById.get(String(slip._id));
+      if (full) {
+        const requiredPlan = this.slipRequiredPlan(slip);
+        return {
+          ...full,
+          locked: false,
+          accessAllowed: true,
+          requiredPlan,
+          access: { allowed: true, plan, requiredPlan },
+        };
+      }
+      return this.lockedSlipPreview(slip, plan);
     });
+
     const total = visible.length;
     const pageItems = visible.slice(
       (pageInfo.page - 1) * pageInfo.pageSize,
@@ -1150,13 +1188,7 @@ export class PredictionAccessService {
         pages: Math.ceil(total / pageInfo.pageSize),
       },
       accessPlan: plan,
-      ...(plan === PredictionAccessPlan.ANONYMOUS
-        ? {
-            activeSlipsLocked: true,
-            message:
-              'Settled slips are public. Active slips require an eligible subscription.',
-          }
-        : {}),
+      lockedCount: visible.filter((slip: any) => slip.locked).length,
     };
   }
 
@@ -1223,6 +1255,11 @@ export class PredictionAccessService {
     if (!slip) throw new NotFoundException('Slip was not found.');
 
     const plan = await this.getAccessPlan(user);
+    // Settlement status does not grant public access to a restricted slip.
+    if (!this.canAccessSlip(plan, slip)) {
+      throw new NotFoundException('Slip was not found.');
+    }
+
     const odds = this.numberOrNull(slip.combinedOdds);
     const enriched = (
       await this.enrichSlipRecords([
@@ -1241,13 +1278,15 @@ export class PredictionAccessService {
       ])
     )[0];
 
-    const settled = SETTLED_OUTCOMES.has(
-      String(enriched.settlementStatus ?? '').toUpperCase(),
-    );
-    if (!settled && !this.canAccessSlip(plan, slip)) {
-      throw new NotFoundException('Slip was not found.');
-    }
-    return { ...enriched, accessPlan: plan };
+    return {
+      ...enriched,
+      accessPlan: plan,
+      access: {
+        allowed: true,
+        plan,
+        requiredPlan: this.slipRequiredPlan(slip),
+      },
+    };
   }
 
   async listSureOdds(
@@ -1274,6 +1313,44 @@ export class PredictionAccessService {
       .limit(10000)
       .lean()
       .exec()) as any[];
+    const acceptedByDayAndProduct = new Map<string, number>();
+    const accessible: any[] = [];
+    const blockedReason = new Map<string, string>();
+
+    for (const slip of slips) {
+      const id = String(slip._id);
+      if (!this.canAccessSlip(plan, slip)) {
+        blockedReason.set(id, 'SUBSCRIPTION_REQUIRED');
+        continue;
+      }
+
+      const settled = SETTLED_OUTCOMES.has(
+        String(slip.settlementStatus ?? '').toUpperCase(),
+      );
+      if (!settled) {
+        const product = String(
+          slip.sureOddsProduct ??
+            (slip.sureOddsTier === SureOddsTier.VIP ? 'SURE_2' : 'SURE_5'),
+        ).toUpperCase();
+        if (!['SURE_2', 'SURE_5', 'SURE_7'].includes(product)) {
+          blockedReason.set(id, 'PRODUCT_UNAVAILABLE');
+          continue;
+        }
+        const dailyTarget =
+          (PREDICTION_ACCESS_CONFIG.sureOdds.products as any)[product]
+            ?.dailyTarget ?? 0;
+        const day = this.getDateKey(slip);
+        const quotaKey = `${day}:${product}`;
+        const current = acceptedByDayAndProduct.get(quotaKey) ?? 0;
+        if (current >= dailyTarget) {
+          blockedReason.set(id, 'DAILY_LIMIT');
+          continue;
+        }
+        acceptedByDayAndProduct.set(quotaKey, current + 1);
+      }
+      accessible.push(slip);
+    }
+
     const normalized = slips.map((slip) => {
       const odds = this.numberOrNull(slip.combinedOdds);
       return {
@@ -1286,68 +1363,52 @@ export class PredictionAccessService {
           : 'PROVIDER',
       };
     });
-    const enriched = await this.enrichSlipRecords(normalized);
-    const settled = enriched.filter((slip: any) =>
-      SETTLED_OUTCOMES.has(String(slip.settlementStatus ?? '').toUpperCase()),
+    const accessibleIds = new Set(accessible.map((slip) => String(slip._id)));
+    const enrichedAllowed = await this.enrichSlipRecords(
+      normalized.filter((slip) => accessibleIds.has(String(slip._id))),
     );
-    const active = enriched.filter(
-      (slip: any) =>
-        !SETTLED_OUTCOMES.has(
-          String(slip.settlementStatus ?? '').toUpperCase(),
-        ),
+    const enrichedById = new Map(
+      enrichedAllowed.map((slip: any) => [String(slip._id), slip]),
     );
 
-    // Daily Sure Odds quotas apply only to active product access. Historical
-    // settled slips are public and are not consumed by subscription quotas.
-    const acceptedByDayAndProduct = new Map<string, number>();
-    const eligibleActive: any[] = [];
-    for (const slip of active) {
-      if (!this.canAccessSlip(plan, slip)) continue;
-      const product = String(
-        slip.sureOddsProduct ??
-          (slip.sureOddsTier === SureOddsTier.VIP ? 'SURE_2' : 'SURE_5'),
-      ).toUpperCase();
-      if (!['SURE_2', 'SURE_5', 'SURE_7'].includes(product)) continue;
-      if (plan === PredictionAccessPlan.VIP && product !== 'SURE_2') continue;
-      const dailyTarget =
-        (PREDICTION_ACCESS_CONFIG.sureOdds.products as any)[product]
-          ?.dailyTarget ?? 0;
-      const day = this.getDateKey(slip);
-      const quotaKey = `${day}:${product}`;
-      const current = acceptedByDayAndProduct.get(quotaKey) ?? 0;
-      if (current >= dailyTarget) continue;
-      acceptedByDayAndProduct.set(quotaKey, current + 1);
-      eligibleActive.push(slip);
-    }
+    const items = normalized.map((slip) => {
+      const full = enrichedById.get(String(slip._id));
+      if (full) {
+        const requiredPlan = this.slipRequiredPlan(slip);
+        return {
+          ...full,
+          locked: false,
+          accessAllowed: true,
+          requiredPlan,
+          access: { allowed: true, plan, requiredPlan },
+        };
+      }
+      return this.lockedSlipPreview(
+        slip,
+        plan,
+        blockedReason.get(String(slip._id)) ?? 'SUBSCRIPTION_REQUIRED',
+      );
+    });
 
-    const eligible = [...settled, ...eligibleActive].sort(
-      (a: any, b: any) => this.getRecordDate(b) - this.getRecordDate(a),
-    );
-    const total = eligible.length;
+    const total = items.length;
     const start = (pageInfo.page - 1) * pageInfo.pageSize;
     return {
-      items: eligible.slice(start, start + pageInfo.pageSize),
+      items: items.slice(start, start + pageInfo.pageSize),
       pagination: {
         ...pageInfo,
         total,
         pages: Math.ceil(total / pageInfo.pageSize),
       },
       accessPlan: plan,
+      lockedCount: items.filter((slip: any) => slip.locked).length,
       sureOddsPolicy: PREDICTION_ACCESS_CONFIG.sureOdds,
       dailySelectionTargets: {
-        vip: PREDICTION_ACCESS_CONFIG.sureOdds.vipDailyTarget,
-        premiumAdditional: PREDICTION_ACCESS_CONFIG.sureOdds.premiumDailyTarget,
+        regular: PREDICTION_ACCESS_CONFIG.sureOdds.vipDailyTarget,
+        vipAdditional: PREDICTION_ACCESS_CONFIG.sureOdds.premiumDailyTarget,
         premiumTotal:
           PREDICTION_ACCESS_CONFIG.sureOdds.vipDailyTarget +
           PREDICTION_ACCESS_CONFIG.sureOdds.premiumDailyTarget,
       },
-      ...(plan === PredictionAccessPlan.ANONYMOUS
-        ? {
-            activeSlipsLocked: true,
-            message:
-              'Settled Sure Odds slips are public. Active Sure Odds slips require VIP or Premium.',
-          }
-        : {}),
     };
   }
 
@@ -1598,7 +1659,7 @@ export class PredictionAccessService {
         leagueName: this.resolveLeagueDisplayName(
           league,
           leagueId,
-          fixture.payload?.competitions?.[0],
+          mappedCompetition ?? fixture.payload?.competitions?.[0],
         ),
         leagueLogo: this.logoUrl(league?.payload),
         country,
@@ -1610,7 +1671,7 @@ export class PredictionAccessService {
         competitionRegion: region || null,
         competitionType: competitionType || null,
         leaguePriority:
-          mappedCompetition?.priority ?? league?.priority ?? 'SELECTIVE',
+          mappedCompetition?.priority ?? league?.priority ?? 'UNKNOWN',
         isPriorityLeague: Boolean(league?.isPriority),
         homeTeamLogo: this.logoUrl(home),
         awayTeamLogo: this.logoUrl(away),
@@ -1619,29 +1680,34 @@ export class PredictionAccessService {
     return result;
   }
 
+  private isLeagueCode(value: string, leagueId = ''): boolean {
+    const normalized = value.trim();
+    return !normalized ||
+      normalized.toLowerCase() === leagueId.trim().toLowerCase() ||
+      /^[a-z0-9]+(?:[._-][a-z0-9]+)+$/i.test(normalized);
+  }
+
   private resolveLeagueDisplayName(
     league: any,
     leagueId: string,
     competition?: any,
   ): string {
+    const canonical = this.findPriorityCompetition(leagueId);
     const candidates = [
       competition?.displayName,
       competition?.name,
-      competition?.shortName,
+      competition?.fullName,
+      canonical?.displayName,
+      canonical?.name,
+      canonical?.fullName,
       league?.payload?.displayName,
+      league?.payload?.fullName,
       league?.payload?.name,
       league?.name,
     ];
-    const isCode = (value: string) =>
-      /^[a-z0-9]+(?:[._][a-z0-9]+)+$/i.test(value);
     for (const candidate of candidates) {
       const value = String(candidate ?? '').trim();
-      if (
-        value &&
-        value.toLowerCase() !== leagueId.toLowerCase() &&
-        !isCode(value)
-      )
-        return value;
+      if (value && !this.isLeagueCode(value, leagueId)) return value;
     }
     return 'League name unavailable';
   }
@@ -1675,21 +1741,17 @@ export class PredictionAccessService {
   ): string {
     const normalizedRegion = this.normalizeIdentifier(region);
     const normalizedType = this.normalizeIdentifier(type);
-    if (
-      ['international', 'global', 'world'].some(
-        (value) =>
-          normalizedRegion.includes(value) || normalizedType.includes(value),
-      )
-    )
+
+    // World competitions (for example, the FIFA World Cup) stay in the
+    // International group. Other international competitions (for example,
+    // AFCON) are grouped as Regional for the Free-plan exclusion rule.
+    if (normalizedRegion === 'world' || normalizedRegion.includes('world')) {
       return 'International';
-    if (
-      ['regional', 'continental'].some(
-        (value) =>
-          normalizedRegion.includes(value) || normalizedType.includes(value),
-      )
-    )
+    }
+    if (normalizedType === 'international' || normalizedRegion === 'international') {
       return 'Regional';
-    return country.trim() || 'Regional';
+    }
+    return country.trim() || 'Other competitions';
   }
 
   // ---------------------------------------------------------------------------
@@ -1758,7 +1820,7 @@ export class PredictionAccessService {
     input: PredictionReadFilters,
   ): Record<string, any> | null {
     if (!pick || !Array.isArray(market.selections)) return null;
-    const priority = this.resolvePriority(market.leagueId);
+    const priority = this.resolvePriority(market.leagueId, pick.leaguePriority);
     const visibleRankedMarkets = this.filterPickCenter(pick, plan)
       .selectedMarkets as any[];
     const approved = new Set(
@@ -1806,21 +1868,60 @@ export class PredictionAccessService {
         plan,
         priority,
         mode:
-          plan === PredictionAccessPlan.ANONYMOUS ||
-          plan === PredictionAccessPlan.FREE
-            ? 'SELECTIVE_LEAGUES'
-            : 'FULL_ACCESS',
+          plan === PredictionAccessPlan.ANONYMOUS
+            ? 'SELECTIVE_AND_HIGH_PRIORITY_CATEGORIES'
+            : plan === PredictionAccessPlan.FREE
+              ? 'ALL_EXCEPT_REGIONAL_PRIORITY'
+              : 'FULL_ACCESS',
       },
     };
+  }
+
+  /**
+   * Pick Center has one public recommendation per market. Older stored records
+   * may contain every eligible outcome from a market; retain only the highest
+   * ranked outcome for each market before returning/displaying the fixture.
+   */
+  private oneSelectionPerMarket(selections: any[]): any[] {
+    const bestByMarket = new Map<string, any>();
+    for (const selection of selections ?? []) {
+      const marketKey = String(selection?.marketKey ?? selection?.marketCode ?? '')
+        .trim()
+        .toUpperCase();
+      if (!marketKey) continue;
+      const current = bestByMarket.get(marketKey);
+      if (!current) {
+        bestByMarket.set(marketKey, selection);
+        continue;
+      }
+      const score = Number(selection?.rankingScore ?? Number.NEGATIVE_INFINITY);
+      const currentScore = Number(current?.rankingScore ?? Number.NEGATIVE_INFINITY);
+      const probability = Number(selection?.probability ?? 0);
+      const currentProbability = Number(current?.probability ?? 0);
+      const confidence = Number(selection?.confidence ?? 0);
+      const currentConfidence = Number(current?.confidence ?? 0);
+      if (
+        score > currentScore ||
+        (score === currentScore && probability > currentProbability) ||
+        (score === currentScore && probability === currentProbability && confidence > currentConfidence)
+      ) {
+        bestByMarket.set(marketKey, selection);
+      }
+    }
+    return [...bestByMarket.values()].sort((a, b) => {
+      const rankA = Number(a?.rank ?? Number.MAX_SAFE_INTEGER);
+      const rankB = Number(b?.rank ?? Number.MAX_SAFE_INTEGER);
+      return rankA - rankB || String(a?.marketKey ?? '').localeCompare(String(b?.marketKey ?? ''));
+    });
   }
 
   private filterPickCenter(
     pick: any,
     plan: PredictionAccessPlan,
   ): Record<string, any> {
-    const selectedMarkets = Array.isArray(pick.selectedMarkets)
-      ? pick.selectedMarkets
-      : [];
+    const selectedMarkets = this.oneSelectionPerMarket(
+      Array.isArray(pick.selectedMarkets) ? pick.selectedMarkets : [],
+    );
     return {
       ...pick,
       selectedMarkets,
@@ -1828,13 +1929,14 @@ export class PredictionAccessService {
       access: {
         allowed: true,
         plan,
-        priority: this.resolvePriority(pick.leagueId),
+        priority: this.resolvePriority(pick.leagueId, pick.leaguePriority),
         marketLimit: null,
         mode:
-          plan === PredictionAccessPlan.ANONYMOUS ||
-          plan === PredictionAccessPlan.FREE
-            ? 'SELECTIVE_LEAGUES'
-            : 'FULL_ACCESS',
+          plan === PredictionAccessPlan.ANONYMOUS
+            ? 'SELECTIVE_AND_HIGH_PRIORITY_CATEGORIES'
+            : plan === PredictionAccessPlan.FREE
+              ? 'ALL_EXCEPT_REGIONAL_PRIORITY'
+              : 'FULL_ACCESS',
       },
     };
   }
@@ -1843,21 +1945,87 @@ export class PredictionAccessService {
     plan: PredictionAccessPlan,
     priority: CompetitionPriority | 'UNKNOWN',
   ): boolean {
+    const normalizedPriority = String(priority ?? 'UNKNOWN')
+      .trim()
+      .toUpperCase()
+      .replace(/[\s-]+/g, '_');
+
     if (plan === PredictionAccessPlan.ANONYMOUS) {
       return (
-        PREDICTION_ACCESS_CONFIG.anonymousActivePriorities as readonly CompetitionPriority[]
-      ).includes(priority as CompetitionPriority);
+        PREDICTION_ACCESS_CONFIG.anonymousActivePriorities as readonly string[]
+      ).includes(normalizedPriority);
     }
+
     if (plan === PredictionAccessPlan.FREE) {
       return (
-        PREDICTION_ACCESS_CONFIG.freeActivePriorities as readonly CompetitionPriority[]
-      ).includes(priority as CompetitionPriority);
+        PREDICTION_ACCESS_CONFIG.freeActivePriorities as readonly string[]
+      ).includes(normalizedPriority);
     }
+
     return (
       plan === PredictionAccessPlan.REGULAR ||
       plan === PredictionAccessPlan.VIP ||
       plan === PredictionAccessPlan.PREMIUM
     );
+  }
+
+  private activePriorityRequiredPlan(
+    priority: CompetitionPriority | 'UNKNOWN',
+  ): 'free' | 'regular' {
+    return priority === CompetitionPriority.ELITE ? 'free' : 'regular';
+  }
+
+  private slipRequiredPlan(
+    slip: any,
+  ): 'regular' | 'vip' | 'premium' {
+    const isSureOdds =
+      slip?.sureOdds === true ||
+      String(slip?.productType ?? '').toUpperCase() ===
+        PredictionProductType.SURE_ODDS;
+    if (isSureOdds) {
+      const sureProduct = String(
+        slip?.sureOddsProduct ??
+          (slip?.sureOddsTier === SureOddsTier.VIP ? 'SURE_2' : 'SURE_5'),
+      ).toUpperCase();
+      return (
+        (PREDICTION_ACCESS_CONFIG.sureOdds.products as any)[sureProduct]
+          ?.requiredPlan ?? 'premium'
+      );
+    }
+    const productType = String(slip?.productType ?? '').toUpperCase();
+    return (
+      (PREDICTION_ACCESS_CONFIG.slipProducts as any)[productType]?.requiredPlan ??
+      'premium'
+    );
+  }
+
+  private lockedSlipPreview(
+    slip: any,
+    plan: PredictionAccessPlan,
+    reason = 'SUBSCRIPTION_REQUIRED',
+  ): Record<string, any> {
+    const requiredPlan = this.slipRequiredPlan(slip);
+    return {
+      _id: String(slip?._id ?? ''),
+      slipId: String(slip?._id ?? ''),
+      productType: String(slip?.productType ?? '').toUpperCase(),
+      sureOdds: slip?.sureOdds === true,
+      sureOddsProduct: slip?.sureOddsProduct ?? null,
+      sureOddsTier: slip?.sureOddsTier ?? null,
+      fixtureDateFrom: slip?.fixtureDateFrom ?? null,
+      generatedDateKey: slip?.generatedDateKey ?? null,
+      createdAt: slip?.createdAt ?? null,
+      status: slip?.status ?? SlipStatus.PUBLISHED,
+      locked: true,
+      accessAllowed: false,
+      requiredPlan,
+      access: {
+        allowed: false,
+        plan,
+        requiredPlan,
+        reason,
+      },
+    };
   }
 
   private canAccessSlip(plan: PredictionAccessPlan, slip: any): boolean {
@@ -1887,11 +2055,14 @@ export class PredictionAccessService {
         sureProduct
       ];
       if (!range || odds < range.minOdds || odds > range.maxOdds) return false;
-      if (plan === PredictionAccessPlan.VIP) return sureProduct === 'SURE_2';
-      return (
-        plan === PredictionAccessPlan.PREMIUM &&
-        ['SURE_2', 'SURE_5', 'SURE_7'].includes(sureProduct)
-      );
+      const requiredPlan = range.requiredPlan as PredictionAccessPlan | undefined;
+      if (
+        requiredPlan !== PredictionAccessPlan.REGULAR &&
+        requiredPlan !== PredictionAccessPlan.VIP &&
+        requiredPlan !== PredictionAccessPlan.PREMIUM
+      ) return false;
+      const planRanks = PREDICTION_ACCESS_CONFIG.planRank as Record<string, number>;
+      return planRanks[plan] >= planRanks[requiredPlan];
     }
 
     // Legacy product identifiers stay in the database/admin history but do not
@@ -1906,8 +2077,7 @@ export class PredictionAccessService {
     return planRanks[plan] >= planRanks[band.requiredPlan];
   }
 
-  private async getVisibleCuratedRecords(
-    plan: PredictionAccessPlan,
+  private async getCuratedRecordsForInput(
     input: {
       from?: string;
       to?: string;
@@ -1920,62 +2090,302 @@ export class PredictionAccessService {
       .sort({ fixtureDateFrom: 1, createdAt: -1 })
       .lean()
       .exec()) as any[];
+    return this.filterCuratedRecordsByInput(records, input);
+  }
 
-    // Settled history is public for every plan, regardless of competition priority.
-    const settled = this.filterCuratedRecordsByInput(
-      records.filter((record) => this.isCuratedSettled(record)),
-      input,
-    );
+  private async getVisibleCuratedRecords(
+    plan: PredictionAccessPlan,
+    input: {
+      from?: string;
+      to?: string;
+      league?: string;
+      predictionId?: string;
+    } = {},
+  ): Promise<any[]> {
+    const records = await this.getCuratedRecordsForInput(input);
+    const settled = records.filter((record) => this.isCuratedSettled(record));
     const active = records.filter((record) =>
       this.isCurrentPublishedCurated(record),
     );
-
-    // Anonymous visitors receive settled records only. Active curated picks remain
-    // protected by the existing registration and subscription rules.
-    if (plan === PredictionAccessPlan.ANONYMOUS) return settled;
-
-    if (plan !== PredictionAccessPlan.FREE) {
-      return this.filterCuratedRecordsByInput([...active, ...settled], input);
-    }
-
-    // Free registered users can see every published, active curated prediction
-    // whose selections all belong to Selective-priority competitions. No daily cap.
-    const selectiveActive = active.filter((record) =>
-      this.curatedRecordMatchesPriority(
-        record,
-        PREDICTION_ACCESS_CONFIG.freeCuratedPriorities as readonly CompetitionPriority[],
-      ),
-    );
-    return this.filterCuratedRecordsByInput(
-      [...selectiveActive, ...settled],
-      input,
+    const visibleActive = active
+      .map((record) => this.filterCuratedRecordForPlan(plan, record))
+      .filter((record): record is Record<string, any> => Boolean(record));
+    return [...visibleActive, ...settled].sort(
+      (a, b) => this.curatedFixtureTime(a) - this.curatedFixtureTime(b),
     );
   }
 
-  private curatedRecordMatchesPriority(
+  private filterCuratedRecordForPlan(
+    plan: PredictionAccessPlan,
     record: any,
-    allowedPriorities: readonly CompetitionPriority[],
-  ): boolean {
+  ): Record<string, any> | null {
     const selections = Array.isArray(record?.selections)
       ? record.selections
       : [];
-    if (!selections.length) {
-      const leagueId = String(record?.leagueId ?? '').trim();
-      const leagueName = String(record?.leagueName ?? '').trim();
-      if (!leagueId && !leagueName) return false;
-      const priority = this.resolvePriority(leagueId, leagueName);
-      return allowedPriorities.includes(priority as CompetitionPriority);
+    if (!selections.length) return null;
+
+    const visibleSelections = selections.filter((selection: any) =>
+      this.isCuratedSelectionSettled(selection) ||
+      this.canAccessCuratedSelection(plan, selection, record),
+    );
+    if (!visibleSelections.length) return null;
+    if (visibleSelections.length === selections.length) return record;
+
+    // The parent combined odds/probability include hidden selections. Remove
+    // those aggregates rather than accidentally disclosing information about
+    // the restricted legs. The visible selections remain their original data.
+    const partial: Record<string, any> = {
+      ...record,
+      selections: visibleSelections,
+      partialAccess: true,
+      access: {
+        allowed: true,
+        plan,
+        mode: 'PARTIAL_CURATED_CATEGORY_ACCESS',
+        visibleSelectionCount: visibleSelections.length,
+      },
+    };
+    delete partial.selectionCount;
+    delete partial.combinedProbability;
+    delete partial.combinedOdds;
+    delete partial.confidence;
+    delete partial.diagnostics;
+    return partial;
+  }
+
+  private canAccessCuratedSelection(
+    plan: PredictionAccessPlan,
+    selection: any,
+    record?: any,
+  ): boolean {
+    if (
+      plan === PredictionAccessPlan.VIP ||
+      plan === PredictionAccessPlan.PREMIUM
+    ) return true;
+    if (plan !== PredictionAccessPlan.REGULAR) return false;
+    return !this.isCuratedSelectiveSelection(selection, record);
+  }
+
+  private isCuratedSelectionSettled(selection: any): boolean {
+    return SETTLED_OUTCOMES.has(
+      String(
+        selection?.settlementOutcome ??
+          selection?.actualOutcome ??
+          selection?.settlementStatus ??
+          selection?.matchSettlementStatus ??
+          '',
+      ).toUpperCase(),
+    );
+  }
+
+  private isCuratedSelectiveSelection(selection: any, record?: any): boolean {
+    const categoryValues = [
+      selection?.predictionCategory,
+      selection?.curatedCategory,
+      selection?.category,
+      selection?.categoryType,
+      selection?.priority,
+      selection?.tier,
+      record?.predictionCategory,
+      record?.curatedCategory,
+      record?.category,
+      record?.categoryType,
+      record?.priority,
+      record?.tier,
+    ]
+      .filter((value) => value !== null && value !== undefined)
+      .map((value) => String(value).trim().toUpperCase().replace(/[\s-]+/g, '_'));
+
+    if (categoryValues.some((value) => value === 'SELECTIVE' || value.includes('SELECTIVE'))) {
+      return true;
     }
 
-    // A curated accumulator spanning multiple leagues is visible to Free only
-    // when every leg belongs to an allowed league; one paid-only leg locks it.
-    return selections.every((selection: any) => {
-      const priority = this.resolvePriority(
-        selection?.leagueId,
-        selection?.leagueName,
-      );
-      return allowedPriorities.includes(priority as CompetitionPriority);
-    });
+    const knownNonSelectiveCategories = new Set([
+      'ELITE', 'HIGH', 'MEDIUM', 'LOW', 'NORMAL', 'STANDARD', 'CRITICAL', 'REGIONAL', 'VIP', 'PREMIUM',
+    ]);
+    if (categoryValues.some((value) => knownNonSelectiveCategories.has(value))) {
+      return false;
+    }
+
+    // The current CuratedPrediction schema does not store a dedicated category
+    // field. For older records without one, resolve the category from that
+    // selection's competition priority; unknown competitions fail closed.
+    const priority = this.resolvePriority(
+      selection?.leagueId,
+      selection?.leaguePriority,
+      selection?.priority,
+      selection?.leagueName,
+      record?.leagueId,
+      record?.leagueName,
+    );
+    return priority === CompetitionPriority.SELECTIVE || priority === 'UNKNOWN';
+  }
+
+  private async buildCuratedLeagueSummary(
+    records: any[],
+    plan: PredictionAccessPlan,
+  ): Promise<Record<string, any>> {
+    const entries: Array<{
+      record: any;
+      leagueId: string;
+      leagueName: string;
+      eventId: string;
+      locked: boolean;
+      requiredPlan: 'regular' | 'vip';
+      uniqueSelectionId: string;
+    }> = [];
+
+    for (const record of records ?? []) {
+      const selections = Array.isArray(record?.selections) && record.selections.length
+        ? record.selections
+        : [record];
+      for (let selectionIndex = 0; selectionIndex < selections.length; selectionIndex += 1) {
+        const selection = selections[selectionIndex];
+        const leagueId = String(
+          selection?.leagueId ?? selection?.competitionId ?? record?.leagueId ?? '',
+        ).trim().toLowerCase();
+        if (!leagueId) continue;
+        const leagueName = String(
+          selection?.leagueName ?? selection?.competitionName ?? record?.leagueName ?? leagueId,
+        ).trim();
+        const eventId = String(
+          selection?.eventId ?? selection?.fixtureId ?? record?.eventId ?? record?._id ?? '',
+        ).trim();
+        if (!eventId) continue;
+
+        const settled = this.isCuratedSettled(record) || this.isCuratedSelectionSettled(selection);
+        const selective = this.isCuratedSelectiveSelection(selection, record);
+        const locked = !settled && !this.canAccessCuratedSelection(plan, selection, record);
+        const requiredPlan: 'regular' | 'vip' = selective ? 'vip' : 'regular';
+        const recordId = String(record?._id ?? record?.predictionCode ?? 'curated');
+        const selectionId = [
+          selection?.marketPredictionId,
+          selection?.marketKey,
+          selection?.selectionKey,
+        ].map((value) => String(value ?? '')).join(':') || String(selectionIndex);
+        entries.push({
+          record,
+          leagueId,
+          leagueName,
+          eventId,
+          locked,
+          requiredPlan,
+          uniqueSelectionId: `${recordId}:${eventId}:${selectionId}`,
+        });
+      }
+    }
+
+    if (!entries.length) {
+      return { countries: [], totalLeagues: 0, totalPredictions: 0 };
+    }
+
+    const leagueIds = [...new Set(entries.map((entry) => entry.leagueId))];
+    const leagueDocuments = (await this.espnLeagueModel
+      .find({ leagueId: { $in: leagueIds } })
+      .select('leagueId name country priority payload')
+      .lean()
+      .exec()) as any[];
+    const leagueMap = new Map<string, any>(
+      leagueDocuments.map((league) => [String(league.leagueId ?? '').toLowerCase(), league]),
+    );
+
+    const countryMap = new Map<string, Map<string, any>>();
+    for (const entry of entries) {
+      const league = leagueMap.get(entry.leagueId) ?? {};
+      const competition = this.findPriorityCompetition(entry.leagueId, entry.leagueName);
+      const payload = league.payload ?? {};
+      const region = String(
+        competition?.region ?? payload.region ?? payload.competitionRegion ?? '',
+      ).toUpperCase();
+      const type = String(
+        competition?.type ?? payload.type ?? payload.competitionType ?? '',
+      ).toUpperCase();
+      const country = String(
+        league.country ?? payload.country ?? entry.record?.country ?? '',
+      ).trim();
+      const countryName = this.predictionCountryGroup(region, type, country);
+      const priority = this.resolvePriority(entry.leagueId, competition?.priority, league.priority, entry.leagueName);
+      const resolvedName = this.resolveLeagueDisplayName(league, entry.leagueId);
+      const leagueName = resolvedName !== 'League name unavailable'
+        ? resolvedName
+        : String(competition?.name ?? competition?.displayName ?? (this.isLeagueCode(entry.leagueName, entry.leagueId) ? 'Football competition' : entry.leagueName));
+      const leagueKey = entry.leagueId || this.normalizeIdentifier(leagueName);
+
+      if (!countryMap.has(countryName)) countryMap.set(countryName, new Map());
+      const countryLeagues = countryMap.get(countryName)!;
+      let current = countryLeagues.get(leagueKey);
+      if (!current) {
+        current = {
+          id: entry.leagueId || leagueKey,
+          name: leagueName,
+          logo: this.logoUrl(league.payload),
+          priority,
+          eventIds: new Set<string>(),
+          accessibleSelectionIds: new Set<string>(),
+          lockedSelectionIds: new Set<string>(),
+          lockedRequiredPlans: new Set<string>(),
+        };
+        countryLeagues.set(leagueKey, current);
+      }
+      current.eventIds.add(entry.eventId);
+      if (entry.locked) {
+        current.lockedSelectionIds.add(entry.uniqueSelectionId);
+        current.lockedRequiredPlans.add(entry.requiredPlan);
+      } else {
+        current.accessibleSelectionIds.add(entry.uniqueSelectionId);
+      }
+    }
+
+    const countries = [...countryMap.entries()]
+      .map(([name, leagueMapForCountry]) => {
+        const leagues = [...leagueMapForCountry.values()]
+          .map((league) => ({
+            id: league.id,
+            name: league.name,
+            logo: league.logo,
+            priority: league.priority,
+            count: league.eventIds.size,
+            lockedCount: league.lockedSelectionIds.size,
+            locked: league.accessibleSelectionIds.size === 0,
+            requiredPlan: league.lockedRequiredPlans.has('vip')
+              ? 'vip'
+              : league.lockedRequiredPlans.has('regular')
+                ? 'regular'
+                : null,
+          }))
+          .filter((league) => league.count > 0)
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const lockedLeagueCount = leagues.filter((league) => league.lockedCount > 0).length;
+        const lockedRequiredPlans = leagues
+          .filter((league) => league.lockedCount > 0)
+          .map((league) => String(league.requiredPlan ?? 'regular'));
+        const requiredPlan = lockedRequiredPlans.includes('vip')
+          ? 'vip'
+          : lockedRequiredPlans.includes('regular')
+            ? 'regular'
+            : null;
+        return {
+          name,
+          count: leagues.reduce((sum, league) => sum + league.count, 0),
+          predictionLeagueCount: leagues.length,
+          locked: leagues.length > 0 && leagues.every((league) => league.locked),
+          lockedLeagueCount,
+          requiredPlan,
+          leagues,
+        };
+      })
+      .filter((country) => country.leagues.length > 0)
+      .sort((a, b) => {
+        const rank = (name: string) =>
+          name === 'International' ? 0 : name === 'Regional' ? 1 : 2;
+        return rank(a.name) - rank(b.name) || a.name.localeCompare(b.name);
+      });
+
+    return {
+      countries,
+      totalLeagues: countries.reduce((sum, country) => sum + country.predictionLeagueCount, 0),
+      totalPredictions: countries.reduce((sum, country) => sum + country.count, 0),
+    };
   }
 
   private isCuratedSettled(record: any): boolean {
@@ -2072,32 +2482,42 @@ export class PredictionAccessService {
     });
   }
 
-  private resolvePriority(
-    ...rawValues: unknown[]
-  ): CompetitionPriority | 'UNKNOWN' {
+  private findPriorityCompetition(...rawValues: unknown[]): any | null {
     const candidates = rawValues
       .filter((value) => value !== null && value !== undefined)
       .map((value) => this.normalizeIdentifier(String(value)))
       .filter(Boolean);
-    if (!candidates.length) return 'UNKNOWN';
-    for (const competition of PRIORITY_COMPETITIONS as any[]) {
-      const identifiers = [
-        competition.id,
-        competition.name,
-        competition.providers?.espnLeagueSlug,
-        competition.providers?.footballDataCode,
-        competition.providers?.oddsApiSportKey,
-      ]
-        .filter(Boolean)
-        .map((value: string) => this.normalizeIdentifier(value));
-      if (
-        identifiers.some((identifier: string) =>
-          candidates.includes(identifier),
-        )
-      )
-        return competition.priority as CompetitionPriority;
+    if (!candidates.length) return null;
+    return (
+      (PRIORITY_COMPETITIONS as any[]).find((competition) => {
+        const identifiers = [
+          competition.id,
+          competition.name,
+          competition.providers?.espnLeagueSlug,
+          competition.providers?.footballDataCode,
+          competition.providers?.oddsApiSportKey,
+        ]
+          .filter(Boolean)
+          .map((value: string) => this.normalizeIdentifier(value));
+        return identifiers.some((identifier: string) => candidates.includes(identifier));
+      }) ?? null
+    );
+  }
+
+  private resolvePriority(
+    ...rawValues: unknown[]
+  ): CompetitionPriority | 'UNKNOWN' {
+    const validPriorities = new Set<string>(Object.values(CompetitionPriority));
+    for (const rawValue of rawValues) {
+      const candidate = String(rawValue ?? '').trim().toUpperCase();
+      if (validPriorities.has(candidate)) {
+        return candidate as CompetitionPriority;
+      }
     }
-    return CompetitionPriority.SELECTIVE;
+    const competition = this.findPriorityCompetition(...rawValues);
+    return competition?.priority
+      ? (competition.priority as CompetitionPriority)
+      : 'UNKNOWN';
   }
 
   private normalizeIdentifier(value: string): string {
@@ -2221,3 +2641,4 @@ export class PredictionAccessService {
     return new Date(timestamp).toISOString().slice(0, 10);
   }
 }
+

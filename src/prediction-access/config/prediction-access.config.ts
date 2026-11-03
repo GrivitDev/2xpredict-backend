@@ -4,14 +4,20 @@ import { PREDICTION_ENGINE_CONFIG } from '../../predictions-engine/config/predic
 
 /**
  * Single source of truth for Prediction Engine visibility and subscription entitlements.
- * Anonymous and Free users receive unlimited access within Selective-priority leagues.
- * Paid plans receive access to all supported competition priorities.
+ * Counts and lock metadata are public; prediction and slip contents remain protected.
  */
 export const PREDICTION_ACCESS_CONFIG = {
   publicSettledPredictions: true,
-  anonymousActivePriorities: [CompetitionPriority.SELECTIVE] as const,
-  freeActivePriorities: [CompetitionPriority.SELECTIVE] as const,
-  freeCuratedPriorities: [CompetitionPriority.SELECTIVE] as const,
+  anonymousActivePriorities: ['SELECTIVE', 'HIGH'] as const,
+  /** Free members can read every priority category except REGIONAL. */
+  freeActivePriorities: [
+    CompetitionPriority.ELITE,
+    CompetitionPriority.HIGH,
+    CompetitionPriority.SELECTIVE,
+  ] as const,
+  freeActiveAccess: 'ALL_SUPPORTED_EXCEPT_REGIONAL_PRIORITY' as const,
+  /** Regular members can read curated picks except those explicitly classified as Selective. */
+  regularCuratedExcludedCategories: ['SELECTIVE'] as const,
   paidActiveAccess: 'ALL_SUPPORTED_COMPETITIONS' as const,
   selectablePriority: CompetitionPriority.SELECTIVE,
   marketPageSize: 25,
@@ -19,15 +25,16 @@ export const PREDICTION_ACCESS_CONFIG = {
   /** Operational query safeguard, not a per-user/day product quota. */
   maximumPickCenterMatches: 1000,
   slipProducts: {
+    // All standard combined-odds products are Premium-only.
     ODDS_10: {
       minOdds: 9,
       maxOdds: 10,
-      requiredPlan: 'regular',
+      requiredPlan: 'premium',
     },
     ODDS_25: {
       minOdds: 23,
       maxOdds: 25,
-      requiredPlan: 'vip',
+      requiredPlan: 'premium',
     },
     ODDS_50: {
       minOdds: 48,
@@ -39,7 +46,20 @@ export const PREDICTION_ACCESS_CONFIG = {
     vipDailyTarget: PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.vipDailyTarget,
     premiumDailyTarget:
       PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.premiumDailyTarget,
-    products: PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products,
+    products: {
+      SURE_2: {
+        ...PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products.SURE_2,
+        requiredPlan: 'regular',
+      },
+      SURE_5: {
+        ...PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products.SURE_5,
+        requiredPlan: 'vip',
+      },
+      SURE_7: {
+        ...PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products.SURE_7,
+        requiredPlan: 'vip',
+      },
+    },
     // Compatibility values for older callers; product-specific ranges are authoritative.
     vipMinimumCombinedOdds:
       PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products.SURE_2.minOdds,
@@ -62,3 +82,4 @@ export const PREDICTION_ACCESS_CONFIG = {
     premium: 4,
   } satisfies Record<PredictionAccessPlan, number>,
 } as const;
+
