@@ -14,7 +14,10 @@ import {
   PredictionSlip,
   PredictionSlipSchema,
 } from '../predictions-engine/schemas/prediction-slip.schema';
-import { CuratedPrediction, CuratedPredictionSchema } from '../predictions-engine/schemas/curated-prediction.schema';
+import {
+  CuratedPrediction,
+  CuratedPredictionSchema,
+} from '../predictions-engine/schemas/curated-prediction.schema';
 import {
   EspnFixture,
   EspnFixtureSchema,

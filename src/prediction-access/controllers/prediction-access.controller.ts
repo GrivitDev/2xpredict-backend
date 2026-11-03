@@ -39,17 +39,23 @@ export class PredictionAccessController {
   }
 
   @Get('settled')
-  listSettled(@Req() request: PredictionAccessRequest, @Query() query: Record<string, string | undefined>) {
-    return this.access.listSettledMarkets({
-      eventId: query.eventId,
-      leagueId: query.leagueId,
-      marketKey: query.marketKey,
-      from: query.from,
-      to: query.to,
-      page: this.optionalNumber(query.page),
-      pageSize: this.optionalNumber(query.pageSize),
-      includePast: true,
-    }, request?.user ?? null);
+  listSettled(
+    @Req() request: PredictionAccessRequest,
+    @Query() query: Record<string, string | undefined>,
+  ) {
+    return this.access.listSettledMarkets(
+      {
+        eventId: query.eventId,
+        leagueId: query.leagueId,
+        marketKey: query.marketKey,
+        from: query.from,
+        to: query.to,
+        page: this.optionalNumber(query.page),
+        pageSize: this.optionalNumber(query.pageSize),
+        includePast: true,
+      },
+      request?.user ?? null,
+    );
   }
 
   @Get('markets')
@@ -94,6 +100,7 @@ export class PredictionAccessController {
         page: this.optionalNumber(query.page),
         pageSize: this.optionalNumber(query.pageSize),
         includePast: query.includePast === 'true',
+        settledOnly: query.settledOnly === 'true',
       },
       request?.user ?? null,
     );
@@ -113,7 +120,11 @@ export class PredictionAccessController {
     @Query() query: Record<string, string | undefined>,
   ) {
     return this.access.listCuratedPredictions(request?.user ?? null, {
-      from: query.from, to: query.to, league: query.league, page: this.optionalNumber(query.page), pageSize: this.optionalNumber(query.pageSize),
+      from: query.from,
+      to: query.to,
+      league: query.league,
+      page: this.optionalNumber(query.page),
+      pageSize: this.optionalNumber(query.pageSize),
     });
   }
 

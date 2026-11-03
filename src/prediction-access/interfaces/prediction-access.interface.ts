@@ -33,6 +33,8 @@ export interface PredictionReadFilters {
   page?: number;
   pageSize?: number;
   includePast?: boolean;
+  /** Return only settled selections saved in Pick Center fixture records. */
+  settledOnly?: boolean;
   minimumProbability?: number;
   minimumConfidence?: number;
   status?: string;
