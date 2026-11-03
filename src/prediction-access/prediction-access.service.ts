@@ -469,41 +469,31 @@ export class PredictionAccessService {
       const selectedMarkets = Array.isArray(pick.selectedMarkets)
         ? pick.selectedMarkets
         : [];
-      const settledMarkets = selectedMarkets.filter((selection: any) =>
-        SETTLED_OUTCOMES.has(
+      // Pick Center is the active-prediction view. A selection moves to the
+      // separate Settled view as soon as Settlement records its final outcome.
+      const activeSelections = selectedMarkets.filter((selection: any) =>
+        !SETTLED_OUTCOMES.has(
           String(
-            selection.actualOutcome ?? selection.settlementStatus ?? '',
+            selection.actualOutcome ?? selection.settlementStatus ?? 'PENDING',
           ).toUpperCase(),
         ),
       );
       const priority = this.resolvePriority(pick.leagueId);
       const activeLeagueAllowed = this.canAccessActiveLeague(plan, priority);
-      const fixtureTime = new Date(pick.fixtureDate ?? '').getTime();
-      const activeDateAllowed =
-        input.includePast === true ||
-        (Number.isFinite(fixtureTime) && fixtureTime >= Date.now());
-
-      if (activeLeagueAllowed && activeDateAllowed) {
-        visible.push(this.filterPickCenter(pick, plan));
-        continue;
-      }
-
-      // Expose only settled selections when the match's active selections are
-      // outside this viewer's access window or league entitlement.
-      if (settledMarkets.length) {
-        visible.push({
-          ...pick,
-          selectedMarkets: settledMarkets,
-          visibleMarketCount: settledMarkets.length,
-          settled: true,
-          access: {
-            allowed: true,
+      // The selected date range is already applied by findPickCenterRecords.
+      // Keep every still-pending published selection in General Picks even if
+      // kickoff has passed; only settled outcomes move to the Settled view.
+      if (activeLeagueAllowed && activeSelections.length) {
+        visible.push(
+          this.filterPickCenter(
+            {
+              ...pick,
+              selectedMarkets: activeSelections,
+              visibleMarketCount: activeSelections.length,
+            },
             plan,
-            priority,
-            marketLimit: null,
-            mode: 'SETTLED_PUBLIC',
-          },
-        });
+          ),
+        );
       }
     }
 
@@ -512,6 +502,13 @@ export class PredictionAccessService {
       (pageInfo.page - 1) * pageInfo.pageSize,
       pageInfo.page * pageInfo.pageSize,
     );
+    // Counts are derived from every Pick Center fixture in the selected date
+    // range, before entitlement filtering. Only aggregate counts and league
+    // metadata are exposed for restricted competitions; their predictions and
+    // market selections remain protected by the normal response filter.
+    const leagueSummary = pageInfo.page === 1
+      ? await this.buildPickCenterLeagueSummary(enriched, plan)
+      : undefined;
     return {
       items: pageItems,
       pagination: {
@@ -519,8 +516,159 @@ export class PredictionAccessService {
         total,
         pages: Math.ceil(total / pageInfo.pageSize),
       },
+      ...(leagueSummary ? { leagueSummary } : {}),
       accessPlan: plan,
     };
+  }
+
+  /**
+   * Date-scoped Pick Center league counts for the public country selector.
+   * Restricted leagues remain represented with counts and a lock flag, while
+   * no selected market or prediction payload is returned for those leagues.
+   */
+  private async buildPickCenterLeagueSummary(
+    records: any[],
+    plan: PredictionAccessPlan,
+  ): Promise<Record<string, any>> {
+    const eligibleRecords = (records ?? []).filter(
+      (record) =>
+        String(record?.eventId ?? '').trim() &&
+        Array.isArray(record?.selectedMarkets) &&
+        record.selectedMarkets.some((selection: any) =>
+          !SETTLED_OUTCOMES.has(
+            String(
+              selection?.actualOutcome ?? selection?.settlementStatus ?? 'PENDING',
+            ).toUpperCase(),
+          ),
+        ),
+    );
+    if (!eligibleRecords.length) {
+      return { countries: [], totalLeagues: 0, totalPredictions: 0 };
+    }
+
+    const leagueIds = [
+      ...new Set(
+        eligibleRecords
+          .map((record) => String(record.leagueId ?? '').trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ];
+    const leagueDocuments = leagueIds.length
+      ? ((await this.espnLeagueModel
+          .find({ leagueId: { $in: leagueIds } })
+          .select('leagueId name country priority payload')
+          .lean()
+          .exec()) as any[])
+      : [];
+    const leagueMap = new Map<string, any>(
+      leagueDocuments.map((league) => [
+        String(league.leagueId ?? '').toLowerCase(),
+        league,
+      ]),
+    );
+
+    const countryMap = new Map<string, Map<string, any>>();
+    for (const record of eligibleRecords) {
+      const eventId = String(record.eventId);
+      const leagueId = String(record.leagueId ?? '').trim().toLowerCase();
+      const league = leagueMap.get(leagueId) ?? {};
+      const leagueName = this.resolveLeagueDisplayName(league, leagueId) !== 'League name unavailable'
+        ? this.resolveLeagueDisplayName(league, leagueId)
+        : String(record.leagueName ?? leagueId ?? 'Football competition');
+      const competition = (PRIORITY_COMPETITIONS as any[]).find((item) => {
+        const identifiers = [
+          item.id,
+          item.name,
+          item.providers?.espnLeagueSlug,
+          item.providers?.footballDataCode,
+          item.providers?.oddsApiSportKey,
+        ]
+          .filter(Boolean)
+          .map((value: string) => this.normalizeIdentifier(value));
+        const candidates = [leagueId, leagueName, String(league.slug ?? '')]
+          .filter(Boolean)
+          .map((value) => this.normalizeIdentifier(value));
+        return identifiers.some((identifier: string) => candidates.includes(identifier));
+      });
+      const payload = league.payload ?? {};
+      const region = String(
+        competition?.region ?? payload.region ?? payload.competitionRegion ?? '',
+      ).toUpperCase();
+      const type = String(
+        competition?.type ?? payload.type ?? payload.competitionType ?? '',
+      ).toUpperCase();
+      const country = String(
+        league.country ?? payload.country ?? record.country ?? record.countryName ?? '',
+      ).trim();
+      const countryName = this.predictionCountryGroup(region, type, country);
+      // Match the exact resolver used by listPickCenter/canAccessActiveLeague
+      // so the visible lock state cannot disagree with the read endpoint.
+      const priority = this.resolvePriority(leagueId);
+      const locked = !this.canAccessActiveLeague(plan, priority);
+      const leagueKey = leagueId || this.normalizeIdentifier(leagueName);
+
+      if (!countryMap.has(countryName)) countryMap.set(countryName, new Map());
+      const countryLeagues = countryMap.get(countryName)!;
+      const current = countryLeagues.get(leagueKey);
+      if (current) {
+        current.eventIds.add(eventId);
+        current.locked = current.locked || locked;
+      } else {
+        countryLeagues.set(leagueKey, {
+          id: leagueId || leagueKey,
+          name: leagueName,
+          logo: this.logoUrl(league.payload),
+          priority,
+          locked,
+          eventIds: new Set([eventId]),
+        });
+      }
+    }
+
+    const countries = [...countryMap.entries()]
+      .map(([name, leagueMapForCountry]) => {
+        const leagues = [...leagueMapForCountry.values()]
+          .map((league) => ({
+            id: league.id,
+            name: league.name,
+            logo: league.logo,
+            priority: league.priority,
+            locked: league.locked,
+            count: league.eventIds.size,
+          }))
+          .filter((league) => league.count > 0)
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const lockedLeagueCount = leagues.filter((league) => league.locked).length;
+        return {
+          name,
+          count: leagues.reduce((sum, league) => sum + league.count, 0),
+          predictionLeagueCount: leagues.length,
+          locked: leagues.length > 0 && lockedLeagueCount === leagues.length,
+          lockedLeagueCount,
+          leagues,
+        };
+      })
+      .filter((country) => country.leagues.length > 0)
+      .sort((a, b) => {
+        const rank = (name: string) => name === 'International' ? 0 : name === 'Regional' ? 1 : 2;
+        return rank(a.name) - rank(b.name) || a.name.localeCompare(b.name);
+      });
+
+    return {
+      countries,
+      totalLeagues: countries.reduce((sum, country) => sum + country.predictionLeagueCount, 0),
+      totalPredictions: countries.reduce((sum, country) => sum + country.count, 0),
+    };
+  }
+
+  private predictionCountryGroup(
+    region: string,
+    type: string,
+    country: string,
+  ): string {
+    if (region === 'WORLD' || /WORLD/.test(region)) return 'International';
+    if (type === 'INTERNATIONAL') return 'Regional';
+    return country || 'Other competitions';
   }
 
   /** Admin-only read: bypasses subscription league and ranked-market limits. */
@@ -636,13 +784,7 @@ export class PredictionAccessService {
   ): Promise<Record<string, unknown>> {
     const plan = await this.getAccessPlan(user);
     const pageInfo = this.pagination(input.page, input.pageSize, 25, 100);
-    const selectionMatch: Record<string, any> = {
-      actualOutcome: { $in: Array.from(SETTLED_OUTCOMES) },
-    };
 
-    if (input.selectionKey?.trim()) {
-      selectionMatch.key = input.selectionKey.trim();
-    }
     if (input.minimumProbability !== undefined) {
       const probability = Number(input.minimumProbability);
       if (!Number.isFinite(probability) || probability < 0 || probability > 1) {
@@ -650,7 +792,6 @@ export class PredictionAccessService {
           'minimumProbability must be between 0 and 1.',
         );
       }
-      selectionMatch.probability = { $gte: probability };
     }
     if (input.minimumConfidence !== undefined) {
       const confidence = Number(input.minimumConfidence);
@@ -663,48 +804,186 @@ export class PredictionAccessService {
           `minimumConfidence must be between 60 and ${PREDICTION_ENGINE_CONFIG.model.maximumConfidence}.`,
         );
       }
-      selectionMatch.confidence = { $gte: confidence };
+    }
+    if (
+      input.marketKey?.trim() &&
+      !Object.values(PredictionMarket).includes(
+        input.marketKey as PredictionMarket,
+      )
+    ) {
+      throw new BadRequestException(
+        `Unknown marketKey "${input.marketKey}".`,
+      );
+    }
+
+    // Build the settled history from the selections that were actually
+    // published, not every possible outcome stored in a MarketPrediction.
+    // A Pick Center row may hold up to its selected market set; Curated
+    // Predictions contribute their own saved selection snapshots as well.
+    const pickQuery: Record<string, any> = {};
+    if (input.eventId?.trim()) pickQuery.eventId = input.eventId.trim();
+    if (input.leagueId?.trim())
+      pickQuery.leagueId = input.leagueId.trim().toLowerCase();
+    this.applyDateRange(
+      pickQuery,
+      'fixtureDate',
+      input.from,
+      input.to,
+      true,
+    );
+
+    const pickRecords = (await this.pickCenterModel
+      .find(pickQuery)
+      .sort({ fixtureDate: -1 })
+      .limit(PREDICTION_ACCESS_CONFIG.maximumPickCenterMatches)
+      .select('eventId selectedMarkets')
+      .lean()
+      .exec()) as any[];
+
+    const curatedQuery: Record<string, any> = {
+      status: { $in: ['PUBLISHED', 'SETTLED'] },
+    };
+    if (input.eventId?.trim())
+      curatedQuery['selections.eventId'] = input.eventId.trim();
+    if (input.leagueId?.trim())
+      curatedQuery['selections.leagueId'] = input.leagueId.trim().toLowerCase();
+    this.applyDateRange(
+      curatedQuery,
+      'selections.fixtureDate',
+      input.from,
+      input.to,
+      true,
+    );
+    const curatedRecords = (await this.curatedPredictionModel
+      .find(curatedQuery)
+      .sort({ fixtureDateFrom: -1, updatedAt: -1 })
+      .limit(PREDICTION_ACCESS_CONFIG.maximumPickCenterMatches)
+      .select('selections')
+      .lean()
+      .exec()) as any[];
+
+    const approvedSelections = new Map<string, any>();
+    const addApprovedSelection = (
+      eventIdValue: unknown,
+      selection: any,
+    ) => {
+      const eventId = String(eventIdValue ?? '').trim();
+      const marketPredictionId = String(selection?.marketPredictionId ?? '').trim();
+      const selectionKey = String(selection?.selectionKey ?? '').trim();
+      const marketKey = String(selection?.marketKey ?? '').trim();
+      if (!eventId || !marketPredictionId || !selectionKey) return;
+      if (input.selectionKey?.trim() && selectionKey !== input.selectionKey.trim()) return;
+      if (input.marketKey?.trim() && marketKey !== input.marketKey.trim()) return;
+
+      const probability = Number(selection?.probability);
+      if (
+        input.minimumProbability !== undefined &&
+        (!Number.isFinite(probability) || probability < Number(input.minimumProbability))
+      ) return;
+      const confidence = Number(selection?.confidence);
+      if (
+        input.minimumConfidence !== undefined &&
+        (!Number.isFinite(confidence) || confidence < Number(input.minimumConfidence))
+      ) return;
+
+      approvedSelections.set(
+        `${eventId}::${marketPredictionId}::${selectionKey}`,
+        selection,
+      );
+    };
+
+    for (const pick of pickRecords) {
+      for (const selected of pick.selectedMarkets ?? []) {
+        addApprovedSelection(pick.eventId, selected);
+      }
+    }
+    for (const curated of curatedRecords) {
+      for (const selected of curated.selections ?? []) {
+        addApprovedSelection(selected.eventId, selected);
+      }
+    }
+
+    const marketPredictionIds = [
+      ...new Set(
+        [...approvedSelections.values()]
+          .map((selection) => String(selection.marketPredictionId ?? '').trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (!marketPredictionIds.length) {
+      return {
+        items: [],
+        pagination: {
+          ...pageInfo,
+          total: 0,
+          pages: 0,
+        },
+        accessPlan: plan,
+      };
     }
 
     const marketQuery: Record<string, any> = {
-      selections: { $elemMatch: selectionMatch },
+      _id: { $in: marketPredictionIds },
+      selections: {
+        $elemMatch: {
+          actualOutcome: { $in: Array.from(SETTLED_OUTCOMES) },
+        },
+      },
     };
-    // Settled prediction history is public for every access plan; active league restrictions do not apply here.
     if (input.eventId?.trim()) marketQuery.eventId = input.eventId.trim();
     if (input.leagueId?.trim())
       marketQuery.leagueId = input.leagueId.trim().toLowerCase();
-    if (input.marketKey?.trim()) {
-      if (
-        !Object.values(PredictionMarket).includes(
-          input.marketKey as PredictionMarket,
-        )
-      ) {
-        throw new BadRequestException(
-          `Unknown marketKey "${input.marketKey}".`,
-        );
-      }
-      marketQuery.marketKey = input.marketKey.trim();
-    }
-    this.applyDateRange(marketQuery, 'fixtureDate', input.from, input.to, true);
+    if (input.marketKey?.trim()) marketQuery.marketKey = input.marketKey.trim();
+    this.applyDateRange(
+      marketQuery,
+      'fixtureDate',
+      input.from,
+      input.to,
+      true,
+    );
 
-    const [engineMarkets, total] = await Promise.all([
-      this.marketPredictionModel
-        .find(marketQuery)
-        .sort({ fixtureDate: -1, marketName: 1 })
-        .skip((pageInfo.page - 1) * pageInfo.pageSize)
-        .limit(pageInfo.pageSize)
-        .lean()
-        .exec(),
-      this.marketPredictionModel.countDocuments(marketQuery).exec(),
-    ]);
+    const engineMarkets = (await this.marketPredictionModel
+      .find(marketQuery)
+      .select('eventId leagueId fixtureDate homeTeamName awayTeamName marketKey marketName selections')
+      .sort({ fixtureDate: -1, marketName: 1 })
+      .lean()
+      .exec()) as any[];
 
-    const items = (engineMarkets as any[])
+    const rawItems = engineMarkets
       .map((market) => {
-        const selections = (market.selections ?? []).filter((selection: any) =>
-          SETTLED_OUTCOMES.has(
-            String(selection.actualOutcome ?? '').toUpperCase(),
-          ),
-        );
+        const eventId = String(market.eventId ?? '');
+        const marketPredictionId = String(market._id ?? '');
+        const selections = (market.selections ?? [])
+          .filter((selection: any) => {
+            const key = `${eventId}::${marketPredictionId}::${String(selection.key ?? '')}`;
+            return (
+              SETTLED_OUTCOMES.has(String(selection.actualOutcome ?? '').toUpperCase()) &&
+              approvedSelections.has(key)
+            );
+          })
+          .map((selection: any) => {
+            const selectionKey = String(selection.key ?? '');
+            const snapshot = approvedSelections.get(
+              `${eventId}::${marketPredictionId}::${selectionKey}`,
+            ) ?? {};
+            const outcome = String(selection.actualOutcome ?? '').toUpperCase();
+            return {
+              ...selection,
+              ...snapshot,
+              marketPredictionId,
+              marketKey: String(market.marketKey ?? snapshot.marketKey ?? ''),
+              marketName: String(market.marketName ?? snapshot.marketName ?? 'Market'),
+              selectionKey,
+              selectionName: String(
+                snapshot.selectionName ??
+                selection.fullName ??
+                selection.abbreviation ??
+                selectionKey,
+              ),
+              actualOutcome: outcome,
+              settlementStatus: outcome,
+            };
+          });
         return {
           ...market,
           source: 'prediction-engine',
@@ -713,6 +992,19 @@ export class PredictionAccessService {
         };
       })
       .filter((market) => market.selections.length > 0);
+
+    const total = rawItems.length;
+    const pageItems = rawItems.slice(
+      (pageInfo.page - 1) * pageInfo.pageSize,
+      pageInfo.page * pageInfo.pageSize,
+    );
+    const fixtureMeta = await this.getFixturePresentationMap(
+      [...new Set(pageItems.map((market) => String(market.eventId ?? '')).filter(Boolean))],
+    );
+    const items = pageItems.map((market) => ({
+      ...market,
+      ...(fixtureMeta.get(String(market.eventId)) ?? {}),
+    }));
 
     return {
       items,
@@ -1228,6 +1520,25 @@ export class PredictionAccessService {
         teamMap.get(`${leagueId}:${String(fixture.awayTeamId)}`) ??
         teamMap.get(String(fixture.awayTeamId));
       const league = leagueMap.get(leagueId);
+      const mappedCompetition = (PRIORITY_COMPETITIONS as any[]).find((item) => {
+        const identifiers = [
+          item.id,
+          item.name,
+          item.providers?.espnLeagueSlug,
+          item.providers?.footballDataCode,
+          item.providers?.oddsApiSportKey,
+        ]
+          .filter(Boolean)
+          .map((value: string) => this.normalizeIdentifier(value));
+        return identifiers.includes(this.normalizeIdentifier(leagueId));
+      });
+      const region = String(
+        mappedCompetition?.region ?? league?.payload?.region ?? league?.payload?.competitionRegion ?? '',
+      ).toUpperCase();
+      const competitionType = String(
+        mappedCompetition?.type ?? league?.payload?.type ?? league?.payload?.competitionType ?? '',
+      ).toUpperCase();
+      const country = league?.country ?? null;
       result.set(String(fixture.eventId), {
         leagueId,
         leagueName: this.resolveLeagueDisplayName(
@@ -1236,8 +1547,11 @@ export class PredictionAccessService {
           fixture.payload?.competitions?.[0],
         ),
         leagueLogo: this.logoUrl(league?.payload),
-        country: league?.country ?? null,
-        leaguePriority: league?.priority ?? 'SELECTIVE',
+        country,
+        predictionCountryGroup: this.predictionCountryGroup(region, competitionType, String(country ?? '')),
+        competitionRegion: region || null,
+        competitionType: competitionType || null,
+        leaguePriority: mappedCompetition?.priority ?? league?.priority ?? 'SELECTIVE',
         isPriorityLeague: Boolean(league?.isPriority),
         homeTeamLogo: this.logoUrl(home),
         awayTeamLogo: this.logoUrl(away),
