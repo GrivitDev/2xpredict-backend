@@ -60,9 +60,9 @@ export class EspnQueueBuilderService {
   ) {}
 
   /**
-   * Seeds persistent delayed work after startup. The worker later creates the
-   * next dated window-extension job after each successful run; no cron job or
-   * recurring MongoDB discovery scan is needed.
+   * Seeds persistent fixture maintenance after startup: a near-term window
+   * refresh every configured interval, an outer-horizon refresh daily, and a
+   * daily far-edge extension. Each successful worker schedules its successor.
    */
   async buildDailyLeagueRefreshQueue(): Promise<{
     active: number;
@@ -105,6 +105,21 @@ export class EspnQueueBuilderService {
         priority: this.getQueuePriority(league.priority),
       });
       if (result) queued += 1;
+
+      const priority = this.getQueuePriority(league.priority);
+      const todayKey = this.getLagosDateKey();
+      const nearWindowQueued = await this.queueFixtureWindowRefresh({
+        leagueId, season: league.season, priority, window: 'NEAR',
+        scheduledFor: new Date(),
+        triggerEventId: `WINDOW_REFRESH:NEAR:BOOT:${todayKey}`,
+      });
+      const farWindowQueued = await this.queueFixtureWindowRefresh({
+        leagueId, season: league.season, priority, window: 'FAR',
+        scheduledFor: new Date(),
+        triggerEventId: `WINDOW_REFRESH:FAR:BOOT:${todayKey}`,
+      });
+      if (nearWindowQueued) queued += 1;
+      if (farWindowQueued) queued += 1;
     }
 
     // Catalogue and league-detail maintenance are also persistent queue jobs.
@@ -232,7 +247,6 @@ export class EspnQueueBuilderService {
         season: 1,
         fixtureDate: 1,
         completed: 1,
-        live: 1,
         completedAt: 1,
         fixtureCollectedAt: 1,
         'payload.summaryCollectedAt': 1,
@@ -488,7 +502,12 @@ export class EspnQueueBuilderService {
     return this.isPending(job);
   }
 
-  /** Seed post-kickoff checks for unresolved fixtures from the last 24 hours. */
+  /**
+   * Seed one durable +160-minute post-kickoff Summary per known fixture in the
+   * recent-and-upcoming horizon. Future fixtures are included so the delayed
+   * jobs already exist before kickoff; post-match jobs are never gated by the
+   * stored live/completed flags.
+   */
   async buildPostMatchCheckQueue(params?: {
     leagueId?: string;
     season?: number;
@@ -531,16 +550,16 @@ export class EspnQueueBuilderService {
     // receive their post-match Summary job when their normal rolling fixture
     // refresh encounters them, avoiding a large startup burst of delayed jobs.
     const lifecycleStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const lifecycleEnd = this.addLagosCalendarDays(now, this.fixtureRefreshForwardDays);
     const fixtures = await this.espnFixtureModel
       .find({
         $or: [...activeKeys.values()].map((key) => ({
           leagueId: key.leagueId,
           season: key.season,
         })),
-        fixtureDate: { $gte: lifecycleStart, $lte: now },
-        completed: { $ne: true },
+        fixtureDate: { $gte: lifecycleStart, $lte: lifecycleEnd },
       })
-      .select({ eventId: 1, leagueId: 1, season: 1, fixtureDate: 1, live: 1 })
+      .select({ eventId: 1, leagueId: 1, season: 1, fixtureDate: 1, status: 1, statusDetail: 1, statusShortDetail: 1 })
       .lean()
       .exec();
 
@@ -552,17 +571,23 @@ export class EspnQueueBuilderService {
       const season = fixture.season;
       const fixtureDate = this.asValidDate(fixture.fixtureDate);
       const active = activeKeys.get(`${leagueId}:${season}`);
-      if (!eventId || !fixtureDate || !active) {
+      const statusText = [fixture.status, fixture.statusDetail, fixture.statusShortDetail]
+        .filter(Boolean).join(' ').toUpperCase();
+      if (!eventId || !fixtureDate || !active || /(CANCEL|POSTPON|ABANDON|VOID)/.test(statusText)) {
         skipped += 1;
         continue;
       }
-      const summaryQueued = await this.queuePostKickoffSummaryRefresh({
-        eventId,
-        leagueId,
-        season,
-        priority: active.priority,
+      const scheduledFor = new Date(Math.max(
+        now.getTime(),
+        fixtureDate.getTime() + this.postMatchDelayMs,
+      ));
+      const fixtureRefreshQueued = await this.queuePostKickoffFixtureRefresh({
+        eventId, leagueId, season, priority: active.priority, scheduledFor,
       });
-      if (summaryQueued) queued += 1;
+      const summaryQueued = await this.queuePostKickoffSummaryRefresh({
+        eventId, leagueId, season, priority: active.priority,
+      });
+      if (fixtureRefreshQueued || summaryQueued) queued += 1;
       else skipped += 1;
     }
     return { checked: fixtures.length, queued, skipped };
@@ -684,17 +709,19 @@ export class EspnQueueBuilderService {
         (await this.espnActiveCompetitionService.getBySlug(leagueId));
       if (!activeLeague)
         return { fixtureRefreshQueued: false, summaryRefreshQueued: false };
-      const job = await this.espnQueueService.addFixtureRefreshJob({
-        leagueId,
-        season: params.season,
-        priority: this.getQueuePriority(activeLeague.priority),
-        scheduledFor: new Date(),
-        triggerEventId: `FINISHED:${eventId}`,
+      const fixtureDate = this.asValidDate(fixture?.fixtureDate);
+      const scheduledFor = fixtureDate
+        ? new Date(Math.max(Date.now(), fixtureDate.getTime() + this.postMatchDelayMs))
+        : new Date();
+      const fixtureRefreshQueued = await this.queuePostKickoffFixtureRefresh({
+        eventId, leagueId, season: params.season,
+        priority: this.getQueuePriority(activeLeague.priority), scheduledFor,
       });
-      return {
-        fixtureRefreshQueued: this.isPending(job),
-        summaryRefreshQueued: false,
-      };
+      const summaryRefreshQueued = await this.queuePostKickoffSummaryRefresh({
+        eventId, leagueId, season: params.season,
+        priority: this.getQueuePriority(activeLeague.priority),
+      });
+      return { fixtureRefreshQueued, summaryRefreshQueued };
     }
     const summaryRefreshQueued = await this.queueFinishedSummaryRefresh({
       eventId,
@@ -743,31 +770,50 @@ export class EspnQueueBuilderService {
 
     const fixture = await this.espnFixtureModel
       .findOne({ eventId, leagueId, season })
-      .select({ fixtureDate: 1 })
+      .select({
+        fixtureDate: 1,
+        completed: 1,
+        status: 1,
+        statusDetail: 1,
+        statusShortDetail: 1,
+        homeScore: 1,
+        awayScore: 1,
+        fixtureCollectedAt: 1,
+        'payload.summaryCollectedAt': 1,
+      })
       .lean()
       .exec();
     const fixtureDate = this.asValidDate(fixture?.fixtureDate);
     if (!fixture || !fixtureDate) return false;
 
-    const triggerEventId = `POSTMATCH_SUMMARY:${eventId}`;
-    if (
-      await this.espnQueueService.hasJob({
-        jobType: EspnQueueJobType.SUMMARY_REFRESH,
-        leagueId,
-        eventId,
-        season,
-        triggerEventId,
-      })
-    ) {
+    const statusText = [fixture.status, fixture.statusDetail, fixture.statusShortDetail]
+      .filter(Boolean).join(' ').toUpperCase();
+    if (/(CANCEL|POSTPON|ABANDON|VOID)/.test(statusText)) return false;
+
+    const hasScores =
+      typeof fixture.homeScore === 'number' && Number.isFinite(fixture.homeScore) &&
+      typeof fixture.awayScore === 'number' && Number.isFinite(fixture.awayScore);
+    const primaryStatus = String(fixture.status ?? '').toUpperCase();
+    const hasVerifiedResult = fixture.completed === true && hasScores &&
+      !/(SCHEDULED|UPCOMING|NOT[_ ]STARTED|STATUS_PRE|STATUS_SCHEDULED)/.test(primaryStatus);
+    const postMatchDueAt = new Date(fixtureDate.getTime() + this.postMatchDelayMs);
+    const summaryCollectedAt = this.asValidDate(fixture.payload?.summaryCollectedAt);
+    const fixtureCollectedAt = this.asValidDate(fixture.fixtureCollectedAt);
+
+    // Do not reopen an already-verified post-match Summary. However, a fixture
+    // date change moves the +160m target forward, making an older Summary stale
+    // and eligible for the same deterministic refresh job to be reopened.
+    if (hasVerifiedResult && summaryCollectedAt && summaryCollectedAt >= postMatchDueAt) {
       return false;
     }
 
-    const scheduledFor = new Date(
-      Math.max(
-        Date.now(),
-        fixtureDate.getTime() + this.postMatchDelayMs,
-      ),
-    );
+    const triggerEventId = `POSTMATCH_SUMMARY:${eventId}`;
+    const scheduledFor = new Date(Math.max(Date.now(), postMatchDueAt.getTime()));
+    // Fixture scoreboard refresh is a separate durable job, coalesced by
+    // competition/season/calendar date. It is never gated by live/completed.
+    await this.queuePostKickoffFixtureRefresh({
+      eventId, leagueId, season, priority: params.priority, scheduledFor,
+    });
     const job = await this.espnQueueService.addSummaryRefreshJob({
       leagueId,
       eventId,
@@ -780,6 +826,111 @@ export class EspnQueueBuilderService {
       triggerEventId,
     });
     return this.isPendingFresh(job);
+  }
+
+  async queuePostKickoffFixtureRefresh(params: {
+    eventId: string;
+    leagueId: string;
+    season: number;
+    priority?: number;
+    scheduledFor?: Date;
+  }): Promise<boolean> {
+    const eventId = String(params.eventId ?? '').trim();
+    const leagueId = this.normalizeLeagueId(params.leagueId);
+    if (!eventId || !leagueId || !Number.isInteger(params.season)) return false;
+    const fixture = await this.espnFixtureModel
+      .findOne({ eventId, leagueId, season: params.season })
+      .select({
+        fixtureDate: 1,
+        completed: 1,
+        status: 1,
+        statusDetail: 1,
+        statusShortDetail: 1,
+        homeScore: 1,
+        awayScore: 1,
+        fixtureCollectedAt: 1,
+      })
+      .lean()
+      .exec();
+    const fixtureDate = this.asValidDate(fixture?.fixtureDate);
+    if (!fixtureDate) return false;
+
+    const statusText = [fixture?.status, fixture?.statusDetail, fixture?.statusShortDetail]
+      .filter(Boolean).join(' ').toUpperCase();
+    if (/(CANCEL|POSTPON|ABANDON|VOID)/.test(statusText)) return false;
+    const hasScores =
+      typeof fixture?.homeScore === 'number' && Number.isFinite(fixture.homeScore) &&
+      typeof fixture?.awayScore === 'number' && Number.isFinite(fixture.awayScore);
+    const primaryStatus = String(fixture?.status ?? '').toUpperCase();
+    const hasVerifiedResult = fixture?.completed === true && hasScores &&
+      !/(SCHEDULED|UPCOMING|NOT[_ ]STARTED|STATUS_PRE|STATUS_SCHEDULED)/.test(primaryStatus);
+    const postMatchDueAt = new Date(fixtureDate.getTime() + this.postMatchDelayMs);
+    const fixtureCollectedAt = this.asValidDate(fixture?.fixtureCollectedAt);
+    if (hasVerifiedResult && fixtureCollectedAt && fixtureCollectedAt >= postMatchDueAt) {
+      return false;
+    }
+
+    const scheduledFor = params.scheduledFor ?? new Date(
+      Math.max(Date.now(), postMatchDueAt.getTime()),
+    );
+    const dateKey = this.getLagosDateKey(fixtureDate);
+    const triggerEventId = `POSTMATCH_FIXTURE_DATE:${dateKey}`;
+    const activeLeague =
+      (await this.espnActiveCompetitionService.getByLeagueId(leagueId)) ??
+      (await this.espnActiveCompetitionService.getBySlug(leagueId));
+    if (!activeLeague?.isActive || activeLeague.season !== params.season || activeLeague.fixturesCollectedSeason !== params.season) return false;
+
+    // A stable league/season/date job coalesces all matches played that day.
+    // Re-adding a completed key intentionally reopens it for the next checkpoint.
+    const job = await this.espnQueueService.addFixtureRefreshJob({
+      leagueId,
+      season: params.season,
+      priority: params.priority ?? this.getQueuePriority(activeLeague.priority),
+      scheduledFor,
+      triggerEventId,
+    });
+    return this.isPendingFresh(job);
+  }
+
+  private async queueFixtureWindowRefresh(params: {
+    leagueId: string;
+    season: number;
+    priority: number;
+    window: 'NEAR' | 'FAR';
+    scheduledFor: Date;
+    triggerEventId: string;
+  }): Promise<boolean> {
+    if (await this.espnQueueService.hasJob({
+      jobType: EspnQueueJobType.FIXTURE_REFRESH,
+      leagueId: params.leagueId,
+      season: params.season,
+      triggerEventId: params.triggerEventId,
+    })) return false;
+    const job = await this.espnQueueService.addFixtureRefreshJob({
+      leagueId: params.leagueId,
+      season: params.season,
+      priority: params.priority,
+      scheduledFor: params.scheduledFor,
+      triggerEventId: params.triggerEventId,
+    });
+    return this.isPendingFresh(job);
+  }
+
+  async scheduleNextRollingFixtureRefresh(params: {
+    leagueId: string;
+    season: number;
+    priority: number;
+    window: 'NEAR' | 'FAR';
+  }): Promise<boolean> {
+    const scheduledFor = params.window === 'NEAR'
+      ? new Date(Date.now() + SPORTS_DATA_COLLECTION_CONFIG.ESPN.fixtures.nearTermRefreshIntervalHours * 60 * 60_000)
+      : this.nextLagosMidnight();
+    const triggerEventId = params.window === 'NEAR'
+      ? `WINDOW_REFRESH:NEAR:${Math.floor(scheduledFor.getTime() / (SPORTS_DATA_COLLECTION_CONFIG.ESPN.fixtures.nearTermRefreshIntervalHours * 60 * 60_000))}`
+      : `WINDOW_REFRESH:FAR:${this.getLagosDateKey(scheduledFor)}`;
+    return this.queueFixtureWindowRefresh({
+      ...params, scheduledFor, triggerEventId,
+    });
   }
 
   async queueFinishedSummaryRefresh(params: {
@@ -1110,7 +1261,7 @@ export class EspnQueueBuilderService {
         const fixture = raw as unknown as QueueFixture;
         const eventId = String(fixture.eventId ?? '').trim();
         const fixtureDate = this.asValidDate(fixture.fixtureDate);
-        if (!eventId || !fixtureDate || fixture.live === true) {
+        if (!eventId || !fixtureDate) {
           skipped += 1;
           continue;
         }
@@ -1214,7 +1365,7 @@ export class EspnQueueBuilderService {
 
     const nowMs = Date.now();
     const elapsedMs = nowMs - kickoff.getTime();
-    if (elapsedMs < this.postMatchDelayMs || fixture.live === true) return false;
+    if (elapsedMs < this.postMatchDelayMs) return false;
 
     const statusText = [fixture.status, fixture.statusDetail, fixture.statusShortDetail]
       .filter(Boolean).join(' ').toUpperCase();
@@ -1246,6 +1397,10 @@ export class EspnQueueBuilderService {
       nowMs,
       kickoff.getTime() + nextOffset * 60_000,
     ));
+    const fixtureRefreshQueued = await this.queuePostKickoffFixtureRefresh({
+      eventId, leagueId, season: params.season,
+      priority: params.priority ?? 4, scheduledFor,
+    });
     const job = await this.espnQueueService.addSummaryRefreshJob({
       leagueId,
       eventId,
@@ -1254,7 +1409,7 @@ export class EspnQueueBuilderService {
       scheduledFor,
       triggerEventId,
     });
-    return this.isPendingFresh(job);
+    return this.isPendingFresh(job) || fixtureRefreshQueued;
   }
 
   async scheduleNextPostMatchCheck(params: {
@@ -1578,4 +1733,5 @@ export class EspnQueueBuilderService {
     return String(job.status) === 'PENDING' && Number(job.attempts ?? 0) === 0;
   }
 }
+
 

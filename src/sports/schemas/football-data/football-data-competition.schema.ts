@@ -60,3 +60,4 @@ export class FootballDataCompetition {
 export const FootballDataCompetitionSchema = SchemaFactory.createForClass(
   FootballDataCompetition,
 );
+

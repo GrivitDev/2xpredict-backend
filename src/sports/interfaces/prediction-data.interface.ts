@@ -106,3 +106,4 @@ export interface SportsSettlementData {
 
   summaryCollectedAt: unknown;
 }
+

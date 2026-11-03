@@ -82,3 +82,4 @@ SportsOddsSnapshotSchema.index({
   awayTeam: 1,
   commenceTime: 1,
 });
+

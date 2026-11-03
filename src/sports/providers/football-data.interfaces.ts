@@ -247,3 +247,4 @@ export interface FootballDataReferee {
 
   nationality?: string;
 }
+

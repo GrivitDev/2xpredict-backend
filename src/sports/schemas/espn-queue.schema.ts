@@ -2,7 +2,9 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
 
 import {
+  EspnQueueFailureCategory,
   EspnQueueJobType,
+  EspnQueueLane,
   EspnQueueStatus,
 } from '../interfaces/espn-queue.interface';
 
@@ -93,6 +95,36 @@ export class EspnQueue {
 
   @Prop({
     required: true,
+    type: String,
+    enum: Object.values(EspnQueueLane),
+    default: EspnQueueLane.NORMAL,
+    index: true,
+  })
+  lane!: EspnQueueLane;
+
+  @Prop({ type: String, enum: Object.values(EspnQueueFailureCategory) })
+  failureCategory?: EspnQueueFailureCategory;
+
+  @Prop({ required: true, default: 0, min: 0 })
+  retryCount!: number;
+
+  @Prop({ type: Date, index: true })
+  firstFailedAt?: Date;
+
+  @Prop({ type: Date, index: true })
+  lastAttemptAt?: Date;
+
+  @Prop({ type: String, index: true })
+  ownerId?: string;
+
+  @Prop({ type: Date, index: true })
+  heartbeatAt?: Date;
+
+  @Prop({ type: Date, index: true })
+  leaseExpiresAt?: Date;
+
+  @Prop({
+    required: true,
     default: 0,
     min: 0,
   })
@@ -149,7 +181,9 @@ export const EspnQueueSchema = SchemaFactory.createForClass(EspnQueue);
 // ============================================================
 
 EspnQueueSchema.index({
+  lane: 1,
   status: 1,
+  nextAttemptAt: 1,
   priority: 1,
   scheduledFor: 1,
   createdAt: 1,
@@ -198,3 +232,15 @@ EspnQueueSchema.index({
   triggerEventId: 1,
   type: 1,
 });
+
+EspnQueueSchema.index({
+  status: 1,
+  leaseExpiresAt: 1,
+});
+
+EspnQueueSchema.index({
+  lane: 1,
+  failureCategory: 1,
+  firstFailedAt: 1,
+});
+

@@ -266,7 +266,8 @@ const COMPLETED_STATUSES = new Set([
 
 const QUEUE_COMPLETED_RETENTION_DAYS = 7;
 
-const STALE_PROCESSING_MINUTES = 5;
+const STALE_PROCESSING_MINUTES =
+  SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.leaseMinutes;
 
 const UPCOMING_WINDOW_HOURS =
   SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.upcomingWindowHours;
@@ -443,7 +444,8 @@ export class SportsSystemMonitorService implements OnModuleInit {
 
   onModuleInit(): void {
     this.adminGateway.registerModule('sports', {
-      message: 'Sports monitor initialized; queue, collection and provider snapshots are streamed to admin clients.',
+      message:
+        'Sports monitor initialized; queue, collection and provider snapshots are streamed to admin clients.',
       operationalStatus: 'UNKNOWN',
     });
   }
@@ -481,55 +483,341 @@ export class SportsSystemMonitorService implements OnModuleInit {
       });
     }
 
-    return this.attachRuntimeHealth(this.createLoadingSnapshot(
-      query,
-      this.monitorRefreshErrors.get(cacheKey),
-      this.monitorRefreshes.has(cacheKey),
-    ));
+    return this.attachRuntimeHealth(
+      this.createLoadingSnapshot(
+        query,
+        this.monitorRefreshErrors.get(cacheKey),
+        this.monitorRefreshes.has(cacheKey),
+      ),
+    );
   }
 
-  private attachRuntimeHealth(snapshot: SportsSystemMonitorResponse): SportsSystemMonitorResponse {
+  private attachRuntimeHealth(
+    snapshot: SportsSystemMonitorResponse,
+  ): SportsSystemMonitorResponse {
     const checkedAt = new Date().toISOString();
     const worker = this.espnQueueWorker.getMonitorRuntimeStatus();
     const alerts: SportsMonitorAlert[] = [];
-    const addAlert = (code: string, severity: SportsMonitorAlert['severity'], message: string, details?: Record<string, unknown>) => {
-      alerts.push({ code, severity, message, occurredAt: checkedAt, ...(details ? { details } : {}) });
+    const addAlert = (
+      code: string,
+      severity: SportsMonitorAlert['severity'],
+      message: string,
+      details?: Record<string, unknown>,
+    ) => {
+      alerts.push({
+        code,
+        severity,
+        message,
+        occurredAt: checkedAt,
+        ...(details ? { details } : {}),
+      });
     };
 
-    if (snapshot.snapshotError) addAlert('MONITOR_SNAPSHOT_FAILED', 'CRITICAL', 'The sports monitor could not build its database snapshot.', { error: snapshot.snapshotError });
-    if (worker.queueReadFailures >= 3) addAlert('QUEUE_READ_FAILURES', 'CRITICAL', 'The ESPN worker has repeated failures reading its next queue wake-up.', { consecutiveFailures: worker.queueReadFailures });
-    else if (worker.queueReadFailures > 0) addAlert('QUEUE_READ_FAILURES', 'WARNING', 'The ESPN worker has a queue-read failure and is retrying.', { consecutiveFailures: worker.queueReadFailures });
-    if (worker.lastWatchdogError) addAlert('QUEUE_WATCHDOG_FAILED', 'WARNING', 'The last ESPN queue watchdog check failed.', { error: worker.lastWatchdogError });
-    if (worker.draining && (worker.activeJobAgeMs ?? 0) > 10 * 60_000) addAlert('QUEUE_JOB_LONG_RUNNING', 'WARNING', 'An ESPN queue job has been running for more than ten minutes.', { jobKey: worker.activeJobKey, jobType: worker.activeJobType, activeJobAgeMs: worker.activeJobAgeMs });
-    if (snapshot.queue.staleProcessing > 0) addAlert('STALE_PROCESSING_JOBS', 'CRITICAL', 'One or more ESPN queue jobs have remained in PROCESSING beyond the stale-job threshold.', { count: snapshot.queue.staleProcessing });
-    if (snapshot.queue.failed > 0 && snapshot.queue.latestFailureAt && Date.now() - new Date(snapshot.queue.latestFailureAt).getTime() < 24 * 60 * 60_000) addAlert('RECENT_QUEUE_FAILURES', 'WARNING', 'The ESPN queue contains failed jobs from the last 24 hours.', { failedJobs: snapshot.queue.failed, latestFailure: snapshot.queue.latestFailure, latestFailureAt: snapshot.queue.latestFailureAt });
+    if (snapshot.snapshotError)
+      addAlert(
+        'MONITOR_SNAPSHOT_FAILED',
+        'CRITICAL',
+        'The sports monitor could not build its database snapshot.',
+        { error: snapshot.snapshotError },
+      );
+    if (worker.queueReadFailures >= 3)
+      addAlert(
+        'QUEUE_READ_FAILURES',
+        'CRITICAL',
+        'The ESPN worker has repeated failures reading its next queue wake-up.',
+        { consecutiveFailures: worker.queueReadFailures },
+      );
+    else if (worker.queueReadFailures > 0)
+      addAlert(
+        'QUEUE_READ_FAILURES',
+        'WARNING',
+        'The ESPN worker has a queue-read failure and is retrying.',
+        { consecutiveFailures: worker.queueReadFailures },
+      );
+    if (worker.lastWatchdogError)
+      addAlert(
+        'QUEUE_WATCHDOG_FAILED',
+        'WARNING',
+        'The last ESPN queue watchdog check failed.',
+        { error: worker.lastWatchdogError },
+      );
+    if (worker.draining && (worker.activeJobAgeMs ?? 0) > 10 * 60_000)
+      addAlert(
+        'QUEUE_JOB_LONG_RUNNING',
+        'WARNING',
+        'An ESPN queue job has been running for more than ten minutes.',
+        {
+          jobKey: worker.activeJobKey,
+          jobType: worker.activeJobType,
+          activeJobAgeMs: worker.activeJobAgeMs,
+        },
+      );
+    if (snapshot.queue.staleProcessing > 0)
+      addAlert(
+        'STALE_PROCESSING_JOBS',
+        'CRITICAL',
+        'One or more ESPN queue jobs have remained in PROCESSING beyond the stale-job threshold.',
+        { count: snapshot.queue.staleProcessing },
+      );
+    if (snapshot.queue.retryLaneJobs > 100)
+      addAlert(
+        'BACKGROUND_RETRY_BACKLOG',
+        'WARNING',
+        'The background retry lane has accumulated a large recovery backlog.',
+        { retryJobs: snapshot.queue.retryLaneJobs },
+      );
+    if (snapshot.queue.quarantinedJobs > 0)
+      addAlert(
+        'QUEUE_QUARANTINE',
+        'WARNING',
+        'Some jobs require configuration or data correction and were quarantined rather than replayed indefinitely.',
+        { quarantinedJobs: snapshot.queue.quarantinedJobs },
+      );
+    if (
+      snapshot.queue.oldestRetryFailedAt &&
+      Date.now() - new Date(snapshot.queue.oldestRetryFailedAt).getTime() >
+        24 * 60 * 60_000
+    )
+      addAlert(
+        'BACKGROUND_RETRY_AGE',
+        'WARNING',
+        'At least one recoverable job has remained unresolved for more than 24 hours and is continuing its scheduled background retries.',
+        {
+          oldestRetryFailedAt: snapshot.queue.oldestRetryFailedAt,
+          retryJobs: snapshot.queue.retryLaneJobs,
+        },
+      );
     for (const provider of snapshot.providers) {
-      if (provider.usage.remainingDailyRequests === 0 || provider.usage.remainingMonthlyRequests === 0) addAlert('PROVIDER_QUOTA_EXHAUSTED', 'WARNING', `${provider.provider} has exhausted a configured provider request allowance.`, { provider: provider.provider, remainingDailyRequests: provider.usage.remainingDailyRequests, remainingMonthlyRequests: provider.usage.remainingMonthlyRequests });
-      if (provider.usage.activeLocks > 0) addAlert('PROVIDER_ENDPOINT_LOCKED', 'INFO', `${provider.provider} has one or more endpoint rate-limit locks active.`, { provider: provider.provider, activeLocks: provider.usage.activeLocks });
+      if (
+        provider.usage.remainingDailyRequests === 0 ||
+        provider.usage.remainingMonthlyRequests === 0
+      )
+        addAlert(
+          'PROVIDER_QUOTA_EXHAUSTED',
+          'WARNING',
+          `${provider.provider} has exhausted a configured provider request allowance.`,
+          {
+            provider: provider.provider,
+            remainingDailyRequests: provider.usage.remainingDailyRequests,
+            remainingMonthlyRequests: provider.usage.remainingMonthlyRequests,
+          },
+        );
+      if (provider.usage.activeLocks > 0)
+        addAlert(
+          'PROVIDER_ENDPOINT_LOCKED',
+          'INFO',
+          `${provider.provider} has one or more endpoint rate-limit locks active.`,
+          {
+            provider: provider.provider,
+            activeLocks: provider.usage.activeLocks,
+          },
+        );
     }
-    if (snapshot.sync.failures.length > 0) addAlert('SYNC_STATE_FAILURES', 'WARNING', 'The sports sync ledger contains recent or unresolved failed operations.', { count: snapshot.sync.failures.length, failures: snapshot.sync.failures.slice(0, 5) as unknown as Record<string, unknown> });
-    if (snapshot.expectedWork.staleActiveLeagues > 0) addAlert('STALE_ACTIVE_COMPETITIONS', 'WARNING', 'Some active competitions have stale fixture collection.', { count: snapshot.expectedWork.staleActiveLeagues });
-    if (snapshot.expectedWork.upcomingFixturesMissingSummary > 0) addAlert('UPCOMING_SUMMARIES_MISSING', 'WARNING', 'Upcoming fixtures inside the Summary window are missing summary payloads.', { count: snapshot.expectedWork.upcomingFixturesMissingSummary });
-    if (snapshot.expectedWork.upcomingFixturesMissingOdds > 0) addAlert('UPCOMING_ODDS_MISSING', 'WARNING', 'Upcoming fixtures with Odds API support do not have a matching odds snapshot.', { count: snapshot.expectedWork.upcomingFixturesMissingOdds });
-    if (snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0) addAlert('POSTMATCH_RESULTS_MISSING', 'WARNING', 'Fixtures past the post-match checkpoint still lack a verified final result and both scores.', { count: snapshot.expectedWork.postMatchFixturesMissingFinalResult });
-    if (snapshot.expectedWork.staleUpcomingStatusFixtures > 0) addAlert('STALE_UPCOMING_FIXTURE_STATUS', 'WARNING', 'Fixtures past the post-match checkpoint still have a scheduled/upcoming root status.', { count: snapshot.expectedWork.staleUpcomingStatusFixtures });
+    if (snapshot.sync.failures.length > 0)
+      addAlert(
+        'SYNC_STATE_FAILURES',
+        'WARNING',
+        'The sports sync ledger contains recent or unresolved failed operations.',
+        {
+          count: snapshot.sync.failures.length,
+          failures: snapshot.sync.failures.slice(0, 5) as unknown as Record<
+            string,
+            unknown
+          >,
+        },
+      );
+    if (snapshot.expectedWork.staleActiveLeagues > 0)
+      addAlert(
+        'STALE_ACTIVE_COMPETITIONS',
+        'WARNING',
+        'Some active competitions have stale fixture collection.',
+        { count: snapshot.expectedWork.staleActiveLeagues },
+      );
+    if (snapshot.expectedWork.upcomingFixturesMissingSummary > 0)
+      addAlert(
+        'UPCOMING_SUMMARIES_MISSING',
+        'WARNING',
+        'Upcoming fixtures inside the Summary window are missing summary payloads.',
+        { count: snapshot.expectedWork.upcomingFixturesMissingSummary },
+      );
+    if (snapshot.expectedWork.upcomingFixturesMissingOdds > 0)
+      addAlert(
+        'UPCOMING_ODDS_MISSING',
+        'WARNING',
+        'Upcoming fixtures with Odds API support do not have a matching odds snapshot.',
+        { count: snapshot.expectedWork.upcomingFixturesMissingOdds },
+      );
+    if (snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0)
+      addAlert(
+        'POSTMATCH_RESULTS_MISSING',
+        'WARNING',
+        'Fixtures past the post-match checkpoint still lack a verified final result and both scores.',
+        { count: snapshot.expectedWork.postMatchFixturesMissingFinalResult },
+      );
+    if (snapshot.expectedWork.staleUpcomingStatusFixtures > 0)
+      addAlert(
+        'STALE_UPCOMING_FIXTURE_STATUS',
+        'WARNING',
+        'Fixtures past the post-match checkpoint still have a scheduled/upcoming root status.',
+        { count: snapshot.expectedWork.staleUpcomingStatusFixtures },
+      );
 
     const components: SportsRuntimeMonitor['components'] = {
-      ESPN_QUEUE: { status: worker.queueReadFailures >= 3 || snapshot.queue.staleProcessing > 0 ? 'CRITICAL' : worker.lastWatchdogError || snapshot.queue.failed > 0 ? 'DEGRADED' : worker.started ? 'HEALTHY' : 'UNKNOWN', message: worker.started ? (worker.draining ? 'Queue worker is processing work.' : 'Queue worker is running and waiting for due work.') : worker.waitingForStartupRelease ? 'Worker is initialized and waiting for the startup service to release normal queue work.' : 'Worker is not currently running.', metrics: { pending: snapshot.queue.pending, processing: snapshot.queue.processing, failed: snapshot.queue.failed, staleProcessing: snapshot.queue.staleProcessing, jobsSucceeded: worker.jobsSucceeded, jobsFailed: worker.jobsFailed } },
-      ESPN_FIXTURES: { status: snapshot.expectedWork.staleActiveLeagues > 0 || snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0 || snapshot.expectedWork.staleUpcomingStatusFixtures > 0 ? 'DEGRADED' : 'HEALTHY', message: snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0 || snapshot.expectedWork.staleUpcomingStatusFixtures > 0 ? 'Fixture coverage has unresolved post-match results or stale upcoming statuses.' : snapshot.expectedWork.staleActiveLeagues > 0 ? 'Some active competition fixture collections are stale.' : 'Fixture inventory, post-match results and active competition freshness checks completed.', metrics: { storedFixtures: snapshot.inventory.espnFixtures, staleActiveLeagues: snapshot.expectedWork.staleActiveLeagues, postMatchMissingFinalResult: snapshot.expectedWork.postMatchFixturesMissingFinalResult, staleUpcomingStatus: snapshot.expectedWork.staleUpcomingStatusFixtures } },
-      ESPN_SUMMARY: { status: snapshot.expectedWork.upcomingFixturesMissingSummary > 0 || snapshot.expectedWork.finishedFixturesMissingSummary > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Summary readiness is derived from fixture payload coverage and sync-state progress.', metrics: { upcomingMissing: snapshot.expectedWork.upcomingFixturesMissingSummary, finishedMissing: snapshot.expectedWork.finishedFixturesMissingSummary } },
-      ESPN_STANDINGS: { status: snapshot.expectedWork.standingsMissingTeams > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Standings coverage is measured against teams found in current-season fixtures; some competitions may not require standings.', metrics: { missingTeams: snapshot.expectedWork.standingsMissingTeams, storedRows: snapshot.inventory.espnStandings } },
-      YOUTUBE: { status: snapshot.providers.find((p) => p.provider === 'youtube')?.usage.remainingDailyRequests === 0 ? 'DEGRADED' : 'HEALTHY', message: 'YouTube queue and provider quota telemetry are available in the queue/provider sections.', metrics: { storedHighlights: snapshot.inventory.youtubeHighlights, pendingJobs: snapshot.queue.byType['YOUTUBE_HIGHLIGHT'] ?? 0, remainingDailyRequests: snapshot.providers.find((p) => p.provider === 'youtube')?.usage.remainingDailyRequests ?? null } },
-      FOOTBALL_DATA: { status: 'UNKNOWN', message: 'Football-Data integration is disabled by current collection configuration; inventory is retained for visibility.', metrics: { enabled: SPORTS_DATA_COLLECTION_CONFIG.FOOTBALL_DATA.enabled, storedMatches: snapshot.inventory.footballDataMatches } },
-      ODDS_API: { status: snapshot.expectedWork.upcomingFixturesMissingOdds > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Odds availability is checked against exact stored event IDs for competitions with configured Odds API mappings.', metrics: { storedOddsSnapshots: snapshot.inventory.sportsOddsSnapshots, missingUpcomingOdds: snapshot.expectedWork.upcomingFixturesMissingOdds } },
-      ACTIVE_COMPETITIONS: { status: snapshot.scope.activeCompetitions > 0 ? 'HEALTHY' : 'DEGRADED', message: snapshot.scope.activeCompetitions > 0 ? 'Active competition registry is populated.' : 'No active competitions are available to the monitor.', metrics: { active: snapshot.scope.activeCompetitions, catalogue: snapshot.scope.catalogueCompetitions } },
-      SYNC_LEDGER: { status: snapshot.sync.failures.length > 0 ? 'DEGRADED' : 'HEALTHY', message: 'Sync health is based on persisted queue/cron states and their unit progress.', metrics: { states: snapshot.sync.totalStates, failures: snapshot.sync.failures.length, completionPercent: snapshot.sync.stateCompletionPercent } },
+      ESPN_QUEUE: {
+        status:
+          worker.queueReadFailures >= 3 || snapshot.queue.staleProcessing > 0
+            ? 'CRITICAL'
+            : worker.lastWatchdogError ||
+                snapshot.queue.quarantinedJobs > 0 ||
+                snapshot.queue.retryLaneJobs > 100
+              ? 'DEGRADED'
+              : worker.started
+                ? 'HEALTHY'
+                : 'UNKNOWN',
+        message: worker.started
+          ? `Queue is active with ${worker.normalJobsActive ?? 0} normal and ${worker.retryJobsActive ?? 0} recovery jobs executing.`
+          : worker.waitingForStartupRelease
+            ? 'Worker is initialized and waiting for startup release.'
+            : 'Worker is not currently running.',
+        metrics: {
+          pending: snapshot.queue.pending,
+          processing: snapshot.queue.processing,
+          failed: snapshot.queue.failed,
+          retryLaneJobs: snapshot.queue.retryLaneJobs,
+          quarantinedJobs: snapshot.queue.quarantinedJobs,
+          oldestRetryFailedAt: snapshot.queue.oldestRetryFailedAt ?? null,
+          staleProcessing: snapshot.queue.staleProcessing,
+          activeJobs: worker.activeJobCount ?? 0,
+          normalJobsActive: worker.normalJobsActive ?? 0,
+          retryJobsActive: worker.retryJobsActive ?? 0,
+          jobsSucceeded: worker.jobsSucceeded,
+          jobsFailed: worker.jobsFailed,
+        },
+      },
+      ESPN_FIXTURES: {
+        status:
+          snapshot.expectedWork.staleActiveLeagues > 0 ||
+          snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0 ||
+          snapshot.expectedWork.staleUpcomingStatusFixtures > 0
+            ? 'DEGRADED'
+            : 'HEALTHY',
+        message:
+          snapshot.expectedWork.postMatchFixturesMissingFinalResult > 0 ||
+          snapshot.expectedWork.staleUpcomingStatusFixtures > 0
+            ? 'Fixture coverage has unresolved post-match results or stale upcoming statuses.'
+            : snapshot.expectedWork.staleActiveLeagues > 0
+              ? 'Some active competition fixture collections are stale.'
+              : 'Fixture inventory, post-match results and active competition freshness checks completed.',
+        metrics: {
+          storedFixtures: snapshot.inventory.espnFixtures,
+          staleActiveLeagues: snapshot.expectedWork.staleActiveLeagues,
+          postMatchMissingFinalResult:
+            snapshot.expectedWork.postMatchFixturesMissingFinalResult,
+          staleUpcomingStatus:
+            snapshot.expectedWork.staleUpcomingStatusFixtures,
+        },
+      },
+      ESPN_SUMMARY: {
+        status:
+          snapshot.expectedWork.upcomingFixturesMissingSummary > 0 ||
+          snapshot.expectedWork.finishedFixturesMissingSummary > 0
+            ? 'DEGRADED'
+            : 'HEALTHY',
+        message:
+          'Summary readiness is derived from fixture payload coverage and sync-state progress.',
+        metrics: {
+          upcomingMissing: snapshot.expectedWork.upcomingFixturesMissingSummary,
+          finishedMissing: snapshot.expectedWork.finishedFixturesMissingSummary,
+        },
+      },
+      ESPN_STANDINGS: {
+        status:
+          snapshot.expectedWork.standingsMissingTeams > 0
+            ? 'DEGRADED'
+            : 'HEALTHY',
+        message:
+          'Standings coverage is measured against teams found in current-season fixtures; some competitions may not require standings.',
+        metrics: {
+          missingTeams: snapshot.expectedWork.standingsMissingTeams,
+          storedRows: snapshot.inventory.espnStandings,
+        },
+      },
+      YOUTUBE: {
+        status:
+          snapshot.providers.find((p) => p.provider === 'youtube')?.usage
+            .remainingDailyRequests === 0
+            ? 'DEGRADED'
+            : 'HEALTHY',
+        message:
+          'YouTube queue and provider quota telemetry are available in the queue/provider sections.',
+        metrics: {
+          storedHighlights: snapshot.inventory.youtubeHighlights,
+          pendingJobs: snapshot.queue.byType['YOUTUBE_HIGHLIGHT'] ?? 0,
+          remainingDailyRequests:
+            snapshot.providers.find((p) => p.provider === 'youtube')?.usage
+              .remainingDailyRequests ?? null,
+        },
+      },
+      FOOTBALL_DATA: {
+        status: 'UNKNOWN',
+        message:
+          'Football-Data integration is disabled by current collection configuration; inventory is retained for visibility.',
+        metrics: {
+          enabled: SPORTS_DATA_COLLECTION_CONFIG.FOOTBALL_DATA.enabled,
+          storedMatches: snapshot.inventory.footballDataMatches,
+        },
+      },
+      ODDS_API: {
+        status:
+          snapshot.expectedWork.upcomingFixturesMissingOdds > 0
+            ? 'DEGRADED'
+            : 'HEALTHY',
+        message:
+          'Odds availability is checked against exact stored event IDs for competitions with configured Odds API mappings.',
+        metrics: {
+          storedOddsSnapshots: snapshot.inventory.sportsOddsSnapshots,
+          missingUpcomingOdds:
+            snapshot.expectedWork.upcomingFixturesMissingOdds,
+        },
+      },
+      ACTIVE_COMPETITIONS: {
+        status: snapshot.scope.activeCompetitions > 0 ? 'HEALTHY' : 'DEGRADED',
+        message:
+          snapshot.scope.activeCompetitions > 0
+            ? 'Active competition registry is populated.'
+            : 'No active competitions are available to the monitor.',
+        metrics: {
+          active: snapshot.scope.activeCompetitions,
+          catalogue: snapshot.scope.catalogueCompetitions,
+        },
+      },
+      SYNC_LEDGER: {
+        status: snapshot.sync.failures.length > 0 ? 'DEGRADED' : 'HEALTHY',
+        message:
+          'Sync health is based on persisted queue/cron states and their unit progress.',
+        metrics: {
+          states: snapshot.sync.totalStates,
+          failures: snapshot.sync.failures.length,
+          completionPercent: snapshot.sync.stateCompletionPercent,
+        },
+      },
     };
 
     const critical = alerts.some((a) => a.severity === 'CRITICAL');
-    const warning = alerts.some((a) => a.severity === 'WARNING') || Object.values(components).some((c) => c.status === 'DEGRADED');
-    const status: SportsMonitorHealthStatus = critical ? 'CRITICAL' : warning ? 'DEGRADED' : snapshot.snapshotReady === false ? 'UNKNOWN' : 'HEALTHY';
-    return { ...snapshot, health: { status, checkedAt, worker, components, alerts } };
+    const warning =
+      alerts.some((a) => a.severity === 'WARNING') ||
+      Object.values(components).some((c) => c.status === 'DEGRADED');
+    const status: SportsMonitorHealthStatus = critical
+      ? 'CRITICAL'
+      : warning
+        ? 'DEGRADED'
+        : snapshot.snapshotReady === false
+          ? 'UNKNOWN'
+          : 'HEALTHY';
+    return {
+      ...snapshot,
+      health: { status, checkedAt, worker, components, alerts },
+    };
   }
 
   private getMonitorCacheKey(query: SportsSystemMonitorQuery): string {
@@ -557,7 +845,17 @@ export class SportsSystemMonitorService implements OnModuleInit {
             refreshing: true,
           },
         });
-        this.adminGateway.publishModuleEvent('sports', 'sports:monitor-update', { leagueId: query.leagueId ?? null, snapshotReady: true, snapshotPartial: true, refreshing: true, occurredAt: new Date().toISOString() });
+        this.adminGateway.publishModuleEvent(
+          'sports',
+          'sports:monitor-update',
+          {
+            leagueId: query.leagueId ?? null,
+            snapshotReady: true,
+            snapshotPartial: true,
+            refreshing: true,
+            occurredAt: new Date().toISOString(),
+          },
+        );
       },
     )
       .then((snapshot) => {
@@ -570,8 +868,22 @@ export class SportsSystemMonitorService implements OnModuleInit {
             refreshing: false,
           },
         });
-        this.adminGateway.setModuleOperationalStatus('sports', 'READY', 'Sports monitor snapshot refreshed successfully.');
-        this.adminGateway.publishModuleEvent('sports', 'sports:monitor-update', { leagueId: query.leagueId ?? null, snapshotReady: true, snapshotPartial: false, refreshing: false, occurredAt: new Date().toISOString() });
+        this.adminGateway.setModuleOperationalStatus(
+          'sports',
+          'READY',
+          'Sports monitor snapshot refreshed successfully.',
+        );
+        this.adminGateway.publishModuleEvent(
+          'sports',
+          'sports:monitor-update',
+          {
+            leagueId: query.leagueId ?? null,
+            snapshotReady: true,
+            snapshotPartial: false,
+            refreshing: false,
+            occurredAt: new Date().toISOString(),
+          },
+        );
       })
       .catch((error: unknown) => {
         const message =
@@ -579,8 +891,17 @@ export class SportsSystemMonitorService implements OnModuleInit {
             ? error.message
             : 'Unable to build the sports system monitor snapshot.';
         this.monitorRefreshErrors.set(cacheKey, message);
-        this.adminGateway.setModuleOperationalStatus('sports', 'DEGRADED', message, { leagueId: query.leagueId ?? null });
-        this.adminGateway.publishModuleEvent('sports', 'sports:error', { leagueId: query.leagueId ?? null, message, occurredAt: new Date().toISOString() });
+        this.adminGateway.setModuleOperationalStatus(
+          'sports',
+          'DEGRADED',
+          message,
+          { leagueId: query.leagueId ?? null },
+        );
+        this.adminGateway.publishModuleEvent('sports', 'sports:error', {
+          leagueId: query.leagueId ?? null,
+          message,
+          occurredAt: new Date().toISOString(),
+        });
         this.logger.error(
           `Sports system monitor refresh failed for ${cacheKey}: ${message}`,
           error instanceof Error ? error.stack : undefined,
@@ -634,6 +955,8 @@ export class SportsSystemMonitorService implements OnModuleInit {
         processing: 0,
         completedRetained: 0,
         failed: 0,
+        retryLaneJobs: 0,
+        quarantinedJobs: 0,
         staleProcessing: 0,
         completedRetentionDays: QUEUE_COMPLETED_RETENTION_DAYS,
         byType: {},
@@ -727,7 +1050,7 @@ export class SportsSystemMonitorService implements OnModuleInit {
       this.loadSyncStateSnapshot(),
       this.buildProviderSummaries(),
     ]);
-    const sync = await this.buildSyncSummary(contexts, now, syncStates);
+    const sync = this.buildSyncSummary(contexts, now, syncStates);
 
     const pipeline = this.buildPipelineDefinitions(sync);
 
@@ -1226,13 +1549,28 @@ export class SportsSystemMonitorService implements OnModuleInit {
                               '$fixtureDate',
                               new Date(
                                 now.getTime() -
-                                  Math.max(1, SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.integrityRecoveryLookbackDays) *
-                                    24 * 60 * 60_000,
+                                  Math.max(
+                                    1,
+                                    SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary
+                                      .integrityRecoveryLookbackDays,
+                                  ) *
+                                    24 *
+                                    60 *
+                                    60_000,
                               ),
                             ],
                           },
-                          { $lte: ['$fixtureDate', new Date(now.getTime() - SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes * 60_000)] },
-                          { $ne: ['$live', true] },
+                          {
+                            $lte: [
+                              '$fixtureDate',
+                              new Date(
+                                now.getTime() -
+                                  SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary
+                                    .finishedMatchDelayMinutes *
+                                    60_000,
+                              ),
+                            ],
+                          },
                           {
                             $not: [
                               {
@@ -1240,8 +1578,10 @@ export class SportsSystemMonitorService implements OnModuleInit {
                                   input: {
                                     $toUpper: {
                                       $concat: [
-                                        { $ifNull: ['$status', ''] }, ' ',
-                                        { $ifNull: ['$statusDetail', ''] }, ' ',
+                                        { $ifNull: ['$status', ''] },
+                                        ' ',
+                                        { $ifNull: ['$statusDetail', ''] },
+                                        ' ',
                                         { $ifNull: ['$statusShortDetail', ''] },
                                       ],
                                     },
@@ -1276,19 +1616,35 @@ export class SportsSystemMonitorService implements OnModuleInit {
                               '$fixtureDate',
                               new Date(
                                 now.getTime() -
-                                  Math.max(1, SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.integrityRecoveryLookbackDays) *
-                                    24 * 60 * 60_000,
+                                  Math.max(
+                                    1,
+                                    SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary
+                                      .integrityRecoveryLookbackDays,
+                                  ) *
+                                    24 *
+                                    60 *
+                                    60_000,
                               ),
                             ],
                           },
-                          { $lte: ['$fixtureDate', new Date(now.getTime() - SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes * 60_000)] },
-                          { $ne: ['$live', true] },
+                          {
+                            $lte: [
+                              '$fixtureDate',
+                              new Date(
+                                now.getTime() -
+                                  SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary
+                                    .finishedMatchDelayMinutes *
+                                    60_000,
+                              ),
+                            ],
+                          },
                           {
                             $regexMatch: {
                               input: {
                                 $toUpper: { $ifNull: ['$status', ''] },
                               },
-                              regex: 'SCHEDULED|UPCOMING|NOT[_ ]STARTED|STATUS_PRE|STATUS_SCHEDULED',
+                              regex:
+                                'SCHEDULED|UPCOMING|NOT[_ ]STARTED|STATUS_PRE|STATUS_SCHEDULED',
                             },
                           },
                           {
@@ -1298,8 +1654,10 @@ export class SportsSystemMonitorService implements OnModuleInit {
                                   input: {
                                     $toUpper: {
                                       $concat: [
-                                        { $ifNull: ['$status', ''] }, ' ',
-                                        { $ifNull: ['$statusDetail', ''] }, ' ',
+                                        { $ifNull: ['$status', ''] },
+                                        ' ',
+                                        { $ifNull: ['$statusDetail', ''] },
+                                        ' ',
                                         { $ifNull: ['$statusShortDetail', ''] },
                                       ],
                                     },
@@ -1407,7 +1765,9 @@ export class SportsSystemMonitorService implements OnModuleInit {
 
         finishedMissingSummary: Math.max(0, finished - finishedWithSummary),
 
-        postMatchMissingFinalResult: Number(row.postMatchMissingFinalResult ?? 0),
+        postMatchMissingFinalResult: Number(
+          row.postMatchMissingFinalResult ?? 0,
+        ),
 
         staleUpcomingStatus: Number(row.staleUpcomingStatus ?? 0),
 
@@ -1443,7 +1803,8 @@ export class SportsSystemMonitorService implements OnModuleInit {
 
       existing.finishedMissingSummary += incoming.finishedMissingSummary;
 
-      existing.postMatchMissingFinalResult += incoming.postMatchMissingFinalResult;
+      existing.postMatchMissingFinalResult +=
+        incoming.postMatchMissingFinalResult;
 
       existing.staleUpcomingStatus += incoming.staleUpcomingStatus;
 
@@ -1597,7 +1958,14 @@ export class SportsSystemMonitorService implements OnModuleInit {
 
     // One grouped collection pass provides status, type, and type/status totals.
     // The previous implementation scanned the queue three separate times.
-    const [statusTypeRows, latestFailure, latestCompleted] = await Promise.all([
+    const [
+      statusTypeRows,
+      latestFailure,
+      latestCompleted,
+      retryLaneJobs,
+      quarantinedJobs,
+      oldestRetryJob,
+    ] = await Promise.all([
       this.espnQueueModel
         .aggregate<{
           _id: {
@@ -1622,7 +1990,22 @@ export class SportsSystemMonitorService implements OnModuleInit {
                     {
                       $and: [
                         { $eq: ['$status', EspnQueueStatus.PROCESSING] },
-                        { $lt: ['$updatedAt', staleCutoff] },
+                        {
+                          $or: [
+                            { $lte: ['$leaseExpiresAt', new Date()] },
+                            {
+                              $and: [
+                                {
+                                  $eq: [
+                                    { $type: '$leaseExpiresAt' },
+                                    'missing',
+                                  ],
+                                },
+                                { $lte: ['$startedAt', staleCutoff] },
+                              ],
+                            },
+                          ],
+                        },
                       ],
                     },
                     1,
@@ -1644,6 +2027,30 @@ export class SportsSystemMonitorService implements OnModuleInit {
       this.espnQueueModel
         .findOne({ status: EspnQueueStatus.COMPLETED })
         .sort({ completedAt: -1, updatedAt: -1 })
+        .lean()
+        .exec(),
+
+      this.espnQueueModel
+        .countDocuments({
+          status: EspnQueueStatus.FAILED,
+          lane: 'BACKGROUND_RETRY' as unknown as EspnQueueDocument['lane'],
+        })
+        .exec(),
+
+      this.espnQueueModel
+        .countDocuments({
+          status: EspnQueueStatus.FAILED,
+          lane: 'QUARANTINE' as unknown as EspnQueueDocument['lane'],
+        })
+        .exec(),
+
+      this.espnQueueModel
+        .findOne({
+          status: EspnQueueStatus.FAILED,
+          lane: 'BACKGROUND_RETRY' as unknown as EspnQueueDocument['lane'],
+        })
+        .sort({ firstFailedAt: 1, failedAt: 1 })
+        .select({ firstFailedAt: 1, failedAt: 1 })
         .lean()
         .exec(),
     ]);
@@ -1682,6 +2089,13 @@ export class SportsSystemMonitorService implements OnModuleInit {
       processing: byStatus[EspnQueueStatus.PROCESSING] ?? 0,
       completedRetained: byStatus[EspnQueueStatus.COMPLETED] ?? 0,
       failed: byStatus[EspnQueueStatus.FAILED] ?? 0,
+      retryLaneJobs: Number(retryLaneJobs ?? 0),
+      quarantinedJobs: Number(quarantinedJobs ?? 0),
+      oldestRetryFailedAt: this.toIso(
+        (oldestRetryJob as { firstFailedAt?: Date; failedAt?: Date } | null)
+          ?.firstFailedAt ??
+          (oldestRetryJob as { failedAt?: Date } | null)?.failedAt,
+      ),
       staleProcessing,
       completedRetentionDays: QUEUE_COMPLETED_RETENTION_DAYS,
       byType,
@@ -1819,13 +2233,19 @@ export class SportsSystemMonitorService implements OnModuleInit {
       }>([
         {
           $match: {
-            $or: clauses,
-
-            status: EspnQueueStatus.PROCESSING,
-
-            updatedAt: {
-              $lt: staleCutoff,
-            },
+            $and: [
+              { $or: clauses },
+              { status: EspnQueueStatus.PROCESSING },
+              {
+                $or: [
+                  { leaseExpiresAt: { $lte: new Date() } },
+                  {
+                    leaseExpiresAt: { $exists: false },
+                    startedAt: { $lte: staleCutoff },
+                  },
+                ],
+              },
+            ],
           },
         },
 
@@ -2413,9 +2833,7 @@ export class SportsSystemMonitorService implements OnModuleInit {
       return [];
     }
 
-    const until = new Date(
-      now.getTime() + UPCOMING_WINDOW_HOURS * 60 * 60_000,
-    );
+    const until = new Date(now.getTime() + UPCOMING_WINDOW_HOURS * 60 * 60_000);
 
     return this.espnFixtureModel
       .find({
@@ -2542,7 +2960,8 @@ export class SportsSystemMonitorService implements OnModuleInit {
       const team = record.team;
       if (team && typeof team === 'object' && !Array.isArray(team)) {
         const id = (team as Record<string, unknown>).id;
-        if (typeof id === 'string' || typeof id === 'number') ids.add(String(id));
+        if (typeof id === 'string' || typeof id === 'number')
+          ids.add(String(id));
       }
       for (const child of Object.values(record)) collectTeamIds(child, ids);
     };
@@ -2795,7 +3214,8 @@ export class SportsSystemMonitorService implements OnModuleInit {
 
       standingsMissingTeams: standings.missingTeams,
 
-      postMatchFixturesMissingFinalResult: fixtureSummary.postMatchMissingFinalResult,
+      postMatchFixturesMissingFinalResult:
+        fixtureSummary.postMatchMissingFinalResult,
 
       staleUpcomingStatusFixtures: fixtureSummary.staleUpcomingStatus,
     };
@@ -3055,7 +3475,9 @@ export class SportsSystemMonitorService implements OnModuleInit {
         ]);
 
         const periods = providerState as unknown as
-          ProviderStatePeriods | null | undefined;
+          | ProviderStatePeriods
+          | null
+          | undefined;
 
         const endpoints = endpointDocuments.map((document) => ({
           endpoint: document.endpoint,
@@ -3209,6 +3631,10 @@ export class SportsSystemMonitorService implements OnModuleInit {
 
         failed: 0,
 
+        retryLaneJobs: 0,
+
+        quarantinedJobs: 0,
+
         staleProcessing: 0,
 
         completedRetentionDays: QUEUE_COMPLETED_RETENTION_DAYS,
@@ -3249,6 +3675,10 @@ export class SportsSystemMonitorService implements OnModuleInit {
       completedRetained: aggregate.byStatus.get(EspnQueueStatus.COMPLETED) ?? 0,
 
       failed: aggregate.byStatus.get(EspnQueueStatus.FAILED) ?? 0,
+
+      retryLaneJobs: 0,
+
+      quarantinedJobs: 0,
 
       staleProcessing: aggregate.staleProcessing,
 
@@ -3598,7 +4028,8 @@ export class SportsSystemMonitorService implements OnModuleInit {
           total.standingsMissingTeams + item.standingsMissingTeams,
 
         postMatchFixturesMissingFinalResult:
-          total.postMatchFixturesMissingFinalResult + item.postMatchFixturesMissingFinalResult,
+          total.postMatchFixturesMissingFinalResult +
+          item.postMatchFixturesMissingFinalResult,
 
         staleUpcomingStatusFixtures:
           total.staleUpcomingStatusFixtures + item.staleUpcomingStatusFixtures,
@@ -3645,7 +4076,7 @@ export class SportsSystemMonitorService implements OnModuleInit {
         'ESPN Summary is stored inside sports_espn_fixtures.payload.summary with payload.summaryCollectedAt. No separate Summary collection is used.',
 
       fixtureRefreshModel:
-        'FIXTURE_REFRESH is responsible only for the rolling ESPN fixture window. Normal collection covers today through today+8 days. Stale active leagues are refreshed when fixture collection is older than 48 hours.',
+        'FIXTURE_REFRESH maintains the rolling eight-day ESPN fixture window. The near-term first three days refresh every six hours, the outer days refresh daily, and the far edge extends daily. Post-match event dates receive their own kickoff+160-minute refresh and bounded result checkpoints.',
 
       summaryRefreshModel:
         'SUMMARY_REFRESH is event-specific. Upcoming Summary refreshes use the configured rolling window; post-match checks run at kickoff +160 minutes and at bounded +4h, +6h, +12h and +24h checkpoints while the canonical result remains incomplete. A rotating indexed integrity scan checks recent fixtures and queues only missing/inconsistent records.',
@@ -3692,20 +4123,6 @@ export class SportsSystemMonitorService implements OnModuleInit {
     }
 
     return date.toISOString();
-  }
-
-  private hasSummary(fixture: Pick<EspnFixtureDocument, 'payload'>): boolean {
-    const payload = fixture.payload;
-
-    if (!payload || typeof payload !== 'object') {
-      return false;
-    }
-
-    const summary = payload.summary;
-
-    return Boolean(
-      summary && typeof summary === 'object' && Object.keys(summary).length > 0,
-    );
   }
 
   private extractFixtureTeamName(

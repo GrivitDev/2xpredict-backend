@@ -55,3 +55,4 @@ export class OddsApiSport {
 }
 
 export const OddsApiSportSchema = SchemaFactory.createForClass(OddsApiSport);
+

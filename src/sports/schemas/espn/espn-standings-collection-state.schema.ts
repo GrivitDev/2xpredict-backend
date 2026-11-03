@@ -84,3 +84,4 @@ EspnStandingsCollectionStateSchema.index(
   { unique: true },
 );
 EspnStandingsCollectionStateSchema.index({ status: 1, nextRetryAt: 1 });
+

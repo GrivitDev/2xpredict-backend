@@ -97,3 +97,4 @@ export interface ActiveCompetition {
    */
   lastUpdatedAt?: Date;
 }
+

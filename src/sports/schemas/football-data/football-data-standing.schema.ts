@@ -99,3 +99,4 @@ FootballDataStandingSchema.index({
   group: 1,
   'payload.position': 1,
 });
+

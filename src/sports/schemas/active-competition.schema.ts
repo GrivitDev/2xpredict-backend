@@ -158,3 +158,4 @@ ActiveCompetitionSchema.index({
   espnLeagueSlug: 1,
   season: 1,
 });
+

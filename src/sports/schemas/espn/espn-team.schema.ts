@@ -119,3 +119,4 @@ EspnTeamSchema.index({
   leagueId: 1,
   active: 1,
 });
+

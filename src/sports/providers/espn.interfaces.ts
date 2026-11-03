@@ -1965,3 +1965,4 @@ export interface EspnNewsImage {
 
   [key: string]: unknown;
 }
+

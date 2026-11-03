@@ -163,3 +163,4 @@ SportsProviderRateLimitSchema.index(
 SportsProviderRateLimitSchema.index({
   lockedUntil: 1,
 });
+

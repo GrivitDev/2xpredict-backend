@@ -111,3 +111,4 @@ FootballDataMatchSchema.index({
   awayTeamId: 1,
   utcDate: -1,
 });
+

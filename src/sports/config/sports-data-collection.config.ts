@@ -57,7 +57,13 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
       forwardDays: 8,
 
       /** Minimum freshness guarantee for active competitions. */
-      staleAfterHours: 48,
+      staleAfterHours: 6,
+
+      /** Refresh the near-term three-day fixture window throughout the day. */
+      nearTermRefreshIntervalHours: 6,
+
+      /** Refresh the outer days of the eight-day horizon once daily. */
+      farTermRefreshIntervalHours: 24,
 
       /** Queue spacing between normal fixture work slots. */
       slotIntervalMinutes: 0.02,
@@ -76,10 +82,10 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
       enabled: true,
 
       /** Bounded startup Summary lookahead, measured in elapsed hours from now. */
-      startupWindowHours: 80,
+      startupWindowHours: 72,
 
-      /** Runtime upcoming Summary window; keep aligned with the 82-hour startup horizon. */
-      upcomingWindowHours: 82,
+      /** Runtime upcoming Summary window; aligned with the 72-hour startup horizon. */
+      upcomingWindowHours: 72,
 
       /** First post-kickoff Summary refresh. 160 minutes is close to three hours. */
       finishedMatchDelayMinutes: 160,
@@ -89,7 +95,7 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
        * incomplete after a successful Summary response. These are offsets from
        * kickoff, not repeated delays from the time the previous job completed.
        */
-      postMatchRecoveryCheckpointsMinutes: [240, 360, 720, 1440],
+      postMatchRecoveryCheckpointsMinutes: [180, 210, 240, 360, 720, 1440],
 
       /**
        * Daily integrity recovery scans only this recent history window. The
@@ -111,8 +117,18 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
     queue: {
       enabled: true,
       maxAttempts: 3,
-      staleProcessingMinutes: 5,
-      retryDelayMinutes: 5,
+      /** Eight execution slots: six normal and two reserved for recovery. */
+      maxConcurrentJobs: 8,
+      normalReservedConcurrency: 6,
+      retryReservedConcurrency: 2,
+      /** A renewable lease prevents a healthy long-running job being stolen. */
+      leaseMinutes: 8,
+      heartbeatSeconds: 60,
+      staleProcessingMinutes: 8,
+      retryDelayMinutes: 1,
+      retryDelaysMinutes: [1, 2, 5, 10, 20, 40, 60, 180, 360, 720, 1440],
+      retryJitterPercent: 20,
+      retryRecoveryBatchSize: 100,
     },
   },
 

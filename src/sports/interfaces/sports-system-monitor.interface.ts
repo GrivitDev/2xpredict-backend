@@ -112,6 +112,12 @@ export interface MonitorQueueSummary {
 
   failed: number;
 
+  retryLaneJobs: number;
+
+  quarantinedJobs: number;
+
+  oldestRetryFailedAt?: string;
+
   staleProcessing: number;
 
   completedRetentionDays: number;
@@ -577,12 +583,15 @@ export interface MonitorLeagueSummary {
   expectedWork: MonitorExpectedWork;
 }
 
-
 // ============================================================
 // LIVE RUNTIME / HEALTH
 // ============================================================
 
-export type SportsMonitorHealthStatus = 'HEALTHY' | 'DEGRADED' | 'CRITICAL' | 'UNKNOWN';
+export type SportsMonitorHealthStatus =
+  | 'HEALTHY'
+  | 'DEGRADED'
+  | 'CRITICAL'
+  | 'UNKNOWN';
 export type SportsMonitorAlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
 
 export interface SportsMonitorAlert {
@@ -602,6 +611,9 @@ export interface SportsWorkerRuntimeStatus {
   activeJobKey?: string;
   activeJobType?: string;
   activeJobAgeMs?: number;
+  activeJobCount?: number;
+  normalJobsActive?: number;
+  retryJobsActive?: number;
   queueReadFailures: number;
   drainCycles: number;
   drainFailures: number;
@@ -622,7 +634,14 @@ export interface SportsRuntimeMonitor {
   status: SportsMonitorHealthStatus;
   checkedAt: string;
   worker: SportsWorkerRuntimeStatus;
-  components: Record<string, { status: SportsMonitorHealthStatus; message: string; metrics?: Record<string, number | string | boolean | null> }>;
+  components: Record<
+    string,
+    {
+      status: SportsMonitorHealthStatus;
+      message: string;
+      metrics?: Record<string, number | string | boolean | null>;
+    }
+  >;
   alerts: SportsMonitorAlert[];
 }
 

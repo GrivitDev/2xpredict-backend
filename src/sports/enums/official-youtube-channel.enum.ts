@@ -680,3 +680,4 @@ export function getYoutubeHighlightChannelIds(
     awayTeam,
   ).filter((channel): channel is OfficialYoutubeChannel => channel !== null);
 }
+

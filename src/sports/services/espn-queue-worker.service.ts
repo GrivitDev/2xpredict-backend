@@ -6,6 +6,7 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 
 import { EspnService } from '../providers/espn.service';
 
@@ -20,6 +21,7 @@ import { SportsSyncStateService } from './sports-sync-state.service';
 
 import {
   EspnQueueJobType,
+  EspnQueueLane,
   EspnQueueStatus,
 } from '../interfaces/espn-queue.interface';
 import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
@@ -37,6 +39,16 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import type { SportsWorkerRuntimeStatus } from '../interfaces/sports-system-monitor.interface';
 
+type QueueWorkerLane = EspnQueueLane.NORMAL | EspnQueueLane.BACKGROUND_RETRY;
+
+interface ActiveQueueJob {
+  key: string;
+  type: string;
+  startedAt: number;
+  lane: QueueWorkerLane;
+  scopeKey?: string;
+}
+
 class SummaryJobDeferredError extends Error {
   readonly summaryJobDeferred = true;
 }
@@ -48,7 +60,15 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
   private workerStarted = false;
   private youtubeQueuePrepared = false;
   private draining = false;
+  private pumping = false;
   private wakeRequested = false;
+  private readonly activeSlots: Record<QueueWorkerLane, number> = {
+    [EspnQueueLane.NORMAL]: 0,
+    [EspnQueueLane.BACKGROUND_RETRY]: 0,
+  };
+  private readonly activeJobs = new Map<string, ActiveQueueJob>();
+  private readonly laneNoWork = new Set<QueueWorkerLane>();
+  private readonly workerInstanceId = `sports-${process.pid}-${randomUUID()}`;
   private recoveryAttempted = false;
   private timer?: NodeJS.Timeout;
   private watchdogTimer?: NodeJS.Timeout;
@@ -102,6 +122,9 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       activeJobKey: this.activeJobKey,
       activeJobType: this.activeJobType,
       activeJobAgeMs: this.activeJobStartedAt ? Math.max(0, Date.now() - this.activeJobStartedAt) : undefined,
+      activeJobCount: this.activeSlots[EspnQueueLane.NORMAL] + this.activeSlots[EspnQueueLane.BACKGROUND_RETRY],
+      normalJobsActive: this.activeSlots[EspnQueueLane.NORMAL],
+      retryJobsActive: this.activeSlots[EspnQueueLane.BACKGROUND_RETRY],
       queueReadFailures: this.queueReadFailures,
       drainCycles: this.drainCycles,
       drainFailures: this.drainFailures,
@@ -241,88 +264,50 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       if (this.espnQueueService.isNormalOperationsReady()) {
         this.systemMonitor.reportModuleHealth('sports', 'HEALTHY', {
           source: 'queue-watchdog',
-          message: 'ESPN queue watchdog is healthy.',
+          message: 'ESPN queue and background-retry workers are running.',
           details: {
-            draining: this.draining,
+            activeJobs: this.activeSlots[EspnQueueLane.NORMAL] + this.activeSlots[EspnQueueLane.BACKGROUND_RETRY],
+            normalJobs: this.activeSlots[EspnQueueLane.NORMAL],
+            retryJobs: this.activeSlots[EspnQueueLane.BACKGROUND_RETRY],
             queueReadFailures: this.queueReadFailures,
           },
         });
-        // Report a potentially stalled handler without stealing its lease. The
-        // provider client has bounded request timeouts; this warning surfaces a
-        // regression if a future integration accidentally stops respecting them.
-        if (this.draining) {
-          const activeForMs = this.activeJobStartedAt
-            ? Date.now() - this.activeJobStartedAt
-            : 0;
-          const warningAfterMs = Math.max(
-            5 * 60_000,
-            SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.staleProcessingMinutes *
-              2 *
-              60_000,
-          );
-          if (
-            activeForMs >= warningAfterMs &&
-            Date.now() - this.lastLongJobWarningAt >= 5 * 60_000
-          ) {
+
+        // Recovery maintenance is independent of whether jobs are currently
+        // executing. Renewed leases protect healthy work from being reclaimed.
+        const orphaned = await this.espnQueueService.recoverOrphanedFailedJobs(36500, 100);
+        if (orphaned > 0) {
+          this.logger.warn(`Background retry lane adopted ${orphaned} legacy failed job(s)`);
+        }
+        const recovered = await this.espnQueueService.recoverStaleJobs(
+          SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.leaseMinutes,
+        );
+        if (recovered > 0) {
+          this.logger.warn(`Background recovery reclaimed ${recovered} expired job lease(s)`);
+        }
+
+        for (const active of this.activeJobs.values()) {
+          const activeForMs = Date.now() - active.startedAt;
+          if (activeForMs >= 5 * 60_000 && Date.now() - this.lastLongJobWarningAt >= 5 * 60_000) {
             this.lastLongJobWarningAt = Date.now();
-            this.logger.error(
-              `ESPN queue handler may be stalled: job=${this.activeJobKey ?? 'unknown'}, ` +
-                `runningFor=${Math.round(activeForMs / 60_000)}m. The active job lease is not being stolen; inspect provider/database timeout logs.`,
-            );
-          } else if (Date.now() - this.lastWatchdogReportAt >= 10 * 60_000) {
-            this.lastWatchdogReportAt = Date.now();
-            this.logger.log(
-              `ESPN queue worker heartbeat: processing ${this.activeJobKey ?? 'a queue job'}; ` +
-                `currentJobAge=${Math.round(activeForMs / 1000)}s`,
-            );
-          }
-        } else {
-          const orphanedFailures =
-            await this.espnQueueService.recoverOrphanedFailedJobs(7, 100);
-          if (orphanedFailures > 0) {
             this.logger.warn(
-              `Queue watchdog restored ${orphanedFailures} retryable failed job(s) missing retry timestamps`,
+              `ESPN job exceeded the five-minute execution target: ${active.key} (${Math.round(activeForMs / 60_000)}m). Its lease remains protected by heartbeat renewal.`,
             );
+            break;
           }
+        }
 
-          const recovered = await this.espnQueueService.recoverStaleJobs(
-            SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.staleProcessingMinutes,
+        const nextAt = await this.espnQueueService.getNextWakeAt();
+        const slotsUsed = this.activeSlots[EspnQueueLane.NORMAL] + this.activeSlots[EspnQueueLane.BACKGROUND_RETRY];
+        if (slotsUsed < SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxConcurrentJobs && nextAt && nextAt.getTime() <= Date.now()) {
+          this.wake(0);
+        } else if (Date.now() - this.lastWatchdogReportAt >= 10 * 60_000) {
+          this.lastWatchdogReportAt = Date.now();
+          this.logger.log(
+            nextAt
+              ? `Sports queue heartbeat: active=${slotsUsed}, nextDue=${nextAt.toISOString()}`
+              : `Sports queue heartbeat: active=${slotsUsed}, no scheduled work waiting`,
           );
-          if (recovered > 0) {
-            this.logger.warn(
-              `Queue watchdog recovered ${recovered} stale ESPN job(s)`,
-            );
-          }
-
-          // Repair the narrow case where the process died after marking a
-          // recurring job terminal but before it wrote the next durable job.
-          const terminalFailures =
-            await this.espnQueueService.getTerminalRecoveryCandidates(50, 7);
-          for (const failedJob of terminalFailures) {
-            await this.handleTerminalFailure(
-              failedJob as unknown as Record<string, unknown>,
-            );
-          }
-
-          const nextAt = await this.espnQueueService.getNextWakeAt();
-          const now = Date.now();
-          if (nextAt && nextAt.getTime() <= now) {
-            const overdueSeconds = Math.max(
-              0,
-              Math.round((now - nextAt.getTime()) / 1000),
-            );
-            this.logger.warn(
-              `ESPN queue watchdog found due work ${overdueSeconds}s overdue; re-arming the worker`,
-            );
-            this.wake(0);
-          } else if (now - this.lastWatchdogReportAt >= 10 * 60_000) {
-            this.lastWatchdogReportAt = now;
-            this.logger.log(
-              nextAt
-                ? `ESPN queue worker heartbeat: healthy and waiting for the next job at ${nextAt.toISOString()}`
-                : 'ESPN queue worker heartbeat: healthy; no pending or retryable jobs are due',
-            );
-          }
         }
       }
       this.lastWatchdogError = undefined;
@@ -341,101 +326,140 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
         occurredAt: new Date(),
         stack: error instanceof Error ? error.stack : undefined,
       });
-      this.logger.warn(
-        `ESPN queue watchdog could not inspect the queue; it will retry: ${message}`,
-      );
-      // Keep a failed Mongo read from disarming the only worker wake-up path.
+      this.logger.warn(`Sports queue watchdog could not inspect durable work: ${message}`);
       this.wake(this.queueReadRetryMs);
     } finally {
       this.scheduleWatchdog();
     }
   }
 
-  /** New work and due-job notifications wake the worker; otherwise it sleeps. */
-  private wake(delayMs = 0): void {
+  /** New durable work wakes the pump immediately; delayed retries sleep until due. */
+  private wake(delayMs = 0, resetLaneAvailability = true): void {
     if (!this.workerStarted) return;
-    if (this.draining) {
+    if (resetLaneAvailability) this.laneNoWork.clear();
+    if (this.pumping) {
       this.wakeRequested = true;
       return;
     }
     if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(
-      () => {
-        this.timer = undefined;
-        void this.drainQueue();
-      },
-      Math.max(0, delayMs),
-    );
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.drainQueue();
+    }, Math.max(0, delayMs));
     this.timer.unref?.();
   }
 
+  private chooseNextLane(): QueueWorkerLane | undefined {
+    const total = this.activeSlots[EspnQueueLane.NORMAL] + this.activeSlots[EspnQueueLane.BACKGROUND_RETRY];
+    const max = SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxConcurrentJobs;
+    if (total >= max) return undefined;
+
+    const normalBase = SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.normalReservedConcurrency;
+    const retryBase = SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.retryReservedConcurrency;
+    const normalActive = this.activeSlots[EspnQueueLane.NORMAL];
+    const retryActive = this.activeSlots[EspnQueueLane.BACKGROUND_RETRY];
+    const normalUnavailable = this.laneNoWork.has(EspnQueueLane.NORMAL);
+    const retryUnavailable = this.laneNoWork.has(EspnQueueLane.BACKGROUND_RETRY);
+
+    // Both lanes receive their reserved capacity whenever both contain work.
+    if (!retryUnavailable && retryActive < retryBase) return EspnQueueLane.BACKGROUND_RETRY;
+    if (!normalUnavailable && normalActive < normalBase) return EspnQueueLane.NORMAL;
+
+    // An empty lane releases its unused reserved capacity to the other lane.
+    if (normalUnavailable && !retryUnavailable && retryActive < max) return EspnQueueLane.BACKGROUND_RETRY;
+    if (retryUnavailable && !normalUnavailable && normalActive < max) return EspnQueueLane.NORMAL;
+    return undefined;
+  }
+
+  private refreshActiveRuntime(): void {
+    const entries = [...this.activeJobs.values()].sort((a, b) => a.startedAt - b.startedAt);
+    const current = entries[0];
+    this.draining = this.activeSlots[EspnQueueLane.NORMAL] + this.activeSlots[EspnQueueLane.BACKGROUND_RETRY] > 0;
+    this.activeJobKey = current?.key;
+    this.activeJobType = current?.type;
+    this.activeJobStartedAt = current?.startedAt;
+  }
+
   private async drainQueue(): Promise<void> {
-    if (this.draining || !this.workerStarted || !this.youtubeQueuePrepared)
-      return;
+    if (this.pumping || !this.workerStarted || !this.youtubeQueuePrepared) return;
     if (!this.espnQueueService.isNormalOperationsReady()) return;
-    this.draining = true;
+
+    this.pumping = true;
     this.wakeRequested = false;
     this.drainCycles += 1;
     this.lastDrainStartedAt = new Date();
     try {
-      // Recover jobs whose processing lease expired. A lease threshold avoids
-      // stealing work from another healthy process during a rolling restart.
       if (!this.recoveryAttempted) {
         this.recoveryAttempted = true;
-        const recovered = await this.espnQueueService.recoverStaleJobs(
-          SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.staleProcessingMinutes,
-        );
-        if (recovered > 0)
-          this.logger.warn(`Recovered ${recovered} interrupted ESPN jobs`);
+        const [stale, orphaned] = await Promise.all([
+          this.espnQueueService.recoverStaleJobs(SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.leaseMinutes),
+          this.espnQueueService.recoverOrphanedFailedJobs(36500, 100),
+        ]);
+        if (stale || orphaned) {
+          this.logger.warn(`Initial queue recovery completed: expiredLeases=${stale}, legacyFailures=${orphaned}`);
+        }
       }
-      let processedInBatch = 0;
-      const maxJobsPerDrain = 25;
-      while (
-        processedInBatch < maxJobsPerDrain &&
-        (await this.processNextJob({ includeFailed: true }))
-      ) {
-        processedInBatch += 1;
-      }
-      if (processedInBatch === maxJobsPerDrain) {
-        // Yield between batches so collection backfills cannot monopolize the
-        // process; finally schedules the next bounded batch.
-        this.wakeRequested = true;
+
+      let launched = 0;
+      while (launched < SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxConcurrentJobs) {
+        const lane = this.chooseNextLane();
+        if (!lane) break;
+        this.activeSlots[lane] += 1;
+        this.refreshActiveRuntime();
+        launched += 1;
+
+        let processed = false;
+        void this.processNextJob({ lane }).then((result) => {
+          processed = result;
+          if (!result) this.laneNoWork.add(lane);
+        }).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.drainFailures += 1;
+          this.systemMonitor.reportModuleHealth('sports', 'DEGRADED', {
+            source: 'queue-worker', message, details: { lane },
+          });
+          this.logger.error(`Queue lane claim failed (${lane}): ${message}`);
+        }).finally(() => {
+          this.activeSlots[lane] = Math.max(0, this.activeSlots[lane] - 1);
+          this.refreshActiveRuntime();
+          // Refill a free slot immediately. The no-work marker prevents a hot
+          // loop against an empty lane while allowing the other lane to borrow.
+          this.wake(0, false);
+        });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.drainFailures += 1;
       this.systemMonitor.reportModuleHealth('sports', 'DEGRADED', {
-        source: 'queue-worker',
-        message,
+        source: 'queue-worker', message,
       });
       this.systemMonitor.reportError({
-        module: 'sports',
-        source: 'queue-worker',
-        operation: 'drain-queue',
-        message,
-        occurredAt: new Date(),
-        stack: error instanceof Error ? error.stack : undefined,
+        module: 'sports', source: 'queue-worker', operation: 'pump-queue',
+        message, occurredAt: new Date(), stack: error instanceof Error ? error.stack : undefined,
       });
-      this.logger.error(`ESPN queue drain failed: ${message}`);
+      this.logger.error(`Sports queue pump failed: ${message}`);
     } finally {
-      this.draining = false;
+      this.pumping = false;
       this.lastDrainCompletedAt = new Date();
-      try {
-        const nextAt = await this.espnQueueService.getNextWakeAt();
-        this.queueReadFailures = 0;
-        if (this.wakeRequested) {
-          this.wake(0);
-        } else if (nextAt) {
-          this.wake(Math.max(0, nextAt.getTime() - Date.now()));
+      this.refreshActiveRuntime();
+      if (this.wakeRequested) {
+        this.wakeRequested = false;
+        this.wake(0, false);
+      } else {
+        const used = this.activeSlots[EspnQueueLane.NORMAL] + this.activeSlots[EspnQueueLane.BACKGROUND_RETRY];
+        if (used < SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxConcurrentJobs) {
+          try {
+            const nextAt = await this.espnQueueService.getNextWakeAt();
+            if (nextAt) this.wake(Math.max(0, nextAt.getTime() - Date.now()), false);
+            this.queueReadFailures = 0;
+          } catch (error) {
+            this.queueReadFailures += 1;
+            this.logger.warn(
+              `Could not determine the next durable queue wake-up (failures=${this.queueReadFailures}); retrying in ${this.queueReadRetryMs / 1000}s: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            this.wake(this.queueReadRetryMs, false);
+          }
         }
-      } catch (error) {
-        this.queueReadFailures += 1;
-        this.logger.warn(
-          `Could not determine the next ESPN queue wake-up (consecutive failures=${this.queueReadFailures}); retrying in ${this.queueReadRetryMs / 1000}s: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        this.wake(this.queueReadRetryMs);
       }
     }
   }
@@ -452,121 +476,27 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       standingsStateKey: string;
     }>,
   ): Promise<{ succeeded: number; failed: number; unavailable: number }> {
-    const pending = new Map(
-      contexts.map((context) => [
-        `${context.leagueId}/${context.season}`,
-        context,
-      ]),
-    );
     let succeeded = 0;
-    let failed = 0;
     let unavailable = 0;
+    let pending = 0;
 
-    this.logger.log(
-      `ESPN STANDINGS STARTUP PHASE started: activeLeagueSeasons=${pending.size}`,
-    );
-
-    const recovered = await this.espnQueueService.recoverStaleJobs(
-      SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.staleProcessingMinutes,
-    );
-    const orphaned = await this.espnQueueService.recoverOrphanedFailedJobs();
-    if (recovered > 0 || orphaned > 0) {
-      this.logger.warn(
-        `Recovered queue work before standings startup: stale=${recovered}, orphanedFailed=${orphaned}`,
-      );
-    }
-
-    while (pending.size > 0) {
-      for (const [key, context] of [...pending.entries()]) {
-        const unitSuccessful =
-          await this.sportsSyncStateService.isUnitSuccessful(
-            context.standingsStateKey,
-            'STEP:STANDINGS_INITIAL',
-          );
-
-        if (unitSuccessful) {
-          succeeded += 1;
-          pending.delete(key);
-          continue;
-        }
-
-        const unitUnavailable =
-          await this.sportsSyncStateService.isUnitUnavailable(
-            context.standingsStateKey,
-            'STEP:STANDINGS_INITIAL',
-          );
-        if (unitUnavailable) {
-          unavailable += 1;
-          pending.delete(key);
-          continue;
-        }
-
-        // Use the queue service's concrete durable lookup. A lookup failure
-        // must propagate as an infrastructure error; it is not an ESPN result.
-        const job = await this.espnQueueService.getStartupStandingsJobStatus(
-          context.leagueId,
-          context.season,
-        );
-
-        if (!job) {
-          throw new Error(
-            `Startup standings job is missing for ${context.leagueId}/${context.season}`,
-          );
-        }
-
-        if (job.status === 'COMPLETED') {
-          throw new Error(
-            `Startup standings job completed without successful sync state for ${context.leagueId}/${context.season}`,
-          );
-        }
-
-        const terminalFailure =
-          job.status === 'FAILED' &&
-          job.attempts >= job.maxAttempts &&
-          !job.nextAttemptAt;
-
-        if (terminalFailure) {
-          const lastError =
-            typeof job.lastError === 'string' ? job.lastError : '';
-          const errorText = lastError.toLowerCase();
-          if (
-            errorText.includes('standings are unavailable') ||
-            errorText.includes('no populated standings') ||
-            errorText.includes('empty standings payload')
-          ) {
-            unavailable += 1;
-          } else {
-            failed += 1;
-          }
-          this.logger.warn(
-            `Initial standings outcome for ${context.leagueId}/${context.season}: ${errorText.includes('standings') && (errorText.includes('unavailable') || errorText.includes('no populated') || errorText.includes('empty')) ? 'UNAVAILABLE' : 'FAILED'}; ${lastError || 'no error details'}`,
-          );
-          pending.delete(key);
-        }
-      }
-
-      if (pending.size === 0) break;
-
-      const processed = await this.processNextJob({
-        jobTypes: [EspnQueueJobType.STANDINGS_REFRESH],
-        includeFailed: true,
-        triggerEventIdPrefix: 'STARTUP_STANDINGS:',
-      });
-
-      if (!processed) {
-        // Startup-only standings recovery waits five minutes when no job is due, rather
-        // than querying the durable queue every second. The normal worker remains
-        // gated until this phase completes, preserving startup ordering.
-        await new Promise<void>((resolve) => setTimeout(resolve, 5 * 60_000));
+    for (const context of contexts) {
+      if (await this.sportsSyncStateService.isUnitSuccessful(context.standingsStateKey, 'STEP:STANDINGS_INITIAL')) {
+        succeeded += 1;
+      } else if (await this.sportsSyncStateService.isUnitUnavailable(context.standingsStateKey, 'STEP:STANDINGS_INITIAL')) {
+        unavailable += 1;
+      } else {
+        pending += 1;
       }
     }
 
+    // Standings jobs are already durable. Do not hold the entire Sports Module
+    // behind an optional or temporarily unavailable ESPN standings endpoint.
+    // The normal worker and its independent retry lane take over after release.
     this.logger.log(
-      `ESPN STANDINGS STARTUP PHASE completed: ` +
-        `total=${contexts.length}, succeeded=${succeeded}, unavailable=${unavailable}, failed=${failed}`,
+      `ESPN STARTUP STANDINGS RELEASED: ready=${succeeded}, notApplicableOrUnavailable=${unavailable}, queuedForBackgroundProcessing=${pending}`,
     );
-
-    return { succeeded, failed, unavailable };
+    return { succeeded, failed: 0, unavailable };
   }
 
   /**
@@ -582,120 +512,58 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       summaryStateKey: string;
     }>,
   ): Promise<{ succeeded: number; failed: number }> {
-    const pending = new Map(
-      contexts.map((context) => [
-        `${context.leagueId}/${context.season}/${context.eventId}`,
-        context,
-      ]),
-    );
     let succeeded = 0;
-    let failed = 0;
-
-    this.logger.log(
-      `ESPN SUMMARY STARTUP WORKER started: fixtures=${pending.size}`,
-    );
-
-    const recovered = await this.espnQueueService.recoverStaleJobs(
-      SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.staleProcessingMinutes,
-    );
-    const orphaned = await this.espnQueueService.recoverOrphanedFailedJobs();
-    if (recovered > 0 || orphaned > 0) {
-      this.logger.warn(
-        `Recovered queue work before Summary startup: stale=${recovered}, orphanedFailed=${orphaned}`,
+    let pending = 0;
+    for (const context of contexts) {
+      const stepKey = this.sportsSyncStateService.getSummaryStepKey(context.eventId);
+      const successful = await this.sportsSyncStateService.isUnitSuccessful(
+        context.summaryStateKey,
+        `STEP:${stepKey}`,
       );
+      if (successful) succeeded += 1;
+      else pending += 1;
     }
 
-    while (pending.size > 0) {
-      let processed = false;
-      let earliestNextRunAt: Date | undefined;
-
-      for (const [key, context] of pending) {
-        const stepKey = this.sportsSyncStateService.getSummaryStepKey(
-          context.eventId,
-        );
-        const successful = await this.sportsSyncStateService.isUnitSuccessful(
-          context.summaryStateKey,
-          `STEP:${stepKey}`,
-        );
-
-        if (successful) {
-          succeeded += 1;
-          pending.delete(key);
-          continue;
-        }
-
-        const processedJob = await this.processNextJob({
-          jobTypes: [EspnQueueJobType.SUMMARY_REFRESH],
-          includeFailed: true,
-          leagueId: context.leagueId,
-          season: context.season,
-          eventId: context.eventId,
-        });
-
-        if (processedJob) {
-          processed = true;
-          break;
-        }
-
-        const work = await this.espnQueueService.getSummaryRefreshWorkStatus({
-          leagueId: context.leagueId,
-          eventId: context.eventId,
-          season: context.season,
-        });
-
-        if (
-          work?.status === EspnQueueStatus.FAILED &&
-          work.attempts >= work.maxAttempts &&
-          !work.nextRunAt
-        ) {
-          failed += 1;
-          pending.delete(key);
-          this.logger.error(
-            `Startup Summary failed for ${context.leagueId}/${context.season}/${context.eventId}: ` +
-              `${work.lastError ?? 'retry budget exhausted without an error message'}`,
-          );
-          continue;
-        }
-
-        if (!work) {
-          failed += 1;
-          pending.delete(key);
-          this.logger.error(
-            `Startup Summary has no outstanding queue work for ${context.leagueId}/${context.season}/${context.eventId}`,
-          );
-          continue;
-        }
-
-        const nextRunAt = work.nextRunAt ?? new Date(Date.now() + 1_000);
-        if (
-          !earliestNextRunAt ||
-          nextRunAt.getTime() < earliestNextRunAt.getTime()
-        ) {
-          earliestNextRunAt = nextRunAt;
-        }
-      }
-
-      if (pending.size === 0 || processed) {
-        continue;
-      }
-
-      const waitMs = earliestNextRunAt
-        ? Math.max(1_000, earliestNextRunAt.getTime() - Date.now())
-        : 1_000;
-      await this.wait(waitMs);
-    }
-
+    // Summary payloads are important for prediction eligibility, but one slow
+    // provider endpoint must not prevent fixtures, news and other competitions
+    // from becoming operational. All missing Summaries are already durable
+    // queue jobs and will be processed by the normal/retry lanes after release.
     this.logger.log(
-      `ESPN SUMMARY STARTUP WORKER completed: total=${contexts.length}, ` +
-        `succeeded=${succeeded}, failed=${failed}`,
+      `ESPN STARTUP SUMMARY RELEASED: alreadyReady=${succeeded}, queuedForBackgroundProcessing=${pending}`,
     );
-
-    return { succeeded, failed };
+    return { succeeded, failed: 0 };
   }
 
   // ============================================================
   // JOB EXECUTION
   // ============================================================
+
+  /**
+   * Jobs that mutate one shared synchronization ledger are serialized by
+   * logical scope. This is a process-local guard; the deployed worker should
+   * remain a single NestJS process unless a distributed scope lease is added.
+   */
+  private getSerializedJobScope(job: Record<string, unknown>): string | undefined {
+    const type = job.type as EspnQueueJobType;
+    const leagueId = job.leagueId ? this.stringifyJobId(job.leagueId) : '';
+    const season = typeof job.season === 'number' ? job.season : undefined;
+    if (!leagueId || season === undefined) return undefined;
+
+    if (
+      type === EspnQueueJobType.FIXTURE_REFRESH ||
+      type === EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP
+    ) {
+      return `FIXTURE:${leagueId}:${season}`;
+    }
+    if (type === EspnQueueJobType.STANDINGS_REFRESH) {
+      return `STANDINGS:${leagueId}:${season}`;
+    }
+    if (type === EspnQueueJobType.SUMMARY_REFRESH) {
+      const eventId = job.eventId ? this.stringifyJobId(job.eventId) : '';
+      return eventId ? `SUMMARY:${leagueId}:${season}:${eventId}` : undefined;
+    }
+    return undefined;
+  }
 
   private async processNextJob(params?: {
     jobTypes?: EspnQueueJobType[];
@@ -704,24 +572,52 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     leagueId?: string;
     season?: number;
     eventId?: string;
+    lane?: QueueWorkerLane;
   }): Promise<boolean> {
-    const job = await this.espnQueueService.getNextJob(params);
+    const claimId = `${this.workerInstanceId}:${randomUUID()}`;
+    const leaseMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.leaseMinutes * 60_000;
+    const job = await this.espnQueueService.getNextJob({
+      ...params, workerId: claimId, leaseMs,
+    });
 
     if (!job) {
+      if (params?.lane) this.laneNoWork.add(params.lane);
       return false;
     }
 
     const queueJob = job as unknown as Record<string, unknown>;
-    this.activeJobKey = this.safeJobString(
-      queueJob.jobKey ?? queueJob._id,
-      'unknown',
-    );
-    this.activeJobStartedAt = Date.now();
-    this.activeJobType = this.safeJobString(queueJob.type, 'unknown');
+    const jobId = this.stringifyJobId(queueJob._id);
+    const jobKey = this.safeJobString(queueJob.jobKey ?? queueJob._id, 'unknown');
+    const jobType = this.safeJobString(queueJob.type, 'unknown');
+    const startedAt = Date.now();
+    const lane = params?.lane ?? (queueJob.lane === EspnQueueLane.BACKGROUND_RETRY ? EspnQueueLane.BACKGROUND_RETRY : EspnQueueLane.NORMAL);
+    const scopeKey = this.getSerializedJobScope(queueJob);
+    if (scopeKey && [...this.activeJobs.values()].some((active) => active.scopeKey === scopeKey)) {
+      // Fixture jobs rewrite a shared date-unit array and standings jobs update
+      // shared league-season state. Do not run two such mutations concurrently.
+      // Summary jobs are serialized only per event; different events still run
+      // in parallel across the eight worker slots.
+      await this.espnQueueService.deferClaimedJob(
+        jobId,
+        claimId,
+        new Date(Date.now() + 30_000),
+        lane,
+      );
+      return true;
+    }
+    this.laneNoWork.delete(lane);
+    this.activeJobs.set(jobId, { key: jobKey, type: jobType, startedAt, lane, scopeKey });
+    this.refreshActiveRuntime();
+    this.logger.debug(`Processing ${lane} ESPN queue job ${jobKey} (${jobType})`);
 
-    this.logger.debug(
-      `Processing ESPN queue job ${this.activeJobKey} (${String(queueJob.type)})`,
-    );
+    const heartbeat = setInterval(() => {
+      void this.espnQueueService.renewJobLease(jobId, claimId, leaseMs).then((renewed) => {
+        if (!renewed) this.logger.warn(`Queue job lease ownership changed while job was running: ${jobKey}`);
+      }).catch((error) => {
+        this.logger.warn(`Could not renew queue job lease ${jobKey}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.heartbeatSeconds * 1000);
+    heartbeat.unref?.();
 
     try {
       await this.processJob(queueJob);
@@ -783,13 +679,21 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       // is safe because every successor has a deterministic logical key. If
       // successor creation fails, this job remains retryable instead of
       // creating a silent gap in its workflow chain.
+      if (!(await this.espnQueueService.ownsProcessingJob(jobId, claimId))) {
+        this.logger.warn(`Job ${jobKey} lost its processing lease before completion; the newer owner will reconcile it.`);
+        return true;
+      }
       await this.afterSuccessfulJob(queueJob);
-      await this.espnQueueService.markCompleted(String(queueJob._id));
+      const completed = await this.espnQueueService.markCompleted(jobId, claimId);
+      if (!completed) {
+        this.logger.warn(`Job ${jobKey} could not be acknowledged because its processing lease changed.`);
+        return true;
+      }
       this.jobsSucceeded += 1;
       this.lastJobAt = new Date();
-      this.lastJobType = this.activeJobType;
+      this.lastJobType = jobType;
       this.lastJobStatus = 'SUCCEEDED';
-      this.lastJobDurationMs = this.activeJobStartedAt ? Date.now() - this.activeJobStartedAt : undefined;
+      this.lastJobDurationMs = Date.now() - startedAt;
       this.lastJobError = undefined;
     } catch (error) {
       if (
@@ -799,9 +703,9 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       ) {
         this.logger.debug(error instanceof Error ? error.message : 'Deferred Summary job outside its active timing window.');
         this.lastJobAt = new Date();
-        this.lastJobType = this.activeJobType;
+        this.lastJobType = jobType;
         this.lastJobStatus = 'DEFERRED';
-        this.lastJobDurationMs = this.activeJobStartedAt ? Date.now() - this.activeJobStartedAt : undefined;
+        this.lastJobDurationMs = Date.now() - startedAt;
         // The job has already been returned to PENDING at its contract-compliant
         // time. Do not mark it failed or count this as a provider attempt.
         return true;
@@ -809,9 +713,9 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       const message = error instanceof Error ? error.message : String(error);
       this.jobsFailed += 1;
       this.lastJobAt = new Date();
-      this.lastJobType = this.activeJobType;
+      this.lastJobType = jobType;
       this.lastJobStatus = 'FAILED';
-      this.lastJobDurationMs = this.activeJobStartedAt ? Date.now() - this.activeJobStartedAt : undefined;
+      this.lastJobDurationMs = Date.now() - startedAt;
       this.lastJobError = message;
 
       const isExpectedYoutubeMiss =
@@ -819,477 +723,33 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
         message.startsWith('No suitable YouTube highlight found');
 
       if (isExpectedYoutubeMiss) {
-        this.logger.log('ESPN YouTube highlight unavailable; retry workflow evaluated');
+        this.logger.debug(`No YouTube highlight found for ${jobKey}; bounded search workflow evaluated.`);
       } else {
-        this.logger.error('ESPN queue job failed; see system monitor for diagnostics');
-        this.systemMonitor.reportError({
-          module: 'sports',
-          source: this.safeJobString(queueJob.type, 'queue-worker'),
-          operation: this.safeJobString(queueJob.type, 'job'),
-          message,
-          occurredAt: new Date(),
-          stack: error instanceof Error ? error.stack : undefined,
-          referenceKey: this.safeJobString(queueJob.jobKey ?? queueJob._id, ''),
-        });
-        this.systemMonitor.reportActivity({
-          module: 'sports',
-          source: 'queue-worker',
-          operation: this.safeJobString(queueJob.type, 'job'),
-          status: 'FAILED',
-          message: `ESPN queue job failed: ${message}`,
-          occurredAt: new Date(),
-          durationMs: this.activeJobStartedAt
-            ? Date.now() - this.activeJobStartedAt
-            : undefined,
-          referenceKey: this.safeJobString(queueJob.jobKey ?? queueJob._id, ''),
-        });
+        // Retries are intentionally quiet: individual transient failures are
+        // retained on the durable job and monitored as aggregate recovery work.
+        this.logger.debug(`Queue job ${jobKey} failed; handing it to background recovery: ${message}`);
       }
 
-      await this.espnQueueService.markFailed(job, message);
-
-      const attempts = Number(queueJob.attempts ?? 0);
-      const maxAttempts = Number(queueJob.maxAttempts ?? 0);
-      if (
-        !isExpectedYoutubeMiss &&
-        maxAttempts > 0 &&
-        attempts >= maxAttempts
-      ) {
+      const failure = await this.espnQueueService.markFailed(job, message);
+      if (failure.quarantined && !isExpectedYoutubeMiss) {
+        this.systemMonitor.reportError({
+          module: 'sports', source: jobType, operation: 'quarantined-job',
+          message, occurredAt: new Date(), referenceKey: jobKey,
+        });
         this.systemMonitor.reportModuleHealth('sports', 'DEGRADED', {
           source: 'queue-worker',
-          message: `ESPN job ${String(queueJob.jobKey ?? queueJob._id)} exhausted ${maxAttempts} attempts: ${message}`,
+          message: `A non-replayable or invalid job was quarantined: ${jobKey}`,
+          details: { jobKey, category: failure.category },
         });
-      }
-      if (maxAttempts > 0 && attempts >= maxAttempts) {
-        await this.handleTerminalFailure(queueJob).catch((recoveryError) => {
-          this.logger.error(
-            `Could not schedule recovery for terminal ESPN job ${String(queueJob.jobKey ?? queueJob._id)}: ${
-              recoveryError instanceof Error
-                ? recoveryError.message
-                : String(recoveryError)
-            }`,
-          );
-        });
+        this.logger.warn(`Queue job ${jobKey} was quarantined (${failure.category}); it will not be replayed automatically.`);
       }
     } finally {
-      this.activeJobKey = undefined;
-      this.activeJobType = undefined;
-      this.activeJobStartedAt = undefined;
-      this.lastLongJobWarningAt = 0;
+      clearInterval(heartbeat);
+      this.activeJobs.delete(jobId);
+      this.refreshActiveRuntime();
     }
 
     return true;
-  }
-
-  private async handleTerminalFailure(
-    job: Record<string, unknown>,
-  ): Promise<void> {
-    await this.afterTerminalFailure(job);
-    const jobId = job._id ? this.stringifyJobId(job._id) : '';
-    if (jobId) await this.espnQueueService.markTerminalRecoveryReviewed(jobId);
-  }
-
-  /**
-   * A terminal task failure must not silently break an otherwise recurring
-   * workflow. Schedule a bounded, delayed recovery generation with its own
-   * stable job key. After three recovery generations, leave an explicit error
-   * for operational review rather than creating an unbounded request storm.
-   */
-  private async afterTerminalFailure(
-    job: Record<string, unknown>,
-  ): Promise<void> {
-    const type = job.type as EspnQueueJobType;
-    const leagueId = job.leagueId ? this.stringifyJobId(job.leagueId) : '';
-    const season = typeof job.season === 'number' ? job.season : undefined;
-    const trigger =
-      typeof job.triggerEventId === 'string' ? job.triggerEventId : '';
-    const existingGeneration = this.getRecoveryGeneration(trigger);
-    const nextGeneration = existingGeneration + 1;
-    const rootKey = trigger.startsWith('RECOVERY:')
-      ? trigger.replace(/^RECOVERY:\d+:/, '')
-      : this.safeJobString(
-          job.jobKey ?? job._id,
-          `${type}:${leagueId}:${season ?? 'current'}`,
-        );
-
-    if (type === EspnQueueJobType.YOUTUBE_HIGHLIGHT) {
-      this.logger.warn(
-        `YouTube highlight job exhausted retries for ${leagueId}:${this.safeJobString(job.eventId)}; ` +
-          'it may be requeued after cooldown if the fixture is encountered again today.',
-      );
-      return;
-    }
-
-    if (existingGeneration >= 3) {
-      if (type === EspnQueueJobType.SUMMARY_REFRESH) {
-        this.logger.error(
-          `Summary job ${String(job.jobKey ?? job._id)} exhausted its ${existingGeneration} delayed recovery generations; ` +
-            'leaving it terminal for inspection rather than repeatedly requesting an unavailable payload.',
-        );
-        return;
-      }
-      this.logger.error(
-        `ESPN workflow ${String(job.jobKey ?? job._id)} exhausted its ${existingGeneration} rapid recovery generation(s); ` +
-          'switching to a slower lifecycle retry rather than silently terminating the recurring chain.',
-      );
-      await this.scheduleSlowLifecycleFallback(job, type, leagueId, season);
-      return;
-    }
-
-    const recoveryTrigger = `RECOVERY:${nextGeneration}:${rootKey}`;
-    const priority =
-      Number.isFinite(Number(job.priority)) && Number(job.priority) >= 1
-        ? Number(job.priority)
-        : 4;
-
-    switch (type) {
-      case EspnQueueJobType.FIXTURE_REFRESH: {
-        if (!leagueId || season === undefined) return;
-        if (
-          trigger.startsWith('WINDOW_EXTEND:') ||
-          (!trigger.startsWith('POSTMATCH') && !trigger.startsWith('FINISHED:'))
-        ) {
-          await this.espnQueueBuilderService.scheduleNextWindowExtension({
-            leagueId,
-            season,
-            priority,
-          });
-          this.logger.warn(
-            `Scheduled the next fixture-window extension after terminal failure for ${leagueId}/${season}`,
-          );
-          return;
-        }
-
-        const eventId = this.getTriggeredEventId(trigger);
-        if (!eventId) return;
-        const postMatchRecoveryTrigger = `POSTMATCH_RECHECK:${eventId}:RECOVERY:${nextGeneration}`;
-        const hasPostMatchRecovery = await this.espnQueueService.hasJob({
-          jobType: EspnQueueJobType.FIXTURE_REFRESH,
-          leagueId,
-          season,
-          triggerEventId: postMatchRecoveryTrigger,
-        });
-        const fixture = await this.espnFixtureModel
-          .findOne({ eventId, leagueId, season })
-          .select({ completed: 1, fixtureDate: 1 })
-          .lean()
-          .exec();
-        if (fixture?.completed === true) {
-          // Reconcile each follow-up independently. The queue builders enforce
-          // stable keys, so a partially completed recovery is safe to repeat.
-          await this.espnQueueBuilderService.queueFinishedSummaryRefresh({
-            eventId,
-            leagueId,
-            season,
-            priority,
-          });
-          await this.espnQueueBuilderService.queueYoutubeHighlightForCompletedFixture(
-            {
-              eventId,
-              leagueId,
-              season,
-              priority,
-            },
-          );
-          await this.espnQueueBuilderService.queueStandingsRefresh({
-            leagueId,
-            season,
-            priority,
-            eventId,
-            triggerEventId: recoveryTrigger,
-          });
-          return;
-        }
-        const fixtureDate = fixture?.fixtureDate
-          ? new Date(fixture.fixtureDate)
-          : undefined;
-        const recentEnough = Boolean(
-          fixtureDate &&
-          !Number.isNaN(fixtureDate.getTime()) &&
-          fixtureDate.getTime() >= Date.now() - 24 * 60 * 60 * 1000,
-        );
-        if (fixture && recentEnough && !hasPostMatchRecovery) {
-          await this.espnQueueBuilderService.scheduleNextPostMatchCheck({
-            eventId,
-            leagueId,
-            season,
-            priority,
-            scheduledFor: new Date(Date.now() + 30 * 60_000),
-            recoveryGeneration: nextGeneration,
-          });
-        }
-        return;
-      }
-
-      case EspnQueueJobType.SUMMARY_REFRESH: {
-        const jobId = job._id ? this.stringifyJobId(job._id) : '';
-        if (!jobId) return;
-        const delayMs =
-          existingGeneration === 0
-            ? 60 * 60_000
-            : existingGeneration === 1
-              ? 6 * 60 * 60_000
-              : 24 * 60 * 60_000;
-        const scheduledFor = new Date(Date.now() + delayMs);
-        const recovered =
-          await this.espnQueueService.scheduleTerminalSummaryRecovery(
-            jobId,
-            `SUMMARY_RECOVERY:${nextGeneration}`,
-            scheduledFor,
-          );
-        if (recovered) {
-          this.logger.warn(
-            `Scheduled Summary recovery generation ${nextGeneration} for ${leagueId}:${this.safeJobString(job.eventId)} at ${scheduledFor.toISOString()}`,
-          );
-        }
-        return;
-      }
-
-      case EspnQueueJobType.LEAGUE_CATALOGUE_REFRESH:
-        if (
-          await this.espnQueueService.hasJob({
-            jobType: EspnQueueJobType.LEAGUE_CATALOGUE_REFRESH,
-            leagueId: '__system__',
-            triggerEventId: recoveryTrigger,
-          })
-        )
-          return;
-        await this.espnQueueBuilderService.scheduleNextCatalogueRefresh({
-          scheduledFor: new Date(
-            Date.now() + (existingGeneration === 0 ? 60 : 180) * 60_000,
-          ),
-          triggerEventId: recoveryTrigger,
-        });
-        this.logger.warn(
-          `Scheduled catalogue recovery generation ${nextGeneration}`,
-        );
-        return;
-
-      case EspnQueueJobType.LEAGUE_DETAIL_REFRESH:
-        if (!leagueId) return;
-        if (
-          await this.espnQueueService.hasJob({
-            jobType: EspnQueueJobType.LEAGUE_DETAIL_REFRESH,
-            leagueId,
-            season,
-            triggerEventId: recoveryTrigger,
-          })
-        )
-          return;
-        await this.espnQueueBuilderService.scheduleLeagueDetailRecovery({
-          leagueId,
-          season,
-          priority,
-          triggerEventId: recoveryTrigger,
-          delayMs: (existingGeneration === 0 ? 60 : 360) * 60_000,
-        });
-        this.logger.warn(
-          `Scheduled league-detail recovery ${nextGeneration} for ${leagueId}`,
-        );
-        return;
-
-      case EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP:
-        if (!leagueId || season === undefined) return;
-        if (
-          await this.espnQueueService.hasJob({
-            jobType: EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP,
-            leagueId,
-            season,
-            triggerEventId: recoveryTrigger,
-          })
-        )
-          return;
-        await this.espnQueueBuilderService.queueSeasonFixtureBootstrap({
-          leagueId,
-          season,
-          priority,
-          scheduledFor: new Date(Date.now() + 6 * 60 * 60_000),
-          triggerEventId: recoveryTrigger,
-        });
-        this.logger.warn(
-          `Scheduled season-bootstrap recovery ${nextGeneration} for ${leagueId}/${season}`,
-        );
-        return;
-
-      case EspnQueueJobType.STANDINGS_REFRESH:
-        if (!leagueId || season === undefined) return;
-        if (
-          await this.espnQueueService.hasJob({
-            jobType: EspnQueueJobType.STANDINGS_REFRESH,
-            leagueId,
-            season,
-            triggerEventId: recoveryTrigger,
-          })
-        )
-          return;
-        await this.espnQueueBuilderService.queueStandingsRefresh({
-          leagueId,
-          season,
-          priority,
-          eventId: typeof job.eventId === 'string' ? job.eventId : undefined,
-          triggerEventId: recoveryTrigger,
-          scheduledFor: new Date(
-            Date.now() + (existingGeneration === 0 ? 15 : 60) * 60_000,
-          ),
-        });
-        this.logger.warn(
-          `Scheduled standings recovery ${nextGeneration} for ${leagueId}/${season}`,
-        );
-        return;
-
-      default:
-        return;
-    }
-  }
-
-  /**
-   * After bounded short-delay recovery generations are exhausted, recurring
-   * workflows retain a slower durable retry cadence. This prevents a bad day
-   * of provider failures from killing the chain, without hammering the APIs.
-   * Summary collection remains bounded; YouTube misses remain event-driven.
-   */
-  private async scheduleSlowLifecycleFallback(
-    job: Record<string, unknown>,
-    type: EspnQueueJobType,
-    leagueId: string,
-    season?: number,
-  ): Promise<void> {
-    const jobKey = this.safeJobString(
-      job.jobKey ?? job._id,
-      `${type}:${leagueId}`,
-    );
-    const priority =
-      Number.isFinite(Number(job.priority)) && Number(job.priority) >= 1
-        ? Number(job.priority)
-        : 4;
-    const due = new Date(Date.now() + 24 * 60 * 60_000);
-    const fallbackTrigger = `LIFECYCLE_FALLBACK:${jobKey}`;
-
-    switch (type) {
-      case EspnQueueJobType.FIXTURE_REFRESH: {
-        if (!leagueId || season === undefined) return;
-        const trigger =
-          typeof job.triggerEventId === 'string' ? job.triggerEventId : '';
-        const eventId = this.getTriggeredEventId(trigger);
-        if (
-          !eventId ||
-          (!trigger.startsWith('POSTMATCH') && !trigger.startsWith('FINISHED:'))
-        ) {
-          // The daily extension chain always continues at the next Nigeria midnight.
-          await this.espnQueueBuilderService.scheduleNextWindowExtension({
-            leagueId,
-            season,
-            priority,
-          });
-          return;
-        }
-        const fixture = await this.espnFixtureModel
-          .findOne({ eventId, leagueId, season })
-          .select({ completed: 1, fixtureDate: 1 })
-          .lean()
-          .exec();
-        if (fixture?.completed === true) {
-          await this.espnQueueBuilderService.queueFinishedSummaryRefresh({
-            eventId,
-            leagueId,
-            season,
-            priority,
-          });
-          await this.espnQueueBuilderService.queueYoutubeHighlightForCompletedFixture(
-            {
-              eventId,
-              leagueId,
-              season,
-              priority,
-            },
-          );
-          await this.espnQueueBuilderService.queueStandingsRefresh({
-            leagueId,
-            season,
-            priority,
-            eventId,
-            triggerEventId: fallbackTrigger,
-            scheduledFor: due,
-          });
-          return;
-        }
-        const fixtureDate = fixture?.fixtureDate
-          ? new Date(fixture.fixtureDate)
-          : undefined;
-        if (
-          fixtureDate &&
-          !Number.isNaN(fixtureDate.getTime()) &&
-          fixtureDate.getTime() >= Date.now() - 24 * 60 * 60_000
-        ) {
-          await this.espnQueueBuilderService.scheduleNextPostMatchCheck({
-            eventId,
-            leagueId,
-            season,
-            priority,
-            scheduledFor: due,
-          });
-        }
-        return;
-      }
-
-      case EspnQueueJobType.LEAGUE_CATALOGUE_REFRESH:
-        await this.espnQueueBuilderService.scheduleNextCatalogueRefresh({
-          scheduledFor: due,
-          triggerEventId: fallbackTrigger,
-        });
-        return;
-
-      case EspnQueueJobType.LEAGUE_DETAIL_REFRESH:
-        if (!leagueId) return;
-        await this.espnQueueBuilderService.scheduleLeagueDetailRecovery({
-          leagueId,
-          season,
-          priority,
-          triggerEventId: fallbackTrigger,
-          delayMs: 24 * 60 * 60_000,
-        });
-        return;
-
-      case EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP:
-        if (!leagueId || season === undefined) return;
-        await this.espnQueueBuilderService.queueSeasonFixtureBootstrap({
-          leagueId,
-          season,
-          priority,
-          scheduledFor: new Date(Date.now() + 12 * 60 * 60_000),
-          triggerEventId: fallbackTrigger,
-        });
-        return;
-
-      case EspnQueueJobType.STANDINGS_REFRESH:
-        if (!leagueId || season === undefined) return;
-        await this.espnQueueBuilderService.queueStandingsRefresh({
-          leagueId,
-          season,
-          priority,
-          eventId: typeof job.eventId === 'string' ? job.eventId : undefined,
-          triggerEventId: fallbackTrigger,
-          scheduledFor: due,
-        });
-        return;
-
-      case EspnQueueJobType.SUMMARY_REFRESH:
-        // Summary receives three delayed recovery generations, then stops with
-        // an explicit terminal failure to avoid repeated requests for bad IDs.
-        return;
-
-      case EspnQueueJobType.YOUTUBE_HIGHLIGHT:
-      default:
-        return;
-    }
-  }
-
-  private getRecoveryGeneration(trigger: string): number {
-    const summaryGeneration = trigger.match(/^SUMMARY_RECOVERY:(\d+)$/);
-    if (summaryGeneration) return Number(summaryGeneration[1]);
-    const prefixGeneration = trigger.match(/^RECOVERY:(\d+):/);
-    if (prefixGeneration) return Number(prefixGeneration[1]);
-    const suffixGeneration = trigger.match(/:RECOVERY:(\d+)$/);
-    return suffixGeneration ? Number(suffixGeneration[1]) : 0;
   }
 
   private async afterSuccessfulJob(
@@ -1370,10 +830,24 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
+      const priority = typeof job.priority === 'number' ? job.priority : 4;
+      if (trigger.startsWith('WINDOW_REFRESH:NEAR:')) {
+        await this.espnQueueBuilderService.scheduleNextRollingFixtureRefresh({
+          leagueId, season, priority, window: 'NEAR',
+        });
+        await this.espnQueueBuilderService.buildSummaryRefreshQueue({ leagueId, season });
+        await this.espnQueueBuilderService.buildPostMatchCheckQueue({ leagueId, season });
+      } else if (trigger.startsWith('WINDOW_REFRESH:FAR:')) {
+        await this.espnQueueBuilderService.scheduleNextRollingFixtureRefresh({
+          leagueId, season, priority, window: 'FAR',
+        });
+        await this.espnQueueBuilderService.buildPostMatchCheckQueue({ leagueId, season });
+      }
+
       const eventId = this.getTriggeredEventId(trigger);
       if (eventId) {
         // The post-kickoff Summary job is independent of ESPN's completed flag.
-        // It is durable and scheduled for kickoff + 3 hours.
+        // It is durable and scheduled for kickoff + 160 minutes.
         await this.espnQueueBuilderService.queuePostKickoffSummaryRefresh({
           eventId,
           leagueId,
@@ -1886,6 +1360,7 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
 
     let forcedFinishedDate: string | undefined;
     let finishedEventId: string | undefined;
+    let forceRefreshDateRange = false;
 
     const triggeredEventId = this.getTriggeredEventId(triggerEventId);
     if (triggeredEventId) {
@@ -1903,11 +1378,27 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
           dateTo = forcedFinishedDate;
         }
       }
+    } else if (triggerEventId.startsWith('POSTMATCH_FIXTURE_DATE:')) {
+      const dateKey = triggerEventId.slice('POSTMATCH_FIXTURE_DATE:'.length).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+        throw new Error(`Post-match fixture refresh has an invalid date key: ${dateKey}`);
+      }
+      forcedFinishedDate = dateKey;
+      dateFrom = dateKey;
+      dateTo = dateKey;
+    } else if (triggerEventId.startsWith('WINDOW_REFRESH:NEAR:')) {
+      dateFrom = this.toDateOnly(now);
+      dateTo = this.toDateOnly(this.addLagosCalendarDays(now, 2));
+      forceRefreshDateRange = true;
+    } else if (triggerEventId.startsWith('WINDOW_REFRESH:FAR:')) {
+      dateFrom = this.toDateOnly(this.addLagosCalendarDays(now, 3));
+      dateTo = this.toDateOnly(this.addLagosCalendarDays(now, forwardDays));
+      forceRefreshDateRange = true;
     } else if (triggerEventId.startsWith('WINDOW_EXTEND:')) {
-      // Extend coverage one day at a time, using the configured forward horizon.
       const targetDate = this.addLagosCalendarDays(now, forwardDays);
       dateFrom = this.toDateOnly(targetDate);
       dateTo = dateFrom;
+      forceRefreshDateRange = true;
     }
 
     const state = await this.sportsSyncStateService.ensureFixtureRefreshState({
@@ -1927,6 +1418,16 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
         canonicalStateKey,
         forcedFinishedDate,
       );
+    } else if (forceRefreshDateRange) {
+      const cursor = new Date(`${dateFrom}T00:00:00Z`);
+      const end = new Date(`${dateTo}T00:00:00Z`);
+      while (cursor <= end) {
+        await this.sportsSyncStateService.resetDateForRefresh(
+          canonicalStateKey,
+          cursor.toISOString().slice(0, 10),
+        );
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
     }
 
     const incompleteDates =
@@ -2030,9 +1531,22 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
         throw new Error(`ESPN scoreboard ${leagueId}/${monthKey} contained malformed event records`);
       }
       const requestedDates = new Set(dateKeys);
-      const events = record.events.filter((item) => {
-        const eventDate = (item as Record<string, unknown>).date as string;
-        return requestedDates.has(eventDate.slice(0, 10));
+      const monthlyEvents = record.events as Array<Record<string, unknown>>;
+      const monthlyEventIds = [...new Set(monthlyEvents
+        .map((item) => String(item.id ?? '').trim())
+        .filter(Boolean))];
+      const knownEvents = monthlyEventIds.length > 0
+        ? await this.espnFixtureModel.find({ eventId: { $in: monthlyEventIds } })
+            .select({ eventId: 1 }).lean().exec()
+        : [];
+      const knownEventIds = new Set(knownEvents.map((item) => String(item.eventId)));
+      const events = monthlyEvents.filter((item) => {
+        const eventDate = typeof item.date === 'string' ? item.date : '';
+        const eventId = String(item.id ?? '').trim();
+        // Keep any already-known event even when ESPN moved it outside the
+        // original requested date slice. The canonical upsert will apply its
+        // new kickoff date instead of leaving a stale duplicate behind.
+        return requestedDates.has(eventDate.slice(0, 10)) || knownEventIds.has(eventId);
       });
 
       // An empty month/day slice is valid when the database has no inventory
@@ -2127,12 +1641,31 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     const startupJob =
       triggerEventId.startsWith('STARTUP_SUMMARY:') ||
       triggerEventId.startsWith('STARTUP_SUMMARY_66H:');
+    const postMatchSummaryJob =
+      triggerEventId.startsWith('POSTMATCH_SUMMARY:') ||
+      triggerEventId.startsWith('POSTMATCH_RECHECK:');
     const upcomingDelayMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.upcomingWindowHours * 60 * 60_000;
     const startupDelayMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours * 60 * 60_000;
     const finishedDelayMs = SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes * 60_000;
     let eligibleAtMs: number | undefined;
     let deferralReason: string | undefined;
-    if (kickoff.getTime() > nowMs) {
+
+    if (postMatchSummaryJob) {
+      // A durable post-match job remains a post-match job even if ESPN later
+      // moves the kickoff date. Never allow a rescheduled fixture to consume
+      // the post-match refresh identity during its prematch window.
+      const recheckMatch = triggerEventId.match(/^POSTMATCH_RECHECK:([^:]+):(\d+)$/);
+      const postMatchOffsetMinutes = recheckMatch
+        ? Number(recheckMatch[2])
+        : SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes;
+      const safeOffsetMinutes = Number.isFinite(postMatchOffsetMinutes) && postMatchOffsetMinutes >= 0
+        ? postMatchOffsetMinutes
+        : SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes;
+      eligibleAtMs = kickoff.getTime() + safeOffsetMinutes * 60_000;
+      if (nowMs < eligibleAtMs) {
+        deferralReason = `Post-match Summary refresh is due at kickoff + ${safeOffsetMinutes} minutes.`;
+      }
+    } else if (kickoff.getTime() > nowMs) {
       const targetLeadMs = startupJob ? startupDelayMs : upcomingDelayMs;
       eligibleAtMs = kickoff.getTime() - targetLeadMs;
       if (nowMs < eligibleAtMs) {
@@ -2143,7 +1676,7 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     } else {
       eligibleAtMs = kickoff.getTime() + finishedDelayMs;
       if (nowMs < eligibleAtMs) {
-        deferralReason = 'Finished-match Summary refresh is due at kickoff + 160 minutes.';
+        deferralReason = `Finished-match Summary refresh is due at kickoff + ${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.finishedMatchDelayMinutes} minutes.`;
       }
     }
 
@@ -2154,6 +1687,10 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
       const deferred = await this.espnQueueService.deferProcessingSummaryJob(
         jobId,
         scheduledFor,
+        String(job.ownerId ?? ''),
+        job.lane === EspnQueueLane.BACKGROUND_RETRY
+          ? EspnQueueLane.BACKGROUND_RETRY
+          : EspnQueueLane.NORMAL,
       );
       if (!deferred) throw new Error(`Could not defer Summary job ${jobId} to ${scheduledFor.toISOString()}`);
       throw new SummaryJobDeferredError(
@@ -2646,3 +2183,4 @@ export class EspnQueueWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 }
+

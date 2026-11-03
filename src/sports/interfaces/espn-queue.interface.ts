@@ -37,6 +37,19 @@ export enum EspnQueueJobType {
   SEASON_FIXTURE_BOOTSTRAP = 'SEASON_FIXTURE_BOOTSTRAP',
 }
 
+export enum EspnQueueLane {
+  NORMAL = 'NORMAL',
+  BACKGROUND_RETRY = 'BACKGROUND_RETRY',
+  QUARANTINE = 'QUARANTINE',
+}
+
+export enum EspnQueueFailureCategory {
+  TRANSIENT = 'TRANSIENT',
+  DATA_NOT_READY = 'DATA_NOT_READY',
+  PERMANENT = 'PERMANENT',
+  NON_REPLAYABLE = 'NON_REPLAYABLE',
+}
+
 export enum EspnQueueStatus {
   PENDING = 'PENDING',
   PROCESSING = 'PROCESSING',
@@ -96,6 +109,22 @@ export interface EspnQueueJob {
 
   status: EspnQueueStatus;
 
+  lane: EspnQueueLane;
+
+  failureCategory?: EspnQueueFailureCategory;
+
+  retryCount: number;
+
+  firstFailedAt?: Date;
+
+  lastAttemptAt?: Date;
+
+  ownerId?: string;
+
+  heartbeatAt?: Date;
+
+  leaseExpiresAt?: Date;
+
   attempts: number;
 
   maxAttempts: number;
@@ -112,4 +141,5 @@ export interface EspnQueueJob {
 
   lastError?: string;
 }
+
 

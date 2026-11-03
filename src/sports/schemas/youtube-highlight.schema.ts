@@ -128,3 +128,4 @@ YouTubeHighlightSchema.index({
   competitionId: 1,
   status: 1,
 });
+

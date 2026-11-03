@@ -5,7 +5,9 @@ import { Model } from 'mongoose';
 import { EspnQueue, EspnQueueDocument } from '../schemas/espn-queue.schema';
 
 import {
+  EspnQueueFailureCategory,
   EspnQueueJobType,
+  EspnQueueLane,
   EspnQueueStatus,
 } from '../interfaces/espn-queue.interface';
 
@@ -14,6 +16,8 @@ import { SportsSyncUnitStatus } from '../schemas/sports-sync-state.schema';
 import { SportsSyncStateService } from './sports-sync-state.service';
 
 import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
+
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access */
 
 @Injectable()
 export class EspnQueueService {
@@ -641,52 +645,9 @@ export class EspnQueueService {
       }
 
       if (existing.status === EspnQueueStatus.FAILED) {
-        if (existing.attempts >= existing.maxAttempts) {
-          const isRecoverableLifecycleJob =
-            params.jobType === EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP ||
-            params.jobType === EspnQueueJobType.STANDINGS_REFRESH ||
-            params.jobType === EspnQueueJobType.LEAGUE_CATALOGUE_REFRESH ||
-            params.jobType === EspnQueueJobType.LEAGUE_DETAIL_REFRESH ||
-            (params.jobType === EspnQueueJobType.FIXTURE_REFRESH &&
-              Boolean(
-                params.triggerEventId?.startsWith('FINISHED:') ||
-                params.triggerEventId?.startsWith('POSTMATCH:') ||
-                params.triggerEventId?.startsWith('POSTMATCH_RECHECK:'),
-              ));
-          const retryCooldownElapsed = Boolean(
-            existing.failedAt &&
-            now.getTime() - existing.failedAt.getTime() >= 60 * 60 * 1000,
-          );
-
-          if (!isRecoverableLifecycleJob || !retryCooldownElapsed) {
-            return existing;
-          }
-
-          return this.reopenJob(existing, {
-            priority: params.priority,
-            scheduledFor: params.scheduledFor,
-            triggerEventId: params.triggerEventId,
-          });
-        }
-
-        if (
-          existing.nextAttemptAt &&
-          existing.nextAttemptAt.getTime() > now.getTime()
-        ) {
-          return existing;
-        }
-
-        existing.status = EspnQueueStatus.PENDING;
-        existing.priority = params.priority;
-        existing.scheduledFor = params.scheduledFor;
-        existing.startedAt = undefined;
-        existing.completedAt = undefined;
-        existing.failedAt = undefined;
-        existing.nextAttemptAt = undefined;
-        existing.lastError = undefined;
-        const saved = await existing.save();
-        this.notifyWorker();
-        return saved;
+        // Failed work is owned by the independent recovery lane. A queue
+        // builder must not reset its backoff or move it into normal traffic.
+        return existing;
       }
 
       return this.reopenJob(existing, params);
@@ -702,6 +663,8 @@ export class EspnQueueService {
         triggerEventId: params.triggerEventId,
         priority: params.priority,
         status: EspnQueueStatus.PENDING,
+        lane: EspnQueueLane.NORMAL,
+        retryCount: 0,
         attempts: 0,
         maxAttempts:
           params.jobType === EspnQueueJobType.YOUTUBE_HIGHLIGHT
@@ -744,52 +707,9 @@ export class EspnQueueService {
       }
 
       if (existing.status === EspnQueueStatus.FAILED) {
-        if (existing.attempts >= existing.maxAttempts) {
-          const isRecoverableLifecycleJob =
-            params.jobType === EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP ||
-            params.jobType === EspnQueueJobType.STANDINGS_REFRESH ||
-            params.jobType === EspnQueueJobType.LEAGUE_CATALOGUE_REFRESH ||
-            params.jobType === EspnQueueJobType.LEAGUE_DETAIL_REFRESH ||
-            (params.jobType === EspnQueueJobType.FIXTURE_REFRESH &&
-              Boolean(
-                params.triggerEventId?.startsWith('FINISHED:') ||
-                params.triggerEventId?.startsWith('POSTMATCH:') ||
-                params.triggerEventId?.startsWith('POSTMATCH_RECHECK:'),
-              ));
-          const failedAt = existing.failedAt?.getTime();
-          const retryCooldownElapsed =
-            typeof failedAt === 'number' &&
-            Date.now() - failedAt >= 60 * 60 * 1000;
-
-          if (!isRecoverableLifecycleJob || !retryCooldownElapsed) {
-            return existing;
-          }
-
-          return this.reopenJob(existing, {
-            priority: params.priority,
-            scheduledFor: params.scheduledFor,
-            triggerEventId: params.triggerEventId,
-          });
-        }
-
-        if (
-          existing.nextAttemptAt &&
-          existing.nextAttemptAt.getTime() > Date.now()
-        ) {
-          return existing;
-        }
-
-        existing.status = EspnQueueStatus.PENDING;
-        existing.priority = params.priority;
-        existing.scheduledFor = params.scheduledFor;
-        existing.startedAt = undefined;
-        existing.completedAt = undefined;
-        existing.failedAt = undefined;
-        existing.nextAttemptAt = undefined;
-        existing.lastError = undefined;
-        const saved = await existing.save();
-        this.notifyWorker();
-        return saved;
+        // The durable retry lane owns every failed job, including legacy jobs.
+        // Duplicate-key races must never reset its backoff or move it to NORMAL.
+        return existing;
       }
 
       return this.reopenJob(existing, params);
@@ -1009,13 +929,16 @@ export class EspnQueueService {
     season: number;
     recentFailureCooldownMs?: number;
   }): Promise<boolean> {
-    const leagueId = String(params.leagueId ?? '').trim().toLowerCase();
+    const leagueId = String(params.leagueId ?? '')
+      .trim()
+      .toLowerCase();
     const eventId = String(params.eventId ?? '').trim();
     if (!leagueId || !eventId || !Number.isInteger(params.season)) return false;
 
     const now = new Date();
     const recentFailureCutoff = new Date(
-      now.getTime() - Math.max(0, params.recentFailureCooldownMs ?? 60 * 60_000),
+      now.getTime() -
+        Math.max(0, params.recentFailureCooldownMs ?? 60 * 60_000),
     );
     const active = await this.queueModel
       .findOne({
@@ -1024,9 +947,16 @@ export class EspnQueueService {
         eventId,
         season: params.season,
         $or: [
-          { status: { $in: [EspnQueueStatus.PENDING, EspnQueueStatus.PROCESSING] } },
+          {
+            status: {
+              $in: [EspnQueueStatus.PENDING, EspnQueueStatus.PROCESSING],
+            },
+          },
           { status: EspnQueueStatus.FAILED, nextAttemptAt: { $gt: now } },
-          { status: EspnQueueStatus.FAILED, failedAt: { $gte: recentFailureCutoff } },
+          {
+            status: EspnQueueStatus.FAILED,
+            failedAt: { $gte: recentFailureCutoff },
+          },
         ],
       })
       .select({ _id: 1 })
@@ -1130,81 +1060,64 @@ export class EspnQueueService {
     leagueId?: string;
     season?: number;
     eventId?: string;
+    lane?: EspnQueueLane;
+    workerId?: string;
+    leaseMs?: number;
   }): Promise<EspnQueueDocument | null> {
     const now = new Date();
+    const lane = params?.lane;
+    const eligible: Record<string, unknown>[] = [];
 
-    const includeFailed = params?.includeFailed === true;
-
-    const statuses = includeFailed
-      ? [EspnQueueStatus.PENDING, EspnQueueStatus.FAILED]
-      : [EspnQueueStatus.PENDING];
-
-    const query: Record<string, unknown> = {
-      status:
-        statuses.length === 1
-          ? statuses[0]
-          : {
-              $in: statuses,
-            },
-
-      $or: [
-        {
-          status: EspnQueueStatus.PENDING,
-
-          nextAttemptAt: { $in: [null] },
-
-          scheduledFor: {
-            $lte: now,
+    if (!lane || lane === EspnQueueLane.NORMAL) {
+      eligible.push({
+        status: EspnQueueStatus.PENDING,
+        $or: [{ lane: EspnQueueLane.NORMAL }, { lane: { $exists: false } }],
+        $and: [
+          {
+            $or: [
+              { nextAttemptAt: { $in: [null] }, scheduledFor: { $lte: now } },
+              { nextAttemptAt: { $lte: now } },
+            ],
           },
-        },
-
-        {
-          status: EspnQueueStatus.PENDING,
-
-          nextAttemptAt: {
-            $lte: now,
-          },
-        },
-
-        ...(includeFailed
-          ? [
-              {
-                status: EspnQueueStatus.FAILED,
-
-                nextAttemptAt: {
-                  $lte: now,
-                },
-              },
-            ]
-          : []),
-      ],
-    };
-
-    if (params?.jobTypes && params.jobTypes.length > 0) {
-      query.type = {
-        $in: params.jobTypes,
-      };
+        ],
+      });
     }
 
-    if (params?.leagueId?.trim()) {
+    if (
+      lane === EspnQueueLane.BACKGROUND_RETRY ||
+      (!lane && params?.includeFailed === true)
+    ) {
+      eligible.push({
+        status: EspnQueueStatus.FAILED,
+        lane: EspnQueueLane.BACKGROUND_RETRY,
+        nextAttemptAt: { $lte: now },
+      });
+    }
+
+    if (lane === EspnQueueLane.QUARANTINE) return null;
+    if (eligible.length === 0) return null;
+
+    const query: Record<string, unknown> = { $or: eligible };
+    if (params?.jobTypes?.length) query.type = { $in: params.jobTypes };
+    if (params?.leagueId?.trim())
       query.leagueId = params.leagueId.trim().toLowerCase();
-    }
-
-    if (typeof params?.season === 'number') {
-      query.season = params.season;
-    }
-
-    if (params?.eventId?.trim()) {
-      query.eventId = params.eventId.trim();
-    }
-
+    if (typeof params?.season === 'number') query.season = params.season;
+    if (params?.eventId?.trim()) query.eventId = params.eventId.trim();
     if (params?.triggerEventIdPrefix?.trim()) {
-      // Escape the prefix before using it as a Mongo regular expression.
       const escapedPrefix = params.triggerEventIdPrefix
         .trim()
         .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       query.triggerEventId = { $regex: `^${escapedPrefix}` };
     }
+
+    const workerId = params?.workerId?.trim() || `sports-worker-${process.pid}`;
+    const leaseMs = Math.max(60_000, params?.leaseMs ?? 8 * 60_000);
+    const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+
+    const sort =
+      lane === EspnQueueLane.BACKGROUND_RETRY
+        ? { priority: 1, nextAttemptAt: 1, firstFailedAt: 1, createdAt: 1 }
+        : { priority: 1, scheduledFor: 1, createdAt: 1 };
 
     return this.queueModel
       .findOneAndUpdate(
@@ -1212,63 +1125,139 @@ export class EspnQueueService {
         {
           $set: {
             status: EspnQueueStatus.PROCESSING,
-
+            ownerId: workerId,
             startedAt: now,
+            heartbeatAt: now,
+            leaseExpiresAt,
+            lastAttemptAt: now,
           },
-
-          $inc: {
-            attempts: 1,
-          },
-
-          $unset: {
-            nextAttemptAt: 1,
-
-            failedAt: 1,
-
-            completedAt: 1,
-          },
+          $inc: { attempts: 1 },
+          $unset: { nextAttemptAt: 1, failedAt: 1, completedAt: 1 },
         },
         {
-          sort: {
-            priority: 1,
-
-            scheduledFor: 1,
-
-            createdAt: 1,
-          },
-
+          sort,
           returnDocument: 'after',
         },
       )
       .exec();
   }
 
+  async renewJobLease(
+    jobId: string,
+    workerId: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const now = new Date();
+    const result = await this.queueModel
+      .updateOne(
+        { _id: jobId, status: EspnQueueStatus.PROCESSING, ownerId: workerId },
+        {
+          $set: {
+            heartbeatAt: now,
+            leaseExpiresAt: new Date(now.getTime() + Math.max(60_000, leaseMs)),
+          },
+        },
+      )
+      .exec();
+    return (result.modifiedCount ?? 0) > 0;
+  }
+
+  async ownsProcessingJob(jobId: string, workerId: string): Promise<boolean> {
+    return Boolean(
+      await this.queueModel
+        .findOne({
+          _id: jobId,
+          status: EspnQueueStatus.PROCESSING,
+          ownerId: workerId,
+        })
+        .select({ _id: 1 })
+        .lean()
+        .exec(),
+    );
+  }
+
+  /**
+   * Releases a claimed job when another job for the same mutable sync-state
+   * scope is already running in this worker process. Deferral is not a failure
+   * and therefore does not consume the execution retry budget.
+   */
+  async deferClaimedJob(
+    jobId: string,
+    workerId: string,
+    scheduledFor: Date,
+    lane: EspnQueueLane = EspnQueueLane.NORMAL,
+  ): Promise<boolean> {
+    if (
+      !(scheduledFor instanceof Date) ||
+      Number.isNaN(scheduledFor.getTime())
+    ) {
+      throw new Error(
+        'Queue claim deferral requires a valid scheduledFor date',
+      );
+    }
+    const backgroundRetry = lane === EspnQueueLane.BACKGROUND_RETRY;
+    const result = await this.queueModel
+      .updateOne(
+        { _id: jobId, status: EspnQueueStatus.PROCESSING, ownerId: workerId },
+        {
+          $set: backgroundRetry
+            ? {
+                status: EspnQueueStatus.FAILED,
+                lane: EspnQueueLane.BACKGROUND_RETRY,
+                nextAttemptAt: scheduledFor,
+                failedAt: new Date(),
+              }
+            : {
+                status: EspnQueueStatus.PENDING,
+                lane: EspnQueueLane.NORMAL,
+                scheduledFor,
+              },
+          $inc: { attempts: -1 },
+          $unset: {
+            startedAt: 1,
+            heartbeatAt: 1,
+            leaseExpiresAt: 1,
+            ownerId: 1,
+            ...(backgroundRetry ? {} : { nextAttemptAt: 1, failedAt: 1 }),
+          },
+        },
+      )
+      .exec();
+    const deferred = (result.modifiedCount ?? 0) > 0;
+    if (deferred) this.notifyWorker();
+    return deferred;
+  }
+
   // ============================================================
   // COMPLETE
   // ============================================================
 
-  async markCompleted(jobId: string): Promise<void> {
-    await this.queueModel.updateOne(
-      {
-        _id: jobId,
-      },
-      {
+  async markCompleted(jobId: string, workerId?: string): Promise<boolean> {
+    const filter: Record<string, unknown> = {
+      _id: jobId,
+      status: EspnQueueStatus.PROCESSING,
+    };
+    if (workerId) filter.ownerId = workerId;
+    const result = await this.queueModel
+      .updateOne(filter, {
         $set: {
           status: EspnQueueStatus.COMPLETED,
-
           completedAt: new Date(),
         },
-
         $unset: {
           nextAttemptAt: 1,
-
           startedAt: 1,
-
+          heartbeatAt: 1,
+          leaseExpiresAt: 1,
+          ownerId: 1,
           lastError: 1,
+          failureCategory: 1,
         },
-      },
-    );
-    this.notifyWorker();
+      })
+      .exec();
+    const completed = (result.modifiedCount ?? 0) > 0;
+    if (completed) this.notifyWorker();
+    return completed;
   }
 
   /**
@@ -1279,6 +1268,8 @@ export class EspnQueueService {
   async deferProcessingSummaryJob(
     jobId: string,
     scheduledFor: Date,
+    workerId?: string,
+    lane: EspnQueueLane = EspnQueueLane.NORMAL,
   ): Promise<boolean> {
     if (
       !(scheduledFor instanceof Date) ||
@@ -1292,21 +1283,34 @@ export class EspnQueueService {
           _id: jobId,
           type: EspnQueueJobType.SUMMARY_REFRESH,
           status: EspnQueueStatus.PROCESSING,
+          ...(workerId ? { ownerId: workerId } : {}),
         },
         {
-          $set: {
-            status: EspnQueueStatus.PENDING,
-            scheduledFor,
-          },
-          // getNextJob increments attempts when claiming work. A timing deferral
-          // is not an execution failure, so restore that counter.
+          $set:
+            lane === EspnQueueLane.BACKGROUND_RETRY
+              ? {
+                  status: EspnQueueStatus.FAILED,
+                  lane: EspnQueueLane.BACKGROUND_RETRY,
+                  nextAttemptAt: scheduledFor,
+                  failedAt: new Date(),
+                }
+              : {
+                  status: EspnQueueStatus.PENDING,
+                  lane: EspnQueueLane.NORMAL,
+                  scheduledFor,
+                },
+          // A timing deferral is not a failed provider attempt.
           $inc: { attempts: -1 },
           $unset: {
             startedAt: 1,
-            nextAttemptAt: 1,
-            failedAt: 1,
+            heartbeatAt: 1,
+            leaseExpiresAt: 1,
+            ownerId: 1,
             completedAt: 1,
             lastError: 1,
+            ...(lane === EspnQueueLane.BACKGROUND_RETRY
+              ? {}
+              : { nextAttemptAt: 1, failedAt: 1 }),
           },
         },
       )
@@ -1320,145 +1324,143 @@ export class EspnQueueService {
   // FAIL
   // ============================================================
 
-  async markFailed(job: EspnQueueDocument, error: unknown): Promise<void> {
+  async markFailed(
+    job: EspnQueueDocument,
+    error: unknown,
+  ): Promise<{
+    lane: EspnQueueLane;
+    category: EspnQueueFailureCategory;
+    retryCount: number;
+    nextAttemptAt?: Date;
+    quarantined: boolean;
+  }> {
     const message = error instanceof Error ? error.message : String(error);
+    const category = this.classifyFailure(job, error, message);
+    const now = new Date();
+    const workerId = typeof job.ownerId === 'string' ? job.ownerId : undefined;
+    const filter: Record<string, unknown> = {
+      _id: job._id,
+      status: EspnQueueStatus.PROCESSING,
+    };
+    if (workerId) filter.ownerId = workerId;
 
-    // Each persisted YouTube stage corresponds to one bounded outbound search.
-    // Technical/API failures never cause the same stage to issue another call.
-    if (job.type === EspnQueueJobType.YOUTUBE_HIGHLIGHT) {
-      await this.queueModel
-        .updateOne(
-          { _id: job._id },
-          {
-            $set: {
-              status: EspnQueueStatus.FAILED,
-              lastError: message,
-              failedAt: new Date(),
-            },
-            $unset: {
-              nextAttemptAt: 1,
-              startedAt: 1,
-              completedAt: 1,
-            },
-          },
-        )
-        .exec();
-      this.notifyWorker();
-      return;
-    }
+    // A YouTube stage represents one outbound search and must not be replayed:
+    // the provider may have received the request even if our process lost its response.
+    const quarantine =
+      category === EspnQueueFailureCategory.PERMANENT ||
+      category === EspnQueueFailureCategory.NON_REPLAYABLE;
 
-    if (job.attempts < job.maxAttempts) {
-      const exponentialRetryDelayMs =
-        Math.min(15, Math.pow(2, Math.max(job.attempts - 1, 0))) * 60_000;
-      const retryDelayMs = exponentialRetryDelayMs;
-
-      await this.queueModel.updateOne(
-        {
-          _id: job._id,
-        },
-        {
+    if (quarantine) {
+      const result = await this.queueModel
+        .updateOne(filter, {
           $set: {
             status: EspnQueueStatus.FAILED,
+            lane: EspnQueueLane.QUARANTINE,
+            failureCategory: category,
             lastError: message,
-            failedAt: new Date(),
-            nextAttemptAt: new Date(Date.now() + retryDelayMs),
+            failedAt: now,
           },
-          $unset: {
-            startedAt: 1,
-            completedAt: 1,
-          },
-        },
-      );
-      this.notifyWorker();
-
-      return;
-    }
-
-    // A terminal Summary error is a real failure, not a successful completion.
-    // The worker schedules a bounded delayed recovery generation after this
-    // state is durable; if the process crashes first, the watchdog can find it.
-    if (job.type === EspnQueueJobType.SUMMARY_REFRESH) {
-      await this.queueModel.updateOne(
-        { _id: job._id },
-        {
-          $set: {
-            status: EspnQueueStatus.FAILED,
-            lastError: message,
-            failedAt: new Date(),
-          },
+          $min: { firstFailedAt: now },
           $unset: {
             nextAttemptAt: 1,
             startedAt: 1,
+            heartbeatAt: 1,
+            leaseExpiresAt: 1,
+            ownerId: 1,
             completedAt: 1,
           },
-        },
-      );
-      this.notifyWorker();
-      return;
+        })
+        .exec();
+      if ((result.modifiedCount ?? 0) > 0) this.notifyWorker();
+      return {
+        lane: EspnQueueLane.QUARANTINE,
+        category,
+        retryCount: Number(job.retryCount ?? 0),
+        quarantined: true,
+      };
     }
 
-    await this.queueModel.updateOne(
-      {
-        _id: job._id,
-      },
-      {
+    const retryCount = Number(job.retryCount ?? 0) + 1;
+    const delays = SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.retryDelaysMinutes;
+    const delayMinutes =
+      delays[Math.min(retryCount - 1, delays.length - 1)] ?? 1440;
+    const jitterPercent =
+      SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.retryJitterPercent;
+    const jitterFactor = 1 + ((Math.random() * 2 - 1) * jitterPercent) / 100;
+    const retryDelayMs = Math.max(
+      30_000,
+      Math.round(delayMinutes * 60_000 * jitterFactor),
+    );
+    const nextAttemptAt = new Date(now.getTime() + retryDelayMs);
+
+    const result = await this.queueModel
+      .updateOne(filter, {
         $set: {
           status: EspnQueueStatus.FAILED,
+          lane: EspnQueueLane.BACKGROUND_RETRY,
+          failureCategory: category,
           lastError: message,
-          failedAt: new Date(),
-          completedAt: new Date(),
+          failedAt: now,
+          nextAttemptAt,
         },
+        $min: { firstFailedAt: now },
+        $inc: { retryCount: 1 },
         $unset: {
-          nextAttemptAt: 1,
           startedAt: 1,
+          heartbeatAt: 1,
+          leaseExpiresAt: 1,
+          ownerId: 1,
+          completedAt: 1,
         },
-      },
-    );
-    this.notifyWorker();
+      })
+      .exec();
+
+    // If ownership was lost, never overwrite a newer worker's claim or result.
+    if ((result.modifiedCount ?? 0) > 0) this.notifyWorker();
+    return {
+      lane: EspnQueueLane.BACKGROUND_RETRY,
+      category,
+      retryCount,
+      nextAttemptAt,
+      quarantined: false,
+    };
   }
 
-  /**
-   * Schedule a bounded background retry for a terminal Summary failure while
-   * retaining the same event-specific job identity and existing schema.
-   */
-  async scheduleTerminalSummaryRecovery(
-    jobId: string,
-    triggerEventId: string,
-    scheduledFor: Date,
-  ): Promise<boolean> {
-    if (
-      !(scheduledFor instanceof Date) ||
-      Number.isNaN(scheduledFor.getTime())
-    ) {
-      throw new Error('Summary recovery requires a valid scheduledFor date');
+  private classifyFailure(
+    job: EspnQueueDocument,
+    error: unknown,
+    message: string,
+  ): EspnQueueFailureCategory {
+    if (job.type === EspnQueueJobType.YOUTUBE_HIGHLIGHT) {
+      return EspnQueueFailureCategory.NON_REPLAYABLE;
     }
-    const result = await this.queueModel
-      .updateOne(
-        {
-          _id: jobId,
-          type: EspnQueueJobType.SUMMARY_REFRESH,
-          status: EspnQueueStatus.FAILED,
-        },
-        {
-          $set: {
-            status: EspnQueueStatus.PENDING,
-            attempts: 0,
-            scheduledFor,
-            triggerEventId,
-          },
-          $unset: {
-            startedAt: 1,
-            completedAt: 1,
-            failedAt: 1,
-            nextAttemptAt: 1,
-            lastError: 1,
-          },
-        },
+
+    const normalized = message.toLowerCase();
+    if (
+      /invalid (league|queue|job|date|month|endpoint)|unsupported queue job|season mismatch|requires (a|an)|must be a valid|no activecompetition found|malformed job parameters/.test(
+        normalized,
       )
-      .exec();
-    const recovered = (result.modifiedCount ?? 0) > 0;
-    if (recovered) this.notifyWorker();
-    return recovered;
+    ) {
+      return EspnQueueFailureCategory.PERMANENT;
+    }
+    if (
+      /summary.{0,30}(not found|unavailable|not ready|empty)|not yet published|no populated standings|standings are unavailable|empty standings payload|final result.{0,30}(missing|unavailable)|omitted the events array/.test(
+        normalized,
+      )
+    ) {
+      return EspnQueueFailureCategory.DATA_NOT_READY;
+    }
+
+    const status =
+      error &&
+      typeof error === 'object' &&
+      typeof (error as { getStatus?: unknown }).getStatus === 'function'
+        ? Number((error as { getStatus: () => number }).getStatus())
+        : undefined;
+    if (status === 400 || status === 401 || status === 403) {
+      return EspnQueueFailureCategory.PERMANENT;
+    }
+    return EspnQueueFailureCategory.TRANSIENT;
   }
 
   /**
@@ -1477,16 +1479,19 @@ export class EspnQueueService {
         },
         {
           $set: {
-            status: EspnQueueStatus.PENDING,
-            attempts: 0,
-            scheduledFor: new Date(),
+            status: EspnQueueStatus.FAILED,
+            lane: EspnQueueLane.BACKGROUND_RETRY,
+            failureCategory: EspnQueueFailureCategory.TRANSIENT,
+            nextAttemptAt: new Date(),
+            lastError: 'Recovered known legacy standings normalization failure',
           },
           $unset: {
             startedAt: 1,
+            heartbeatAt: 1,
+            leaseExpiresAt: 1,
+            ownerId: 1,
             completedAt: 1,
             failedAt: 1,
-            nextAttemptAt: 1,
-            lastError: 1,
           },
         },
       )
@@ -1497,203 +1502,197 @@ export class EspnQueueService {
     return recovered;
   }
 
-  // ============================================================
-  // TERMINAL WORKFLOW RECOVERY CANDIDATES
-  // ============================================================
-
   /**
-   * Finds recent terminal failures whose successor may not have been queued
-   * before a process restart. The worker reconciles these by deterministic
-   * successor keys; this query never touches fixture documents.
-   */
-  async getTerminalRecoveryCandidates(
-    limit = 50,
-    maximumAgeDays = 7,
-  ): Promise<EspnQueueDocument[]> {
-    const now = Date.now();
-    const cutoff = new Date(now - 60_000);
-    const oldest = new Date(now - maximumAgeDays * 24 * 60 * 60_000);
-    return this.queueModel
-      .find({
-        status: EspnQueueStatus.FAILED,
-        nextAttemptAt: { $exists: false },
-        lastError: { $not: /TERMINAL_RECOVERY_REVIEWED:/ },
-        failedAt: { $gte: oldest, $lte: cutoff },
-        $expr: { $gte: ['$attempts', '$maxAttempts'] },
-        $or: [
-          {
-            type: {
-              $in: [
-                EspnQueueJobType.STANDINGS_REFRESH,
-                EspnQueueJobType.SUMMARY_REFRESH,
-                EspnQueueJobType.LEAGUE_CATALOGUE_REFRESH,
-                EspnQueueJobType.LEAGUE_DETAIL_REFRESH,
-                EspnQueueJobType.SEASON_FIXTURE_BOOTSTRAP,
-              ],
-            },
-          },
-          {
-            type: EspnQueueJobType.FIXTURE_REFRESH,
-            triggerEventId: /^WINDOW_EXTEND:/,
-          },
-          {
-            type: EspnQueueJobType.FIXTURE_REFRESH,
-            triggerEventId: /^(POSTMATCH|FINISHED:)/,
-            scheduledFor: { $gte: new Date(now - 24 * 60 * 60_000) },
-          },
-          {
-            type: EspnQueueJobType.FIXTURE_REFRESH,
-            triggerEventId: { $not: /^(WINDOW_EXTEND:|POSTMATCH|FINISHED:)/ },
-          },
-        ],
-      })
-      .sort({ failedAt: -1 })
-      .limit(Math.max(1, Math.min(200, limit)))
-      .exec();
-  }
-
-  /** Mark a terminal failure as inspected once its recovery decision is durable. */
-  async markTerminalRecoveryReviewed(jobId: string): Promise<void> {
-    const existing = await this.queueModel
-      .findOne({ _id: jobId, status: EspnQueueStatus.FAILED })
-      .select({ lastError: 1 })
-      .lean()
-      .exec();
-    if (
-      !existing ||
-      String(existing.lastError ?? '').includes('TERMINAL_RECOVERY_REVIEWED:')
-    )
-      return;
-    const originalError = String(
-      existing.lastError ?? 'No error message recorded',
-    );
-    await this.queueModel
-      .updateOne(
-        { _id: jobId, status: EspnQueueStatus.FAILED },
-        { $set: { lastError: `TERMINAL_RECOVERY_REVIEWED: ${originalError}` } },
-      )
-      .exec();
-  }
-
-  /**
-   * Repairs retryable FAILED records that predate the retry timestamp contract.
-   * This is a queue-only query and deliberately excludes exhausted jobs.
+   * Adopts legacy FAILED jobs into the durable background-retry lane. This
+   * intentionally includes exhausted legacy jobs: the new retry policy is
+   * independent of the old finite maxAttempts counter.
    */
   async recoverOrphanedFailedJobs(
-    maximumAgeDays = 7,
+    maximumAgeDays = 36500,
     limit = 100,
   ): Promise<number> {
-    const now = Date.now();
+    const now = new Date();
+    const oldest = new Date(
+      now.getTime() - Math.max(1, maximumAgeDays) * 24 * 60 * 60_000,
+    );
     const filter = {
-      type: { $ne: EspnQueueJobType.YOUTUBE_HIGHLIGHT },
       status: EspnQueueStatus.FAILED,
-      nextAttemptAt: { $in: [null] },
-      failedAt: {
-        $lte: new Date(now - 60_000),
-        $gte: new Date(now - maximumAgeDays * 24 * 60 * 60_000),
+      $or: [{ failedAt: { $gte: oldest } }, { failedAt: { $exists: false } }],
+      lane: {
+        $nin: [EspnQueueLane.BACKGROUND_RETRY, EspnQueueLane.QUARANTINE],
       },
-      $expr: { $lt: ['$attempts', '$maxAttempts'] },
     };
     const candidates = await this.queueModel
       .find(filter)
-      .select({ _id: 1 })
-      .sort({ failedAt: 1 })
+      .select({
+        _id: 1,
+        type: 1,
+        lastError: 1,
+        failureCategory: 1,
+        firstFailedAt: 1,
+        failedAt: 1,
+        createdAt: 1,
+      })
+      .sort({ failedAt: 1, createdAt: 1 })
       .limit(Math.max(1, Math.min(500, limit)))
       .lean()
       .exec();
     if (candidates.length === 0) return 0;
 
-    const result = await this.queueModel
-      .updateMany(
-        { ...filter, _id: { $in: candidates.map((job) => job._id) } },
-        {
-          $set: {
-            status: EspnQueueStatus.PENDING,
-            scheduledFor: new Date(now),
-            nextAttemptAt: new Date(now),
+    let adopted = 0;
+    for (const candidate of candidates) {
+      const message = String(
+        candidate.lastError ?? 'Recovered legacy failed job',
+      );
+      const category =
+        candidate.type === EspnQueueJobType.YOUTUBE_HIGHLIGHT
+          ? EspnQueueFailureCategory.NON_REPLAYABLE
+          : candidate.failureCategory === EspnQueueFailureCategory.PERMANENT ||
+              candidate.failureCategory ===
+                EspnQueueFailureCategory.NON_REPLAYABLE
+            ? candidate.failureCategory
+            : this.classifyFailure(candidate, new Error(message), message);
+      const quarantined =
+        category === EspnQueueFailureCategory.PERMANENT ||
+        category === EspnQueueFailureCategory.NON_REPLAYABLE;
+      const result = await this.queueModel
+        .updateOne(
+          {
+            _id: candidate._id,
+            status: EspnQueueStatus.FAILED,
+            lane: {
+              $nin: [EspnQueueLane.BACKGROUND_RETRY, EspnQueueLane.QUARANTINE],
+            },
           },
-          $unset: { startedAt: 1, failedAt: 1, completedAt: 1 },
-        },
-      )
-      .exec();
-    const recovered = result.modifiedCount ?? 0;
-    if (recovered > 0) this.notifyWorker();
-    return recovered;
+          {
+            $set: {
+              lane: quarantined
+                ? EspnQueueLane.QUARANTINE
+                : EspnQueueLane.BACKGROUND_RETRY,
+              failureCategory: category,
+              ...(quarantined ? {} : { nextAttemptAt: now }),
+              lastError: message,
+            },
+            $min: {
+              firstFailedAt:
+                candidate.firstFailedAt ??
+                candidate.failedAt ??
+                (candidate as typeof candidate & { createdAt?: Date })
+                  .createdAt ??
+                now,
+            },
+            $unset: quarantined
+              ? {
+                  nextAttemptAt: 1,
+                  startedAt: 1,
+                  heartbeatAt: 1,
+                  leaseExpiresAt: 1,
+                  ownerId: 1,
+                  completedAt: 1,
+                }
+              : {
+                  startedAt: 1,
+                  heartbeatAt: 1,
+                  leaseExpiresAt: 1,
+                  ownerId: 1,
+                  completedAt: 1,
+                },
+          },
+        )
+        .exec();
+      adopted += result.modifiedCount ?? 0;
+    }
+
+    if (adopted > 0) this.notifyWorker();
+    return adopted;
   }
 
   // ============================================================
   // RECOVER STALE JOBS
   // ============================================================
 
-  async recoverStaleJobs(staleMinutes = 15): Promise<number> {
-    const cutoff = new Date(Date.now() - staleMinutes * 60_000);
-
-    const staleJobs = await this.queueModel
-      .find({
-        status: EspnQueueStatus.PROCESSING,
-        startedAt: { $lte: cutoff },
-      })
-      .exec();
-
+  async recoverStaleJobs(staleMinutes = 8): Promise<number> {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - staleMinutes * 60_000);
+    const staleFilter = {
+      status: EspnQueueStatus.PROCESSING,
+      $or: [
+        { leaseExpiresAt: { $lte: now } },
+        { leaseExpiresAt: { $exists: false }, startedAt: { $lte: cutoff } },
+      ],
+    };
+    const staleJobs = await this.queueModel.find(staleFilter).limit(200).exec();
     if (staleJobs.length === 0) return 0;
 
     let recovered = 0;
     for (const job of staleJobs) {
-      // Compare-and-set prevents a job completed after the initial read from
-      // being accidentally moved back to PENDING by this recovery pass.
-      const isYoutubeSearch = job.type === EspnQueueJobType.YOUTUBE_HIGHLIGHT;
+      const nonReplayable = job.type === EspnQueueJobType.YOUTUBE_HIGHLIGHT;
+      const delayAt = nonReplayable ? undefined : now;
       const update = await this.queueModel
         .updateOne(
           {
             _id: job._id,
             status: EspnQueueStatus.PROCESSING,
-            startedAt: { $lte: cutoff },
+            ownerId: job.ownerId,
+            ...(job.leaseExpiresAt
+              ? { leaseExpiresAt: { $lte: now } }
+              : {
+                  startedAt: { $lte: cutoff },
+                  leaseExpiresAt: { $exists: false },
+                }),
           },
-          isYoutubeSearch
-            ? {
-                $set: {
+          {
+            $set: nonReplayable
+              ? {
                   status: EspnQueueStatus.FAILED,
-                  failedAt: new Date(),
+                  lane: EspnQueueLane.QUARANTINE,
+                  failureCategory: EspnQueueFailureCategory.NON_REPLAYABLE,
+                  failedAt: now,
                   lastError:
-                    'Stale YouTube search stage was not replayed to preserve the per-fixture request cap',
+                    'Interrupted one-shot YouTube search was quarantined to preserve the per-fixture request cap',
+                }
+              : {
+                  status: EspnQueueStatus.FAILED,
+                  lane: EspnQueueLane.BACKGROUND_RETRY,
+                  failureCategory: EspnQueueFailureCategory.TRANSIENT,
+                  failedAt: now,
+                  nextAttemptAt: delayAt,
+                  lastError:
+                    'Recovered expired processing lease; job moved to background retry',
                 },
-                $unset: { startedAt: 1, nextAttemptAt: 1 },
-              }
-            : {
-                $set: {
-                  status: EspnQueueStatus.PENDING,
-                  nextAttemptAt: new Date(),
-                  lastError: 'Recovered stale processing job',
-                },
-                $unset: { startedAt: 1 },
-              },
+            $min: { firstFailedAt: now },
+            $unset: {
+              startedAt: 1,
+              heartbeatAt: 1,
+              leaseExpiresAt: 1,
+              ownerId: 1,
+              completedAt: 1,
+            },
+            ...(nonReplayable ? {} : { $inc: { retryCount: 1 } }),
+          },
         )
         .exec();
 
       if ((update.modifiedCount ?? 0) === 0) continue;
       recovered += 1;
 
-      // A YouTube stage can never be repeated safely after a stale lease because
-      // the remote request may already have reached YouTube before the process
-      // stopped. Other job types keep their normal sync-state recovery path.
-      if (isYoutubeSearch) continue;
-
-      const stateKey = this.sportsSyncStateService.getQueueStateKey({
-        jobType: job.type,
-        leagueId: job.leagueId,
-        season: job.season,
-        eventId: job.eventId,
-        triggerEventId: job.triggerEventId,
-        queueJobKey: job.jobKey,
-      });
-
-      try {
-        await this.sportsSyncStateService.resetInterruptedUnits(
-          stateKey,
-          new Date(Date.now() - staleMinutes * 60_000),
-        );
-      } catch {
-        // Queue recovery remains valid when an old sync-state record is missing.
+      if (!nonReplayable) {
+        const stateKey = this.sportsSyncStateService.getQueueStateKey({
+          jobType: job.type,
+          leagueId: job.leagueId,
+          season: job.season,
+          eventId: job.eventId,
+          triggerEventId: job.triggerEventId,
+          queueJobKey: job.jobKey,
+        });
+        try {
+          await this.sportsSyncStateService.resetInterruptedUnits(
+            stateKey,
+            cutoff,
+          );
+        } catch {
+          // The durable queue remains recoverable even if an old ledger is absent.
+        }
       }
     }
 
@@ -1742,6 +1741,14 @@ export class EspnQueueService {
     },
   ): Promise<EspnQueueDocument> {
     job.status = EspnQueueStatus.PENDING;
+    job.lane = EspnQueueLane.NORMAL;
+    job.retryCount = 0;
+    job.failureCategory = undefined;
+    job.firstFailedAt = undefined;
+    job.lastAttemptAt = undefined;
+    job.ownerId = undefined;
+    job.heartbeatAt = undefined;
+    job.leaseExpiresAt = undefined;
 
     job.priority = params.priority;
 

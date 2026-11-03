@@ -452,3 +452,4 @@ export class FootballDataService implements OnModuleInit {
     throw new ServiceUnavailableException('Football-Data.org request failed');
   }
 }
+

@@ -506,3 +506,4 @@ export class ActiveCompetitionService {
     return typeof value === 'string' ? value.trim().toLowerCase() : '';
   }
 }
+

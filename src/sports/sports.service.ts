@@ -42,3 +42,4 @@ export class SportsService {
     return this.sportsDataReadService.getActiveCompetitions();
   }
 }
+

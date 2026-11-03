@@ -65,3 +65,4 @@ export const FootballDataTeamSchema =
 FootballDataTeamSchema.index({
   name: 1,
 });
+

@@ -69,3 +69,4 @@ export interface OddsApiOutcome {
 
   [key: string]: unknown;
 }
+

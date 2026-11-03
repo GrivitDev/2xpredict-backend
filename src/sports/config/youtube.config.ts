@@ -28,3 +28,4 @@ export const YOUTUBE_CONFIG = {
 } as const;
 
 export type YoutubeConfig = typeof YOUTUBE_CONFIG;
+

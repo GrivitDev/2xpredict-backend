@@ -970,8 +970,8 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     );
 
     this.logger.log(
-      `ESPN STARTUP SUMMARY PHASE started: seasonStart-to-upcomingWindowHours=${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}, ` +
-        `batchSize=${this.startupSummaryBatchSize}. Summary jobs cover each active season from its first calendar day through ${startupWindowEnd.toISOString()} and are processed by the durable queue.`,
+      `ESPN STARTUP SUMMARY PHASE started: recent-and-upcoming window=${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}h, ` +
+        `batchSize=${this.startupSummaryBatchSize}. Only recently played fixtures and fixtures through ${startupWindowEnd.toISOString()} are seeded; older historical enrichment does not block startup.`,
     );
 
     // Fixture collection must complete before Summary state is reconciled.
@@ -995,18 +995,10 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     }> = [];
 
     for (const context of contexts) {
-      // The initial Summary phase covers the season from its first calendar
-      // day through the configured startup-window boundary. It must include past,
-      // live and completed fixtures too; completed matches are still useful
-      // Summary/history evidence for downstream systems.
-      const seasonStartDate = new Date(
-        `${context.fixtureDateFrom}T00:00:00.000Z`,
-      );
-      if (!Number.isFinite(seasonStartDate.getTime())) {
-        throw new Error(
-          `Invalid season start date for ${context.leagueId}/${context.season}: ${context.fixtureDateFrom}`,
-        );
-      }
+      // Keep startup Summary work bounded to the last 24 hours plus the
+      // configured 72-hour upcoming horizon. Older historical enrichment is
+      // not a startup prerequisite and must not hold normal operations hostage.
+      const summaryWindowStart = new Date(Date.now() - 24 * 60 * 60_000);
 
       const state = await this.sportsSyncStateService.ensureSummaryRefreshState(
         {
@@ -1014,7 +1006,7 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
           season: context.season,
           priority: context.priority,
           trackingMode: 'WINDOW',
-          kickoffWindowStart: seasonStartDate,
+          kickoffWindowStart: summaryWindowStart,
           kickoffWindowEnd: startupWindowEnd,
         },
       );
@@ -1023,7 +1015,7 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       const eligibleEventIds =
         await this.sportsSyncStateService.getSummaryEventIdsInWindow(
           state.stateKey,
-          seasonStartDate,
+          summaryWindowStart,
           startupWindowEnd,
         );
       const refreshedState = await this.sportsSyncStateService.requireState(
@@ -1109,18 +1101,17 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
         startupSummaryContexts,
       );
 
+    // Summary jobs remain durable and continue through the normal/retry worker
+    // after startup. Prediction eligibility still enforces required data.
     if (workerResult.failed > 0) {
-      throw new Error(
-        `Startup Summary collection failed for ${workerResult.failed} fixture(s); ` +
-          'normal operations remain locked until the required Summary data is collected.',
-      );
+      this.logger.warn(`Startup Summary left ${workerResult.failed} item(s) for background recovery.`);
     }
 
     this.logger.log(
       `ESPN STARTUP SUMMARY PHASE resolved: checked=${checked}, ` +
         `missing=${missingSummary}, queued=${queued}, ` +
         `processed=${workerResult.succeeded}, ` +
-        `seasonStart-through-${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}hAhead.`,
+        `recent-and-upcoming-through-${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}hAhead.`,
     );
 
     return {
@@ -1320,3 +1311,4 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     });
   }
 }
+

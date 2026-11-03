@@ -87,3 +87,4 @@ export function hasFootballDataCoverage(espnLeagueSlug: string): boolean {
     getFootballDataCompetitionByEspnLeagueSlug(espnLeagueSlug) !== undefined
   );
 }
+

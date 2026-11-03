@@ -53,3 +53,4 @@ export interface YoutubeHighlight {
 
   error?: string;
 }
+

@@ -44,3 +44,4 @@ EspnStandingSchema.index(
   },
 );
 EspnStandingSchema.index({ fetchedAt: -1 });
+

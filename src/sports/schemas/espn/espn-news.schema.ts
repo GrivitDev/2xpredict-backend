@@ -130,3 +130,4 @@ EspnNewsSchema.index({ feedPublishedAt: -1, _id: 1 });
 EspnNewsSchema.index({ kind: 1, feedPublishedAt: -1 });
 EspnNewsSchema.index({ leagueIds: 1, kind: 1, feedPublishedAt: -1 });
 EspnNewsSchema.index({ teamIds: 1, kind: 1, feedPublishedAt: -1 });
+

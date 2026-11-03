@@ -29,3 +29,4 @@ export interface SportsDataFilter {
    */
   teamId?: string;
 }
+
