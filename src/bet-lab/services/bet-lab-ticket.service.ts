@@ -29,6 +29,7 @@ import { BetLabEventService } from './bet-lab-event.service';
 import { BetLabMarketService } from './bet-lab-market.service';
 import { BetLabWalletService } from './bet-lab-wallet.service';
 import { roundDecimal } from '../utils/odds.util';
+import { findBetLabSelectionCompatibilityError } from '../utils/bet-lab-selection-compatibility.util';
 import { AdminGateway } from '../../realtime/admin.gateway';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
 
@@ -104,11 +105,10 @@ export class BetLabTicketService {
     this.validateStake(dto.stake);
     if (
       !Array.isArray(dto.legs) ||
-      dto.legs.length < BET_LAB_CONFIG.tickets.minimumAccumulatorLegs ||
-      dto.legs.length > BET_LAB_CONFIG.tickets.maximumAccumulatorLegs
+      dto.legs.length < BET_LAB_CONFIG.tickets.minimumAccumulatorLegs
     ) {
       throw new BadRequestException(
-        `Accumulator slips must contain ${BET_LAB_CONFIG.tickets.minimumAccumulatorLegs}–${BET_LAB_CONFIG.tickets.maximumAccumulatorLegs} selections.`,
+        `Accumulator slips must contain at least ${BET_LAB_CONFIG.tickets.minimumAccumulatorLegs} selections.`,
       );
     }
     const requests: BetLabSelectionRequest[] = dto.legs.map((leg) =>
@@ -119,16 +119,10 @@ export class BetLabTicketService {
       }),
     );
 
-    // Standard accumulators are independently priced across separate fixtures.
-    // A same-match combination has correlated outcomes and cannot safely use
-    // multiplied standalone prices. It must wait for a true joint-priced
-    // Bet Builder rather than silently overstate a ticket's odds.
+    // Multiple compatible selections from the same fixture are valid. The
+    // server rechecks the complete combination after resolving canonical
+    // market selections, so clients cannot bypass contradiction validation.
     const eventIds = requests.map((request) => request.eventId);
-    if (new Set(eventIds).size !== eventIds.length) {
-      throw new BadRequestException(
-        'Ordinary accumulators allow only one selection per match. Same-match combinations require a separately joint-priced Bet Builder.',
-      );
-    }
     const fingerprint = this.fingerprint(
       BetLabTicketType.ACCUMULATOR,
       dto.stake,
@@ -153,6 +147,9 @@ export class BetLabTicketService {
 
     try {
       const quotes = await this.resolveSelectionQuotes(requests);
+      const compatibilityError = findBetLabSelectionCompatibilityError(quotes);
+      if (compatibilityError) throw new BadRequestException(compatibilityError);
+
       const ticket = await this.placeTicketAtomic(
         userId,
         BetLabTicketType.ACCUMULATOR,
@@ -460,12 +457,9 @@ export class BetLabTicketService {
         );
       }
       combined *= price;
-      if (
-        !Number.isFinite(combined) ||
-        combined > BET_LAB_CONFIG.tickets.maximumCombinedOdds
-      ) {
+      if (!Number.isFinite(combined)) {
         throw new BadRequestException(
-          'Combined odds exceed the configured limit.',
+          'Combined odds exceed the supported numeric range.',
         );
       }
     }
@@ -570,5 +564,6 @@ export class BetLabTicketService {
     );
   }
 }
+
 
 

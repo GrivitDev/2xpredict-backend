@@ -1,6 +1,5 @@
 import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize,
   ArrayMinSize,
   IsArray,
   IsIn,
@@ -38,7 +37,6 @@ export class BetLabSlipLegDto {
 export class PlaceBetLabSlipDto {
   @IsArray()
   @ArrayMinSize(BET_LAB_CONFIG.tickets.minimumAccumulatorLegs)
-  @ArrayMaxSize(BET_LAB_CONFIG.tickets.maximumAccumulatorLegs)
   @ValidateNested({ each: true })
   @Type(() => BetLabSlipLegDto)
   legs!: BetLabSlipLegDto[];
@@ -54,4 +52,5 @@ export class PlaceBetLabSlipDto {
   @Matches(/^[a-zA-Z0-9:_-]+$/)
   idempotencyKey!: string;
 }
+
 

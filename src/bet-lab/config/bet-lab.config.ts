@@ -14,11 +14,8 @@ export const BET_LAB_CONFIG = {
     maximumPotentialReturn: Number.MAX_SAFE_INTEGER,
   },
   tickets: {
-    maximumAccumulatorLegs: 20,
     minimumAccumulatorLegs: 2,
     settledTicketRetentionDays: 7,
-    /** Odds products above this guard are rejected to avoid numeric overflow. */
-    maximumCombinedOdds: 1_000_000,
   },
   odds: {
     minimumDecimalOdds: 1.01,
@@ -35,4 +32,5 @@ export const BET_LAB_CONFIG = {
 
 export type BetLabPlan =
   keyof typeof BET_LAB_CONFIG.virtualPoints.monthlyAllowanceByPlan;
+
 
