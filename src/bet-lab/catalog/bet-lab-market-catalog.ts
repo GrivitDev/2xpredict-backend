@@ -2,26 +2,15 @@ import { BetLabMarketCategory } from '../enums/bet-lab-market-category.enum';
 import { BetLabMarketCode } from '../enums/bet-lab-market-code.enum';
 import {
   CanonicalMarketDefinition,
+  CanonicalPeriod,
+  CanonicalSelectionMode,
   FOOTBALL_MARKET_CATALOG as CANONICAL_MARKETS,
   canonicalLineSlug,
   expandCanonicalSelections,
 } from '../../odds/catalog/football-market-catalog';
 
-export type BetLabPeriod = 'FULL_TIME' | 'FIRST_HALF' | 'SECOND_HALF' | 'MATCH';
-export type BetLabSelectionMode =
-  | 'STATIC'
-  | 'OVER_UNDER'
-  | 'ASIAN_HANDICAP'
-  | 'EUROPEAN_HANDICAP'
-  | 'CORRECT_SCORE'
-  | 'HALF_TIME_CORRECT_SCORE'
-  | 'PLAYER_ANYTIME'
-  | 'PLAYER_FIRST_SCORER'
-  | 'PLAYER_BOOKING'
-  | 'PLAYER_SENDING_OFF'
-  | 'PLAYER_SHOTS'
-  | 'PLAYER_SHOTS_ON_TARGET'
-  | 'PLAYER_ASSIST';
+export type BetLabPeriod = CanonicalPeriod;
+export type BetLabSelectionMode = CanonicalSelectionMode;
 
 export interface BetLabSelectionDefinition {
   code: string;
@@ -55,36 +44,103 @@ export interface BetLabMarketDefinition {
 export interface BetLabMarketExpansionContext {
   homeTeamName: string;
   awayTeamName: string;
-  players?: Array<{ id: string; name: string; abbreviation: string; teamId?: string }>;
+  players?: Array<{
+    id: string;
+    name: string;
+    abbreviation: string;
+    teamId?: string;
+  }>;
 }
 
 function categoryFor(market: CanonicalMarketDefinition): BetLabMarketCategory {
-  if (market.id === 'TOTAL_CORNERS_OVER_UNDER') return BetLabMarketCategory.CORNERS;
+  if (market.id === 'TOTAL_CORNERS_OVER_UNDER')
+    return BetLabMarketCategory.CORNERS;
   if (market.id === 'TOTAL_CARDS_OVER_UNDER') return BetLabMarketCategory.CARDS;
   switch (market.family) {
-    case 'RESULT': return BetLabMarketCategory.MATCH_RESULT;
-    case 'GOALS': return BetLabMarketCategory.GOALS;
-    case 'PERIOD': return BetLabMarketCategory.HALF_TIME;
-    case 'HANDICAP': return BetLabMarketCategory.HANDICAP;
-    default: return BetLabMarketCategory.STATISTICS;
+    case 'RESULT':
+      return BetLabMarketCategory.MATCH_RESULT;
+    case 'GOALS':
+      return BetLabMarketCategory.GOALS;
+    case 'PERIOD':
+      return BetLabMarketCategory.HALF_TIME;
+    case 'HANDICAP':
+      return BetLabMarketCategory.HANDICAP;
+    default:
+      return BetLabMarketCategory.STATISTICS;
   }
 }
 
-export const BET_LAB_MARKET_CATALOG: BetLabMarketDefinition[] = CANONICAL_MARKETS.map((market) => ({
-  code: market.betLabMarketCode as BetLabMarketCode,
-  jsonVariable: market.jsonVariable,
-  fullName: market.fullName,
-  abbreviation: market.abbreviation,
-  category: categoryFor(market),
-  period: market.period,
-  selectionMode: market.selectionMode,
-  selections: market.selections.map((selection) => ({ ...selection, code: selection.key })),
-  lines: market.lines ? [...market.lines] : undefined,
-  notes: market.notes,
-}));
+export const BET_LAB_MARKET_CATALOG: BetLabMarketDefinition[] =
+  CANONICAL_MARKETS.map((market) => ({
+    code: market.betLabMarketCode as BetLabMarketCode,
+    jsonVariable: market.jsonVariable,
+    fullName: market.fullName,
+    abbreviation: market.abbreviation,
+    category: categoryFor(market),
+    period: market.period,
+    selectionMode: market.selectionMode,
+    selections: market.selections.map((selection) => ({
+      ...selection,
+      code: selection.key,
+    })),
+    lines: market.lines ? [...market.lines] : undefined,
+    notes: market.notes,
+  }));
 
-export const BET_LAB_MARKET_BY_CODE = new Map<BetLabMarketCode, BetLabMarketDefinition>(
-  BET_LAB_MARKET_CATALOG.map((market) => [market.code, market]),
+// BetLab exposes a derived read-only catalogue; it cannot add or mutate markets.
+for (const market of BET_LAB_MARKET_CATALOG) {
+  for (const selection of market.selections) Object.freeze(selection);
+  Object.freeze(market.selections);
+  if (market.lines) Object.freeze(market.lines);
+  Object.freeze(market);
+}
+Object.freeze(BET_LAB_MARKET_CATALOG);
+
+function createReadonlyMap<K, V>(
+  entries: Iterable<readonly [K, V]>,
+): ReadonlyMap<K, V> {
+  const source = new Map<K, V>(entries);
+  const view: ReadonlyMap<K, V> = {
+    get size() {
+      return source.size;
+    },
+    get(key: K) {
+      return source.get(key);
+    },
+    has(key: K) {
+      return source.has(key);
+    },
+    entries(): MapIterator<[K, V]> {
+      return source.entries();
+    },
+    keys(): MapIterator<K> {
+      return source.keys();
+    },
+    values(): MapIterator<V> {
+      return source.values();
+    },
+    forEach(callback, thisArg) {
+      source.forEach((value, key) => {
+        callback.call(thisArg, value, key, view);
+      });
+    },
+    [Symbol.iterator](): MapIterator<[K, V]> {
+      return source[Symbol.iterator]();
+    },
+  };
+  return Object.freeze(view);
+}
+
+export const BET_LAB_MARKET_BY_CODE: ReadonlyMap<
+  BetLabMarketCode,
+  BetLabMarketDefinition
+> = createReadonlyMap(
+  BET_LAB_MARKET_CATALOG.map((market) => [market.code, market] as const),
+);
+
+/** Active API market allow-list derived exclusively from the Odds catalogue. */
+export const BET_LAB_ACTIVE_MARKET_CODES: readonly string[] = Object.freeze(
+  BET_LAB_MARKET_CATALOG.map((market) => String(market.code)),
 );
 
 export function formatLine(line: number): string {
@@ -96,11 +152,17 @@ export function lineSlug(line: number): string {
   return canonicalLineSlug(line);
 }
 
-export function overUnderSelectionCode(side: 'OVER' | 'UNDER', line: number): string {
+export function overUnderSelectionCode(
+  side: 'OVER' | 'UNDER',
+  line: number,
+): string {
   return `${side}_${lineSlug(line)}`;
 }
 
-export function handicapSelectionCode(side: 'HOME' | 'AWAY', line: number): string {
+export function handicapSelectionCode(
+  side: 'HOME' | 'AWAY',
+  line: number,
+): string {
   return `${side}_${lineSlug(line)}`;
 }
 
@@ -108,35 +170,52 @@ export function expandMarketSelections(
   market: BetLabMarketDefinition,
   context: BetLabMarketExpansionContext,
 ): BetLabSelectionDefinition[] {
-  const definition = CANONICAL_MARKETS.find((item) => item.betLabMarketCode === market.code);
+  const definition = CANONICAL_MARKETS.find(
+    (item) => String(item.betLabMarketCode) === String(market.code),
+  );
   if (!definition) return [];
-  return expandCanonicalSelections(definition, context.homeTeamName, context.awayTeamName).map((selection) => ({
+  return expandCanonicalSelections(
+    definition,
+    context.homeTeamName,
+    context.awayTeamName,
+  ).map((selection) => ({
     code: selection.key,
     jsonVariable: selection.jsonVariable,
     fullName: selection.fullName,
     abbreviation: selection.abbreviation,
     settlementKey: selection.settlementKey,
     ...(selection.line !== undefined ? { line: selection.line } : {}),
-    ...(selection.handicap !== undefined ? { handicap: selection.handicap } : {}),
+    ...(selection.handicap !== undefined
+      ? { handicap: selection.handicap }
+      : {}),
   }));
 }
 
 export function assertBetLabCatalogValid(): void {
   const seenMarkets = new Set<string>();
   for (const market of BET_LAB_MARKET_CATALOG) {
-    if (seenMarkets.has(market.code)) throw new Error(`Duplicate Bet Lab market code: ${market.code}`);
+    if (seenMarkets.has(market.code))
+      throw new Error(`Duplicate Bet Lab market code: ${market.code}`);
     seenMarkets.add(market.code);
     const selectionKeys = new Set<string>();
-    for (const selection of expandMarketSelections(market, { homeTeamName: 'Home', awayTeamName: 'Away' })) {
+    for (const selection of expandMarketSelections(market, {
+      homeTeamName: 'Home',
+      awayTeamName: 'Away',
+    })) {
       if (!selection.code.trim() || !selection.settlementKey.trim()) {
         throw new Error(`Market ${market.code} has an incomplete selection.`);
       }
-      if (selectionKeys.has(selection.code)) throw new Error(`Duplicate selection ${selection.code} in ${market.code}`);
+      if (selectionKeys.has(selection.code))
+        throw new Error(
+          `Duplicate selection ${selection.code} in ${market.code}`,
+        );
       selectionKeys.add(selection.code);
     }
   }
   if (BET_LAB_MARKET_CATALOG.length !== 16) {
-    throw new Error(`Expected 16 Bet Lab market groups, found ${BET_LAB_MARKET_CATALOG.length}.`);
+    throw new Error(
+      `Expected 16 Bet Lab market groups, found ${BET_LAB_MARKET_CATALOG.length}.`,
+    );
   }
 }
 

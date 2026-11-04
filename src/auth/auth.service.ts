@@ -256,10 +256,18 @@ export class AuthService {
   // REQUEST PASSWORD RESET
   // ======================
   async requestPasswordReset(email: string) {
-    const user = await this.usersService.findByEmailWithPassword(email);
+    if (typeof email !== 'string' || !email.trim()) {
+      throw new BadRequestException('Enter a valid email address.');
+    }
 
+    const normalizedEmail = email.trim().toLowerCase();
+    const responseMessage =
+      'If an account exists for that email address, password reset instructions have been sent.';
+    const user = await this.usersService.findByEmailWithPassword(normalizedEmail);
+
+    // Do not reveal whether an email address is registered.
     if (!user) {
-      throw new BadRequestException('User not found');
+      return { message: responseMessage };
     }
 
     const rawToken = crypto.randomBytes(32).toString('hex');
@@ -280,9 +288,7 @@ export class AuthService {
       `&token=${encodeURIComponent(rawToken)}`;
 
     await this.emailService.sendPasswordResetEmail(user.email, resetLink);
-    return {
-      message: 'Password reset email sent.',
-    };
+    return { message: responseMessage };
   }
 
   // ======================

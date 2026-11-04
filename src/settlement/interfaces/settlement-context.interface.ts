@@ -96,6 +96,8 @@ export interface SettlementProcessResult {
   eventId: string;
   sourceFingerprint: string;
   partial: boolean;
+  /** True when the worker safely declines a stale/non-final lifecycle job. */
+  skipped?: boolean;
   counts: SettlementTargetCounts;
   unresolvedReasons: string[];
 }

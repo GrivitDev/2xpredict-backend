@@ -152,7 +152,7 @@ function attachSelectionTemplates(
     : definition;
 }
 
-export const FOOTBALL_MARKET_CATALOG: MarketDefinition[] =
+export const FOOTBALL_MARKET_CATALOG: readonly MarketDefinition[] =
   CANONICAL_MARKETS.map((market) =>
     attachSelectionTemplates({
       key: market.predictionMarketKey as PredictionMarket,
@@ -174,8 +174,64 @@ export const FOOTBALL_MARKET_CATALOG: MarketDefinition[] =
     }),
   );
 
-export const MARKET_DEFINITION_BY_KEY = new Map(
-  FOOTBALL_MARKET_CATALOG.map((definition) => [definition.key, definition]),
+function freezeRecursively<T>(value: T): T {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value))
+    return value;
+  for (const nested of Object.values(value as Record<string, unknown>)) {
+    freezeRecursively(nested);
+  }
+  return Object.freeze(value);
+}
+
+// The engine catalogue is a derived view. Freeze its definitions and nested
+// selection templates so a consumer cannot mutate the active market set.
+for (const definition of FOOTBALL_MARKET_CATALOG) {
+  freezeRecursively(definition);
+}
+Object.freeze(FOOTBALL_MARKET_CATALOG);
+
+function createReadonlyMap<K, V>(
+  entries: Iterable<readonly [K, V]>,
+): ReadonlyMap<K, V> {
+  const source = new Map<K, V>(entries);
+  const view: ReadonlyMap<K, V> = {
+    get size() {
+      return source.size;
+    },
+    get(key: K) {
+      return source.get(key);
+    },
+    has(key: K) {
+      return source.has(key);
+    },
+    entries() {
+      return source.entries();
+    },
+    keys() {
+      return source.keys();
+    },
+    values() {
+      return source.values();
+    },
+    forEach(callback, thisArg) {
+      source.forEach((value, key) => {
+        callback.call(thisArg, value, key, view);
+      });
+    },
+    [Symbol.iterator](): MapIterator<[K, V]> {
+      return source[Symbol.iterator]();
+    },
+  };
+  return Object.freeze(view);
+}
+
+export const MARKET_DEFINITION_BY_KEY: ReadonlyMap<
+  PredictionMarket,
+  MarketDefinition
+> = createReadonlyMap(
+  FOOTBALL_MARKET_CATALOG.map(
+    (definition) => [definition.key, definition] as const,
+  ),
 );
 
 export function getMarketDefinition(key: string): MarketDefinition | undefined {

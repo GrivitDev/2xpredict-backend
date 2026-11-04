@@ -10,6 +10,7 @@ import {
 import { SettlementJobStatus } from '../enums/settlement-job-status.enum';
 import { SETTLEMENT_CONFIG } from '../config/settlement.config';
 import { createSettlementSourceFingerprint } from '../utils/summary-fingerprint.util';
+import { isFixtureRefreshConfirmedFinished } from '../utils/fixture-lifecycle.util';
 
 interface FixtureRecord {
   eventId?: unknown;
@@ -23,7 +24,6 @@ interface FixtureRecord {
   awayScore?: unknown;
   payload?: unknown;
   collectedAt?: unknown;
-  fixtureDate?: unknown;
 }
 
 @Injectable()
@@ -47,21 +47,19 @@ export class SettlementQueueService {
   }
 
   /**
-   * Enqueue once the fixture kickoff is at least 180 minutes old; the recovery scan ensures no eligible match is missed by +190 minutes.
-   * Kickoff time is the sole eligibility rule; Summary data and fixture status
-   * never gate job creation. Every eligible job is immediately runnable.
+   * Queue settlement only after an ESPN fixture/scoreboard refresh has persisted
+   * an explicit finished state. Kickoff age and Summary status are not lifecycle
+   * signals. Target creation and Summary updates may re-evaluate a fixture, but
+   * cannot make an unfinished fixture eligible.
    */
-  async enqueueIfKickoffEligible(
+  async enqueueForConfirmedFinishedFixture(
     eventIdValue: string,
     _leagueIdValue?: string,
-    triggerReason = 'KICKOFF_SCAN',
+    triggerReason = 'FIXTURE_REFRESHED',
   ) {
     const eventId = String(eventIdValue ?? '').trim();
     if (!eventId) return { enqueued: false, reason: 'EMPTY_EVENT_ID' as const };
 
-    // ESPN eventId is the canonical unique fixture key. Do not narrow the lookup
-    // by a caller-supplied league label/ID: normalization/casing differences must
-    // never prevent settlement for a valid event.
     const fixture = (await this.fixtureModel
       .findOne({ eventId })
       .select({
@@ -75,29 +73,21 @@ export class SettlementQueueService {
         awayScore: 1,
         payload: 1,
         collectedAt: 1,
-        fixtureDate: 1,
       })
       .lean()
       .exec()) as unknown as FixtureRecord | null;
 
     if (!fixture)
       return { enqueued: false, reason: 'FIXTURE_NOT_FOUND' as const };
-
-    const kickoff = this.toDate(fixture.fixtureDate);
-    if (!kickoff)
-      return { enqueued: false, reason: 'INVALID_KICKOFF_TIME' as const };
-
-    const eligibleAt = new Date(kickoff.getTime() + SETTLEMENT_CONFIG.queue.kickoffSettlementDelayMinutes * 60_000);
-    const now = new Date();
-    if (eligibleAt.getTime() > now.getTime()) {
+    if (!isFixtureRefreshConfirmedFinished(fixture)) {
       return {
         enqueued: false,
-        reason: 'KICKOFF_WINDOW_NOT_REACHED' as const,
-        eligibleAt,
+        reason: 'FIXTURE_NOT_CONFIRMED_FINISHED_BY_FIXTURE_REFRESH' as const,
       };
     }
 
     const payload = this.asRecord(fixture.payload) ?? {};
+    const now = new Date();
     const sourceFingerprint = createSettlementSourceFingerprint(fixture);
     const sourceAt =
       this.toDate(payload.summaryCollectedAt ?? fixture.collectedAt) ?? now;
@@ -175,8 +165,8 @@ export class SettlementQueueService {
     }
 
     // Incomplete or failed work must not become permanently inactive. New-target
-    // events bypass the cooldown; discovery retries terminal jobs only when their
-    // persisted nextRunAt has elapsed.
+    // events bypass the cooldown; later fixture/summary/target events can reawaken
+    // the same source snapshot once its persisted recovery time has elapsed.
     const recoverableStatuses = [
       SettlementJobStatus.COMPLETED,
       SettlementJobStatus.PARTIAL,
@@ -277,8 +267,8 @@ export class SettlementQueueService {
 
     if (job.status === SettlementJobStatus.RETRY) {
       // Do not wake the worker for a retry that is still inside its backoff.
-      // The worker keeps a durable timer for nextRunAt and the discovery scan
-      // will also wake it once that time has elapsed.
+      // The worker keeps a durable timer for nextRunAt; fresh fixture/target
+      // events can also wake it when a new pass is justified.
       const retryAt = this.toDate(job.nextRunAt) ?? now;
       const isDue = retryAt.getTime() <= now.getTime();
       if (isDue) this.signal.emit('queued');
@@ -404,6 +394,7 @@ export class SettlementQueueService {
     job: SettlementJobDocument,
     input: {
       partial: boolean;
+      skipped?: boolean;
       counts: Record<string, number>;
       unresolvedReasons: string[];
       durationMs: number;
@@ -420,13 +411,17 @@ export class SettlementQueueService {
         },
         {
           $set: {
-            status: input.partial
-              ? SettlementJobStatus.PARTIAL
-              : SettlementJobStatus.COMPLETED,
+            status: input.skipped
+              ? SettlementJobStatus.SKIPPED
+              : input.partial
+                ? SettlementJobStatus.PARTIAL
+                : SettlementJobStatus.COMPLETED,
             nextRunAt: new Date(Date.now() + (
-              input.partial
-                ? SETTLEMENT_CONFIG.queue.partialRetryDelayMs
-                : SETTLEMENT_CONFIG.queue.completedTargetRecoveryIntervalMs
+              input.skipped
+                ? SETTLEMENT_CONFIG.queue.skippedRecoveryIntervalMs
+                : input.partial
+                  ? SETTLEMENT_CONFIG.queue.partialRetryDelayMs
+                  : SETTLEMENT_CONFIG.queue.completedTargetRecoveryIntervalMs
             )),
             resultCounts: input.counts,
             unresolvedReasons: input.unresolvedReasons.slice(0, 100),
@@ -565,21 +560,14 @@ export class SettlementQueueService {
         live: 1,
         payload: 1,
         collectedAt: 1,
-        fixtureDate: 1,
       })
       .lean()
       .exec()) as unknown as FixtureRecord | null;
     if (!fixture) return { queued: false, reason: 'FIXTURE_NOT_FOUND' };
-    const kickoff = this.toDate(fixture.fixtureDate);
-    if (!kickoff) return { queued: false, reason: 'INVALID_KICKOFF_TIME' };
-    const eligibleAt = new Date(
-      kickoff.getTime() +
-        SETTLEMENT_CONFIG.queue.kickoffSettlementDelayMinutes * 60_000,
-    );
-    if (eligibleAt.getTime() > Date.now()) {
+    if (!isFixtureRefreshConfirmedFinished(fixture)) {
       return {
         queued: false,
-        reason: `KICKOFF_WINDOW_NOT_REACHED; eligible at ${eligibleAt.toISOString()}`,
+        reason: 'FIXTURE_NOT_CONFIRMED_FINISHED_BY_FIXTURE_REFRESH',
       };
     }
 

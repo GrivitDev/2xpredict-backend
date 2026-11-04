@@ -38,7 +38,6 @@ export const PREDICTION_ENGINE_CONFIG = {
     minimumExpectedGoals: 0.15,
     maximumExpectedGoals: 4.25,
     sourceSummaryStaleHours: 48,
-    maximumProviderOddsAgeHours: 72,
   },
   selectionEligibility: {
     /** Broad input-sanity bounds only; do not use these as betting-price bands. */

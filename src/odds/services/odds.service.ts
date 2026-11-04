@@ -3,8 +3,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
 import { FixtureOdds } from '../schemas/fixture-odds.schema';
-import { ODDS_CONFIG } from '../config/odds.config';
-import { PREDICTION_ENGINE_CONFIG } from '../../predictions-engine/config/prediction-engine.config';
+import { ODDS_CONFIG, isOddsQuoteFresh } from '../config/odds.config';
 import {
   CanonicalProviderQuote,
   StoredOddsProvider,
@@ -22,6 +21,7 @@ const RETAIN_AFTER_COMPLETION_DAYS = 7;
 const MINIMUM_STAT_SAMPLE = 3;
 const MAX_DECIMAL_ODDS = 100000;
 const MAX_GOALS = 10;
+const MAX_NO_PRICE_EVALUATION_CACHE_ENTRIES = 2_000;
 
 type PlainRecord = Record<string, any>;
 type ExpiryFixture = {
@@ -191,7 +191,7 @@ export class OddsService {
   }
 
   async getFixturePrices(eventId: string): Promise<any[]> {
-    return this.oddsModel
+    const rows = await this.oddsModel
       .find({
         eventId: String(eventId).trim(),
         $or: [
@@ -199,9 +199,106 @@ export class OddsService {
           { expiresAt: { $gt: new Date() } },
         ],
       })
-      .sort({ marketId: 1, selectionKey: 1, line: 1 })
+      .select({
+        _id: 0,
+        eventId: 1,
+        marketId: 1,
+        selectionKey: 1,
+        line: 1,
+        decimalOdds: 1,
+        priceType: 1,
+        provider: 1,
+        bookmaker: 1,
+        fairOdds: 1,
+        fairOddsBasis: 1,
+        marketFairOdds: 1,
+        impliedProbability: 1,
+        valuePercent: 1,
+        oddsBasis: 1,
+        oddsCalculationMethod: 1,
+        providerUpdatedAt: 1,
+        updatedAt: 1,
+        predictionReady: 1,
+      })
       .lean()
       .exec();
+    return rows.map((row) => this.attachQuoteFreshness(row));
+  }
+
+  /**
+   * Read only the exact selections needed by a BetLab slip. This keeps quote
+   * reads proportional to the requested legs instead of loading every market
+   * and line for each fixture.
+   */
+  async getPricesForSelections(
+    selections: Array<{
+      eventId: string;
+      marketId: string;
+      selectionKey: string;
+      line?: number;
+    }>,
+  ): Promise<any[]> {
+    const unique = new Map<string, {
+      eventId: string;
+      marketId: string;
+      selectionKey: string;
+      line?: number;
+    }>();
+    for (const item of selections) {
+      const eventId = String(item.eventId ?? '').trim();
+      const marketId = String(item.marketId ?? '').trim();
+      const selectionKey = String(item.selectionKey ?? '').trim();
+      if (!eventId || !marketId || !selectionKey) continue;
+      const line = item.line === undefined ? undefined : Number(item.line);
+      if (line !== undefined && !Number.isFinite(line)) continue;
+      const key = `${eventId}:${marketId}:${selectionKey}:${line ?? '-'}`;
+      unique.set(key, { eventId, marketId, selectionKey, ...(line !== undefined ? { line } : {}) });
+    }
+    const refs = [...unique.values()];
+    if (!refs.length) return [];
+
+    const selectionFilters = refs.map((item) => ({
+      eventId: item.eventId,
+      marketId: item.marketId,
+      selectionKey: item.selectionKey,
+      ...(item.line !== undefined
+        ? { line: item.line }
+        : { $or: [{ line: { $exists: false } }, { line: null }] }),
+    }));
+    const rows = await this.oddsModel
+      .find({
+        $or: selectionFilters,
+        $and: [{
+          $or: [
+            { expiresAt: { $exists: false } },
+            { expiresAt: { $gt: new Date() } },
+          ],
+        }],
+      })
+      .select({
+        _id: 0,
+        eventId: 1,
+        marketId: 1,
+        selectionKey: 1,
+        line: 1,
+        decimalOdds: 1,
+        priceType: 1,
+        provider: 1,
+        bookmaker: 1,
+        fairOdds: 1,
+        fairOddsBasis: 1,
+        marketFairOdds: 1,
+        impliedProbability: 1,
+        valuePercent: 1,
+        oddsBasis: 1,
+        oddsCalculationMethod: 1,
+        providerUpdatedAt: 1,
+        updatedAt: 1,
+        predictionReady: 1,
+      })
+      .lean()
+      .exec();
+    return rows.map((row) => this.attachQuoteFreshness(row));
   }
 
   async getPricesForFixtures(eventIds: string[]): Promise<any[]> {
@@ -209,41 +306,39 @@ export class OddsService {
       ...new Set(eventIds.map((id) => String(id).trim()).filter(Boolean)),
     ];
     if (!ids.length) return [];
-    return (
-      this.oddsModel
-        .find({
-          eventId: { $in: ids },
-          $or: [
-            { expiresAt: { $exists: false } },
-            { expiresAt: { $gt: new Date() } },
-          ],
-        })
-        // Bet Lab and Odds Center consume this canonical price contract only.
-        // Avoid transferring internal bookkeeping fields from every matched row.
-        .select({
-          _id: 0,
-          eventId: 1,
-          marketId: 1,
-          selectionKey: 1,
-          line: 1,
-          decimalOdds: 1,
-          priceType: 1,
-          provider: 1,
-          bookmaker: 1,
-          fairOdds: 1,
-          fairOddsBasis: 1,
-          marketFairOdds: 1,
-          impliedProbability: 1,
-          valuePercent: 1,
-          oddsBasis: 1,
-          oddsCalculationMethod: 1,
-          providerUpdatedAt: 1,
-          updatedAt: 1,
-          predictionReady: 1,
-        })
-        .lean()
-        .exec()
-    );
+    const rows = await this.oddsModel
+      .find({
+        eventId: { $in: ids },
+        $or: [
+          { expiresAt: { $exists: false } },
+          { expiresAt: { $gt: new Date() } },
+        ],
+      })
+      // Consumers receive the canonical quote contract, not internal fields.
+      .select({
+        _id: 0,
+        eventId: 1,
+        marketId: 1,
+        selectionKey: 1,
+        line: 1,
+        decimalOdds: 1,
+        priceType: 1,
+        provider: 1,
+        bookmaker: 1,
+        fairOdds: 1,
+        fairOddsBasis: 1,
+        marketFairOdds: 1,
+        impliedProbability: 1,
+        valuePercent: 1,
+        oddsBasis: 1,
+        oddsCalculationMethod: 1,
+        providerUpdatedAt: 1,
+        updatedAt: 1,
+        predictionReady: 1,
+      })
+      .lean()
+      .exec();
+    return rows.map((row) => this.attachQuoteFreshness(row));
   }
 
   /**
@@ -301,9 +396,7 @@ export class OddsService {
           'payload.competitions.competitors.homeAway': 1,
           'payload.competitions.competitors.team.displayName': 1,
           'payload.competitions.competitors.team.name': 1,
-          'payload.competitions.status': 1,
-          'payload.summary.header.competitions.status': 1,
-        })
+          })
         .lean()
         .exec() as Promise<PlainRecord[]>,
       this.oddsModel
@@ -346,64 +439,15 @@ export class OddsService {
     const result = new Map<string, any>();
     for (const fixture of fixtures) {
       const eventId = String(fixture.eventId);
-      const fixturePayload = this.asRecord(fixture.payload);
-      const fixtureSummary = this.asRecord(fixturePayload.summary);
-      const nestedStatusParts: unknown[] = [
-        ...this.asArray(this.asRecord(fixturePayload).competitions).flatMap(
-          (item): unknown[] => {
-            const status = this.asRecord(this.asRecord(item).status);
-            const type = this.asRecord(status.type);
-            return [
-              status.name,
-              status.detail,
-              status.shortDetail,
-              status.state,
-              type.name,
-              type.detail,
-              type.shortDetail,
-              type.state,
-            ] as unknown[];
-          },
-        ),
-        ...this.asArray(
-          this.asRecord(fixtureSummary.header).competitions,
-        ).flatMap((item): unknown[] => {
-          const status = this.asRecord(this.asRecord(item).status);
-          const type = this.asRecord(status.type);
-          return [
-            status.name,
-            status.detail,
-            status.shortDetail,
-            status.state,
-            type.name,
-            type.detail,
-            type.shortDetail,
-            type.state,
-          ] as unknown[];
-        }),
-      ];
       const fixtureStatus = [
         fixture.status,
         fixture.statusDetail,
         fixture.statusShortDetail,
-        ...nestedStatusParts,
-      ]
-        .filter(Boolean)
-        .map(String)
-        .join(' ');
+      ].filter(Boolean).map(String).join(' ');
       const fixtureUnavailable =
         fixture.completed === true ||
-        /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i.test(
-          fixtureStatus,
-        ) ||
-        /postpon|cancel|abandon|delay/i.test(fixtureStatus) ||
-        nestedStatusParts.some(
-          (value) =>
-            typeof value === 'string' &&
-            /^(?:postponed|cancelled|canceled|abandoned|delayed)$/i.test(
-              value.trim(),
-            ),
-        );
+        /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT|AET|PEN)([^A-Z]|$)/i.test(fixtureStatus) ||
+        /postpon|\bpst\b|cancel|\bcanc\b|abandon|delay|suspend|interrupt|no[_ -]?contest/i.test(fixtureStatus);
       const expected = this.expectedSelectionKeys(fixture);
       const availableRows = byEvent.get(eventId) ?? [];
       const valid = new Map<string, PlainRecord>();
@@ -432,20 +476,10 @@ export class OddsService {
         // The stored document's updatedAt is not proof that the bookmaker quote
         // itself is fresh. Apply the same provider timestamp contract to ESPN and
         // The Odds API; estimated prices retain their explicit estimate label.
-        if (row.priceType === 'PROVIDER') {
-          const quoteAt = this.toDate(row.providerUpdatedAt);
-          const age = quoteAt
-            ? Date.now() - quoteAt.getTime()
-            : Number.POSITIVE_INFINITY;
-          if (
-            !quoteAt ||
-            age < -5 * 60_000 ||
-            age >
-              PREDICTION_ENGINE_CONFIG.model.maximumProviderOddsAgeHours *
-                3_600_000
-          )
-            continue;
-        }
+        const quoteTimestamp = row.priceType === 'PROVIDER'
+          ? row.providerUpdatedAt
+          : row.updatedAt;
+        if (!isOddsQuoteFresh(quoteTimestamp, Date.now())) continue;
         valid.set(
           this.priceKey(
             String(row.marketId),
@@ -588,55 +622,17 @@ export class OddsService {
         'payload.summary.meta.lastUpdatedAt': 1,
         'payload.summary.odds': 1,
         'payload.summary.pickcenter': 1,
-        'payload.summary.header.competitions': 1,
         'payload.summaryCollectedAt': 1,
         'payload.competitions.competitors': 1,
         'payload.competitions.odds': 1,
-        'payload.competitions.status': 1,
       })
       .lean()
       .exec()) as PlainRecord | null;
     if (!fixture) return 0;
 
-    const fixturePayloadForStatus = this.asRecord(fixture.payload);
-    const summaryHeaderForStatus = this.asRecord(
-      this.asRecord(fixturePayloadForStatus.summary).header,
-    );
-    const statusCompetitions = [
-      ...this.asArray(fixturePayloadForStatus.competitions),
-      ...this.asArray(summaryHeaderForStatus.competitions),
-    ];
-    const nestedStatusText = statusCompetitions
-      .flatMap((item) => {
-        const competition = this.asRecord(item);
-        const status = this.asRecord(competition.status);
-        const type = this.asRecord(status.type);
-        return [
-          status.name,
-          status.detail,
-          status.shortDetail,
-          type.name,
-          type.detail,
-          type.shortDetail,
-        ]
-          .filter((value) => value !== undefined && value !== null)
-          .map(String);
-      })
-      .join(' ');
     const rootStatusText = `${fixture.status ?? ''} ${fixture.statusDetail ?? ''} ${fixture.statusShortDetail ?? ''}`;
-    const finishedByStatus =
-      /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i.test(
-        `${rootStatusText} ${nestedStatusText}`,
-      ) ||
-      statusCompetitions.some((item) => {
-        const status = this.asRecord(this.asRecord(item).status);
-        const type = this.asRecord(status.type);
-        return status.completed === true || type.completed === true;
-      });
-    const unavailableByStatus =
-      /postpon|cancel|abandon|delay|suspend|void/i.test(
-        `${rootStatusText} ${nestedStatusText}`,
-      );
+    const finishedByStatus = /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT|AET|PEN)([^A-Z]|$)/i.test(rootStatusText);
+    const unavailableByStatus = /postpon|\bpst\b|cancel|\bcanc\b|abandon|delay|suspend|interrupt|void|no[_ -]?contest/i.test(rootStatusText);
 
     if (fixture.completed === true) {
       this.noPriceEvaluationAt.delete(String(fixture.eventId));
@@ -657,9 +653,8 @@ export class OddsService {
       return 0;
     }
 
-    // ESPN may expose completion or postponement only inside Summary status.
-    // Do not price those fixtures as upcoming/live merely because the root flags
-    // have not caught up yet.
+    // Fixture refresh owns lifecycle discovery. Pricing follows only the
+    // persisted canonical fixture status, never Summary-header status text.
     if (finishedByStatus || unavailableByStatus) {
       this.noPriceEvaluationAt.delete(String(fixture.eventId));
       await this.oddsModel
@@ -675,43 +670,7 @@ export class OddsService {
     const fixtureDate = this.toDate(fixture.fixtureDate);
     if (!fixtureDate) return 0;
     const fixturePayload = this.asRecord(fixture.payload);
-    const fixtureSummary = this.asRecord(fixturePayload.summary);
-    const fixtureSummaryHeader = this.asRecord(fixtureSummary.header);
-    const competitionStatusParts = this.asArray(
-      fixtureSummaryHeader.competitions,
-    )
-      .flatMap((item) => {
-        const competition = this.asRecord(item);
-        const status = this.asRecord(competition.status);
-        const type = this.asRecord(status.type);
-        return [
-          status.name,
-          status.detail,
-          status.shortDetail,
-          status.state,
-          type.name,
-          type.detail,
-          type.shortDetail,
-          type.state,
-        ] as unknown[];
-      })
-      .filter((value) => value !== null && value !== undefined);
-    const fixtureStatusParts = [
-      fixture.status,
-      fixture.statusDetail,
-      fixture.statusShortDetail,
-      ...competitionStatusParts,
-    ].filter(Boolean);
-    const fixtureStatusText = fixtureStatusParts.map(String).join(' ');
-    const statusLooksLive =
-      /(^|[^A-Z])(IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS)([^A-Z]|$)/i.test(
-        fixtureStatusText,
-      ) ||
-      fixtureStatusParts.some((value) =>
-        ['in', 'in_progress', 'in-progress'].includes(
-          String(value).trim().toLowerCase(),
-        ),
-      );
+    const statusLooksLive = /(^|[^A-Z])(IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS)([^A-Z]|$)/i.test(rootStatusText);
     const fixtureIsLive = fixture.live === true || statusLooksLive;
     const nowDateWat = new Date(now + 60 * 60_000);
     const todayStartWat =
@@ -725,9 +684,8 @@ export class OddsService {
     // Today's unfinished matches and explicitly live fixtures remain eligible
     // even if scheduled kickoff has passed. Older non-live fixtures stay out of scope.
     if (!fixtureIsLive && fixtureDate.getTime() <= now && !isTodayWat) return 0;
-    const status =
-      `${fixture.status ?? ''} ${fixture.statusDetail ?? ''} ${fixture.statusShortDetail ?? ''}`.toLowerCase();
-    if (/postpon|cancel|abandon|delay/.test(status)) {
+    const status = rootStatusText.toLowerCase();
+    if (/postpon|cancel|abandon|delay|suspend|interrupt|void|no[_ -]?contest/.test(status)) {
       // Do not keep publishable prices for a fixture whose kickoff is uncertain.
       this.noPriceEvaluationAt.delete(String(fixture.eventId));
       await this.oddsModel
@@ -781,26 +739,6 @@ export class OddsService {
       .select({ _id: 0, collectedAt: 1 })
       .sort({ collectedAt: -1 })
       .limit(1)
-      .lean()
-      .exec()) as PlainRecord[];
-    const historical = (await this.fixtureModel
-      .find({
-        ...priorCompletedFixtureFilter,
-        homeScore: { $exists: true, $ne: null },
-        awayScore: { $exists: true, $ne: null },
-      })
-      .select({
-        eventId: 1,
-        fixtureDate: 1,
-        homeTeamId: 1,
-        awayTeamId: 1,
-        homeScore: 1,
-        awayScore: 1,
-        'payload.summary.boxscore.teams': 1,
-        collectedAt: 1,
-      })
-      .sort({ fixtureDate: -1 })
-      .limit(80)
       .lean()
       .exec()) as PlainRecord[];
     const sourceUpdatedAt = Math.max(
@@ -873,6 +811,30 @@ export class OddsService {
     )
       return 0;
 
+    // Load the heavier 80-match statistical sample only when a new pricing
+    // calculation is actually required. Most worker passes now stop after the
+    // compact existing-price + latest-history freshness checks above.
+    const historical = (await this.fixtureModel
+      .find({
+        ...priorCompletedFixtureFilter,
+        homeScore: { $exists: true, $ne: null },
+        awayScore: { $exists: true, $ne: null },
+      })
+      .select({
+        eventId: 1,
+        fixtureDate: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        homeScore: 1,
+        awayScore: 1,
+        'payload.summary.boxscore.teams': 1,
+        collectedAt: 1,
+      })
+      .sort({ fixtureDate: -1 })
+      .limit(80)
+      .lean()
+      .exec()) as PlainRecord[];
+
     // Keep known external quotes across cache expiry/restarts. Freshness wins
     // across providers so a refreshed backup quote can replace a stale primary;
     // ESPN Summary is the primary quote source; The Odds API fills missing selections.
@@ -904,7 +866,7 @@ export class OddsService {
     const allProviderQuotes = [...preservedProviderQuotes, ...providerQuotes];
     const prices = this.buildPrices(fixture, historical, allProviderQuotes);
     if (!prices.length) {
-      this.noPriceEvaluationAt.set(String(fixture.eventId), sourceUpdatedAt);
+      this.rememberNoPriceEvaluation(String(fixture.eventId), sourceUpdatedAt);
       await this.oddsModel
         .deleteMany({
           eventId: String(fixture.eventId),
@@ -1090,11 +1052,23 @@ export class OddsService {
     return result.modifiedCount ?? 0;
   }
 
+  private rememberNoPriceEvaluation(eventId: string, sourceUpdatedAt: number): void {
+    const key = String(eventId ?? '').trim();
+    if (!key) return;
+
+    // Reinsert to maintain insertion order as a small LRU-style cache.
+    this.noPriceEvaluationAt.delete(key);
+    this.noPriceEvaluationAt.set(key, sourceUpdatedAt);
+
+    while (this.noPriceEvaluationAt.size > MAX_NO_PRICE_EVALUATION_CACHE_ENTRIES) {
+      const oldestKey = this.noPriceEvaluationAt.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.noPriceEvaluationAt.delete(oldestKey);
+    }
+  }
+
   private isFreshPriceTimestamp(value: unknown): boolean {
-    const date = this.toDate(value);
-    if (!date) return false;
-    const ageMs = Date.now() - date.getTime();
-    return ageMs >= -5 * 60_000 && ageMs <= 12 * 60 * 60_000;
+    return isOddsQuoteFresh(value);
   }
 
   /** The Odds module explicitly endorses only a valid, sourced, auditable value. */
@@ -1887,8 +1861,7 @@ export class OddsService {
         (quote) =>
           !quote ||
           quote.priceType !== 'PROVIDER' ||
-          (quote.provider !== 'ESPN' &&
-            !this.isFreshPriceTimestamp(quote.providerUpdatedAt)),
+          !this.isFreshPriceTimestamp(quote.providerUpdatedAt),
       )
     )
       return null;
@@ -2244,6 +2217,26 @@ export class OddsService {
     return Number.isFinite(parsed) ? parsed : null;
   }
 
+  private attachQuoteFreshness<T extends PlainRecord>(row: T): T & {
+    oddsCapturedAt: Date | null;
+    oddsFreshUntil: Date | null;
+    isFresh: boolean;
+  } {
+    const priceType = String(row.priceType ?? '').toUpperCase();
+    const capturedAt = priceType === 'PROVIDER'
+      ? this.toDate(row.providerUpdatedAt)
+      : this.toDate(row.updatedAt);
+    const now = Date.now();
+    const maxAgeMs = ODDS_CONFIG.maximumQuoteAgeHours * 3_600_000;
+    const isFresh = isOddsQuoteFresh(capturedAt, now);
+    return {
+      ...row,
+      oddsCapturedAt: capturedAt,
+      oddsFreshUntil: capturedAt ? new Date(capturedAt.getTime() + maxAgeMs) : null,
+      isFresh,
+    };
+  }
+
   private toDate(value: unknown): Date | null {
     if (value instanceof Date && Number.isFinite(value.getTime())) return value;
     if (typeof value !== 'string' && typeof value !== 'number') return null;
@@ -2251,3 +2244,4 @@ export class OddsService {
     return Number.isFinite(date.getTime()) ? date : null;
   }
 }
+

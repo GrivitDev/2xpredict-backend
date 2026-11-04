@@ -14,7 +14,7 @@ import { ODDS_CONFIG } from '../config/odds.config';
 import { EspnQueueService } from '../../sports/services/espn-queue.service';
 
 const WORKER_INTERVAL_MS = 5 * 60_000;
-const FIXTURES_PER_CYCLE = 20;
+const FIXTURES_PER_CYCLE = 20; // Bounded page; refreshes run with concurrency 2.
 const CANDIDATE_COUNT_REFRESH_MS = 30 * 60_000;
 const EXPIRY_CLEANUP_INTERVAL_MS = 15 * 60_000;
 
@@ -29,7 +29,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private candidateCountRefreshedAt = 0;
   private fixtureExplainLogged = false;
   private stopping = false;
-  private offset = 0;
+  private cursor: { fixtureDate: Date; eventId: string } | null = null;
   private cyclesCompleted = 0;
   private cyclesFailed = 0;
   private lastCycleStartedAt?: Date;
@@ -129,94 +129,87 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       const nowWat = new Date(now.getTime() + 60 * 60_000);
       const todayStartWat = new Date(Date.UTC(nowWat.getUTCFullYear(), nowWat.getUTCMonth(), nowWat.getUTCDate()) - 60 * 60_000);
       const horizon = new Date(now.getTime() + ODDS_CONFIG.lookaheadHours * 60 * 60_000);
-      const liveStatus = /IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS/i;
+      // Use indexed fixtureDate/live fields for discovery. Text/regex status
+      // checks are deliberately left to OddsService after a bounded batch has
+      // been loaded; putting many regex branches in this hot query prevents an
+      // efficient keyset scan on the 2 GB host.
       const fixtureFilter = {
         $and: [
-          { $or: [
-            { fixtureDate: { $gte: todayStartWat, $lte: horizon } },
-            { live: true },
-            { status: liveStatus },
-            { statusDetail: liveStatus },
-            { statusShortDetail: liveStatus },
-            { 'payload.summary.header.competitions.status.state': /^(in|in_progress|in-progress)$/i },
-            { 'payload.summary.header.competitions.status.type.state': /^(in|in_progress|in-progress)$/i },
-            { 'payload.competitions.status.state': /^(in|in_progress|in-progress)$/i },
-            { 'payload.competitions.status.type.state': /^(in|in_progress|in-progress)$/i },
-          ] },
+          {
+            $or: [
+              { fixtureDate: { $gte: todayStartWat, $lte: horizon } },
+              { live: true },
+            ],
+          },
           { completed: { $ne: true } },
-          { $nor: [
-            { status: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { statusDetail: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { statusShortDetail: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { 'payload.summary.header.competitions.status.completed': true },
-            { 'payload.summary.header.competitions.status.type.completed': true },
-            { 'payload.competitions.status.completed': true },
-            { 'payload.competitions.status.type.completed': true },
-            { 'payload.summary.header.competitions.status.name': /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { 'payload.summary.header.competitions.status.type.name': /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { 'payload.competitions.status.name': /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { 'payload.competitions.status.type.name': /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-            { 'payload.summary.header.competitions.status.detail': /postpon|cancel|abandon|delay/i },
-            { 'payload.competitions.status.detail': /postpon|cancel|abandon|delay/i },
-            { status: /postpon|cancel|abandon|delay/i },
-            { statusDetail: /postpon|cancel|abandon|delay/i },
-            { statusShortDetail: /postpon|cancel|abandon|delay/i },
-          ] },
         ],
       };
       await this.logFixtureDiscoveryExplainIfRequested(fixtureFilter);
-      let candidateCount = await this.getCandidateCount(fixtureFilter);
+      const candidateCount = await this.getCandidateCount(fixtureFilter);
       this.lastCandidateCount = candidateCount;
-      if (candidateCount === 0 || this.offset >= candidateCount) this.offset = 0;
-      const loadBatch = async () => (await this.fixtureModel
-        .find(fixtureFilter)
-        .select({
-          eventId: 1,
-          leagueId: 1,
-          homeScore: 1,
-          awayScore: 1,
-          season: 1,
-          fixtureDate: 1,
-          live: 1,
-          completed: 1,
-          status: 1,
-          statusDetail: 1,
-          statusShortDetail: 1,
-          homeTeamId: 1,
-          awayTeamId: 1,
-          'payload.summary.odds': 1,
-          'payload.summary.pickcenter': 1,
-          'payload.summary.meta.lastUpdatedAt': 1,
-          'payload.summary.header.competitions.status': 1,
-          'payload.summaryCollectedAt': 1,
-          'payload.oddsSummaryAttemptedAt': 1,
-          'payload.competitions.competitors': 1,
-          'payload.competitions.odds': 1,
-          'payload.competitions.status': 1,
-        })
-        .sort({ live: -1, fixtureDate: 1, eventId: 1 })
-        .skip(this.offset)
-        .limit(FIXTURES_PER_CYCLE)
-        .lean()
-        .exec()) as any[];
-      let batch = await loadBatch();
-      // Fixture state can change during the five-minute count cache window.
-      // If the cached offset points beyond the current result set, refresh the
-      // count and retry from the first page rather than idling on an empty batch.
-      if (!batch.length && this.offset > 0) {
-        this.offset = 0;
-        candidateCount = await this.getCandidateCount(fixtureFilter, true);
-        batch = await loadBatch();
+      // Keep the cursor unchanged until the batch has completed. A provider
+      // failure or a failed fixture must not advance the scan past work that
+      // still needs a retry.
+      let queryCursor = this.cursor;
+      const loadBatch = async (cursor: { fixtureDate: Date; eventId: string } | null) => {
+        const cursorFilter = cursor
+          ? {
+              $or: [
+                { fixtureDate: { $gt: cursor.fixtureDate } },
+                {
+                  fixtureDate: cursor.fixtureDate,
+                  eventId: { $gt: cursor.eventId },
+                },
+              ],
+            }
+          : undefined;
+        const filter = cursorFilter
+          ? { $and: [...(fixtureFilter.$and ?? []), cursorFilter] }
+          : fixtureFilter;
+        return (await this.fixtureModel
+          .find(filter)
+            .select({
+            eventId: 1,
+            leagueId: 1,
+            homeScore: 1,
+            awayScore: 1,
+            season: 1,
+            fixtureDate: 1,
+            live: 1,
+            completed: 1,
+            status: 1,
+            statusDetail: 1,
+            statusShortDetail: 1,
+            homeTeamId: 1,
+            awayTeamId: 1,
+            'payload.summary.odds': 1,
+            'payload.summary.pickcenter': 1,
+            'payload.summary.meta.lastUpdatedAt': 1,
+            'payload.summaryCollectedAt': 1,
+            'payload.oddsSummaryAttemptedAt': 1,
+            'payload.competitions.competitors': 1,
+            'payload.competitions.odds': 1,
+          })
+          .sort({ fixtureDate: 1, eventId: 1 })
+          .limit(FIXTURES_PER_CYCLE)
+          .lean()
+          .exec()) as any[];
+      };
+      let batch = await loadBatch(queryCursor);
+      // Keyset pagination avoids increasingly expensive skip/offset scans. If
+      // the cursor reaches the end, wrap locally; do not commit until work ends.
+      if (!batch.length && queryCursor) {
+        queryCursor = null;
+        batch = await loadBatch(queryCursor);
       }
       this.lastBatchSize = batch.length;
-      this.offset += batch.length;
-      if (this.offset >= candidateCount) this.offset = 0;
 
-      // Keep API work bounded to this batch while the persistent offset rotates
-      // through the complete eligible fixture set, not just the first page.
+      // Keep provider and database concurrency bounded for the 2 GB host while
+      // rotating through the complete eligible fixture set with indexed paging.
       const providerCollection =
         await this.oddsCollectionService.collectProviderQuotes(batch);
       let refreshed = 0;
+      const failedEventIds = new Set<string>();
       if (batch.length) {
         const seen = new Set<string>();
         const uniqueBatch = batch.filter((fixture) => {
@@ -227,7 +220,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         });
         // Keep database/provider pressure bounded while avoiding one full
         // sequential round-trip per fixture. Provider collection remains batched.
-        const refreshConcurrency = 4;
+        const refreshConcurrency = 2;
         for (let offset = 0; offset < uniqueBatch.length; offset += refreshConcurrency) {
           const refreshBatch = uniqueBatch.slice(offset, offset + refreshConcurrency);
           const outcomes = await Promise.all(refreshBatch.map(async (fixture) => {
@@ -249,7 +242,33 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
             }
           }));
           refreshed += outcomes.filter((outcome) => outcome.ok).length;
+          for (const outcome of outcomes) {
+            if (!outcome.ok) failedEventIds.add(outcome.eventId);
+          }
         }
+
+        const firstFailedIndex = uniqueBatch.findIndex((fixture) =>
+          failedEventIds.has(String(fixture.eventId)),
+        );
+        const cursorFixture = firstFailedIndex >= 0
+          ? (firstFailedIndex > 0 ? uniqueBatch[firstFailedIndex - 1] : null)
+          : batch[batch.length - 1];
+        if (firstFailedIndex >= 0 && firstFailedIndex === 0) {
+          this.cursor = queryCursor;
+        } else if (cursorFixture) {
+          const cursorDate = cursorFixture.fixtureDate instanceof Date
+            ? cursorFixture.fixtureDate
+            : new Date(cursorFixture.fixtureDate);
+          const cursorEventId = String(cursorFixture.eventId ?? '').trim();
+          if (Number.isFinite(cursorDate.getTime()) && cursorEventId) {
+            this.cursor = { fixtureDate: cursorDate, eventId: cursorEventId };
+          }
+        } else {
+          this.cursor = queryCursor;
+        }
+      } else {
+        // An empty result means this cursor reached the end of the current set.
+        this.cursor = null;
       }
       const batchEventIds = batch
         .map((fixture) => String(fixture.eventId))
@@ -300,10 +319,12 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async getCandidateCount(fixtureFilter: Record<string, any>, force = false): Promise<number> {
+  private async getCandidateCount(fixtureFilter: Record<string, any>): Promise<number> {
     const now = Date.now();
-    if (force || this.candidateCountCache === 0
-      || now - this.candidateCountRefreshedAt >= CANDIDATE_COUNT_REFRESH_MS) {
+    // This count is diagnostic only; it never gates batch discovery. Cache
+    // even a zero count so an empty result does not trigger a full count scan
+    // on every five-minute worker pass.
+    if (now - this.candidateCountRefreshedAt >= CANDIDATE_COUNT_REFRESH_MS) {
       this.candidateCountCache = await this.fixtureModel.countDocuments(fixtureFilter).exec();
       this.candidateCountRefreshedAt = now;
     }
@@ -323,7 +344,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       const explanation: any = await this.fixtureModel
         .find(fixtureFilter)
         .select({ eventId: 1, live: 1, fixtureDate: 1 })
-        .sort({ live: -1, fixtureDate: 1, eventId: 1 })
+        .sort({ fixtureDate: 1, eventId: 1 })
         .limit(FIXTURES_PER_CYCLE)
         .explain('executionStats');
       const execution = explanation?.executionStats ?? {};
@@ -366,4 +387,5 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   }
 
 }
+
 

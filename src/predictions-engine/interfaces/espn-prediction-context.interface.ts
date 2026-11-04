@@ -6,6 +6,8 @@ export interface PredictionFixtureCore {
   live: boolean;
   completed: boolean;
   status?: string;
+  statusDetail?: string;
+  statusShortDetail?: string;
   homeTeamId: string;
   awayTeamId: string;
   homeScore?: number;
@@ -44,6 +46,8 @@ export interface StoredFixtureOdds {
   oddsBasis?: OddsBasis | null;
   oddsCalculationMethod?: string | null;
   updatedAt: Date | null;
+  /** Freshness decision supplied by the Odds module. */
+  isFresh: boolean;
 }
 
 import type { EspnStandingsPayload } from '../../sports/providers/espn.interfaces';

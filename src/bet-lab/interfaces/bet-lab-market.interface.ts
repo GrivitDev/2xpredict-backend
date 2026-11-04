@@ -20,6 +20,8 @@ export interface BetLabFixtureIdentity {
   awayTeamName: string;
   venueName?: string;
   status: string;
+  statusDetail?: string;
+  statusShortDetail?: string;
   collectedAt: Date;
   summaryCollectedAt: Date;
   payload: Record<string, unknown>;
@@ -36,6 +38,7 @@ export interface BetLabSelectionQuote extends BetLabSelectionDefinition {
   providerUpdatedAt: Date | null;
   oddsTimestampBasis: BetLabOddsTimestampBasis | null;
   oddsCapturedAt: Date | null;
+  oddsFreshUntil?: Date | null;
   oddsBasis: 'BOOKMAKER_ONLY' | 'BOOKMAKER_PLUS_HISTORY' | 'HISTORICAL_ONLY' | 'PRIOR_ONLY' | null;
   oddsCalculationMethod: string | null;
   isStale: boolean;
@@ -80,3 +83,4 @@ export interface BetLabMarketQuote {
   oddsBasis: 'BOOKMAKER_ONLY' | 'BOOKMAKER_PLUS_HISTORY' | 'HISTORICAL_ONLY' | 'PRIOR_ONLY' | null;
   oddsCalculationMethod: string | null;
 }
+

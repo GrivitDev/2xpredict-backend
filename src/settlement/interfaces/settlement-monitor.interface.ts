@@ -53,6 +53,7 @@ export interface SettlementWorkerRuntimeStatus {
   jobsClaimed: number;
   jobsCompleted: number;
   jobsPartial: number;
+  jobsSkipped: number;
   jobsFailed: number;
   jobsRetried: number;
   jobsTerminalFailed: number;
@@ -60,7 +61,7 @@ export interface SettlementWorkerRuntimeStatus {
   lastDrainCompletedAt?: string;
   lastDrainErrorAt?: string;
   lastJobAt?: string;
-  lastJobStatus?: 'COMPLETED' | 'PARTIAL' | 'RETRY' | 'FAILED';
+  lastJobStatus?: 'COMPLETED' | 'PARTIAL' | 'SKIPPED' | 'RETRY' | 'FAILED';
   lastJobKey?: string;
   lastJobEventId?: string;
   lastJobDurationMs?: number;

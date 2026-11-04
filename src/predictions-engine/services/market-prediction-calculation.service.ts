@@ -77,6 +77,7 @@ export class MarketPredictionCalculationService {
       ? (input.context.storedOdds ?? [])
           .filter((quote) =>
             quote.marketId === canonicalMarket.id
+            && quote.isFresh === true
             && quote.predictionReady === true
             && quote.line !== undefined
             && Number.isFinite(Number(quote.line))
@@ -652,6 +653,7 @@ export class MarketPredictionCalculationService {
     return adjusted;
   }
 }
+
 
 
 

@@ -32,6 +32,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
   private jobsClaimed = 0;
   private jobsCompleted = 0;
   private jobsPartial = 0;
+  private jobsSkipped = 0;
   private jobsFailed = 0;
   private jobsRetried = 0;
   private jobsTerminalFailed = 0;
@@ -40,7 +41,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
   private lastDrainErrorAt?: Date;
   private activeJob?: { jobKey: string; eventId: string; leagueId: string; startedAt: Date; attempt: number };
   private lastJobAt?: Date;
-  private lastJobStatus?: 'COMPLETED' | 'PARTIAL' | 'RETRY' | 'FAILED';
+  private lastJobStatus?: 'COMPLETED' | 'PARTIAL' | 'SKIPPED' | 'RETRY' | 'FAILED';
   private lastJobKey?: string;
   private lastJobEventId?: string;
   private lastJobDurationMs?: number;
@@ -81,6 +82,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       jobsClaimed: this.jobsClaimed,
       jobsCompleted: this.jobsCompleted,
       jobsPartial: this.jobsPartial,
+      jobsSkipped: this.jobsSkipped,
       jobsFailed: this.jobsFailed,
       jobsRetried: this.jobsRetried,
       jobsTerminalFailed: this.jobsTerminalFailed,
@@ -101,7 +103,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     this.adminGateway.setModuleOperationalStatus('settlement', 'STARTING', 'Settlement worker initialized; startup recovery is running.');
     this.systemMonitor.reportModuleHealth('settlement', 'UNKNOWN', { source: 'worker-lifecycle', message: 'Settlement queue worker initialized; startup recovery is running.' });
     this.queue.onEnqueued(this.onQueued);
-    // Jobs are discovered by target-creation and Summary-update events.
+    // Jobs are discovered by fixture-refresh, target-creation and Summary-update events.
     // Startup is limited to recovering interrupted worker leases.
     void this.startupRecovery();
   }
@@ -280,6 +282,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       const durationMs = Date.now() - startedAt;
       const rerunQueued = await this.queue.complete(job, {
         partial: result.partial,
+        skipped: result.skipped === true,
         counts: result.counts as unknown as Record<string, number>,
         unresolvedReasons: result.unresolvedReasons,
         durationMs,
@@ -289,7 +292,10 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       this.lastJobEventId = job.eventId;
       this.lastJobDurationMs = durationMs;
       this.lastJobError = undefined;
-      if (result.partial) {
+      if (result.skipped) {
+        this.jobsSkipped += 1;
+        this.lastJobStatus = 'SKIPPED';
+      } else if (result.partial) {
         this.jobsPartial += 1;
         this.lastJobStatus = 'PARTIAL';
       } else {
@@ -301,9 +307,11 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
         source: 'worker',
         operation: 'process-job',
         status: 'INFO',
-        message: result.partial
-          ? `Settlement job ${job.jobKey} ran but still has unresolved targets.`
-          : `Settlement job ${job.jobKey} completed successfully.`,
+        message: result.skipped
+          ? `Settlement job ${job.jobKey} was skipped because fixture lifecycle was not confirmed.`
+          : result.partial
+            ? `Settlement job ${job.jobKey} ran but still has unresolved targets.`
+            : `Settlement job ${job.jobKey} completed successfully.`,
         occurredAt: new Date(),
         durationMs,
         referenceKey: job.jobKey,
@@ -312,26 +320,31 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       // Partial target outcomes remain visible in queue counts and unresolvedReasons.
       this.systemMonitor.reportModuleHealth('settlement', 'HEALTHY', {
         source: 'worker',
-        message: result.partial
-          ? `Settlement worker recovered and processed ${job.jobKey}; unresolved targets remain.`
-          : `Settlement processing successfully completed job ${job.jobKey}.`,
-        details: { eventId: job.eventId, partial: result.partial, durationMs, counts: result.counts },
+        message: result.skipped
+          ? `Settlement worker safely skipped ${job.jobKey}; fixture lifecycle is not confirmed.`
+          : result.partial
+            ? `Settlement worker recovered and processed ${job.jobKey}; unresolved targets remain.`
+            : `Settlement processing successfully completed job ${job.jobKey}.`,
+        details: { eventId: job.eventId, partial: result.partial, skipped: result.skipped === true, durationMs, counts: result.counts },
       });
       this.adminGateway.setModuleOperationalStatus(
         'settlement',
         'READY',
-        result.partial
-          ? `Settlement worker is running; event ${job.eventId} still has unresolved targets.`
-          : `Settlement worker completed event ${job.eventId}.`,
-        { eventId: job.eventId, partial: result.partial, durationMs, counts: result.counts },
+        result.skipped
+          ? `Settlement worker skipped event ${job.eventId}; fixture lifecycle is not confirmed.`
+          : result.partial
+            ? `Settlement worker is running; event ${job.eventId} still has unresolved targets.`
+            : `Settlement worker completed event ${job.eventId}.`,
+        { eventId: job.eventId, partial: result.partial, skipped: result.skipped === true, durationMs, counts: result.counts },
       );
       this.adminGateway.publishModuleEvent(
         'settlement',
-        rerunQueued ? 'settlement:job-requeued' : 'settlement:job-completed',
+        rerunQueued ? 'settlement:job-requeued' : result.skipped ? 'settlement:job-skipped' : 'settlement:job-completed',
         {
           jobKey: job.jobKey,
           eventId: job.eventId,
           partial: result.partial,
+          skipped: result.skipped === true,
           rerunQueued,
           counts: result.counts,
           unresolvedReasons: result.unresolvedReasons,

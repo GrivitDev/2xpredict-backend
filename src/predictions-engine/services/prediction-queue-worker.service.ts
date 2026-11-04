@@ -14,7 +14,7 @@ import { PredictionQueueService } from './prediction-queue.service';
 import { PredictionEngineService } from './prediction-engine.service';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
-import { OddsService } from '../../odds/services/odds.service';
+import { OddsReadService } from '../../odds/services/odds-read.service';
 import { MarketCalibrationService } from './market-calibration.service';
 import { CuratedPredictionService } from './curated-prediction.service';
 import { SlipCenterService } from './slip-center.service';
@@ -44,7 +44,7 @@ export class PredictionQueueWorkerService
     private readonly engine: PredictionEngineService,
     private readonly monitor: PredictionEngineMonitorService,
     private readonly systemMonitor: SystemMonitorService,
-    private readonly oddsService: OddsService,
+    private readonly oddsService: OddsReadService,
     private readonly marketCalibrationService: MarketCalibrationService,
     private readonly curatedPredictionService: CuratedPredictionService,
     private readonly slipCenterService: SlipCenterService,
@@ -573,3 +573,4 @@ export class PredictionQueueWorkerService
     return error instanceof Error ? error.message : String(error);
   }
 }
+

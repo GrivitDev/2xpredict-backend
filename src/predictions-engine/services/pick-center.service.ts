@@ -9,6 +9,7 @@ import { PickStatus } from '../enums/pick-status.enum';
 import { PredictionRunSummary } from '../interfaces/prediction-run.interface';
 import { PickCenterUpdateResult } from '../interfaces/pick-center.interface';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
+import { isOddsQuoteFresh } from '../../odds/config/odds.config';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 import { MarketCalibrationService } from './market-calibration.service';
 import { CuratedPredictionService } from './curated-prediction.service';
@@ -368,7 +369,6 @@ export class PickCenterService {
           selection.oddsUpdatedAt instanceof Date
             ? selection.oddsUpdatedAt
             : new Date(String(selection.oddsUpdatedAt ?? ''));
-        const ageMs = now - updatedAt.getTime();
         const hasDocumentQuality =
           document.dataQuality !== undefined &&
           document.dataQuality !== null &&
@@ -409,13 +409,7 @@ export class PickCenterService {
           continue;
         if (!Number.isFinite(fairOdds) || fairOdds <= 1) continue;
         if (!Number.isFinite(updatedAt.getTime())) continue;
-        if (
-          selection.priceType === 'PROVIDER' &&
-          selection.oddsProvider !== 'ESPN' &&
-          (ageMs < -5 * 60_000 ||
-            ageMs > config.model.maximumProviderOddsAgeHours * 3_600_000)
-        )
-          continue;
+        if (!isOddsQuoteFresh(updatedAt, now)) continue;
         if (!selection.oddsCalculationMethod || !selection.oddsBasis) continue;
 
         const settlementProfile = selection.settlementProfile ?? undefined;
@@ -664,3 +658,4 @@ export class PickCenterService {
     return 5;
   }
 }
+

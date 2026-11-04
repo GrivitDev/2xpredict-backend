@@ -8,6 +8,7 @@ import { OddsProviderState, OddsProviderStateSchema } from './schemas/odds-provi
 import { OddsProviderCache, OddsProviderCacheSchema } from './schemas/odds-provider-cache.schema';
 import { TheOddsApiService } from './providers/the-odds-api.service';
 import { OddsService } from './services/odds.service';
+import { OddsReadService } from './services/odds-read.service';
 import { OddsCollectionService } from './services/odds-collection.service';
 import { OddsProviderStateService } from './services/odds-provider-state.service';
 import { OddsWorkerService } from './services/odds-worker.service';
@@ -33,12 +34,15 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
     TheOddsApiService,
     OddsCollectionService,
     OddsService,
+    OddsReadService,
     OddsWorkerService,
     OddsMonitorService,
   ],
-  exports: [OddsService, OddsCollectionService],
+  // Downstream modules receive a read-only quote interface.
+  exports: [OddsReadService],
 })
 export class OddsModule {}
+
 
 
 

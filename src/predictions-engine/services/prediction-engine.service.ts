@@ -24,7 +24,7 @@ import { PredictionEngineMonitorService } from './prediction-engine-monitor.serv
 import { getMarketDefinition } from '../catalog/football-market-catalog';
 import { MarketCalibrationService } from './market-calibration.service';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
-import { OddsService } from '../../odds/services/odds.service';
+import { OddsReadService } from '../../odds/services/odds-read.service';
 
 @Injectable()
 export class PredictionEngineService {
@@ -43,7 +43,7 @@ export class PredictionEngineService {
     private readonly monitor: PredictionEngineMonitorService,
     private readonly marketCalibrationService: MarketCalibrationService,
     private readonly settlementTrigger: SettlementTriggerService,
-    private readonly oddsService: OddsService,
+    private readonly oddsService: OddsReadService,
   ) {}
 
   async generateForFixture(eventId: string): Promise<any> {
@@ -502,30 +502,17 @@ export class PredictionEngineService {
   }
 
   private isFinishedFixture(context: PredictionModelInput['context']): boolean {
-    if (context.fixture.completed === true) return true;
-    const roots: Array<Record<string, any>> = [context.summary, context.fixture.payload];
-    const statusValues: unknown[] = [context.fixture.status];
-    for (const root of roots) {
-      statusValues.push(root.status, root.statusDetail, root.statusShortDetail);
-      const header = root.header && typeof root.header === 'object' ? root.header : {};
-      const competitionLists = [
-        Array.isArray(header.competitions) ? header.competitions : [],
-        Array.isArray(root.competitions) ? root.competitions : [],
-      ];
-      for (const list of competitionLists) {
-        for (const competition of list) {
-          if (!competition || typeof competition !== 'object') continue;
-          const status = competition.status && typeof competition.status === 'object' ? competition.status : {};
-          const type = status.type && typeof status.type === 'object' ? status.type : {};
-          if (status.completed === true || type.completed === true) return true;
-          statusValues.push(status.name, status.detail, status.shortDetail, status.state, type.name, type.detail, type.shortDetail, type.state);
-        }
-      }
+    const fixture = context.fixture;
+    if (fixture.completed === true) return true;
+    const statusText = [
+      fixture.status,
+      fixture.statusDetail,
+      fixture.statusShortDetail,
+    ].filter(Boolean).join(' ');
+    if (/postpon|\bpst\b|cancel|\bcanc\b|abandon|suspend|interrupt|delay|no[_ -]?contest/i.test(statusText)) {
+      return true;
     }
-    return statusValues.some((value) =>
-      /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|STATUS_FINAL|POST|FT)([^A-Z]|$)/i.test(String(value ?? ''))
-      || /postpon|cancel|abandon|delay/i.test(String(value ?? '')),
-    );
+    return /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|STATUS_FINAL|FT|AET|PEN)([^A-Z]|$)/i.test(statusText);
   }
 
   private getLiveMatchState(context: PredictionModelInput['context']): {
@@ -627,3 +614,4 @@ export class PredictionEngineService {
     return finalMatrix;
   }
 }
+

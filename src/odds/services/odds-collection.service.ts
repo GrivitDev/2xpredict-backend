@@ -22,7 +22,7 @@ import { OddsService } from './odds.service';
 import { ODDS_CONFIG } from '../config/odds.config';
 
 const ODDS_LOOKAHEAD_MS = ODDS_CONFIG.lookaheadHours * 60 * 60_000;
-const SUMMARY_CALL_CONCURRENCY = 4;
+const SUMMARY_CALL_CONCURRENCY = 2;
 const SUMMARY_CALL_TIMEOUT_MS = 20_000;
 const PROVIDER_MATCH_TOLERANCE_MS = 6 * 60 * 60_000;
 
@@ -120,7 +120,7 @@ export class OddsCollectionService {
       }
     }
     if (oddsApiAvailable) {
-      const requestsPerChunk = 5;
+      const requestsPerChunk = 2;
       for (let offset = 0; offset < uncachedKeys.length; offset += requestsPerChunk) {
         let canRequest = false;
         try {
@@ -218,36 +218,17 @@ export class OddsCollectionService {
     const kickoff = this.toDate(fixture?.fixtureDate)?.getTime();
     if (!eventId || !kickoff) return false;
 
-    const payload = this.asRecord(fixture.payload);
-    const summary = this.asRecord(payload.summary);
-    const competitions = [
-      ...this.asArray(payload.competitions),
-      ...this.asArray(this.asRecord(summary.header).competitions),
-    ];
-    const nestedStatuses = competitions.flatMap((item) => {
-      const competition = this.asRecord(item);
-      const status = this.asRecord(competition.status);
-      const type = this.asRecord(status.type);
-      return [
-        status.name, status.detail, status.shortDetail, status.state,
-        type.name, type.detail, type.shortDetail, type.state,
-      ].filter((value) => value !== undefined && value !== null).map(String);
-    });
-    const statusParts = [
-      fixture.status, fixture.statusDetail, fixture.statusShortDetail,
-      ...nestedStatuses,
-    ].filter(Boolean).map(String);
-    const statusText = statusParts.join(' ').toLowerCase();
-    const completed = fixture.completed === true || competitions.some((item) => {
-      const status = this.asRecord(this.asRecord(item).status);
-      const type = this.asRecord(status.type);
-      return status.completed === true || type.completed === true;
-    }) || /(^|[^a-z])(final|finished|full[ _-]?time|after extra time|after penalties|ft)([^a-z]|$)/i.test(statusText);
-    const unavailable = /postpon|cancel|abandon|delay|suspend|void/i.test(statusText);
+    const statusText = [
+      fixture.status,
+      fixture.statusDetail,
+      fixture.statusShortDetail,
+    ].filter(Boolean).map(String).join(' ').toLowerCase();
+    const completed = fixture.completed === true ||
+      /(^|[^a-z])(final|finished|full[ _-]?time|after extra time|after penalties|ft|aet|pen)([^a-z]|$)/i.test(statusText);
+    const unavailable = /postpon|\bpst\b|cancel|\bcanc\b|abandon|delay|suspend|interrupt|void|no[_ -]?contest/i.test(statusText);
     if (completed || unavailable) return false;
 
-    const liveStatus = /(^|[^a-z])(in[_ -]?progress|inprogress|live|half[_ -]?time|first[_ -]?half|second[_ -]?half|extra[_ -]?time|penalt(?:y|ies)|status_halftime|status_in_progress)([^a-z]|$)/i.test(statusText)
-      || nestedStatuses.some((value) => ['in', 'in_progress', 'in-progress'].includes(value.trim().toLowerCase()));
+    const liveStatus = /(^|[^a-z])(in[_ -]?progress|inprogress|live|half[_ -]?time|first[_ -]?half|second[_ -]?half|extra[_ -]?time|penalt(?:y|ies)|status_halftime|status_in_progress)([^a-z]|$)/i.test(statusText);
     const live = fixture.live === true || liveStatus;
     if (live) return true;
     return kickoff > now && kickoff <= horizon;
@@ -727,4 +708,5 @@ export class OddsCollectionService {
     return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
   }
 }
+
 

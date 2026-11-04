@@ -9,7 +9,7 @@ import {
   PredictionMatchContext,
 } from '../interfaces/espn-prediction-context.interface';
 import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
-import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
+
 import type { OddsBasis, OddsProvider } from '../interfaces/espn-prediction-context.interface';
 
 export interface ProviderSelectionPrice {
@@ -27,22 +27,11 @@ export interface ProviderSelectionPrice {
 
 @Injectable()
 export class MarketOddsService {
-  private isFreshProviderQuote(
-    updatedAt: Date | null | undefined,
-    _provider?: OddsProvider | null,
-  ): boolean {
-    // Source timestamp is required for every provider, including ESPN. The Odds
-    // document's updatedAt must never be used to disguise an unknown quote age.
-    if (!(updatedAt instanceof Date) || !Number.isFinite(updatedAt.getTime())) return false;
-    const ageMs = Date.now() - updatedAt.getTime();
-    const maxAgeMs = PREDICTION_ENGINE_CONFIG.model.maximumProviderOddsAgeHours * 3_600_000;
-    return ageMs >= -5 * 60_000 && ageMs <= maxAgeMs;
-  }
 
   /**
    * Reads real provider 1X2 quotes persisted by OddsService. All three outcomes
-   * must have a valid provider quote. External provider freshness follows the
-   * Odds-module policy; ESPN Summary quotes are accepted when stored.
+   * must have a valid, fresh provider quote. Freshness is supplied by the
+   * Odds module and is not independently reinterpreted here.
    */
   extractMatchResultOdds(context: PredictionMatchContext): MarketOddsBaseline | null {
     const stored = (context.storedOdds ?? []).filter((quote) =>
@@ -52,7 +41,7 @@ export class MarketOddsService {
       && Number.isFinite(quote.decimalOdds)
       && quote.decimalOdds > 1
       && Boolean(quote.oddsCalculationMethod)
-      && this.isFreshProviderQuote(quote.providerUpdatedAt, quote.provider),
+      && quote.isFresh === true,
     );
     const priceFor = (key: string) => stored.find((quote) => quote.selectionKey === key)?.decimalOdds;
     const home = priceFor('HOME_WIN');
@@ -96,11 +85,12 @@ export class MarketOddsService {
       || !Number.isFinite(quote.decimalOdds)
       || quote.decimalOdds < 1.01
       || !quote.oddsCalculationMethod
+      || quote.isFresh !== true
       || !['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY'].includes(String(quote.oddsBasis))
       || (quote.priceType === 'PROVIDER' && quote.provider !== 'ESPN' && quote.provider !== 'THE_ODDS_API')
     ) return null;
 
-    if (quote.priceType === 'PROVIDER' && quote.provider !== 'ESPN' && !this.isFreshProviderQuote(quote.providerUpdatedAt, quote.provider)) return null;
+
     return {
       decimalOdds: Number(quote.decimalOdds),
       predictionReady: true,
@@ -118,6 +108,7 @@ export class MarketOddsService {
     };
   }
 }
+
 
 
 

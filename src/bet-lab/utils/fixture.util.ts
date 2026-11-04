@@ -73,6 +73,8 @@ export function extractFixtureIdentity(fixture: {
   live: boolean;
   completed?: boolean;
   status: string;
+  statusDetail?: string;
+  statusShortDetail?: string;
   homeTeamId: string;
   awayTeamId: string;
   collectedAt: Date;
@@ -106,6 +108,8 @@ export function extractFixtureIdentity(fixture: {
       asNonEmptyString(venue?.displayName) ??
       undefined,
     status: String(fixture.status ?? 'UNKNOWN'),
+    statusDetail: fixture.statusDetail ? String(fixture.statusDetail) : undefined,
+    statusShortDetail: fixture.statusShortDetail ? String(fixture.statusShortDetail) : undefined,
     collectedAt: new Date(fixture.collectedAt),
     summaryCollectedAt,
     payload: {
@@ -176,3 +180,4 @@ export function extractRosterPlayers(summary: UnknownRecord): Array<{
   walk(rosters);
   return [...players.values()];
 }
+

@@ -1,7 +1,11 @@
 // backend/src/sports/services/sports-collection.service.ts
 
-import { Injectable, Logger } from '@nestjs/common';
+import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
+import {
+  isFixtureRefreshConfirmedFinished,
+  isFixtureRefreshExplicitlyNonFinal,
+} from '../../settlement/utils/fixture-lifecycle.util';
 import { createHash } from 'node:crypto';
 
 import { InjectModel } from '@nestjs/mongoose';
@@ -100,8 +104,10 @@ interface SummaryNewsUpsert {
   collectedAt: Date;
 }
 
-
-function mergeSummaryRecords(existingValue: unknown, incomingValue: unknown): Record<string, unknown> {
+function mergeSummaryRecords(
+  existingValue: unknown,
+  incomingValue: unknown,
+): Record<string, unknown> {
   const asObject = (value: unknown): Record<string, unknown> | undefined =>
     value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -121,10 +127,12 @@ function mergeSummaryRecords(existingValue: unknown, incomingValue: unknown): Re
     }
     if (Array.isArray(incomingValue)) {
       // An empty partial response must not erase a previously collected section.
-      if (incomingValue.length > 0 || currentValue === undefined) merged[key] = incomingValue;
+      if (incomingValue.length > 0 || currentValue === undefined)
+        merged[key] = incomingValue;
       continue;
     }
-    if (typeof incomingValue === 'string' && incomingValue.trim() === '') continue;
+    if (typeof incomingValue === 'string' && incomingValue.trim() === '')
+      continue;
     merged[key] = incomingValue;
   }
   return merged;
@@ -259,7 +267,8 @@ export class SportsCollectionService {
     @InjectModel(SportsOddsSnapshot.name)
     private readonly sportsOddsSnapshotModel: Model<SportsOddsSnapshotDocument>,
 
-    // Settlement is triggered only after the canonical ESPN Summary write succeeds.
+    // Fixture refresh discovers lifecycle; Summary can only add result evidence.
+    @Inject(forwardRef(() => SettlementTriggerService))
     private readonly settlementTriggerService: SettlementTriggerService,
   ) {}
 
@@ -469,6 +478,7 @@ export class SportsCollectionService {
     const events = this.extractArray(response, ['events', 'items']);
 
     const fixtureIds: string[] = [];
+    const confirmedFinishedFixtureIds: string[] = [];
 
     let fixtureOperations: Parameters<
       Model<EspnFixtureDocument>['bulkWrite']
@@ -538,6 +548,8 @@ export class SportsCollectionService {
 
       const completed = this.isCompleted(event);
       const incomingLive = this.isLiveEvent(event);
+      const incomingLifecycleBlocksSettlement =
+        isFixtureRefreshExplicitlyNonFinal(event);
       // Scores are always handled as a complete home/away pair. Never update
       // only one side from a partial or malformed scoreboard snapshot.
       const incomingScorePair = this.scorePair(home?.score, away?.score);
@@ -571,6 +583,7 @@ export class SportsCollectionService {
       const preserveCompletedFixture = {
         $and: [
           { $eq: ['$completed', true] },
+          { $literal: !incomingLifecycleBlocksSettlement },
           {
             $or: [
               { $eq: [{ $literal: completed }, false] },
@@ -663,14 +676,24 @@ export class SportsCollectionService {
                 },
 
                 completed: {
-                  $or: ['$completed', { $literal: completed }],
+                  $cond: [
+                    { $literal: incomingLifecycleBlocksSettlement },
+                    false,
+                    { $or: ['$completed', { $literal: completed }] },
+                  ],
                 },
 
                 live: {
                   $cond: [
-                    { $eq: ['$completed', true] },
+                    { $literal: incomingLifecycleBlocksSettlement },
                     false,
-                    { $literal: incomingLive },
+                    {
+                      $cond: [
+                        { $eq: ['$completed', true] },
+                        false,
+                        { $literal: incomingLive },
+                      ],
+                    },
                   ],
                 },
 
@@ -680,8 +703,14 @@ export class SportsCollectionService {
                     '$displayClock',
                     {
                       $literal:
-                        this.getNestedString(event, ['status', 'displayClock']) ??
-                        this.getNestedString(competition, ['status', 'displayClock']),
+                        this.getNestedString(event, [
+                          'status',
+                          'displayClock',
+                        ]) ??
+                        this.getNestedString(competition, [
+                          'status',
+                          'displayClock',
+                        ]),
                     },
                   ],
                 },
@@ -700,27 +729,37 @@ export class SportsCollectionService {
                   ],
                 },
 
-                homeScore:
-                  incomingHomeScore === undefined
-                    ? '$homeScore'
-                    : {
-                        $cond: [
-                          preserveCompletedFixture,
-                          '$homeScore',
-                          { $literal: incomingHomeScore },
-                        ],
-                      },
+                homeScore: {
+                  $cond: [
+                    { $literal: incomingLifecycleBlocksSettlement },
+                    '$$REMOVE',
+                    incomingHomeScore === undefined
+                      ? '$homeScore'
+                      : {
+                          $cond: [
+                            preserveCompletedFixture,
+                            '$homeScore',
+                            { $literal: incomingHomeScore },
+                          ],
+                        },
+                  ],
+                },
 
-                awayScore:
-                  incomingAwayScore === undefined
-                    ? '$awayScore'
-                    : {
-                        $cond: [
-                          preserveCompletedFixture,
-                          '$awayScore',
-                          { $literal: incomingAwayScore },
-                        ],
-                      },
+                awayScore: {
+                  $cond: [
+                    { $literal: incomingLifecycleBlocksSettlement },
+                    '$$REMOVE',
+                    incomingAwayScore === undefined
+                      ? '$awayScore'
+                      : {
+                          $cond: [
+                            preserveCompletedFixture,
+                            '$awayScore',
+                            { $literal: incomingAwayScore },
+                          ],
+                        },
+                  ],
+                },
 
                 venueId: this.toStringValue(competition?.venue?.id),
 
@@ -748,9 +787,17 @@ export class SportsCollectionService {
                 // fixtures as newly finished on every subsequent refresh.
                 completedAt: {
                   $cond: [
-                    { $or: ['$completed', { $literal: completed }] },
-                    { $ifNull: ['$completedAt', { $literal: collectedAt }] },
-                    '$completedAt',
+                    { $literal: incomingLifecycleBlocksSettlement },
+                    '$$REMOVE',
+                    {
+                      $cond: [
+                        { $or: ['$completed', { $literal: completed }] },
+                        {
+                          $ifNull: ['$completedAt', { $literal: collectedAt }],
+                        },
+                        '$completedAt',
+                      ],
+                    },
                   ],
                 },
                 collectedAt,
@@ -770,6 +817,15 @@ export class SportsCollectionService {
       );
 
       fixtureIds.push(eventId);
+      if (
+        isFixtureRefreshConfirmedFinished({
+          completed,
+          live: incomingLive,
+          payload: eventPayload,
+        })
+      ) {
+        confirmedFinishedFixtureIds.push(eventId);
+      }
 
       /*
        * Flush completed Mongo batches immediately. We deliberately do not
@@ -797,7 +853,21 @@ export class SportsCollectionService {
     // Do not mark the enclosing fixture-refresh job successful until the
     // durable follow-up jobs have been written. If Mongo queue insertion fails,
     // the fixture-refresh job itself retries; event keys make the replay safe.
-    await this.espnQueueBuilderService.onFixturesCollected(fixtureIds);
+    const queueBuilder = this.espnQueueBuilderService as Pick<
+      EspnQueueBuilderService,
+      'onFixturesCollected'
+    >;
+    await queueBuilder.onFixturesCollected(fixtureIds);
+
+    // Fixture writes are durable at this point. Settlement independently reads
+    // each event and verifies the fixture-feed lifecycle status before enqueueing.
+    if (confirmedFinishedFixtureIds.length > 0) {
+      const settlementTrigger = this.settlementTriggerService as Pick<
+        SettlementTriggerService,
+        'onFixturesRefreshed'
+      >;
+      await settlementTrigger.onFixturesRefreshed(confirmedFinishedFixtureIds);
+    }
 
     return {
       fixtureIds,
@@ -875,8 +945,10 @@ export class SportsCollectionService {
 
       const isLive = this.isLiveEvent(event);
       const completed = this.isCompleted(event);
+      const incomingLifecycleBlocksSettlement =
+        isFixtureRefreshExplicitlyNonFinal(eventRecord);
 
-      if (!isLive && !completed) {
+      if (!isLive && !completed && !incomingLifecycleBlocksSettlement) {
         continue;
       }
 
@@ -928,7 +1000,11 @@ export class SportsCollectionService {
       // The global live board can temporarily contain a stale in-progress
       // snapshot for an event already stored as final. Never downgrade that
       // canonical completed result from the live path.
-      if (storedFixture.completed === true && !completed) {
+      if (
+        storedFixture.completed === true &&
+        !completed &&
+        !incomingLifecycleBlocksSettlement
+      ) {
         continue;
       }
 
@@ -988,22 +1064,30 @@ export class SportsCollectionService {
           awayTeamId: storedFixture.awayTeamId,
         },
       );
-      const storedSummaryPair = storedSummaryResult &&
+      const storedSummaryPair =
+        storedSummaryResult &&
         storedSummaryResult.homeScore !== undefined &&
         storedSummaryResult.awayScore !== undefined
-        ? this.scorePair(storedSummaryResult.homeScore, storedSummaryResult.awayScore)
-        : undefined;
-      const summaryHasScoreConflict = storedSummaryResult?.scoreConflict === true;
+          ? this.scorePair(
+              storedSummaryResult.homeScore,
+              storedSummaryResult.awayScore,
+            )
+          : undefined;
+      const summaryHasScoreConflict =
+        storedSummaryResult?.scoreConflict === true;
       const existingScorePair = this.scorePair(
         storedFixture.homeScore,
         storedFixture.awayScore,
       );
-      const resolvedScorePair = completed
-        ? summaryHasScoreConflict
-          ? undefined
-          : storedSummaryPair ?? incomingScorePair
-        : incomingScorePair ?? existingScorePair;
-      const clearFinalScores = completed && !resolvedScorePair;
+      const resolvedScorePair = incomingLifecycleBlocksSettlement
+        ? undefined
+        : completed
+          ? summaryHasScoreConflict
+            ? undefined
+            : (storedSummaryPair ?? incomingScorePair)
+          : (incomingScorePair ?? existingScorePair);
+      const clearFinalScores =
+        incomingLifecycleBlocksSettlement || (completed && !resolvedScorePair);
 
       const livePayload: Record<string, unknown> = {
         ...eventRecord,
@@ -1057,23 +1141,29 @@ export class SportsCollectionService {
 
                 completed,
 
-                completedAt: completedAt
-                  ? { $ifNull: ['$completedAt', { $literal: completedAt }] }
-                  : '$completedAt',
+                completedAt: incomingLifecycleBlocksSettlement
+                  ? '$$REMOVE'
+                  : completedAt
+                    ? { $ifNull: ['$completedAt', { $literal: completedAt }] }
+                    : '$completedAt',
 
-                live: isLive,
+                live: incomingLifecycleBlocksSettlement ? false : isLive,
 
                 homeTeamId: this.getTeamId(home),
 
                 awayTeamId: this.getTeamId(away),
 
-                homeScore: resolvedScorePair
-                  ? { $literal: resolvedScorePair.homeScore }
-                  : '$homeScore',
+                homeScore: clearFinalScores
+                  ? '$$REMOVE'
+                  : resolvedScorePair
+                    ? { $literal: resolvedScorePair.homeScore }
+                    : '$homeScore',
 
-                awayScore: resolvedScorePair
-                  ? { $literal: resolvedScorePair.awayScore }
-                  : '$awayScore',
+                awayScore: clearFinalScores
+                  ? '$$REMOVE'
+                  : resolvedScorePair
+                    ? { $literal: resolvedScorePair.awayScore }
+                    : '$awayScore',
 
                 venueId: this.getNestedString(competition, ['venue', 'id']),
 
@@ -1091,7 +1181,9 @@ export class SportsCollectionService {
                 collectedAt: new Date(),
               },
             },
-            ...(clearFinalScores ? [{ $unset: ['homeScore', 'awayScore'] }] : []),
+            ...(clearFinalScores
+              ? [{ $unset: ['homeScore', 'awayScore'] }]
+              : []),
           ],
           {
             upsert: false,
@@ -1141,9 +1233,19 @@ export class SportsCollectionService {
       )
       .exec();
 
-    // Derived tables are opportunistic background work, never startup gates.
+    // Derived standings refreshes are background work, never startup gates.
     for (const affectedLeagueId of affectedLeagueIds) {
       void this.scheduleDerivedRefreshForLeague(affectedLeagueId);
+    }
+
+    if (newlyFinished.length > 0) {
+      const settlementTrigger = this.settlementTriggerService as Pick<
+        SettlementTriggerService,
+        'onFixturesRefreshed'
+      >;
+      await settlementTrigger.onFixturesRefreshed(
+        newlyFinished.map((fixture) => fixture.eventId),
+      );
     }
 
     return {
@@ -1716,20 +1818,13 @@ export class SportsCollectionService {
     const home =
       competitors.find((item) => {
         const competitor = this.asRecord(item);
-
         return competitor?.homeAway === 'home' || competitor?.isHome === true;
       }) ?? competitors[0];
-
     const away =
       competitors.find((item) => {
         const competitor = this.asRecord(item);
-
         return competitor?.homeAway === 'away' || competitor?.isAway === true;
       }) ?? competitors[1];
-
-    const homeCompetitor = this.asRecord(home);
-
-    const awayCompetitor = this.asRecord(away);
 
     const season =
       this.toNumber(this.getNestedString(event, ['season', 'year'])) ??
@@ -1739,6 +1834,8 @@ export class SportsCollectionService {
     const status = this.extractStatus(event);
 
     const completed = this.isCompleted(event);
+    const incomingLifecycleBlocksSettlement =
+      isFixtureRefreshExplicitlyNonFinal(event);
 
     const normalizedLeagueId = this.normalizeLeagueId(params.leagueId);
     const existingFixture = await this.espnFixtureModel
@@ -1768,47 +1865,59 @@ export class SportsCollectionService {
         awayTeamId: existingFixture?.awayTeamId,
       },
     );
-    const summaryScorePair = existingSummaryResult &&
+    const summaryScorePair =
+      existingSummaryResult &&
       existingSummaryResult.homeScore !== undefined &&
       existingSummaryResult.awayScore !== undefined
-      ? this.scorePair(existingSummaryResult.homeScore, existingSummaryResult.awayScore)
-      : undefined;
+        ? this.scorePair(
+            existingSummaryResult.homeScore,
+            existingSummaryResult.awayScore,
+          )
+        : undefined;
     const incomingScorePair = this.extractCompetitorScorePair(competition);
     const existingScorePair = this.scorePair(
       existingFixture?.homeScore,
       existingFixture?.awayScore,
     );
-    const summaryHasScoreConflict = existingSummaryResult?.scoreConflict === true;
+    const summaryHasScoreConflict =
+      existingSummaryResult?.scoreConflict === true;
     const incomingConflictsWithExisting = Boolean(
-      incomingScorePair && existingScorePair &&
+      incomingScorePair &&
+      existingScorePair &&
       (incomingScorePair.homeScore !== existingScorePair.homeScore ||
         incomingScorePair.awayScore !== existingScorePair.awayScore),
     );
     const existingOrIncomingZeroZero = Boolean(
-      (existingScorePair?.homeScore === 0 && existingScorePair.awayScore === 0) ||
+      (existingScorePair?.homeScore === 0 &&
+        existingScorePair.awayScore === 0) ||
       (incomingScorePair?.homeScore === 0 && incomingScorePair.awayScore === 0),
     );
-    const unresolvedFinalResult = completed && !summaryScorePair && (
-      summaryHasScoreConflict ||
-      existingPayload.resultScoreUnresolved === true ||
-      incomingConflictsWithExisting ||
-      existingOrIncomingZeroZero ||
-      (!existingScorePair && !incomingScorePair)
-    );
-    const preserveCompletedFixture = existingFixture?.completed === true && (
-      !completed ||
-      existingPayload.resultScoreUnresolved === true ||
-      summaryHasScoreConflict ||
-      (!summaryScorePair && (!incomingScorePair || incomingConflictsWithExisting))
-    );
-    const resolvedScorePair = unresolvedFinalResult
-      ? undefined
-      : summaryScorePair ?? (
-          preserveCompletedFixture
+    const unresolvedFinalResult =
+      completed &&
+      !summaryScorePair &&
+      (summaryHasScoreConflict ||
+        existingPayload.resultScoreUnresolved === true ||
+        incomingConflictsWithExisting ||
+        existingOrIncomingZeroZero ||
+        (!existingScorePair && !incomingScorePair));
+    const preserveCompletedFixture =
+      existingFixture?.completed === true &&
+      !incomingLifecycleBlocksSettlement &&
+      (!completed ||
+        existingPayload.resultScoreUnresolved === true ||
+        summaryHasScoreConflict ||
+        (!summaryScorePair &&
+          (!incomingScorePair || incomingConflictsWithExisting)));
+    const resolvedScorePair =
+      incomingLifecycleBlocksSettlement || unresolvedFinalResult
+        ? undefined
+        : (summaryScorePair ??
+          (preserveCompletedFixture
             ? existingScorePair
-            : incomingScorePair ?? (completed ? undefined : existingScorePair)
-        );
-    const clearCompletedScores = completed && !resolvedScorePair;
+            : (incomingScorePair ??
+              (completed ? undefined : existingScorePair))));
+    const clearCompletedScores =
+      incomingLifecycleBlocksSettlement || (completed && !resolvedScorePair);
 
     const detailPayload: Record<string, unknown> = preserveCompletedFixture
       ? { ...existingPayload }
@@ -1828,36 +1937,35 @@ export class SportsCollectionService {
     }
 
     const now = new Date();
-    const effectiveCompleted = preserveCompletedFixture || completed;
+    const effectiveCompleted =
+      !incomingLifecycleBlocksSettlement &&
+      (preserveCompletedFixture || completed);
     const set: Record<string, unknown> = {
       eventId,
       leagueId: normalizedLeagueId,
       season,
       fixtureDate: preserveCompletedFixture
-        ? existingFixture?.fixtureDate ?? fixtureDate
+        ? (existingFixture?.fixtureDate ?? fixtureDate)
         : fixtureDate,
       status: preserveCompletedFixture
-        ? existingFixture?.status ?? status
+        ? (existingFixture?.status ?? status)
         : status,
       statusDetail: preserveCompletedFixture
         ? existingFixture?.statusDetail
-        : this.getNestedString(competition, [
-            'status',
-            'type',
-            'description',
-          ]),
+        : this.getNestedString(competition, ['status', 'type', 'description']),
       statusShortDetail: preserveCompletedFixture
         ? existingFixture?.statusShortDetail
-        : this.getNestedString(competition, [
-            'status',
-            'type',
-            'shortDetail',
-          ]),
+        : this.getNestedString(competition, ['status', 'type', 'shortDetail']),
       period: preserveCompletedFixture
         ? undefined
-        : this.toNumber(this.getNestedString(competition, ['status', 'period'])),
+        : this.toNumber(
+            this.getNestedString(competition, ['status', 'period']),
+          ),
       completed: effectiveCompleted,
-      live: effectiveCompleted ? false : this.isLiveEvent(event),
+      live:
+        effectiveCompleted || incomingLifecycleBlocksSettlement
+          ? false
+          : this.isLiveEvent(event),
       homeTeamId: this.getTeamId(home) ?? existingFixture?.homeTeamId,
       awayTeamId: this.getTeamId(away) ?? existingFixture?.awayTeamId,
       venueId: this.getNestedString(competition, ['venue', 'id']),
@@ -1883,7 +1991,18 @@ export class SportsCollectionService {
         { eventId },
         {
           $set: set,
-          ...(clearCompletedScores ? { $unset: { homeScore: 1, awayScore: 1 } } : {}),
+          ...(clearCompletedScores || incomingLifecycleBlocksSettlement
+            ? {
+                $unset: {
+                  ...(clearCompletedScores
+                    ? { homeScore: 1, awayScore: 1 }
+                    : {}),
+                  ...(incomingLifecycleBlocksSettlement
+                    ? { completedAt: 1 }
+                    : {}),
+                },
+              }
+            : {}),
         },
         { upsert: true },
       )
@@ -1894,7 +2013,9 @@ export class SportsCollectionService {
     // score with the numerically larger value.
     if (
       effectiveCompleted &&
-      (!summaryScorePair || summaryHasScoreConflict || incomingConflictsWithExisting)
+      (!summaryScorePair ||
+        summaryHasScoreConflict ||
+        incomingConflictsWithExisting)
     ) {
       try {
         await this.espnQueueService.addSummaryRefreshJob({
@@ -1905,7 +2026,9 @@ export class SportsCollectionService {
           scheduledFor: new Date(),
         });
       } catch (error) {
-        this.logger.warn(`Could not queue Summary verification for fixture details ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+        this.logger.warn(
+          `Could not queue Summary verification for fixture details ${eventId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
 
@@ -1935,9 +2058,17 @@ export class SportsCollectionService {
     const existing = await this.espnFixtureModel
       .findOne({ eventId, leagueId })
       .select({
-        eventId: 1, payload: 1, homeTeamId: 1, awayTeamId: 1,
-        homeScore: 1, awayScore: 1, status: 1, statusDetail: 1,
-        statusShortDetail: 1, completed: 1, live: 1,
+        eventId: 1,
+        payload: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        homeScore: 1,
+        awayScore: 1,
+        status: 1,
+        statusDetail: 1,
+        statusShortDetail: 1,
+        completed: 1,
+        live: 1,
       })
       .lean()
       .exec();
@@ -1978,9 +2109,9 @@ export class SportsCollectionService {
       );
     }
 
-    // ESPN Summary has the authoritative final header/score when the scoreboard
-    // root fields were missed or stale. Reconcile those canonical fields even
-    // when Summary content itself was unchanged.
+    // ESPN Summary supplies detailed score evidence. It is reconciled only when
+    // the fixture feed's own stored status already confirms the match as finished;
+    // Summary never writes the lifecycle fields.
     const reconciliation = await this.reconcileFixtureResultFromSummary({
       leagueId,
       eventId,
@@ -2012,7 +2143,8 @@ export class SportsCollectionService {
 
     // Only a meaningful Summary or canonical-result change should trigger an immediate follow-up.
     // Unchanged refreshes must not mark an active settlement job for a redundant
-    // rerun; the discovery scan remains the safety net for missed root-status changes.
+    // rerun. Fixture refresh is responsible for lifecycle discovery; Summary only
+    // requests a new pass when it changes evidence for an already-finished match.
     if (
       reconciliation?.hasScores &&
       (!unchanged || reconciliation.rootChanged)
@@ -2020,16 +2152,18 @@ export class SportsCollectionService {
       try {
         await this.settlementTriggerService.onSummaryUpdated(eventId, leagueId);
       } catch (error) {
-        this.logger.warn(`Could not enqueue settlement for Summary ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+        this.logger.warn(
+          `Could not enqueue settlement for Summary ${eventId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
     return mergedSummary;
   }
 
   /**
-   * Repairs canonical fixture status/scores from an already-stored ESPN
-   * Summary without another provider request. Only an explicit final Summary
-   * state is accepted; kickoff age alone never marks a fixture completed.
+   * Reconciles score evidence from an already-stored ESPN Summary without another
+   * provider request. The fixture feed must already have confirmed the finished
+   * lifecycle; this method never changes status, completed, live, or completedAt.
    */
   async reconcileFixtureResultFromSummary(params: {
     leagueId: string;
@@ -2050,6 +2184,18 @@ export class SportsCollectionService {
     const leagueId = this.normalizeLeagueId(params.leagueId);
     const eventId = String(params.eventId ?? '').trim();
     if (!leagueId || !eventId) return undefined;
+
+    // Summary is result evidence only. It cannot create a finished state; only
+    // the stored status from an ESPN fixture/scoreboard refresh can authorize it.
+    if (
+      !isFixtureRefreshConfirmedFinished({
+        completed: params.completed,
+        live: params.live,
+        payload: params.fixturePayload,
+      })
+    ) {
+      return undefined;
+    }
 
     const finalResult = this.extractSummaryFinalResult(params.summary, {
       homeTeamId: params.homeTeamId,
@@ -2092,39 +2238,26 @@ export class SportsCollectionService {
     const quarantineScores = !hasScores;
     const existingRootPair = this.scorePair(params.homeScore, params.awayScore);
     const collectedAt = new Date();
-    const finalStatusDetail = finalResult.statusDetail ?? 'Final';
-    const finalStatusShortDetail =
-      finalResult.statusShortDetail ?? finalResult.statusDetail ?? 'FT';
     const scoreChanged = hasScores
       ? !existingRootPair ||
         existingRootPair.homeScore !== resolution.homeScore ||
         existingRootPair.awayScore !== resolution.awayScore
       : Boolean(quarantineScores && existingRootPair);
-    const statusChanged =
-      params.completed !== true ||
-      params.live === true ||
-      String(params.status ?? '') !== finalResult.status ||
-      String(params.statusDetail ?? '') !== finalStatusDetail ||
-      String(params.statusShortDetail ?? '') !== finalStatusShortDetail;
     const markerChanged = hasScores
       ? params.resultScoreUnresolved === true
       : quarantineScores && params.resultScoreUnresolved !== true;
     const payloadScoreUpdates = hasScores
-      ? this.buildPayloadScoreNormalizationUpdates(
-          params.fixturePayload,
-          { homeScore: resolution.homeScore!, awayScore: resolution.awayScore! },
-        )
+      ? this.buildPayloadScoreNormalizationUpdates(params.fixturePayload, {
+          homeScore: resolution.homeScore!,
+          awayScore: resolution.awayScore!,
+        })
       : {};
     const rootChanged =
-      scoreChanged || statusChanged || markerChanged ||
+      scoreChanged ||
+      markerChanged ||
       Object.keys(payloadScoreUpdates).length > 0;
+    // Summary may reconcile verified score evidence, never fixture lifecycle fields.
     const set: Record<string, unknown> = {
-      status: { $literal: finalResult.status },
-      statusDetail: { $literal: finalStatusDetail },
-      statusShortDetail: { $literal: finalStatusShortDetail },
-      completed: true,
-      live: false,
-      completedAt: { $ifNull: ['$completedAt', { $literal: collectedAt }] },
       collectedAt: { $literal: collectedAt },
     };
     if (hasScores) {
@@ -2148,11 +2281,9 @@ export class SportsCollectionService {
     }
 
     const update = await this.espnFixtureModel
-      .updateOne(
-        { eventId, leagueId },
-        updatePipeline,
-        { updatePipeline: true },
-      )
+      .updateOne({ eventId, leagueId }, updatePipeline, {
+        updatePipeline: true,
+      })
       .exec();
     if (update.matchedCount === 0) return undefined;
 
@@ -2205,19 +2336,22 @@ export class SportsCollectionService {
 
     const header = this.asRecord(summary.header);
     const event = this.asRecord(summary.event);
+    const asUnknownArray = (candidate: unknown): unknown[] =>
+      Array.isArray(candidate) ? (candidate as unknown[]) : [];
     const competitions = [
-      ...(Array.isArray(header?.competitions) ? header.competitions : []),
-      ...(Array.isArray(summary.competitions) ? summary.competitions : []),
-      ...(Array.isArray(event?.competitions) ? event.competitions : []),
-    ].map((item) => this.asRecord(item)).filter(
-      (item): item is Record<string, unknown> => Boolean(item),
-    );
+      ...asUnknownArray(header?.competitions),
+      ...asUnknownArray(summary.competitions),
+      ...asUnknownArray(event?.competitions),
+    ]
+      .map((item) => this.asRecord(item))
+      .filter((item): item is Record<string, unknown> => Boolean(item));
 
     // Prefer a competition that explicitly reports a final state rather than
     // assuming the first array entry is always the relevant/final competition.
-    const competition = competitions.find((item) =>
-      this.isTerminalStatusRecord(item.status ?? item),
-    ) ?? competitions[0];
+    const competition =
+      competitions.find((item) =>
+        this.isTerminalStatusRecord(item.status ?? item),
+      ) ?? competitions[0];
 
     const status =
       this.asRecord(competition?.status) ??
@@ -2254,10 +2388,16 @@ export class SportsCollectionService {
     const finalStatusName =
       /(^|_)FINAL($|_)|FULL[_ ]?TIME|FINISHED|COMPLETED/.test(statusName);
     const finalAbbreviation = ['FT', 'AET', 'PEN'].includes(statusAbbreviation);
-    const finalStatusDetail = /\bFT\b|AFTER EXTRA TIME|AFTER PENALTIES/.test(allStatusText);
-    const finalState = ['post', 'final', 'complete', 'completed', 'finished'].includes(
-      statusState,
+    const finalStatusDetail = /\bFT\b|AFTER EXTRA TIME|AFTER PENALTIES/.test(
+      allStatusText,
     );
+    const finalState = [
+      'post',
+      'final',
+      'complete',
+      'completed',
+      'finished',
+    ].includes(statusState);
     if (
       !explicitlyCompleted &&
       !finalStatusName &&
@@ -2277,14 +2417,17 @@ export class SportsCollectionService {
       teamIds,
     );
     const scoreConflict = Boolean(
-      competitorPair && boxscorePair &&
+      competitorPair &&
+      boxscorePair &&
       (competitorPair.homeScore !== boxscorePair.homeScore ||
         competitorPair.awayScore !== boxscorePair.awayScore),
     );
     // The Summary's own result header and its team goal totals should agree.
     // If they do not, do not settle from either value; let the refresh/recovery
     // path retry rather than selecting a numerically larger score.
-    const scorePair = scoreConflict ? undefined : competitorPair ?? boxscorePair;
+    const scorePair = scoreConflict
+      ? undefined
+      : (competitorPair ?? boxscorePair);
 
     return {
       status: statusName || 'STATUS_FINAL',
@@ -2296,8 +2439,8 @@ export class SportsCollectionService {
             homeScore: scorePair.homeScore,
             awayScore: scorePair.awayScore,
             scoreSource: competitorPair
-              ? 'SUMMARY_COMPETITORS' as const
-              : 'SUMMARY_BOXSCORE' as const,
+              ? ('SUMMARY_COMPETITORS' as const)
+              : ('SUMMARY_BOXSCORE' as const),
           }
         : {}),
     };
@@ -2307,21 +2450,29 @@ export class SportsCollectionService {
     const record = this.asRecord(value);
     if (!record) return false;
     const statusType = this.asRecord(record.type);
-    const name = String(statusType?.name ?? record.name ?? '').toUpperCase();
-    const state = String(statusType?.state ?? record.state ?? '').toLowerCase();
-    const detail = String(
-      statusType?.detail ?? statusType?.shortDetail ?? record.detail ?? record.shortDetail ?? '',
-    ).toUpperCase();
-    const abbreviation = String(statusType?.abbreviation ?? '').toUpperCase();
-    const all = `${name} ${state} ${detail} ${abbreviation}`;
+    const name = this.toStringValue(statusType?.name ?? record.name) ?? '';
+    const state = this.toStringValue(statusType?.state ?? record.state) ?? '';
+    const detail =
+      this.toStringValue(
+        statusType?.detail ??
+          statusType?.shortDetail ??
+          record.detail ??
+          record.shortDetail,
+      ) ?? '';
+    const abbreviation = this.toStringValue(statusType?.abbreviation) ?? '';
+    const all = `${name} ${state} ${detail} ${abbreviation}`.toUpperCase();
     if (/CANCEL|POSTPON|ABANDON|VOID|NO[_ ]?CONTEST/.test(all)) return false;
     return Boolean(
       statusType?.completed === true ||
       record.completed === true ||
-      /(^|_)FINAL($|_)|FULL[_ ]?TIME|FINISHED|COMPLETED/.test(name) ||
-      ['post', 'final', 'complete', 'completed', 'finished'].includes(state) ||
-      ['FT', 'AET', 'PEN'].includes(abbreviation) ||
-      /\bFT\b|AFTER EXTRA TIME|AFTER PENALTIES/.test(detail),
+      /(^|_)FINAL($|_)|FULL[_ ]?TIME|FINISHED|COMPLETED/.test(
+        name.toUpperCase(),
+      ) ||
+      ['post', 'final', 'complete', 'completed', 'finished'].includes(
+        state.toLowerCase(),
+      ) ||
+      ['FT', 'AET', 'PEN'].includes(abbreviation.toUpperCase()) ||
+      /\bFT\b|AFTER EXTRA TIME|AFTER PENALTIES/.test(all),
     );
   }
 
@@ -2332,7 +2483,10 @@ export class SportsCollectionService {
       : undefined;
   }
 
-  private scorePair(homeValue: unknown, awayValue: unknown): EspnScorePair | undefined {
+  private scorePair(
+    homeValue: unknown,
+    awayValue: unknown,
+  ): EspnScorePair | undefined {
     const homeScore = this.validScore(homeValue);
     const awayScore = this.validScore(awayValue);
     if (homeScore === undefined || awayScore === undefined) return undefined;
@@ -2350,10 +2504,12 @@ export class SportsCollectionService {
   ): unknown[] | undefined {
     if (!Array.isArray(value)) return undefined;
     let changed = false;
-    const normalized = value.map((item) => {
+    const normalized = (value as unknown[]).map((item: unknown) => {
       const competitor = this.asRecord(item);
       if (!competitor) return item;
-      const homeAway = String(competitor.homeAway ?? '').toLowerCase();
+      const homeAway = (
+        this.toStringValue(competitor.homeAway) ?? ''
+      ).toLowerCase();
       const isHome = homeAway === 'home' || competitor.isHome === true;
       const isAway = homeAway === 'away' || competitor.isAway === true;
       if (!isHome && !isAway) return item;
@@ -2378,7 +2534,10 @@ export class SportsCollectionService {
   ): Record<string, unknown> {
     const payload = this.asRecord(payloadValue) ?? {};
     const updates: Record<string, unknown> = {};
-    const rootCompetitions = this.normalizeCompetitionArrayScores(payload.competitions, scores);
+    const rootCompetitions = this.normalizeCompetitionArrayScores(
+      payload.competitions,
+      scores,
+    );
     if (rootCompetitions) updates['payload.competitions'] = rootCompetitions;
 
     for (const [homeKey, awayKey] of [
@@ -2391,27 +2550,43 @@ export class SportsCollectionService {
       ) {
         const homeCurrent = this.validScore(payload[homeKey]);
         const awayCurrent = this.validScore(payload[awayKey]);
-        if (homeCurrent !== scores.homeScore || awayCurrent !== scores.awayScore) {
-          updates[`payload.${homeKey}`] = typeof payload[homeKey] === 'string'
-            ? String(scores.homeScore)
-            : scores.homeScore;
-          updates[`payload.${awayKey}`] = typeof payload[awayKey] === 'string'
-            ? String(scores.awayScore)
-            : scores.awayScore;
+        if (
+          homeCurrent !== scores.homeScore ||
+          awayCurrent !== scores.awayScore
+        ) {
+          updates[`payload.${homeKey}`] =
+            typeof payload[homeKey] === 'string'
+              ? String(scores.homeScore)
+              : scores.homeScore;
+          updates[`payload.${awayKey}`] =
+            typeof payload[awayKey] === 'string'
+              ? String(scores.awayScore)
+              : scores.awayScore;
         }
       }
     }
 
-    const rootCompetitors = this.normalizeCompetitorScoreArray(payload.competitors, scores);
+    const rootCompetitors = this.normalizeCompetitorScoreArray(
+      payload.competitors,
+      scores,
+    );
     if (rootCompetitors) updates['payload.competitors'] = rootCompetitors;
 
     const header = this.asRecord(payload.header) ?? {};
-    const headerCompetitions = this.normalizeCompetitionArrayScores(header.competitions, scores);
-    if (headerCompetitions) updates['payload.header.competitions'] = headerCompetitions;
+    const headerCompetitions = this.normalizeCompetitionArrayScores(
+      header.competitions,
+      scores,
+    );
+    if (headerCompetitions)
+      updates['payload.header.competitions'] = headerCompetitions;
 
     const event = this.asRecord(payload.event) ?? {};
-    const eventCompetitions = this.normalizeCompetitionArrayScores(event.competitions, scores);
-    if (eventCompetitions) updates['payload.event.competitions'] = eventCompetitions;
+    const eventCompetitions = this.normalizeCompetitionArrayScores(
+      event.competitions,
+      scores,
+    );
+    if (eventCompetitions)
+      updates['payload.event.competitions'] = eventCompetitions;
     return updates;
   }
 
@@ -2420,11 +2595,15 @@ export class SportsCollectionService {
     scores: EspnScorePair,
   ): unknown[] | undefined {
     if (!Array.isArray(value)) return undefined;
+    const values: unknown[] = value;
     let changed = false;
-    const normalized = value.map((item) => {
+    const normalized = values.map((item) => {
       const competition = this.asRecord(item);
       if (!competition) return item;
-      const competitors = this.normalizeCompetitorScoreArray(competition.competitors, scores);
+      const competitors = this.normalizeCompetitorScoreArray(
+        competition.competitors,
+        scores,
+      );
       if (!competitors) return item;
       changed = true;
       return { ...competition, competitors };
@@ -2437,8 +2616,8 @@ export class SportsCollectionService {
   ): EspnScorePair | undefined {
     const competition = this.asRecord(competitionValue);
     if (!competition) return undefined;
-    const competitors = Array.isArray(competition.competitors)
-      ? competition.competitors
+    const competitors: unknown[] = Array.isArray(competition.competitors)
+      ? (competition.competitors as unknown[])
       : [];
     const home = competitors.find((item) => {
       const record = this.asRecord(item);
@@ -2460,51 +2639,61 @@ export class SportsCollectionService {
   ): EspnScorePair | undefined {
     const summary = this.asRecord(summaryValue);
     const boxscore = this.asRecord(summary?.boxscore);
-    const teams = Array.isArray(boxscore?.teams) ? boxscore.teams : [];
+    const teams: unknown[] = Array.isArray(boxscore?.teams)
+      ? (boxscore.teams as unknown[])
+      : [];
     if (teams.length < 2) return undefined;
 
     const competition = this.asRecord(competitionValue);
-    const competitors = Array.isArray(competition?.competitors)
-      ? competition.competitors.map((item) => this.asRecord(item))
+    const competitors: unknown[] = Array.isArray(competition?.competitors)
+      ? (competition.competitors as unknown[])
       : [];
-    const homeCompetitor = competitors.find(
-      (item) => item?.homeAway === 'home' || item?.isHome === true,
-    );
-    const awayCompetitor = competitors.find(
-      (item) => item?.homeAway === 'away' || item?.isAway === true,
-    );
+    const homeCompetitor = competitors.find((item) => {
+      const competitor = this.asRecord(item);
+      return competitor?.homeAway === 'home' || competitor?.isHome === true;
+    });
+    const awayCompetitor = competitors.find((item) => {
+      const competitor = this.asRecord(item);
+      return competitor?.homeAway === 'away' || competitor?.isAway === true;
+    });
     const teamIdsOf = (value: unknown): string[] => {
       const record = this.asRecord(value);
       const nested = this.asRecord(record?.team);
       return [record?.id, record?.teamId, nested?.id, nested?.teamId]
-        .filter((id) => id !== undefined && id !== null && String(id).trim() !== '')
-        .map(String);
+        .map((id) => this.toStringValue(id))
+        .filter((id): id is string => id !== undefined);
     };
     const expectedHomeIds = new Set(
       [teamIds.homeTeamId, ...teamIdsOf(homeCompetitor)]
-        .filter((id) => id !== undefined && id !== null && String(id).trim() !== '')
-        .map((id) => String(id)),
+        .map((id) => this.toStringValue(id))
+        .filter((id): id is string => id !== undefined),
     );
     const expectedAwayIds = new Set(
       [teamIds.awayTeamId, ...teamIdsOf(awayCompetitor)]
-        .filter((id) => id !== undefined && id !== null && String(id).trim() !== '')
-        .map((id) => String(id)),
+        .map((id) => this.toStringValue(id))
+        .filter((id): id is string => id !== undefined),
     );
 
     const goalTotal = (teamValue: unknown): number | undefined => {
       const teamRecord = this.asRecord(teamValue);
       if (!teamRecord) return undefined;
-      const stats = Array.isArray(teamRecord.statistics)
-        ? teamRecord.statistics
+      const statistics: unknown[] = Array.isArray(teamRecord.statistics)
+        ? (teamRecord.statistics as unknown[])
         : [];
-      for (const item of stats) {
-        const stat = this.asRecord(item);
-        const normalizedName = String(
-          stat?.name ?? stat?.abbreviation ?? stat?.displayName ?? '',
-        ).toLowerCase().replace(/[^a-z0-9]/g, '');
+      for (const rawStat of statistics) {
+        const stat = this.asRecord(rawStat);
+        if (!stat) continue;
+        const normalizedName = (
+          this.toStringValue(
+            stat.name ?? stat.abbreviation ?? stat.displayName,
+          ) ?? ''
+        )
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, '');
         if (normalizedName !== 'totalgoals') continue;
-        const value = this.validScore(stat?.value) ?? this.validScore(stat?.displayValue);
-        if (value !== undefined) return value;
+        const score =
+          this.validScore(stat.value) ?? this.validScore(stat.displayValue);
+        if (score !== undefined) return score;
       }
       const nestedTeam = this.asRecord(teamRecord.team);
       return this.validScore(teamRecord.score ?? nestedTeam?.score);
@@ -2516,21 +2705,24 @@ export class SportsCollectionService {
       const entry = this.asRecord(item);
       if (!entry) continue;
       const nestedTeam = this.asRecord(entry.team);
-      const homeAway = String(entry.homeAway ?? nestedTeam?.homeAway ?? '').toLowerCase();
+      const homeAway = (
+        this.toStringValue(entry.homeAway ?? nestedTeam?.homeAway) ?? ''
+      ).toLowerCase();
       const ids = teamIdsOf(entry);
       if (
         homeAway === 'home' ||
         entry.isHome === true ||
         ids.some((id) => expectedHomeIds.has(id))
-      ) homeTeam = entry;
+      )
+        homeTeam = entry;
       if (
         homeAway === 'away' ||
         entry.isAway === true ||
         ids.some((id) => expectedAwayIds.has(id))
-      ) awayTeam = entry;
+      )
+        awayTeam = entry;
     }
 
-    if (!homeTeam || !awayTeam || homeTeam === awayTeam) return undefined;
     return this.scorePair(goalTotal(homeTeam), goalTotal(awayTeam));
   }
 
@@ -2546,14 +2738,24 @@ export class SportsCollectionService {
   private isCompletedFixtureRecord(fixtureValue: unknown): boolean {
     const fixture = this.asRecord(fixtureValue);
     if (!fixture) return false;
-    const text = `${fixture.status ?? ''} ${fixture.statusDetail ?? ''} ${fixture.statusShortDetail ?? ''}`.toUpperCase();
+    const text = [
+      fixture.status,
+      fixture.statusDetail,
+      fixture.statusShortDetail,
+    ]
+      .map((value) => this.toStringValue(value) ?? '')
+      .join(' ')
+      .toUpperCase();
     if (/CANCEL|POSTPON|ABANDON|VOID|NO[_ ]?CONTEST/.test(text)) return false;
-    return fixture.completed === true || this.isTerminalStatusRecord({
-      name: fixture.status,
-      detail: fixture.statusDetail,
-      shortDetail: fixture.statusShortDetail,
-      completed: fixture.completed,
-    });
+    return (
+      fixture.completed === true ||
+      this.isTerminalStatusRecord({
+        name: fixture.status,
+        detail: fixture.statusDetail,
+        shortDetail: fixture.statusShortDetail,
+        completed: fixture.completed,
+      })
+    );
   }
 
   private resolveStoredFixtureResult(
@@ -2568,14 +2770,22 @@ export class SportsCollectionService {
     const summary = this.asRecord(fixture.payload)?.summary;
     const payloadRecord = this.asRecord(fixture.payload) ?? {};
     const summaryResult = this.extractSummaryFinalResult(summary, teamIds);
-    const payloadResult = this.extractStoredPayloadFinalResult(fixture, teamIds);
+    const payloadResult = this.extractStoredPayloadFinalResult(
+      fixture,
+      teamIds,
+    );
     const rootPair = this.scorePair(fixture.homeScore, fixture.awayScore);
 
-    const isFinal = this.isCompletedFixtureRecord(fixture) ||
-      Boolean(summaryResult) || Boolean(payloadResult);
+    const isFinal =
+      this.isCompletedFixtureRecord(fixture) ||
+      Boolean(summaryResult) ||
+      Boolean(payloadResult);
     if (!isFinal) return { shouldRefreshSummary: false };
 
-    if (summaryResult?.homeScore !== undefined && summaryResult.awayScore !== undefined) {
+    if (
+      summaryResult?.homeScore !== undefined &&
+      summaryResult.awayScore !== undefined
+    ) {
       return {
         homeScore: summaryResult.homeScore,
         awayScore: summaryResult.awayScore,
@@ -2591,11 +2801,12 @@ export class SportsCollectionService {
       return { conflict: true, shouldRefreshSummary: true };
     }
 
-    const payloadPair = payloadResult &&
+    const payloadPair =
+      payloadResult &&
       payloadResult.homeScore !== undefined &&
       payloadResult.awayScore !== undefined
-      ? this.scorePair(payloadResult.homeScore, payloadResult.awayScore)
-      : undefined;
+        ? this.scorePair(payloadResult.homeScore, payloadResult.awayScore)
+        : undefined;
     const summaryHasScores = Boolean(
       summaryResult &&
       summaryResult.homeScore !== undefined &&
@@ -2605,10 +2816,12 @@ export class SportsCollectionService {
     // is no complete Summary score pair. Root and fixture payload are usually
     // derived from the same scoreboard response, so their agreement alone is
     // not enough to rule out a stale/defaulted 0-0 result.
-    const suspiciousZeroZero = !summaryHasScores && Boolean(
-      (rootPair?.homeScore === 0 && rootPair.awayScore === 0) ||
-      (payloadPair?.homeScore === 0 && payloadPair.awayScore === 0),
-    );
+    const suspiciousZeroZero =
+      !summaryHasScores &&
+      Boolean(
+        (rootPair?.homeScore === 0 && rootPair.awayScore === 0) ||
+        (payloadPair?.homeScore === 0 && payloadPair.awayScore === 0),
+      );
 
     if (payloadPair && rootPair) {
       if (
@@ -2685,36 +2898,55 @@ export class SportsCollectionService {
       .lean()
       .exec();
     if (existingState?.status === SportsSyncStateStatus.SUCCESS) {
-      return { skipped: true, scanned: 0, repaired: 0, summaryRefreshQueued: 0, conflicts: 0 };
+      return {
+        skipped: true,
+        scanned: 0,
+        repaired: 0,
+        summaryRefreshQueued: 0,
+        conflicts: 0,
+      };
     }
 
     const startedAt = new Date();
-    await this.sportsSyncStateModel.updateOne(
-      { stateKey },
-      {
-        $set: {
-          stateKey,
-          kind: SportsSyncStateKind.QUEUE,
-          status: SportsSyncStateStatus.PROCESSING,
-          trackingMode: 'HISTORY',
-          fixtureGranularity: 'MONTH',
-          jobType: 'FIXTURE_RESULT_RECONCILIATION',
-          lastStartedAt: startedAt,
-          consecutiveFailures: 0,
+    await this.sportsSyncStateModel
+      .updateOne(
+        { stateKey },
+        {
+          $set: {
+            stateKey,
+            kind: SportsSyncStateKind.QUEUE,
+            status: SportsSyncStateStatus.PROCESSING,
+            trackingMode: 'HISTORY',
+            fixtureGranularity: 'MONTH',
+            jobType: 'FIXTURE_RESULT_RECONCILIATION',
+            lastStartedAt: startedAt,
+            consecutiveFailures: 0,
+          },
+          $setOnInsert: { units: [] },
+          $unset: { lastError: 1 },
         },
-        $setOnInsert: { units: [] },
-        $unset: { lastError: 1 },
-      },
-      { upsert: true },
-    ).exec();
+        { upsert: true },
+      )
+      .exec();
 
     const cursor = this.espnFixtureModel
       .find({})
       .select({
-        eventId: 1, leagueId: 1, season: 1, fixtureDate: 1,
-        status: 1, statusDetail: 1, statusShortDetail: 1,
-        completed: 1, live: 1, homeScore: 1, awayScore: 1,
-        homeTeamId: 1, awayTeamId: 1, completedAt: 1, collectedAt: 1,
+        eventId: 1,
+        leagueId: 1,
+        season: 1,
+        fixtureDate: 1,
+        status: 1,
+        statusDetail: 1,
+        statusShortDetail: 1,
+        completed: 1,
+        live: 1,
+        homeScore: 1,
+        awayScore: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        completedAt: 1,
+        collectedAt: 1,
         'payload.header': 1,
         'payload.competitions': 1,
         'payload.competitors': 1,
@@ -2734,19 +2966,29 @@ export class SportsCollectionService {
     let repaired = 0;
     let summaryRefreshQueued = 0;
     let conflicts = 0;
-    const operations: Parameters<Model<EspnFixtureDocument>['bulkWrite']>[0] = [];
-    const summaryRequests: Array<{ eventId: string; leagueId: string; season: number }> = [];
+    const operations: Parameters<Model<EspnFixtureDocument>['bulkWrite']>[0] =
+      [];
+    const summaryRequests: Array<{
+      eventId: string;
+      leagueId: string;
+      season: number;
+    }> = [];
 
     const flushWrites = async (): Promise<void> => {
       if (operations.length === 0) return;
       const chunk = operations.splice(0, operations.length);
-      const writeResult = await this.espnFixtureModel.bulkWrite(chunk, { ordered: false });
-      repaired += typeof writeResult.modifiedCount === 'number' ? writeResult.modifiedCount : 0;
+      const writeResult = await this.espnFixtureModel.bulkWrite(chunk, {
+        ordered: false,
+      });
+      repaired +=
+        typeof writeResult.modifiedCount === 'number'
+          ? writeResult.modifiedCount
+          : 0;
     };
 
     // Historical fixtures may belong to seasons no longer listed as active.
     // Queue their Summary refresh directly through the existing durable queue;
-    // the worker still enforces the usual kickoff timing and retry protocol.
+    // the worker still enforces lifecycle confirmation and the retry protocol.
     const queueHistoricalSummaryRequests = async (): Promise<void> => {
       const requests = summaryRequests.splice(0, summaryRequests.length);
       for (const request of requests) {
@@ -2776,31 +3018,32 @@ export class SportsCollectionService {
         const fixture = raw as unknown as Record<string, unknown>;
         scanned += 1;
         const eventId = this.toStringValue(fixture.eventId);
-        const leagueId = this.normalizeLeagueId(this.toStringValue(fixture.leagueId));
+        const leagueId = this.normalizeLeagueId(
+          this.toStringValue(fixture.leagueId),
+        );
         const season = this.toNumber(fixture.season);
         if (!eventId || !leagueId) continue;
 
+        // The persisted fixture-feed lifecycle snapshot is the only authority
+        // for deciding whether result reconciliation is allowed.
+        if (!isFixtureRefreshConfirmedFinished(fixture)) continue;
+
+        const resolution = this.resolveStoredFixtureResult(fixture);
         const snapshotCollectedAt = fixture.collectedAt;
         const snapshotFilter: Record<string, unknown> = {
           eventId,
           leagueId,
           ...(snapshotCollectedAt !== undefined && snapshotCollectedAt !== null
             ? { collectedAt: snapshotCollectedAt }
-            : { collectedAt: { $exists: false } }),
+            : {}),
         };
-        const resolution = this.resolveStoredFixtureResult(fixture);
-        const isFinal = this.isCompletedFixtureRecord(fixture) ||
-          Boolean(this.extractSummaryFinalResult(this.asRecord(fixture.payload)?.summary, {
-            homeTeamId: fixture.homeTeamId,
-            awayTeamId: fixture.awayTeamId,
-          })) ||
-          Boolean(this.extractStoredPayloadFinalResult(fixture, {
-            homeTeamId: fixture.homeTeamId,
-            awayTeamId: fixture.awayTeamId,
-          }));
-
+        const isFinal = this.isCompletedFixtureRecord(fixture);
         if (resolution.conflict) conflicts += 1;
-        if (resolution.shouldRefreshSummary && isFinal && season !== undefined && Number.isInteger(season)) {
+        if (
+          resolution.shouldRefreshSummary &&
+          season !== undefined &&
+          Number.isInteger(season)
+        ) {
           summaryRequests.push({ eventId, leagueId, season });
         }
 
@@ -2809,8 +3052,14 @@ export class SportsCollectionService {
           resolution.awayScore === undefined ||
           resolution.conflict
         ) {
-          if (isFinal && (resolution.conflict || resolution.shouldRefreshSummary)) {
-            const rootPair = this.scorePair(fixture.homeScore, fixture.awayScore);
+          if (
+            isFinal &&
+            (resolution.conflict || resolution.shouldRefreshSummary)
+          ) {
+            const rootPair = this.scorePair(
+              fixture.homeScore,
+              fixture.awayScore,
+            );
             const payloadRecord = this.asRecord(fixture.payload) ?? {};
             if (rootPair || payloadRecord.resultScoreUnresolved !== true) {
               operations.push({
@@ -2837,45 +3086,30 @@ export class SportsCollectionService {
         }
 
         const rootPair = this.scorePair(fixture.homeScore, fixture.awayScore);
-        const completed = this.isCompletedFixtureRecord(fixture);
         const storedPayload = this.asRecord(fixture.payload) ?? {};
-        const hasUnresolvedMarker = storedPayload.resultScoreUnresolved === true;
-        const shouldUpdateScores = hasUnresolvedMarker || !rootPair ||
+        const hasUnresolvedMarker =
+          storedPayload.resultScoreUnresolved === true;
+        const shouldUpdateScores =
+          hasUnresolvedMarker ||
+          !rootPair ||
           rootPair.homeScore !== resolution.homeScore ||
           rootPair.awayScore !== resolution.awayScore;
-        const summaryResult = this.extractSummaryFinalResult(
-          this.asRecord(fixture.payload)?.summary,
-          { homeTeamId: fixture.homeTeamId, awayTeamId: fixture.awayTeamId },
-        );
-        const resultStatus = summaryResult ?? this.extractStoredPayloadFinalResult(fixture, {
-          homeTeamId: fixture.homeTeamId,
-          awayTeamId: fixture.awayTeamId,
-        });
-        const shouldUpdateStatus = !completed || Boolean(resultStatus && (
-          String(fixture.status ?? '') !== resultStatus.status ||
-          String(fixture.statusDetail ?? '') !== String(resultStatus.statusDetail ?? 'Final') ||
-          String(fixture.statusShortDetail ?? '') !== String(resultStatus.statusShortDetail ?? resultStatus.statusDetail ?? 'FT')
-        ));
         const payloadScoreUpdates = this.buildPayloadScoreNormalizationUpdates(
           fixture.payload,
           { homeScore: resolution.homeScore, awayScore: resolution.awayScore },
         );
-        const shouldUpdatePayloadScores = Object.keys(payloadScoreUpdates).length > 0;
+        const shouldUpdatePayloadScores =
+          Object.keys(payloadScoreUpdates).length > 0;
 
-        if (shouldUpdateScores || shouldUpdateStatus || shouldUpdatePayloadScores) {
+        if (shouldUpdateScores || shouldUpdatePayloadScores) {
           const collectedAt = new Date();
-          const set: Record<string, unknown> = { collectedAt, ...payloadScoreUpdates };
+          const set: Record<string, unknown> = {
+            collectedAt,
+            ...payloadScoreUpdates,
+          };
           if (shouldUpdateScores) {
             set.homeScore = resolution.homeScore;
             set.awayScore = resolution.awayScore;
-          }
-          if (shouldUpdateStatus) {
-            set.completed = true;
-            set.live = false;
-            set.status = resultStatus?.status ?? 'STATUS_FULL_TIME';
-            set.statusDetail = resultStatus?.statusDetail ?? 'Final';
-            set.statusShortDetail = resultStatus?.statusShortDetail ?? resultStatus?.statusDetail ?? 'FT';
-            set.completedAt = fixture.completedAt ?? collectedAt;
           }
           operations.push({
             updateOne: {
@@ -2899,18 +3133,43 @@ export class SportsCollectionService {
       if (summaryRequests.length > 0) {
         await queueHistoricalSummaryRequests();
       }
-      await this.sportsSyncStateModel.updateOne(
-        { stateKey },
-        { $set: { status: SportsSyncStateStatus.SUCCESS, lastSuccessfulAt: new Date(), consecutiveFailures: 0 }, $unset: { lastError: 1 } },
-      ).exec();
+      await this.sportsSyncStateModel
+        .updateOne(
+          { stateKey },
+          {
+            $set: {
+              status: SportsSyncStateStatus.SUCCESS,
+              lastSuccessfulAt: new Date(),
+              consecutiveFailures: 0,
+            },
+            $unset: { lastError: 1 },
+          },
+        )
+        .exec();
 
-      this.logger.log(`Historical ESPN result reconciliation completed: scanned=${scanned}, repaired=${repaired}, summaryRefreshQueued=${summaryRefreshQueued}, conflicts=${conflicts}`);
-      return { skipped: false, scanned, repaired, summaryRefreshQueued, conflicts };
+      this.logger.log(
+        `Historical ESPN result reconciliation completed: scanned=${scanned}, repaired=${repaired}, summaryRefreshQueued=${summaryRefreshQueued}, conflicts=${conflicts}`,
+      );
+      return {
+        skipped: false,
+        scanned,
+        repaired,
+        summaryRefreshQueued,
+        conflicts,
+      };
     } catch (error) {
-      await this.sportsSyncStateModel.updateOne(
-        { stateKey },
-        { $set: { status: SportsSyncStateStatus.FAILED, lastError: error instanceof Error ? error.message : String(error), consecutiveFailures: 1 } },
-      ).exec();
+      await this.sportsSyncStateModel
+        .updateOne(
+          { stateKey },
+          {
+            $set: {
+              status: SportsSyncStateStatus.FAILED,
+              lastError: error instanceof Error ? error.message : String(error),
+              consecutiveFailures: 1,
+            },
+          },
+        )
+        .exec();
       throw error;
     } finally {
       await cursor.close();
@@ -2961,9 +3220,18 @@ export class SportsCollectionService {
     const existingFixtures = await this.espnFixtureModel
       .find({ eventId: { $in: [...uniqueSummaries.keys()] } })
       .select({
-        eventId: 1, leagueId: 1, payload: 1, homeTeamId: 1, awayTeamId: 1,
-        homeScore: 1, awayScore: 1, status: 1, statusDetail: 1,
-        statusShortDetail: 1, completed: 1, live: 1,
+        eventId: 1,
+        leagueId: 1,
+        payload: 1,
+        homeTeamId: 1,
+        awayTeamId: 1,
+        homeScore: 1,
+        awayScore: 1,
+        status: 1,
+        statusDetail: 1,
+        statusShortDetail: 1,
+        completed: 1,
+        live: 1,
       })
       .lean()
       .exec();
@@ -3110,7 +3378,10 @@ export class SportsCollectionService {
         result: await this.reconcileFixtureResultFromSummary(item),
       })),
     );
-    const settlementItems = new Map<string, { leagueId: string; eventId: string }>();
+    const settlementItems = new Map<
+      string,
+      { leagueId: string; eventId: string }
+    >();
     for (const item of changedSummaries) {
       settlementItems.set(item.eventId, {
         leagueId: item.leagueId,
@@ -3126,24 +3397,31 @@ export class SportsCollectionService {
       }
     }
 
-    for (const leagueId of new Set(
-      [...changedSummaries.map((item) => item.leagueId),
-       ...reconciliations
-         .filter((entry) => entry.result?.rootChanged)
-         .map((entry) => entry.item.leagueId)],
-    )) {
+    for (const leagueId of new Set([
+      ...changedSummaries.map((item) => item.leagueId),
+      ...reconciliations
+        .filter((entry) => entry.result?.rootChanged)
+        .map((entry) => entry.item.leagueId),
+    ])) {
       void this.scheduleDerivedRefreshForLeague(leagueId);
     }
 
     // Unchanged Summary refreshes do not trigger settlement unless result
     // reconciliation actually changed the canonical fixture fields.
-    await Promise.all([...settlementItems.values()].map(async (item) => {
-      try {
-        await this.settlementTriggerService.onSummaryUpdated(item.eventId, item.leagueId);
-      } catch (error) {
-        this.logger.warn(`Could not enqueue settlement for Summary ${item.eventId}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }));
+    await Promise.all(
+      [...settlementItems.values()].map(async (item) => {
+        try {
+          await this.settlementTriggerService.onSummaryUpdated(
+            item.eventId,
+            item.leagueId,
+          );
+        } catch (error) {
+          this.logger.warn(
+            `Could not enqueue settlement for Summary ${item.eventId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }),
+    );
 
     return { requested: operations.length, matched, modified };
   }
@@ -3720,42 +3998,50 @@ export class SportsCollectionService {
 
   private isCompleted(event: unknown): boolean {
     const competition = this.getFirstCompetition(event);
+    const competitionRecord = this.asRecord(competition);
+    const eventRecord = this.asRecord(event);
+    const statusRecord = this.asRecord(
+      competitionRecord?.status ?? eventRecord?.status,
+    );
+    const statusType = this.asRecord(statusRecord?.type);
 
-    const competitionRecord =
-      competition !== null && typeof competition === 'object'
-        ? (competition as Record<string, unknown>)
-        : undefined;
+    const name =
+      this.toStringValue(statusType?.name ?? statusRecord?.name) ?? '';
+    const state =
+      this.toStringValue(statusType?.state ?? statusRecord?.state) ?? '';
+    const detail =
+      this.toStringValue(
+        statusType?.detail ?? statusType?.description ?? statusRecord?.detail,
+      ) ?? '';
+    const shortDetail =
+      this.toStringValue(
+        statusType?.shortDetail ?? statusRecord?.shortDetail,
+      ) ?? '';
+    const abbreviation = this.toStringValue(statusType?.abbreviation) ?? '';
+    const statusText =
+      `${name} ${state} ${detail} ${shortDetail} ${abbreviation}`
+        .replace(/[_-]+/g, ' ')
+        .toUpperCase();
 
-    const eventRecord =
-      event !== null && typeof event === 'object'
-        ? (event as Record<string, unknown>)
-        : undefined;
-
-    const status = competitionRecord?.status ?? eventRecord?.status;
-
-    const statusRecord =
-      status !== null && typeof status === 'object'
-        ? (status as Record<string, unknown>)
-        : undefined;
-
-    const statusType =
-      statusRecord?.type !== null && typeof statusRecord?.type === 'object'
-        ? (statusRecord.type as Record<string, unknown>)
-        : undefined;
-
+    if (
+      /CANCEL|POSTPON|ABANDON|SUSPEND|INTERRUPT|VOID|NO\s*CONTEST/.test(
+        statusText,
+      )
+    ) {
+      return false;
+    }
     if (statusType?.completed === true || statusRecord?.completed === true) {
       return true;
     }
 
-    const rawState = statusType?.state ?? statusRecord?.state;
-
-    const state =
-      typeof rawState === 'string' || typeof rawState === 'number'
-        ? String(rawState).toLowerCase()
-        : '';
-
-    return ['post', 'final', 'completed', 'complete', 'finished'].includes(
-      state,
+    return (
+      ['post', 'final', 'completed', 'complete', 'finished'].includes(
+        state.trim().toLowerCase(),
+      ) ||
+      ['FT', 'AET', 'PEN'].includes(abbreviation.trim().toUpperCase()) ||
+      /STATUS FINAL|FULL TIME|FINISHED|COMPLETED|AFTER EXTRA TIME|AFTER PENALTIES|\bFT\b|\bAET\b|\bPEN\b/.test(
+        statusText,
+      )
     );
   }
 
@@ -3921,5 +4207,3 @@ export class SportsCollectionService {
     return `${year}-${month}-${day}`;
   }
 }
-
-

@@ -817,11 +817,9 @@ We appreciate your continued support of 2XPredict.
   }
 
   async sendWelcomeEmail(data: { email: string; fullName: string }) {
-    const dashboardUrl = 'https://www.2xpredict.com/dashboard';
-
     const predictionsUrl = 'https://www.2xpredict.com/predictions';
 
-    const vipUrl = 'https://www.2xpredict.com/subscription';
+    const betlabUrl = 'https://www.2xpredict.com/bet-lab';
 
     return this.resend.emails.send({
       from: '2XPredict <welcome@2xpredict.com>',
@@ -881,11 +879,9 @@ As a member of 2XPredict, you can:
 • Receive timely match insights
 `)}
 
-${primaryButton('Go to Dashboard', dashboardUrl)}
+${primaryButton('Browse Predictions', predictionsUrl)}
 
-${secondaryButton('Browse Predictions', predictionsUrl)}
-
-${secondaryButton('View Subscription Plans', vipUrl)}
+${secondaryButton('Try Betlab', betlabUrl)}
 
 ${paragraph(`
 Thank you for choosing 2XPredict.

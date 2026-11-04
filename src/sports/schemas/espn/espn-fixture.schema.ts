@@ -175,6 +175,9 @@ EspnFixtureSchema.index({
   fixtureDate: 1,
 });
 
+// Supports the Odds worker's bounded fixtureDate/eventId keyset pagination.
+EspnFixtureSchema.index({ fixtureDate: 1, eventId: 1 });
+
 EspnFixtureSchema.index({
   leagueId: 1,
   season: 1,
@@ -204,7 +207,10 @@ EspnFixtureSchema.index({
 
 // Summary odds availability/freshness are queried by the Odds readiness pipeline.
 EspnFixtureSchema.index({ 'payload.summaryCollectedAt': 1, fixtureDate: 1 });
-EspnFixtureSchema.index({ 'payload.summary.meta.lastUpdatedAt': 1, fixtureDate: 1 });
+EspnFixtureSchema.index({
+  'payload.summary.meta.lastUpdatedAt': 1,
+  fixtureDate: 1,
+});
 EspnFixtureSchema.index({ 'payload.summary.pickcenter': 1 });
 EspnFixtureSchema.index({ 'payload.summary.odds': 1 });
 // Indexed publication timestamps for the Football News feed.
@@ -244,6 +250,3 @@ EspnFixtureSchema.index({
   fixtureDate: 1,
   fixtureCollectedAt: 1,
 });
-
-
-

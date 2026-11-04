@@ -11,6 +11,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model, type HydratedDocument } from 'mongoose';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { BET_LAB_CONFIG } from '../config/bet-lab.config';
+import { BET_LAB_MARKET_BY_CODE } from '../catalog/bet-lab-market-catalog';
 import {
   BetLabEventCategory,
   BetLabEventLevel,
@@ -19,6 +20,7 @@ import { BetLabLegStatus } from '../enums/bet-lab-leg-status.enum';
 import { BetLabTicketStatus } from '../enums/bet-lab-ticket-status.enum';
 import { BetLabTicketType } from '../enums/bet-lab-ticket-type.enum';
 import { BetLabSelectionRequest } from '../interfaces/bet-lab-market.interface';
+import { BetLabMarketCode } from '../enums/bet-lab-market-code.enum';
 import { BetLabTicket } from '../schemas/bet-lab-ticket.schema';
 import { BetLabWalletLedger } from '../schemas/bet-lab-wallet-ledger.schema';
 import { PlaceBetLabTicketDto } from '../dto/place-bet-lab-ticket.dto';
@@ -50,12 +52,13 @@ export class BetLabTicketService {
   async placeSingle(userId: string, dto: PlaceBetLabTicketDto) {
     this.validateStake(dto.stake);
     const requests: BetLabSelectionRequest[] = [
-      {
+      this.normalizeSelectionRequest({
         eventId: dto.eventId,
         marketCode: dto.marketCode,
         selectionCode: dto.selectionCode,
-      },
+      }),
     ];
+    const eventId = requests[0].eventId;
     const fingerprint = this.fingerprint(
       BetLabTicketType.SINGLE,
       dto.stake,
@@ -68,7 +71,7 @@ export class BetLabTicketService {
     );
     if (existing) {
       await this.settlementTrigger.onTargetsCreated(
-        [dto.eventId],
+        [eventId],
         'BET_LAB_TICKET_CREATED',
       );
       return {
@@ -88,11 +91,11 @@ export class BetLabTicketService {
         fingerprint,
         quotes,
       );
-      await this.settlementTrigger.onTargetsCreated([dto.eventId], 'BET_LAB_TICKET_CREATED');
+      await this.settlementTrigger.onTargetsCreated([eventId], 'BET_LAB_TICKET_CREATED');
       this.adminGateway.publishModuleEvent('bet-lab', 'bet-lab:ticket-placed', { ticketId: String((ticket as any)?.ticket?._id ?? ''), status: (ticket as any)?.ticket?.status, occurredAt: new Date().toISOString() });
       return ticket;
     } catch (error) {
-      await this.logPlacementFailure(userId, dto.eventId, error);
+      await this.logPlacementFailure(userId, eventId, error);
       throw error;
     }
   }
@@ -100,6 +103,7 @@ export class BetLabTicketService {
   async placeSlip(userId: string, dto: PlaceBetLabSlipDto) {
     this.validateStake(dto.stake);
     if (
+      !Array.isArray(dto.legs) ||
       dto.legs.length < BET_LAB_CONFIG.tickets.minimumAccumulatorLegs ||
       dto.legs.length > BET_LAB_CONFIG.tickets.maximumAccumulatorLegs
     ) {
@@ -107,19 +111,22 @@ export class BetLabTicketService {
         `Accumulator slips must contain ${BET_LAB_CONFIG.tickets.minimumAccumulatorLegs}–${BET_LAB_CONFIG.tickets.maximumAccumulatorLegs} selections.`,
       );
     }
-    const requests: BetLabSelectionRequest[] = dto.legs.map((leg) => ({
-      eventId: String(leg.eventId).trim(),
-      marketCode: leg.marketCode,
-      selectionCode: String(leg.selectionCode).trim(),
-    }));
-    // Allow different markets from the same fixture, but only one selection
-    // from any given market for that fixture.
-    const marketKeys = requests.map(
-      (leg) => `${leg.eventId}:${String(leg.marketCode)}`,
+    const requests: BetLabSelectionRequest[] = dto.legs.map((leg) =>
+      this.normalizeSelectionRequest({
+        eventId: leg.eventId,
+        marketCode: leg.marketCode,
+        selectionCode: leg.selectionCode,
+      }),
     );
-    if (new Set(marketKeys).size !== marketKeys.length) {
+
+    // Standard accumulators are independently priced across separate fixtures.
+    // A same-match combination has correlated outcomes and cannot safely use
+    // multiplied standalone prices. It must wait for a true joint-priced
+    // Bet Builder rather than silently overstate a ticket's odds.
+    const eventIds = requests.map((request) => request.eventId);
+    if (new Set(eventIds).size !== eventIds.length) {
       throw new BadRequestException(
-        'An accumulator may contain only one selection per market for each match.',
+        'Ordinary accumulators allow only one selection per match. Same-match combinations require a separately joint-priced Bet Builder.',
       );
     }
     const fingerprint = this.fingerprint(
@@ -414,16 +421,26 @@ export class BetLabTicketService {
     };
   }
 
-  private async resolveSelectionQuotes(requests: BetLabSelectionRequest[]) {
-    return Promise.all(
-      requests.map((request) =>
-        this.marketService.getSelectionQuote(
-          request.eventId,
-          request.marketCode,
-          request.selectionCode,
-        ),
-      ),
-    );
+  private resolveSelectionQuotes(requests: BetLabSelectionRequest[]) {
+    return this.marketService.getSelectionQuotes(requests);
+  }
+
+  private normalizeSelectionRequest(
+    request: BetLabSelectionRequest,
+  ): BetLabSelectionRequest {
+    const eventId = String(request.eventId ?? '').trim();
+    const selectionCode = String(request.selectionCode ?? '').trim();
+    if (!eventId || !selectionCode) {
+      throw new BadRequestException(
+        'Every selection must include a valid fixture and selection code.',
+      );
+    }
+    if (!BET_LAB_MARKET_BY_CODE.has(request.marketCode)) {
+      throw new BadRequestException(
+        `Unsupported Bet Lab market code: ${String(request.marketCode)}.`,
+      );
+    }
+    return { eventId, marketCode: request.marketCode as BetLabMarketCode, selectionCode };
   }
 
   private calculateCombinedOdds(prices: number[]): number {
@@ -475,6 +492,8 @@ export class BetLabTicketService {
     const normalized = {
       type,
       stake,
+      // Preserve submitted leg order in the idempotency fingerprint. This
+      // keeps retries compatible with tickets created before this stage.
       selections: requests.map((request) => ({
         eventId: String(request.eventId).trim(),
         marketCode: request.marketCode,
@@ -551,4 +570,5 @@ export class BetLabTicketService {
     );
   }
 }
+
 

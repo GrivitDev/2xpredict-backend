@@ -17,7 +17,7 @@ import {
 } from '../interfaces/espn-prediction-context.interface';
 import { EspnPayloadUtil } from '../utils/espn-payload.util';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
-import { OddsService } from '../../odds/services/odds.service';
+import { OddsReadService } from '../../odds/services/odds-read.service';
 
 @Injectable()
 export class PredictionDataService {
@@ -30,7 +30,7 @@ export class PredictionDataService {
     private readonly teamModel: Model<EspnTeam>,
     @InjectModel(EspnStanding.name)
     private readonly standingModel: Model<EspnStanding>,
-    private readonly oddsService: OddsService,
+    private readonly oddsService: OddsReadService,
   ) {}
 
   async loadForPrediction(eventId: string): Promise<PredictionMatchContext> {
@@ -58,11 +58,7 @@ export class PredictionDataService {
         collectedAt: 1,
         'payload.name': 1,
         'payload.shortName': 1,
-        'payload.status': 1,
-        'payload.statusDetail': 1,
-        'payload.statusShortDetail': 1,
         'payload.competitions.competitors': 1,
-        'payload.competitions.status': 1,
         'payload.competitions.odds': 1,
         'payload.competitions.details.athletesInvolved': 1,
         'payload.competitions.details.type': 1,
@@ -75,11 +71,7 @@ export class PredictionDataService {
         'payload.summary.boxscore': 1,
         'payload.summary.keyEvents': 1,
         'payload.summary.meta': 1,
-        'payload.summary.status': 1,
-        'payload.summary.statusDetail': 1,
-        'payload.summary.statusShortDetail': 1,
         'payload.summary.header.competitions.competitors': 1,
-        'payload.summary.header.competitions.status': 1,
         'payload.summaryCollectedAt': 1,
       })
       .lean()
@@ -91,24 +83,14 @@ export class PredictionDataService {
       );
 
     const fixture = this.toFixtureCore(raw);
-    const statusPayload = EspnPayloadUtil.asRecord((raw as unknown as Record<string, unknown>).payload);
-    const statusSummary = EspnPayloadUtil.asRecord(statusPayload.summary);
-    const statusHeader = EspnPayloadUtil.asRecord(statusSummary.header);
-    const statusValues: unknown[] = [fixture.status];
-    const statusCompetitions = [
-      ...EspnPayloadUtil.asArray(statusPayload.competitions),
-      ...EspnPayloadUtil.asArray(statusHeader.competitions),
-    ];
-    for (const competition of statusCompetitions) {
-      const status = EspnPayloadUtil.asRecord(EspnPayloadUtil.asRecord(competition).status);
-      const type = EspnPayloadUtil.asRecord(status.type);
-      statusValues.push(status.name, status.detail, status.shortDetail, status.state, type.name, type.detail, type.shortDetail, type.state);
-      if (status.completed === true || type.completed === true) statusValues.push('FINAL');
-    }
-    const fixtureStatus = statusValues.filter(Boolean).map(String).join(' ');
+    const fixtureStatus = [
+      fixture.status,
+      (raw as unknown as Record<string, unknown>).statusDetail,
+      (raw as unknown as Record<string, unknown>).statusShortDetail,
+    ].filter(Boolean).map(String).join(' ');
     const isUnavailable = fixture.completed === true
-      || /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|STATUS_FINAL|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i.test(fixtureStatus)
-      || /postpon|cancel|abandon|delay/i.test(fixtureStatus);
+      || /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|STATUS_FINAL|AFTER EXTRA TIME|AFTER PENALTIES|FT|AET|PEN)([^A-Z]|$)/i.test(fixtureStatus)
+      || /postpon|\bpst\b|cancel|\bcanc\b|abandon|suspend|interrupt|delay|no[_ -]?contest/i.test(fixtureStatus);
     if (isUnavailable) {
       throw new UnprocessableEntityException(
         'Predictions are unavailable for a completed, postponed, cancelled, or otherwise unavailable fixture.',
@@ -264,11 +246,7 @@ export class PredictionDataService {
 
     const hasPickCenter = this.hasMeaningfulValue(summary.pickcenter);
     const usableOdds = (storedOddsRaw as any[]).some((quote) => {
-      const updatedAt = EspnPayloadUtil.toValidDate(quote?.providerUpdatedAt);
-      const ageMs = updatedAt ? Date.now() - updatedAt.getTime() : Number.POSITIVE_INFINITY;
-      const freshnessOkay = quote?.provider === 'ESPN'
-        || (ageMs >= -5 * 60_000
-          && ageMs <= PREDICTION_ENGINE_CONFIG.model.maximumProviderOddsAgeHours * 3_600_000);
+      const freshnessOkay = quote?.isFresh === true;
       return quote?.priceType === 'PROVIDER'
         && quote?.oddsBasis === 'BOOKMAKER_ONLY'
         && Number.isFinite(Number(quote?.decimalOdds))
@@ -309,6 +287,7 @@ export class PredictionDataService {
         provider: quote.provider === 'ESPN' || quote.provider === 'THE_ODDS_API' ? quote.provider : null,
         bookmaker: typeof quote.bookmaker === 'string' ? quote.bookmaker : null,
         providerUpdatedAt: EspnPayloadUtil.toValidDate(quote.providerUpdatedAt),
+        isFresh: quote.isFresh === true,
         fairOdds: Number.isFinite(Number(quote.fairOdds)) ? Number(quote.fairOdds) : null,
         oddsBasis: ['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY'].includes(String(quote.oddsBasis)) ? quote.oddsBasis : null,
         oddsCalculationMethod: typeof quote.oddsCalculationMethod === 'string' ? quote.oddsCalculationMethod : null,
@@ -395,34 +374,12 @@ export class PredictionDataService {
     const payload = EspnPayloadUtil.asRecord(
       (raw as Record<string, unknown>).payload,
     );
-    const summary = EspnPayloadUtil.asRecord(payload.summary);
-    const summaryHeader = EspnPayloadUtil.asRecord(summary.header);
-    const statusParts = [
-      raw.status,
-      raw.statusDetail,
-      raw.statusShortDetail,
-      payload.status,
-      payload.statusDetail,
-      payload.statusShortDetail,
-      summary.status,
-      summary.statusDetail,
-      summary.statusShortDetail,
-      ...EspnPayloadUtil.asArray(payload.competitions).flatMap((item) => {
-        const competition = EspnPayloadUtil.asRecord(item);
-        const status = EspnPayloadUtil.asRecord(competition.status);
-        const type = EspnPayloadUtil.asRecord(status.type);
-        return [status.name, status.detail, status.shortDetail, status.state, type.name, type.detail, type.shortDetail, type.state];
-      }),
-      ...EspnPayloadUtil.asArray(summaryHeader.competitions).flatMap((item) => {
-        const competition = EspnPayloadUtil.asRecord(item);
-        const status = EspnPayloadUtil.asRecord(competition.status);
-        const type = EspnPayloadUtil.asRecord(status.type);
-        return [status.name, status.detail, status.shortDetail, status.state, type.name, type.detail, type.shortDetail, type.state];
-      }),
-    ].filter((value) => value !== null && value !== undefined);
+    // Match lifecycle and live state are owned by root fields persisted by
+    // Sports fixture refresh. Summary/detail status is feature data, not a gate.
+    const statusParts = [raw.status, raw.statusDetail, raw.statusShortDetail]
+      .filter((value) => value !== null && value !== undefined);
     const statusText = statusParts.map(String).join(' ');
-    const statusLooksLive = /(^|[^A-Z])(IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS)([^A-Z]|$)/i.test(statusText)
-      || statusParts.some((value) => ['in', 'in_progress', 'in-progress'].includes(String(value).trim().toLowerCase()));
+    const statusLooksLive = /(^|[^A-Z])(IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS)([^A-Z]|$)/i.test(statusText);
     const joinedStatus = [raw.status, raw.statusDetail, raw.statusShortDetail].filter((value) => typeof value === 'string' && value.trim()).join(' ');
     return {
       eventId: String((raw as Record<string, unknown>).eventId),
@@ -433,7 +390,9 @@ export class PredictionDataService {
       ),
       live: raw.live === true || statusLooksLive,
       completed: raw.completed === true,
-      status: joinedStatus,
+      status: String(raw.status ?? 'UNKNOWN'),
+      statusDetail: raw.statusDetail ? String(raw.statusDetail) : undefined,
+      statusShortDetail: raw.statusShortDetail ? String(raw.statusShortDetail) : undefined,
       homeTeamId: String((raw as Record<string, unknown>).homeTeamId),
       awayTeamId: String((raw as Record<string, unknown>).awayTeamId),
       homeScore:
@@ -550,6 +509,7 @@ export class PredictionDataService {
     return Boolean(value);
   }
 }
+
 
 
 

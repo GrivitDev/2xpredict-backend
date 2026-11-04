@@ -328,14 +328,76 @@ export const FOOTBALL_MARKET_CATALOG: CanonicalMarketDefinition[] = [
   }),
 ];
 
-export const FOOTBALL_MARKET_BY_ID = new Map(
-  FOOTBALL_MARKET_CATALOG.map((market) => [market.id, market]),
+// Freeze the canonical catalogue and its nested selection/line arrays at runtime.
+// Downstream modules may derive read-only views, but cannot extend or mutate the
+// active market set after application startup.
+for (const market of FOOTBALL_MARKET_CATALOG) {
+  for (const selection of market.selections) Object.freeze(selection);
+  Object.freeze(market.selections);
+  if (market.lines) Object.freeze(market.lines);
+  Object.freeze(market);
+}
+Object.freeze(FOOTBALL_MARKET_CATALOG);
+
+function createReadonlyMap<K, V>(
+  entries: Iterable<readonly [K, V]>,
+): ReadonlyMap<K, V> {
+  const source = new Map<K, V>(entries);
+  const view: ReadonlyMap<K, V> = Object.freeze({
+    get size() {
+      return source.size;
+    },
+    get(key: K) {
+      return source.get(key);
+    },
+    has(key: K) {
+      return source.has(key);
+    },
+    entries() {
+      return source.entries();
+    },
+    keys() {
+      return source.keys();
+    },
+    values() {
+      return source.values();
+    },
+    forEach(
+      callback: (value: V, key: K, map: ReadonlyMap<K, V>) => void,
+      thisArg?: unknown,
+    ) {
+      source.forEach((value, key) => {
+        void callback.call(thisArg, value, key, view);
+      });
+    },
+    [Symbol.iterator](): MapIterator<[K, V]> {
+      return source.entries();
+    },
+  });
+  return view;
+}
+
+export const FOOTBALL_MARKET_BY_ID: ReadonlyMap<
+  string,
+  CanonicalMarketDefinition
+> = createReadonlyMap(
+  FOOTBALL_MARKET_CATALOG.map((market) => [market.id, market] as const),
 );
-export const FOOTBALL_MARKET_BY_PREDICTION_KEY = new Map(
-  FOOTBALL_MARKET_CATALOG.map((market) => [market.predictionMarketKey, market]),
+export const FOOTBALL_MARKET_BY_PREDICTION_KEY: ReadonlyMap<
+  string,
+  CanonicalMarketDefinition
+> = createReadonlyMap(
+  FOOTBALL_MARKET_CATALOG.map(
+    (market) => [market.predictionMarketKey, market] as const,
+  ),
 );
-export const FOOTBALL_MARKET_BY_BET_LAB_CODE = new Map(
-  FOOTBALL_MARKET_CATALOG.map((market) => [market.betLabMarketCode, market]),
+export const FOOTBALL_MARKET_BY_BET_LAB_CODE: ReadonlyMap<
+  string,
+  CanonicalMarketDefinition
+> = createReadonlyMap(
+  FOOTBALL_MARKET_CATALOG.map(
+    (market) => [market.betLabMarketCode, market] as const,
+  ),
 );
 
 export function canonicalLineSlug(value: number): string {

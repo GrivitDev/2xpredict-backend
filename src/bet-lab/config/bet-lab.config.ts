@@ -21,10 +21,6 @@ export const BET_LAB_CONFIG = {
     maximumCombinedOdds: 1_000_000,
   },
   odds: {
-    /** Derive fair prices for Double Chance and Draw No Bet from a complete 1X2 quote. */
-    allowDerivedFairOddsForDoubleChanceAndDrawNoBet: true,
-    /** Quotes older than this are displayed as stale and cannot be used for new tickets. */
-    maximumAgeHours: 72,
     minimumDecimalOdds: 1.01,
     maximumDecimalOdds: 100_000,
     decimalPlaces: 4,
@@ -39,3 +35,4 @@ export const BET_LAB_CONFIG = {
 
 export type BetLabPlan =
   keyof typeof BET_LAB_CONFIG.virtualPoints.monthlyAllowanceByPlan;
+

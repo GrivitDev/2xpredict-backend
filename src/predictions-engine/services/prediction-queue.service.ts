@@ -11,7 +11,7 @@ import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
 import { PredictionQueueSyncResult } from '../interfaces/prediction-queue.interface';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 import { EspnPayloadUtil } from '../utils/espn-payload.util';
-import { OddsService } from '../../odds/services/odds.service';
+import { OddsReadService } from '../../odds/services/odds-read.service';
 
 @Injectable()
 export class PredictionQueueService {
@@ -25,7 +25,7 @@ export class PredictionQueueService {
     @InjectModel(PredictionQueue.name)
     private readonly queueModel: Model<PredictionQueue>,
     private readonly monitor: PredictionEngineMonitorService,
-    private readonly oddsService: OddsService,
+    private readonly oddsService: OddsReadService,
   ) {}
 
   async syncUpcomingFixtures(
@@ -37,31 +37,23 @@ export class PredictionQueueService {
     const horizon = new Date(
       now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
     );
+    const unavailableStatus = /POSTPON|\bPST\b|CANCEL|\bCANC\b|ABANDON|SUSPEND|INTERRUPT|DELAY|VOID|NO[_ -]?CONTEST/i;
     const baseFilter = {
       $and: [
-        { $or: [
-          { fixtureDate: { $gte: now, $lte: horizon } },
-          { live: true },
-          { status: /IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS/i },
-          { statusDetail: /IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS/i },
-          { statusShortDetail: /IN[_ -]?PROGRESS|INPROGRESS|LIVE|HALF[_ -]?TIME|FIRST[_ -]?HALF|SECOND[_ -]?HALF|STATUS_HALFTIME|STATUS_IN_PROGRESS/i },
-          { 'payload.summary.header.competitions.status.state': /^(in|in_progress|in-progress)$/i },
-          { 'payload.summary.header.competitions.status.type.state': /^(in|in_progress|in-progress)$/i },
-          { 'payload.competitions.status.state': /^(in|in_progress|in-progress)$/i },
-          { 'payload.competitions.status.type.state': /^(in|in_progress|in-progress)$/i },
-        ] },
+        {
+          $or: [
+            { fixtureDate: { $gte: now, $lte: horizon } },
+            { live: true },
+          ],
+        },
         { completed: { $ne: true } },
         { $nor: [
-          { status: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-          { statusDetail: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-          { statusShortDetail: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT)([^A-Z]|$)/i },
-          { status: /postpon|cancel|abandon|delay/i },
-          { statusDetail: /postpon|cancel|abandon|delay/i },
-          { statusShortDetail: /postpon|cancel|abandon|delay/i },
-          { 'payload.summary.header.competitions.status.completed': true },
-          { 'payload.summary.header.competitions.status.type.completed': true },
-          { 'payload.competitions.status.completed': true },
-          { 'payload.competitions.status.type.completed': true },
+          { status: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT|AET|PEN)([^A-Z]|$)/i },
+          { statusDetail: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT|AET|PEN)([^A-Z]|$)/i },
+          { statusShortDetail: /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|FT|AET|PEN)([^A-Z]|$)/i },
+          { status: unavailableStatus },
+          { statusDetail: unavailableStatus },
+          { statusShortDetail: unavailableStatus },
         ] },
       ],
     };
@@ -606,4 +598,5 @@ export class PredictionQueueService {
     });
   }
 }
+
 

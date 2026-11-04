@@ -22,6 +22,7 @@ import { SettlementEventLogService } from './settlement-event-log.service';
 import { EspnService } from '../../sports/providers/espn.service';
 import { SportsCollectionService } from '../../sports/services/sports-collection.service';
 import { SETTLEMENT_CONFIG } from '../config/settlement.config';
+import { isFixtureRefreshConfirmedFinished } from '../utils/fixture-lifecycle.util';
 
 @Injectable()
 export class SettlementProcessorService {
@@ -51,10 +52,42 @@ export class SettlementProcessorService {
       .exec()) as unknown as EspnFixture | null;
     if (!fixture)
       throw new Error(`Settlement fixture ${eventId} was not found.`);
-    // Settlement queue eligibility begins at kickoff +180 minutes, so the recovery scan has the fixture queued by +190 minutes. If the canonical
-    // fixture lacks settlement evidence, Settlement performs its own targeted
-    // ESPN Summary call before processing. ESPN failures never block settlement
-    // of facts already stored locally.
+
+    // Drain protection for jobs persisted by earlier queue versions. A Summary
+    // response or elapsed kickoff time cannot authorize settlement.
+    if (!isFixtureRefreshConfirmedFinished(fixture)) {
+      const reason =
+        'Settlement skipped: the persisted ESPN fixture refresh has not confirmed a finished result.';
+      const counts: SettlementTargetCounts = {
+        predictionMarketsFound: 0,
+        predictionSelectionsSettled: 0,
+        predictionSelectionsSkipped: 0,
+        predictionSelectionsUnresolved: 0,
+        betLabTicketsFound: 0,
+        betLabLegsSettled: 0,
+        betLabTicketsFinalized: 0,
+        betLabLegsUnresolved: 0,
+      };
+      await this.eventLog.write({
+        level: SettlementEventLevel.WARN,
+        action: 'SETTLEMENT_SKIPPED_UNCONFIRMED_FIXTURE_LIFECYCLE',
+        message: reason,
+        eventId,
+        jobKey: job.jobKey,
+        metadata: { sourceFingerprint: job.sourceFingerprint },
+      });
+      return {
+        eventId,
+        sourceFingerprint: job.sourceFingerprint,
+        partial: false,
+        skipped: true,
+        counts,
+        unresolvedReasons: [reason],
+      };
+    }
+
+    // Summary enriches evidence after the fixture refresh has already confirmed
+    // the finished lifecycle. Provider failures never block stored local facts.
     let currentFixture = fixture;
     let facts = this.factsService.extract(currentFixture);
     let summaryRequestedThisRun = false;
