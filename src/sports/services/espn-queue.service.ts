@@ -17,8 +17,6 @@ import { SportsSyncStateService } from './sports-sync-state.service';
 
 import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access */
-
 @Injectable()
 export class EspnQueueService {
   private startupReady = false;
@@ -1047,6 +1045,61 @@ export class EspnQueueService {
       .exec();
     const result = results[0];
     return result?.wakeAt instanceof Date ? result.wakeAt : null;
+  }
+
+  /**
+   * Returns the next scheduled retry for one startup workload. This lets a
+   * startup worker sleep until its own work is due instead of polling the
+   * entire queue or being woken by unrelated normal jobs.
+   */
+  async getNextWakeAtForWorkload(params: {
+    jobType: EspnQueueJobType;
+    triggerEventIdPrefix: string;
+  }): Promise<Date | null> {
+    const prefix = params.triggerEventIdPrefix.trim();
+    const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const job = await this.queueModel
+      .findOne({
+        type: params.jobType,
+        triggerEventId: { $regex: `^${escapedPrefix}` },
+        $or: [
+          {
+            status: EspnQueueStatus.PENDING,
+            $or: [{ lane: EspnQueueLane.NORMAL }, { lane: { $exists: false } }],
+          },
+          {
+            status: EspnQueueStatus.FAILED,
+            lane: EspnQueueLane.BACKGROUND_RETRY,
+            nextAttemptAt: { $type: 'date' },
+          },
+        ],
+      })
+      .select({ status: 1, nextAttemptAt: 1, scheduledFor: 1 })
+      .sort({ nextAttemptAt: 1, scheduledFor: 1 })
+      .lean()
+      .exec();
+
+    if (!job) return null;
+    const wakeAt =
+      job.status === EspnQueueStatus.FAILED
+        ? job.nextAttemptAt
+        : job.scheduledFor;
+    return wakeAt instanceof Date ? wakeAt : null;
+  }
+
+  async countQuarantinedWorkloadJobs(params: {
+    jobType: EspnQueueJobType;
+    triggerEventIdPrefix: string;
+  }): Promise<number> {
+    const escapedPrefix = params.triggerEventIdPrefix
+      .trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return this.queueModel.countDocuments({
+      type: params.jobType,
+      triggerEventId: { $regex: `^${escapedPrefix}` },
+      status: EspnQueueStatus.FAILED,
+      lane: EspnQueueLane.QUARANTINE,
+    });
   }
 
   // ============================================================

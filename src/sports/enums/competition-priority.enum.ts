@@ -25,4 +25,3 @@ export enum CompetitionPriority {
    */
   SELECTIVE = 'SELECTIVE',
 }
-

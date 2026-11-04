@@ -31,14 +31,6 @@ export class SportsSyncStateService {
    */
   private readonly summaryFixtureCursorBatchSize = 500;
 
-  /** Initial startup attempt plus configured background retries. */
-  private readonly summaryTotalAttempts =
-    SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxAttempts + 1;
-
-  /** One startup attempt plus the configured retry budget for fixture months. */
-  private readonly fixtureTotalAttempts =
-    SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxAttempts + 1;
-
   constructor(
     @InjectModel(SportsSyncState.name)
     private readonly syncStateModel: Model<SportsSyncStateDocument>,
@@ -437,24 +429,7 @@ export class SportsSyncStateService {
           $project: {
             _id: 0,
             eventId: 1,
-            hasSummary: {
-              $cond: [
-                { $eq: [{ $type: '$payload.summary' }, 'object'] },
-                {
-                  $gt: [
-                    {
-                      $size: {
-                        $objectToArray: {
-                          $ifNull: ['$payload.summary', {}],
-                        },
-                      },
-                    },
-                    0,
-                  ],
-                },
-                false,
-              ],
-            },
+            hasSummary: this.buildUsableSummaryExpression('$payload.summary'),
           },
         },
       ])
@@ -982,10 +957,7 @@ export class SportsSyncStateService {
 
     const message = error instanceof Error ? error.message : String(error);
     const attemptNumber = Math.max(1, unit.attempts ?? 0);
-    const terminal = attemptNumber >= this.summaryTotalAttempts;
-    const nextAttemptAt = terminal
-      ? undefined
-      : new Date(Date.now() + this.getRetryDelay(attemptNumber));
+    const nextAttemptAt = new Date(Date.now() + this.getRetryDelay(attemptNumber));
 
     const set: Record<string, unknown> = {
       'units.$.status': SportsSyncUnitStatus.FAILED,
@@ -1083,10 +1055,7 @@ export class SportsSyncStateService {
         if (!unit) return;
 
         const attempts = unit.attempts ?? 0;
-        const terminal = attempts >= this.summaryTotalAttempts;
-        const nextAttemptAt = terminal
-          ? undefined
-          : new Date(Date.now() + this.getRetryDelay(Math.max(1, attempts)));
+        const nextAttemptAt = new Date(Date.now() + this.getRetryDelay(Math.max(1, attempts)));
         const set: Record<string, unknown> = {
           status: SportsSyncStateStatus.PARTIAL,
           lastError: message,
@@ -1166,8 +1135,7 @@ export class SportsSyncStateService {
           typeof unit.stepKey === 'string' &&
           unit.stepKey.startsWith('SUMMARY:') &&
           (unit.status === SportsSyncUnitStatus.PENDING ||
-            unit.status === SportsSyncUnitStatus.FAILED) &&
-          unit.attempts < this.summaryTotalAttempts,
+            unit.status === SportsSyncUnitStatus.FAILED)
       )
       .map((unit) => String(unit.stepKey).slice('SUMMARY:'.length))
       .filter(Boolean)
@@ -1209,6 +1177,42 @@ export class SportsSyncStateService {
         )
         .filter(Boolean),
     );
+  }
+
+  /**
+   * Counts fixtures in a startup summary window that do not contain a
+   * non-empty canonical Summary payload. This is an actual database check;
+   * it deliberately does not trust the sync-state marker.
+   */
+  async countMissingSummaryFixtures(params: {
+    leagueId: string;
+    season: number;
+    kickoffWindowStart: Date;
+    kickoffWindowEnd: Date;
+  }): Promise<number> {
+    const rows = await this.espnFixtureModel
+      .aggregate<{ count: number }>([
+        {
+          $match: {
+            leagueId: this.normalize(params.leagueId),
+            season: params.season,
+            fixtureDate: {
+              $gte: params.kickoffWindowStart,
+              $lte: params.kickoffWindowEnd,
+            },
+          },
+        },
+        {
+          $project: {
+            hasSummary: this.buildUsableSummaryExpression('$payload.summary'),
+          },
+        },
+        { $match: { hasSummary: false } },
+        { $count: 'count' },
+      ])
+      .exec();
+
+    return Number(rows[0]?.count ?? 0);
   }
 
   async getInitialSummaryEvents(
@@ -1253,8 +1257,7 @@ export class SportsSyncStateService {
           typeof unit.stepKey === 'string' &&
           unit.stepKey.startsWith('SUMMARY:') &&
           (unit.status === SportsSyncUnitStatus.PENDING ||
-            unit.status === SportsSyncUnitStatus.FAILED) &&
-          unit.attempts < this.summaryTotalAttempts,
+            unit.status === SportsSyncUnitStatus.FAILED)
       )
       .filter((unit) => {
         if (!unit.nextAttemptAt) {
@@ -1285,7 +1288,6 @@ export class SportsSyncStateService {
         !unit.stepKey.startsWith('SUMMARY:') ||
         (unit.status !== SportsSyncUnitStatus.PENDING &&
           unit.status !== SportsSyncUnitStatus.FAILED) ||
-        unit.attempts >= this.summaryTotalAttempts ||
         !unit.nextAttemptAt
       ) {
         continue;
@@ -1316,10 +1318,7 @@ export class SportsSyncStateService {
     );
 
     return summaryUnits.every(
-      (unit) =>
-        unit.status === SportsSyncUnitStatus.SUCCESS ||
-        (unit.status === SportsSyncUnitStatus.FAILED &&
-          unit.attempts >= this.summaryTotalAttempts),
+      (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
     );
   }
 
@@ -1346,9 +1345,7 @@ export class SportsSyncStateService {
 
     return Boolean(
       unit &&
-      (unit.status === SportsSyncUnitStatus.SUCCESS ||
-        (unit.status === SportsSyncUnitStatus.FAILED &&
-          unit.attempts >= this.summaryTotalAttempts)),
+      unit.status === SportsSyncUnitStatus.SUCCESS,
     );
   }
 
@@ -1746,8 +1743,7 @@ export class SportsSyncStateService {
         (unit) =>
           unit.type === SportsSyncUnitType.MONTH &&
           (unit.status === SportsSyncUnitStatus.PENDING ||
-            unit.status === SportsSyncUnitStatus.FAILED) &&
-          unit.attempts < this.fixtureTotalAttempts,
+            unit.status === SportsSyncUnitStatus.FAILED)
       )
       .map((unit) => unit.monthKey)
       .filter((month): month is string => Boolean(month))
@@ -1766,8 +1762,7 @@ export class SportsSyncStateService {
         (unit) =>
           unit.type === SportsSyncUnitType.MONTH &&
           (unit.status === SportsSyncUnitStatus.PENDING ||
-            unit.status === SportsSyncUnitStatus.FAILED) &&
-          unit.attempts < this.fixtureTotalAttempts,
+            unit.status === SportsSyncUnitStatus.FAILED)
       )
       .filter((unit) => {
         if (!unit.nextAttemptAt) {
@@ -1793,7 +1788,6 @@ export class SportsSyncStateService {
         unit.type !== SportsSyncUnitType.MONTH ||
         (unit.status !== SportsSyncUnitStatus.PENDING &&
           unit.status !== SportsSyncUnitStatus.FAILED) ||
-        unit.attempts >= this.fixtureTotalAttempts ||
         !unit.nextAttemptAt
       ) {
         continue;
@@ -1902,6 +1896,45 @@ export class SportsSyncStateService {
    * resetting the units prevents empty responses from permanently blocking
    * a season whose fixtures have not been published yet.
    */
+  /**
+   * Reopens only previously successful month units for a full ESPN integrity
+   * audit. Retry counters and all existing fixture documents are preserved.
+   */
+  async reopenSuccessfulMonthUnitsForIntegrityAudit(
+    stateKey: string,
+  ): Promise<number> {
+    const state = await this.requireState(stateKey);
+    let reopened = 0;
+
+    for (const unit of state.units) {
+      if (
+        unit.type !== SportsSyncUnitType.MONTH ||
+        unit.status !== SportsSyncUnitStatus.SUCCESS
+      ) {
+        continue;
+      }
+
+      unit.status = SportsSyncUnitStatus.PENDING;
+      unit.startedAt = undefined;
+      unit.completedAt = undefined;
+      unit.nextAttemptAt = undefined;
+      unit.lastError = undefined;
+      reopened += 1;
+    }
+
+    if (reopened > 0) {
+      state.status = SportsSyncStateStatus.PENDING;
+      state.lastSuccessfulAt = undefined;
+      state.lastCompletedAt = undefined;
+      state.lastError = undefined;
+      state.consecutiveFailures = 0;
+      state.markModified('units');
+      await state.save();
+    }
+
+    return reopened;
+  }
+
   async resetMonthUnitsForRetry(stateKey: string): Promise<number> {
     const state = await this.requireState(stateKey);
     let resetCount = 0;
@@ -2191,12 +2224,7 @@ export class SportsSyncStateService {
 
     const message = error instanceof Error ? error.message : String(error);
     const attempts = unit.attempts ?? 0;
-    const exhaustedFixtureMonth =
-      unit.type === SportsSyncUnitType.MONTH &&
-      attempts >= this.fixtureTotalAttempts;
-    const nextAttemptAt = exhaustedFixtureMonth
-      ? undefined
-      : new Date(Date.now() + this.getRetryDelay(attempts));
+    const nextAttemptAt = new Date(Date.now() + this.getRetryDelay(attempts));
 
     const set: Record<string, unknown> = {
       status: SportsSyncStateStatus.PARTIAL,
@@ -2340,10 +2368,7 @@ export class SportsSyncStateService {
       state.fixtureGranularity === 'MONTH' &&
       monthUnits.length > 0 &&
       monthUnits.every(
-        (unit) =>
-          unit.status === SportsSyncUnitStatus.SUCCESS ||
-          (unit.status === SportsSyncUnitStatus.FAILED &&
-            unit.attempts >= this.fixtureTotalAttempts),
+        (unit) => unit.status === SportsSyncUnitStatus.SUCCESS,
       );
 
     if (!complete) {
@@ -2389,9 +2414,9 @@ export class SportsSyncStateService {
     const terminalFailedMonths = monthUnits.filter(
       (unit) =>
         unit.status === SportsSyncUnitStatus.FAILED &&
-        unit.attempts >= this.fixtureTotalAttempts,
+        unit.attempts >= SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxAttempts + 1,
     ).length;
-    const completedUnits = successMonths + terminalFailedMonths;
+    const completedUnits = successMonths;
 
     return {
       totalMonths,
@@ -2698,6 +2723,74 @@ export class SportsSyncStateService {
     return SportsSyncStateStatus.PENDING;
   }
 
+  /** Mongo expression matching the same known, non-empty Summary sections as the worker. */
+  private buildUsableSummaryExpression(summaryPath: string): Record<string, unknown> {
+    const knownSections = [
+      'header', 'event', 'competitions', 'boxscore', 'plays', 'leaders',
+      'team', 'teams', 'rosters', 'roster', 'injuries', 'standings', 'odds',
+      'pickcenter', 'news', 'videos', 'articles', 'gameInfo', 'format',
+      'broadcasts', 'predictor', 'againstTheSpread', 'winprobability',
+      'drives', 'scoringPlays', 'statistics', 'headToHead', 'venue',
+      'weather', 'rankings', 'situation', 'commentary', 'recent', 'previews',
+    ];
+    const sectionType = { $type: '$$section.v' };
+    const nonEmptyValue = {
+      $switch: {
+        branches: [
+          {
+            case: { $isArray: '$$section.v' },
+            then: { $gt: [{ $size: '$$section.v' }, 0] },
+          },
+          {
+            case: { $eq: [sectionType, 'object'] },
+            then: {
+              $gt: [{ $size: { $objectToArray: '$$section.v' } }, 0],
+            },
+          },
+          {
+            case: { $eq: [sectionType, 'string'] },
+            then: {
+              $gt: [
+                { $strLenCP: { $trim: { input: '$$section.v' } } },
+                0,
+              ],
+            },
+          },
+        ],
+        default: {
+          $in: [sectionType, ['bool', 'int', 'long', 'double', 'decimal']],
+        },
+      },
+    };
+
+    return {
+      $cond: [
+        { $eq: [{ $type: summaryPath }, 'object'] },
+        {
+          $gt: [
+            {
+              $size: {
+                $filter: {
+                  input: { $objectToArray: summaryPath },
+                  as: 'section',
+                  cond: {
+                    $and: [
+                      { $in: ['$$section.k', knownSections] },
+                      { $ne: ['$$section.v', null] },
+                      nonEmptyValue,
+                    ],
+                  },
+                },
+              },
+            },
+            0,
+          ],
+        },
+        false,
+      ],
+    };
+  }
+
   private getRetryDelay(attempts: number): number {
     return Math.min(15, Math.pow(2, Math.max(attempts - 1, 0))) * 60_000;
   }
@@ -2710,4 +2803,5 @@ export class SportsSyncStateService {
     return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
   }
 }
+
 

@@ -14,7 +14,8 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
      */
     rateLimit: {
       minIntervalSeconds: 0.1,
-      normalConcurrency: 4,
+      // Keep the combined ESPN request pressure conservative on the 1 GB VM.
+      normalConcurrency: 2,
       liveConcurrency: 1,
     },
 
@@ -72,6 +73,8 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
       startupMonthLimit: 500000,
 
       /** Maximum simultaneous startup scoreboard requests. */
+      // Two bounded month requests are enough to overlap work without retaining
+      // too many large scoreboard responses in memory.
       startupConcurrency: 2,
     },
 
@@ -107,6 +110,7 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
       integrityRecoveryMaxQueuedPerPass: 20,
 
       /** Summary queue-write batch size; provider calls execute in the durable worker after startup unlocks. */
+      // Queue writes are small; provider processing remains one Summary at a time.
       startupBatchSize: 10,
 
       /** Maximum transient retry attempts inside the ESPN client. */
@@ -117,10 +121,11 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
     queue: {
       enabled: true,
       maxAttempts: 3,
-      /** Eight execution slots: six normal and two reserved for recovery. */
-      maxConcurrentJobs: 8,
-      normalReservedConcurrency: 6,
-      retryReservedConcurrency: 2,
+      /** Hard upper bound across all workload lanes on the 1 GB instance. */
+      maxConcurrentJobs: 3,
+      /** Retained for compatibility with existing monitor/config consumers. */
+      normalReservedConcurrency: 2,
+      retryReservedConcurrency: 1,
       /** A renewable lease prevents a healthy long-running job being stolen. */
       leaseMinutes: 8,
       heartbeatSeconds: 60,
@@ -128,7 +133,21 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
       retryDelayMinutes: 1,
       retryDelaysMinutes: [1, 2, 5, 10, 20, 40, 60, 180, 360, 720, 1440],
       retryJitterPercent: 20,
-      retryRecoveryBatchSize: 100,
+      retryRecoveryBatchSize: 50,
+    },
+
+    /**
+     * Independent workload limits. A lane cannot consume another lane's
+     * reserved worker, while the global queue and provider caps still protect
+     * the small production instance.
+     */
+    workloadConcurrency: {
+      fixtures: 1,
+      summaries: 2,
+      standings: 1,
+      leagueCatalogue: 1,
+      leagueDetails: 1,
+      youtube: 1,
     },
   },
 
@@ -182,3 +201,4 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 } as const;
 
 export type SportsDataCollectionConfig = typeof SPORTS_DATA_COLLECTION_CONFIG;
+

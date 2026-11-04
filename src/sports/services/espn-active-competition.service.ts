@@ -61,8 +61,8 @@ export class EspnActiveCompetitionService {
   async synchronizeLeagueCatalogue(): Promise<EspnLeagueDocument[]> {
     const leagues = await this.espnService.getLeagues();
 
-    if (!Array.isArray(leagues)) {
-      throw new Error('ESPN league catalogue response was not an array');
+    if (!Array.isArray(leagues) || leagues.length === 0) {
+      throw new Error('ESPN league catalogue response was empty or invalid');
     }
 
     const now = new Date();
@@ -74,13 +74,36 @@ export class EspnActiveCompetitionService {
           operation !== null,
       );
 
-    if (operations.length > 0) {
-      await this.espnLeagueModel.bulkWrite(operations, {
-        ordered: false,
-      });
+    if (operations.length !== leagues.length) {
+      throw new Error(
+        `ESPN catalogue contained ${leagues.length} entries but only ${operations.length} had valid league identifiers`,
+      );
     }
 
-    this.logger.log(`ESPN catalogue stored: ${operations.length} leagues`);
+    await this.espnLeagueModel.bulkWrite(operations, { ordered: false });
+
+    const expectedSlugs = [
+      ...new Set(
+        leagues
+          .map((league) =>
+            this.normalizeLeagueId(league.slug) ||
+            this.normalizeLeagueId(league.id),
+          )
+          .filter(Boolean),
+      ),
+    ];
+    const persistedCount = await this.espnLeagueModel.countDocuments({
+      slug: { $in: expectedSlugs },
+    });
+    if (persistedCount !== expectedSlugs.length) {
+      throw new Error(
+        `ESPN catalogue persistence verification failed: expected=${expectedSlugs.length}, persisted=${persistedCount}`,
+      );
+    }
+
+    this.logger.log(
+      `ESPN catalogue stored and verified: ${persistedCount} leagues`,
+    );
 
     return this.getOrderedLeagues();
   }
@@ -196,7 +219,7 @@ export class EspnActiveCompetitionService {
     const leagues = await this.getOrderedLeagues();
 
     const missingDetails = leagues.filter(
-      (league) => !league.detailLastSyncedAt,
+      (league) => !this.hasCompleteLeagueDetail(league),
     );
 
     let processed = 0;
@@ -205,37 +228,43 @@ export class EspnActiveCompetitionService {
     let inactive = 0;
     let skipped = 0;
     let failed = 0;
+    let nextIndex = 0;
 
-    for (const league of missingDetails) {
-      processed += 1;
+    // Two bounded detail requests keep the startup lane productive without
+    // creating a large Promise.all burst on the 1 GB production instance.
+    const detailWorker = async (): Promise<void> => {
+      while (nextIndex < missingDetails.length) {
+        const league = missingDetails[nextIndex++];
+        processed += 1;
 
-      try {
-        const result = await this.synchronizeLeagueDetail(league);
+        try {
+          const result = await this.synchronizeLeagueDetail(league);
+          if (!result) {
+            skipped += 1;
+            continue;
+          }
 
-        if (!result) {
-          skipped += 1;
-          continue;
-        }
-
-        synchronized += 1;
-
-        if (result.isActive) {
-          active += 1;
-        } else {
-          inactive += 1;
-        }
-      } catch (error) {
-        failed += 1;
-
-        this.logger.error(
-          `Failed to synchronize missing ESPN league detail ` +
-            `${league.leagueId}: ${
+          synchronized += 1;
+          if (result.isActive) active += 1;
+          else inactive += 1;
+        } catch (error) {
+          failed += 1;
+          this.logger.error(
+            `Failed to synchronize missing ESPN league detail ${league.leagueId}: ${
               error instanceof Error ? error.message : String(error)
             }`,
-          error instanceof Error ? error.stack : undefined,
-        );
+            error instanceof Error ? error.stack : undefined,
+          );
+        }
       }
-    }
+    };
+
+    await Promise.all(
+      Array.from(
+        { length: Math.min(2, missingDetails.length) },
+        () => detailWorker(),
+      ),
+    );
 
     /*
      * ActiveCompetition remains the operational source of truth for
@@ -469,6 +498,9 @@ export class EspnActiveCompetitionService {
       season,
     });
 
+    // A valid empty month response satisfies date-range verification, but it
+    // must not mark the season's fixture catalogue as published. Preserve the
+    // six-hour lifecycle recheck so newly published fixtures are discovered.
     if (fixtureCount === 0) {
       await this.espnLeagueModel
         .updateOne(
@@ -488,9 +520,8 @@ export class EspnActiveCompetitionService {
           },
         )
         .exec();
-
       this.logger.warn(
-        `ESPN fixture catalogue remains incomplete for ${normalizedLeagueId}/${season}: no fixture documents are stored yet`,
+        `ESPN fixture date ranges were verified but no fixture documents are published yet for ${normalizedLeagueId}/${season}; the season lifecycle will recheck after its cooldown`,
       );
       return false;
     }
@@ -585,6 +616,43 @@ export class EspnActiveCompetitionService {
     const leagues = await this.espnLeagueModel.find().lean().exec();
 
     return this.sortLeaguesByPriority(leagues);
+  }
+
+  /** Verify the persisted catalogue without relying on a sync timestamp. */
+  async assertLeagueCatalogueComplete(): Promise<void> {
+    const leagues = await this.getOrderedLeagues();
+    if (leagues.length === 0) {
+      throw new Error('ESPN league catalogue is empty after synchronization');
+    }
+
+    const incomplete = leagues.filter(
+      (league) =>
+        !this.normalizeLeagueId(league.slug) ||
+        !this.getString(league.name) ||
+        !this.getValidDate(league.lastSyncedAt),
+    );
+    if (incomplete.length > 0) {
+      throw new Error(
+        `ESPN league catalogue has ${incomplete.length} incomplete persisted records`,
+      );
+    }
+  }
+
+  /** Verify required league-detail fields and the stored provider payload. */
+  async assertLeagueDetailsComplete(): Promise<void> {
+    const leagues = await this.getOrderedLeagues();
+    const incomplete = leagues.filter(
+      (league) => !this.hasCompleteLeagueDetail(league),
+    );
+    if (incomplete.length > 0) {
+      const sample = incomplete
+        .slice(0, 10)
+        .map((league) => league.slug || league.leagueId)
+        .join(', ');
+      throw new Error(
+        `ESPN league details are incomplete for ${incomplete.length} catalogue records: ${sample}`,
+      );
+    }
   }
 
   async getByLeagueId(leagueId: string): Promise<EspnLeagueDocument | null> {
@@ -925,6 +993,48 @@ export class EspnActiveCompetitionService {
     return date;
   }
 
+  private hasCompleteLeagueDetail(league: EspnLeagueDocument): boolean {
+    const payload = league.payload as Record<string, unknown> | undefined;
+    if (
+      !this.getValidDate(league.detailLastSyncedAt) ||
+      !this.normalizeLeagueId(league.slug) ||
+      !this.getString(league.name) ||
+      !payload ||
+      typeof payload !== 'object' ||
+      Array.isArray(payload)
+    ) {
+      return false;
+    }
+
+    const payloadSlug = this.normalizeLeagueId(
+      this.getString(payload.slug),
+    );
+    const payloadName =
+      this.getString(payload.name) ?? this.getString(payload.displayName);
+    const hasSeasonReference = ['season', 'seasons'].some((key) => {
+      const value = payload[key];
+      return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+    });
+    const activeSeasonComplete =
+      !league.isActive ||
+      (typeof league.season === 'number' &&
+        Number.isInteger(league.season) &&
+        Boolean(this.getValidDate(league.seasonStartDate)) &&
+        Boolean(this.getValidDate(league.seasonEndDate)));
+
+    return Boolean(
+      payloadSlug === this.normalizeLeagueId(league.slug) &&
+      payloadName &&
+      hasSeasonReference &&
+      activeSeasonComplete,
+    );
+  }
+
+  private getValidDate(value: unknown): Date | undefined {
+    if (!(value instanceof Date)) return undefined;
+    return Number.isNaN(value.getTime()) ? undefined : value;
+  }
+
   private normalizeLeagueId(value?: string): string {
     if (typeof value !== 'string') {
       return '';
@@ -960,4 +1070,5 @@ export class EspnActiveCompetitionService {
     return !league;
   }
 }
+
 

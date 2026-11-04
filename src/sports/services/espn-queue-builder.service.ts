@@ -465,7 +465,7 @@ export class EspnQueueBuilderService {
       return false;
     }
 
-    const scheduledFor = params.scheduledFor ?? new Date();
+    const requestedSchedule = params.scheduledFor ?? new Date();
     const attemptedAt = league.fixtureCollectionAttemptedAt
       ? this.asValidDate(league.fixtureCollectionAttemptedAt)
       : undefined;
@@ -473,7 +473,11 @@ export class EspnQueueBuilderService {
       league.fixtureCollectionAttemptSeason === params.season && attemptedAt
         ? attemptedAt.getTime() + 6 * 60 * 60 * 1000
         : 0;
-    if (scheduledFor.getTime() < cooldownUntil) return false;
+    // Do not drop the season-bootstrap work during its empty-catalogue
+    // cooldown. Keep one durable job scheduled for the first eligible time.
+    const scheduledFor = new Date(
+      Math.max(requestedSchedule.getTime(), cooldownUntil),
+    );
     if (
       await this.espnQueueService.hasActiveSeasonBootstrap(
         leagueId,
@@ -1733,5 +1737,6 @@ export class EspnQueueBuilderService {
     return String(job.status) === 'PENDING' && Number(job.attempts ?? 0) === 0;
   }
 }
+
 
 

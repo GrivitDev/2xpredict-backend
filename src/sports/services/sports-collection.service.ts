@@ -192,7 +192,9 @@ export class SportsCollectionService {
    * Keep Mongo write batches small and bounded when an ESPN scoreboard
    * response contains a large number of events.
    */
-  private readonly mongoBulkChunkSize = 50;
+  // Keep batches bounded for the 1 GB application instance while halving
+  // the write-round-trip count versus the previous 50-operation batches.
+  private readonly mongoBulkChunkSize = 100;
 
   /**
    * Full-season startup fixture collection window.
@@ -469,6 +471,7 @@ export class SportsCollectionService {
   async collectEspnFixtures(
     leagueId: string,
     response: unknown,
+    options: { suppressFollowUpTriggers?: boolean; season?: number } = {},
   ): Promise<{
     fixtureIds: string[];
     collected: number;
@@ -542,6 +545,7 @@ export class SportsCollectionService {
           (event as { season?: { year?: unknown } }).season?.year,
         ) ??
         this.toNumber(competition?.season?.year) ??
+        options.season ??
         fixtureDate.getUTCFullYear();
 
       const status = this.extractStatus(event);
@@ -853,15 +857,17 @@ export class SportsCollectionService {
     // Do not mark the enclosing fixture-refresh job successful until the
     // durable follow-up jobs have been written. If Mongo queue insertion fails,
     // the fixture-refresh job itself retries; event keys make the replay safe.
-    const queueBuilder = this.espnQueueBuilderService as Pick<
-      EspnQueueBuilderService,
-      'onFixturesCollected'
-    >;
-    await queueBuilder.onFixturesCollected(fixtureIds);
+    if (!options.suppressFollowUpTriggers) {
+      const queueBuilder = this.espnQueueBuilderService as Pick<
+        EspnQueueBuilderService,
+        'onFixturesCollected'
+      >;
+      await queueBuilder.onFixturesCollected(fixtureIds);
+    }
 
     // Fixture writes are durable at this point. Settlement independently reads
     // each event and verifies the fixture-feed lifecycle status before enqueueing.
-    if (confirmedFinishedFixtureIds.length > 0) {
+    if (!options.suppressFollowUpTriggers && confirmedFinishedFixtureIds.length > 0) {
       const settlementTrigger = this.settlementTriggerService as Pick<
         SettlementTriggerService,
         'onFixturesRefreshed'
@@ -873,6 +879,71 @@ export class SportsCollectionService {
       fixtureIds,
       collected: fixtureIds.length,
     };
+  }
+
+  /**
+   * Verifies every event ID returned by an ESPN month request is present in
+   * the canonical fixture collection for the expected league and season.
+   * Uses small $in batches so verification remains memory-safe.
+   */
+  /**
+   * Confirms that a Summary refresh actually reached the canonical fixture
+   * document and contains a usable ESPN section. Queue/sync success alone is
+   * not accepted as proof of persistence.
+   */
+  async assertEspnSummaryPersisted(
+    leagueId: string,
+    season: number,
+    eventId: string,
+  ): Promise<void> {
+    const normalizedLeagueId = this.normalizeLeagueId(leagueId);
+    const normalizedEventId = String(eventId ?? '').trim();
+    if (!normalizedLeagueId || !Number.isInteger(season) || !normalizedEventId) {
+      throw new Error('Summary persistence verification requires leagueId, season and eventId');
+    }
+
+    const fixture = await this.espnFixtureModel
+      .findOne({
+        leagueId: normalizedLeagueId,
+        season,
+        eventId: normalizedEventId,
+      })
+      .select({ 'payload.summary': 1 })
+      .lean()
+      .exec();
+
+    const payload = fixture?.payload as Record<string, unknown> | undefined;
+    if (!this.hasUsableSummaryForHash(payload?.summary)) {
+      throw new Error(
+        `Summary persistence verification failed for ${normalizedLeagueId}/${season}/${normalizedEventId}`,
+      );
+    }
+  }
+
+  async assertEspnFixtureIdsPersisted(
+    leagueId: string,
+    season: number,
+    fixtureIds: string[],
+  ): Promise<void> {
+    const normalizedLeagueId = this.normalizeLeagueId(leagueId);
+    const uniqueIds = [...new Set(fixtureIds.map((id) => String(id).trim()).filter(Boolean))];
+    if (!normalizedLeagueId || !Number.isInteger(season)) {
+      throw new Error('Fixture persistence verification requires leagueId and season');
+    }
+
+    for (let offset = 0; offset < uniqueIds.length; offset += 100) {
+      const batch = uniqueIds.slice(offset, offset + 100);
+      const persisted = await this.espnFixtureModel.countDocuments({
+        leagueId: normalizedLeagueId,
+        season,
+        eventId: { $in: batch },
+      });
+      if (persisted !== batch.length) {
+        throw new Error(
+          `Fixture persistence verification failed for ${normalizedLeagueId}/${season}: expected ${batch.length} event documents in batch, found ${persisted}`,
+        );
+      }
+    }
   }
 
   // ============================================================
@@ -3445,12 +3516,32 @@ export class SportsCollectionService {
   }
 
   private hasUsableSummaryForHash(value: unknown): boolean {
-    return (
-      value !== null &&
-      typeof value === 'object' &&
-      !Array.isArray(value) &&
-      Object.keys(value).length > 0
-    );
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return false;
+    }
+
+    // Keep this list aligned with SportsSyncStateService's Mongo expression.
+    // A non-empty object alone is not enough: ESPN can return an envelope with
+    // empty sections, which must not be recorded as a collected Summary.
+    const knownSections = [
+      'header', 'event', 'competitions', 'boxscore', 'plays', 'leaders',
+      'team', 'teams', 'rosters', 'roster', 'injuries', 'standings', 'odds',
+      'pickcenter', 'news', 'videos', 'articles', 'gameInfo', 'format',
+      'broadcasts', 'predictor', 'againstTheSpread', 'winprobability',
+      'drives', 'scoringPlays', 'statistics', 'headToHead', 'venue',
+      'weather', 'rankings', 'situation', 'commentary', 'recent', 'previews',
+    ];
+    const summary = value as Record<string, unknown>;
+
+    return knownSections.some((key) => {
+      if (!(key in summary)) return false;
+      const section = summary[key];
+      if (section === null || section === undefined) return false;
+      if (typeof section === 'string') return section.trim().length > 0;
+      if (Array.isArray(section)) return section.length > 0;
+      if (typeof section === 'object') return Object.keys(section).length > 0;
+      return typeof section === 'boolean' || typeof section === 'number';
+    });
   }
 
   /**
@@ -4207,3 +4298,4 @@ export class SportsCollectionService {
     return `${year}-${month}-${day}`;
   }
 }
+

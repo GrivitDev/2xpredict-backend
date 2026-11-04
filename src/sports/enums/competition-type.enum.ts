@@ -5,4 +5,3 @@ export enum CompetitionType {
 
   INTERNATIONAL = 'INTERNATIONAL',
 }
-

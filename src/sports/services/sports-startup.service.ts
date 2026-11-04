@@ -1,5 +1,7 @@
 // backend/src/sports/services/sports-startup.service.ts
 
+/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
+
 import {
   Injectable,
   Logger,
@@ -76,6 +78,11 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
   private startupFailureCount = 0;
   private readonly startupRetryBaseMs = 5_000;
   private readonly startupRetryMaxMs = 5 * 60_000;
+  private readonly fixtureIntegrityAuditTaskKey =
+    'espn-fixture-integrity-audit';
+  private readonly fixtureIntegrityAuditVersion =
+    'monthly-source-reconciliation-v1';
+  private readonly fixtureIntegrityAuditIntervalMs = 30 * 24 * 60 * 60_000;
 
   constructor(
     private readonly espnService: EspnService,
@@ -121,7 +128,12 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       },
       Math.max(0, delayMs),
     );
-    this.startupTimer.unref?.();
+    const timer = this.startupTimer as
+      | (NodeJS.Timeout & { unref?: () => void })
+      | undefined;
+    if (timer && typeof timer.unref === 'function') {
+      timer.unref();
+    }
   }
 
   private getStartupRetryDelayMs(): number {
@@ -132,6 +144,33 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  private toError(error: unknown): Error {
+    if (error instanceof Error) {
+      return error;
+    }
+
+    if (typeof error === 'string' && error.trim()) {
+      return new Error(error);
+    }
+
+    if (typeof error === 'object' && error !== null && 'message' in error) {
+      const message = (error as { message?: unknown }).message;
+      return new Error(
+        typeof message === 'string' ? message : 'Unknown error object',
+      );
+    }
+
+    if (
+      typeof error === 'number' ||
+      typeof error === 'boolean' ||
+      typeof error === 'bigint'
+    ) {
+      return new Error(String(error));
+    }
+
+    return new Error('Unknown error');
+  }
+
   // ============================================================
   // STARTUP PIPELINE
   // ============================================================
@@ -139,69 +178,137 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
   private async initializeEspn(): Promise<void> {
     if (this.startupStopping || this.startupCompleted || this.startupRunning)
       return;
-    this.startupRunning = true;
-    try {
-      // --------------------------------------------------------
-      // PHASE 1
-      // LEAGUE CATALOGUE
-      // --------------------------------------------------------
 
+    this.startupRunning = true;
+    let fixtureIntegrityAuditStarted = false;
+    try {
+      // PHASE 1: refresh and verify the complete persisted catalogue.
       const leagues =
         await this.espnActiveCompetitionService.synchronizeLeagueCatalogue();
-
+      await this.espnActiveCompetitionService.assertLeagueCatalogueComplete();
       this.logger.log(
-        `ESPN league catalogue synchronized: ${leagues.length} leagues`,
+        `ESPN league catalogue verified: ${leagues.length} competitions`,
       );
 
-      // --------------------------------------------------------
-      // PHASE 2
-      // LEAGUE DETAILS
-      // --------------------------------------------------------
-
+      // PHASE 2: repair missing/incomplete details with bounded concurrency.
       const detailResult =
         await this.espnActiveCompetitionService.synchronizeMissingLeagueDetails();
-
+      if (detailResult.failed > 0 || detailResult.skipped > 0) {
+        throw new Error(
+          `ESPN league-detail phase incomplete: failed=${detailResult.failed}, skipped=${detailResult.skipped}`,
+        );
+      }
+      await this.espnActiveCompetitionService.assertLeagueDetailsComplete();
       this.logger.log(
-        `ESPN missing league-detail synchronization completed: ` +
-          `processed=${detailResult.processed}, ` +
-          `synchronized=${detailResult.synchronized}, ` +
-          `active=${detailResult.active}, ` +
-          `inactive=${detailResult.inactive}, ` +
-          `skipped=${detailResult.skipped}, ` +
-          `failed=${detailResult.failed}`,
+        `ESPN league details verified: catalogue=${leagues.length}, ` +
+          `processed=${detailResult.processed}, synchronized=${detailResult.synchronized}, ` +
+          `active=${detailResult.active}, inactive=${detailResult.inactive}`,
       );
-
-      // --------------------------------------------------------
-      // AUTHORITATIVE ACTIVE LEAGUE LIST
-      // --------------------------------------------------------
 
       const activeLeagues =
         await this.espnActiveCompetitionService.getActiveLeagues();
-
-      this.logger.log(
-        `Preparing ESPN startup pipeline for ${activeLeagues.length} active leagues`,
-      );
-
-      // --------------------------------------------------------
-      // PREPARE FIXTURE SYNCHRONIZATION STATES
-      //
-      // Fixture and standings states are prepared here.
-      // SUMMARY_REFRESH state is deliberately not reconciled until
-      // every fixture state has completed.
-      // --------------------------------------------------------
-
       const leagueContexts = await this.prepareLeagueContexts(activeLeagues);
-
       this.logger.log(
-        `ESPN fixture synchronization states prepared: leagues=${leagueContexts.length}`,
+        `Preparing mandatory ESPN data bootstrap: activeSeasons=${leagueContexts.length}`,
       );
 
-      // --------------------------------------------------------
-      // PHASE 3
-      // FIXTURE COLLECTION
-      // --------------------------------------------------------
+      // The first run after this integrity version is deployed, and then every
+      // 30 days, re-request every previously successful month. That repairs
+      // old partial-success ledgers without deleting any stored documents.
+      const priorFixtureAudit = await this.sportsSyncStateService.getCronState(
+        this.fixtureIntegrityAuditTaskKey,
+      );
+      const lastFixtureAuditAt = priorFixtureAudit?.lastSuccessfulAt
+        ? new Date(priorFixtureAudit.lastSuccessfulAt)
+        : undefined;
+      const fixtureAuditDue =
+        !priorFixtureAudit ||
+        priorFixtureAudit.cronExpression !==
+          this.fixtureIntegrityAuditVersion ||
+        String(priorFixtureAudit.status) !== 'SUCCESS' ||
+        !lastFixtureAuditAt ||
+        Number.isNaN(lastFixtureAuditAt.getTime()) ||
+        Date.now() - lastFixtureAuditAt.getTime() >=
+          this.fixtureIntegrityAuditIntervalMs;
 
-      await this.runFixturePhase(leagueContexts);
+      await this.sportsSyncStateService.ensureCronState({
+        taskKey: this.fixtureIntegrityAuditTaskKey,
+        cronExpression: this.fixtureIntegrityAuditVersion,
+        timeZone: 'UTC',
+      });
+
+      if (fixtureAuditDue) {
+        await this.sportsSyncStateService.markCronStarted(
+          this.fixtureIntegrityAuditTaskKey,
+        );
+        fixtureIntegrityAuditStarted = true;
+        let reopenedMonths = 0;
+        for (const context of leagueContexts) {
+          reopenedMonths +=
+            await this.sportsSyncStateService.reopenSuccessfulMonthUnitsForIntegrityAudit(
+              context.fixtureStateKey,
+            );
+        }
+        this.logger.warn(
+          `Full ESPN fixture integrity audit required: reopened ${reopenedMonths} previously successful month(s). Existing fixture documents are preserved and refreshed from ESPN.`,
+        );
+      }
+
+      // Seed standings before fixture ingestion so its independent workload can
+      // run concurrently with the bounded fixture lane.
+      const standingsSeed =
+        await this.seedStartupStandingsRefreshes(leagueContexts);
+      if (standingsSeed.skipped > 0) {
+        throw new Error(
+          `Could not queue initial standings refresh for ${standingsSeed.skipped} league-season(s)`,
+        );
+      }
+
+      // PHASES 3 and 5: fixtures and standings have independent worker capacity.
+      // Summary depends on the complete fixture catalogue and runs afterwards.
+      const fixtureTask = this.runFixturePhase(leagueContexts).then(
+        async (result) => {
+          // Complete the audit marker as soon as fixture verification finishes;
+          // a slow standings endpoint must not force a full fixture re-audit
+          // after a process restart.
+          if (fixtureIntegrityAuditStarted) {
+            await this.sportsSyncStateService.markCronSuccess({
+              taskKey: this.fixtureIntegrityAuditTaskKey,
+              nextRunAt: new Date(
+                Date.now() + this.fixtureIntegrityAuditIntervalMs,
+              ),
+            });
+            fixtureIntegrityAuditStarted = false;
+          }
+          return result;
+        },
+      );
+      const [fixturePhase, standingsPhase] = await Promise.allSettled([
+        fixtureTask,
+        this.espnQueueWorkerService.runStartupStandingsPhase(
+          leagueContexts.map((context) => ({
+            leagueId: context.leagueId,
+            season: context.season,
+            standingsStateKey: context.standingsStateKey,
+          })),
+        ),
+      ]);
+      if (fixturePhase.status === 'rejected') {
+        throw this.toError(fixturePhase.reason);
+      }
+      if (standingsPhase.status === 'rejected') {
+        throw this.toError(standingsPhase.reason);
+      }
+      const fixtureResult = fixturePhase.value;
+      const standingsResult = standingsPhase.value;
+      this.logger.log(
+        `ESPN fixture phase verified for ${fixtureResult.leagues} league-seasons; ` +
+          `months=${fixtureResult.verifiedMonths}`,
+      );
+      this.logger.log(
+        `ESPN standings phase verified: required=${standingsSeed.queued + standingsSeed.alreadyComplete}, ` +
+          `succeeded=${standingsResult.succeeded}, notApplicable=${standingsResult.unavailable}`,
+      );
 
       for (const context of leagueContexts) {
         await this.sportsSyncStateService.assertFixtureStartupComplete(
@@ -213,134 +320,96 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
             context.leagueId,
             context.season,
           );
-
         if (!catalogueReady) {
-          // Keep the completed startup ledger intact so the global startup
-          // barrier can release normally. A persistent season-bootstrap job
-          // retries the MONTH units after the six-hour empty-catalogue cooldown.
+          // The full season date-range requests were valid and persisted, but
+          // ESPN currently has no fixture documents for this season. Keep the
+          // season lifecycle marker unset so the normal queue schedules a
+          // six-hour recheck; this is not a failed fixture API request.
           this.logger.warn(
-            `ESPN has not published fixture documents for ${context.leagueId}/${context.season}; ` +
-              'a persistent season-bootstrap job will retry the catalogue after its cooldown',
+            `Fixture date-range coverage verified but ESPN returned no fixture documents for ${context.leagueId}/${context.season}; a delayed season bootstrap will recheck publication.`,
           );
         }
       }
 
-      this.logger.log('ESPN FIXTURE PHASE completed. Moving to SUMMARY PHASE.');
-
-      // --------------------------------------------------------
-      // PHASE 4
-      // SUMMARY COLLECTION
-      // --------------------------------------------------------
-
+      // PHASE 4: every historical Summary and every Summary currently inside
+      // the provider's 72-hour availability horizon must exist in MongoDB.
       const summaryResult = await this.runStartupSummaryPhase(leagueContexts);
-
       this.logger.log(
-        `ESPN Summary startup phase completed: checked=${summaryResult.checked}, ` +
-          `missing=${summaryResult.missingSummary}, processed=${summaryResult.processed}, ` +
-          `failed=${summaryResult.failedAttempts}`,
+        `ESPN Summary startup phase verified: checked=${summaryResult.checked}, ` +
+          `missingAtStart=${summaryResult.missingSummary}, ` +
+          `processed=${summaryResult.processed}`,
       );
 
-      // --------------------------------------------------------
-      // PHASE 5
-      // STANDINGS REFRESH
-      // Queue and fully process one initial ESPN standings refresh for every
-      // active league/season. Normal operations remain locked until every job
-      // succeeds or reaches an explicit terminal failure/unavailable outcome.
-      // --------------------------------------------------------
-
-      const standingsSeed =
-        await this.seedStartupStandingsRefreshes(leagueContexts);
-      this.logger.log(
-        `ESPN initial standings jobs prepared: ` +
-          `queued=${standingsSeed.queued}, alreadyComplete=${standingsSeed.alreadyComplete}, ` +
-          `alreadyUnavailable=${standingsSeed.unavailable}, failedToQueue=${standingsSeed.skipped}`,
-      );
-
-      if (standingsSeed.skipped > 0) {
-        throw new Error(
-          `Could not queue initial standings refresh for ${standingsSeed.skipped} active league-season(s)`,
-        );
-      }
-
-      const standingsResult =
-        await this.espnQueueWorkerService.runStartupStandingsPhase(
-          leagueContexts.map((context) => ({
-            leagueId: context.leagueId,
-            season: context.season,
-            standingsStateKey: context.standingsStateKey,
-          })),
-        );
-
-      this.logger.log(
-        `ESPN STANDINGS PHASE completed: ` +
-          `active=${leagueContexts.length}, succeeded=${standingsResult.succeeded}, ` +
-          `unavailable=${standingsResult.unavailable}, failed=${standingsResult.failed}`,
-      );
-
-      // --------------------------------------------------------
-      // FINAL STATE VALIDATION
-      // --------------------------------------------------------
-
+      // FINAL AUDIT: re-check the source records, not just the queue state.
+      await this.espnActiveCompetitionService.assertLeagueCatalogueComplete();
+      await this.espnActiveCompetitionService.assertLeagueDetailsComplete();
       for (const context of leagueContexts) {
         await this.sportsSyncStateService.assertFixtureStartupComplete(
           context.leagueId,
           context.season,
         );
+        if (getEspnStandingsPolicy(context.leagueId) !== 'NONE') {
+          await this.espnStandingsService.assertStartupCollectionVerified(
+            context.leagueId,
+            context.season,
+          );
+        }
+        const summaryWindow = this.getStartupSummaryWindow(context);
+        if (summaryWindow) {
+          const missing =
+            await this.sportsSyncStateService.countMissingSummaryFixtures({
+              leagueId: context.leagueId,
+              season: context.season,
+              kickoffWindowStart: summaryWindow.start,
+              kickoffWindowEnd: summaryWindow.end,
+            });
+          if (missing > 0) {
+            throw new Error(
+              `Final Summary audit found ${missing} missing document(s) for ${context.leagueId}/${context.season}`,
+            );
+          }
+        }
       }
 
-      // --------------------------------------------------------
-      // RESTORE NORMAL OPERATIONS
-      // --------------------------------------------------------
-
+      // Restore and seed normal queue records only after every mandatory dataset
+      // has passed the final integrity audit. Consumers remain gated until below.
       const restored = await this.restoreNormalOperationsQueueStates();
-
-      this.logger.log(
-        `ESPN normal queue-state restoration completed: ` +
-          `states=${restored.states}, ` +
-          `queued=${restored.queued}, ` +
-          `skipped=${restored.skipped}`,
-      );
-
-      // --------------------------------------------------------
-      // INITIAL NORMAL FIXTURE REFRESH QUEUE
-      // --------------------------------------------------------
+      if (restored.skipped > 0) {
+        throw new Error(
+          `Normal queue-state restoration is incomplete: skipped=${restored.skipped}`,
+        );
+      }
 
       const initialQueue =
         await this.espnQueueBuilderService.buildDailyLeagueRefreshQueue();
-
       this.logger.log(
-        `Initial normal ESPN fixture-refresh queue created: ` +
-          `active=${initialQueue.active}, ` +
-          `queued=${initialQueue.queued}, ` +
-          `skipped=${initialQueue.skipped}`,
+        `Initial normal ESPN fixture queue prepared: active=${initialQueue.active}, ` +
+          `queued=${initialQueue.queued}, skipped=${initialQueue.skipped}`,
       );
-
-      // --------------------------------------------------------
-      // RELEASE NORMAL OPERATIONS
-      // --------------------------------------------------------
+      if (initialQueue.skipped > 0) {
+        // Queue seeding is post-audit maintenance, not evidence that the
+        // mandatory startup datasets are incomplete. Skipped jobs remain
+        // visible in the operational logs and are re-evaluated by builders.
+        this.logger.warn(
+          `Initial normal ESPN queue had ${initialQueue.skipped} non-blocking skipped item(s); mandatory startup data has already passed verification.`,
+        );
+      }
 
       this.espnQueueService.markStartupReady();
-
       this.espnQueueService.markNormalOperationsReady();
-
+      this.espnQueueWorkerService.start();
       this.logger.log(
-        'ESPN startup bootstrap is completely finished. ' +
-          'Normal operations are now released.',
+        'ESPN startup integrity audit passed. Normal operations are now released.',
       );
 
-      this.espnQueueWorkerService.start();
-
-      // News is extracted from saved Summaries into sports_espn_news.
-      // Backfill older stored Summaries in the background without blocking
-      // normal queue operations. Once normalized feed records exist, this
-      // one-time backfill is skipped on subsequent starts.
+      // This is derived work from already-persisted Summary payloads. It is safe
+      // to run after release and does not hold the bootstrap barrier open.
       void this.sportsCollectionService
         .backfillSummaryNewsFromStoredFixtures()
         .then((result) => {
           if (!result.skipped) {
             this.logger.log(
-              `ESPN Summary news backfill completed: scanned=${result.scanned}, ` +
-                `upserted=${result.upserted}`,
+              `ESPN Summary news backfill completed: scanned=${result.scanned}, upserted=${result.upserted}`,
             );
           }
         })
@@ -354,16 +423,27 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
 
       this.startupCompleted = true;
       this.startupFailureCount = 0;
-      this.logger.log(
-        'ESPN startup retry guard marked initialization complete',
-      );
     } catch (error) {
+      const startupError = this.toError(error);
       this.startupFailureCount += 1;
       const retryDelayMs = this.getStartupRetryDelayMs();
+      if (fixtureIntegrityAuditStarted) {
+        await this.sportsSyncStateService
+          .markCronFailure({
+            taskKey: this.fixtureIntegrityAuditTaskKey,
+            error: startupError,
+            nextRunAt: new Date(Date.now() + retryDelayMs),
+          })
+          .catch((stateError: unknown) => {
+            this.logger.error(
+              `Could not persist fixture integrity audit failure: ${stateError instanceof Error ? stateError.message : String(stateError)}`,
+            );
+          });
+      }
       this.logger.error(
-        `ESPN startup bootstrap failed (attempt ${this.startupFailureCount}). ` +
-          `Sports synchronization remains locked; retrying in ${Math.ceil(retryDelayMs / 1000)}s.`,
-        error instanceof Error ? error.stack : String(error),
+        `ESPN startup bootstrap remains incomplete (attempt ${this.startupFailureCount}). ` +
+          `Normal operations remain locked; retrying in ${Math.ceil(retryDelayMs / 1000)}s.`,
+        startupError.stack,
       );
       this.startupRunning = false;
       this.scheduleStartupAttempt(retryDelayMs);
@@ -634,51 +714,79 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     let skipped = 0;
 
     for (const context of contexts) {
-      const unitSuccessful = await this.sportsSyncStateService.isUnitSuccessful(
-        context.standingsStateKey,
-        'STEP:STANDINGS_INITIAL',
-      );
-      if (unitSuccessful) {
-        alreadyComplete += 1;
-        continue;
-      }
+      const policy = getEspnStandingsPolicy(context.leagueId);
 
-      if (getEspnStandingsPolicy(context.leagueId) === 'NONE') {
+      if (policy === 'NONE') {
         const reason = `Standings not applicable for competition format: ${context.leagueId}/${context.season}`;
-        await this.espnStandingsService.markNotApplicable(context.leagueId, context.season);
+        await this.espnStandingsService.markNotApplicable(
+          context.leagueId,
+          context.season,
+        );
         await this.sportsSyncStateService.markStepUnavailable(
           context.standingsStateKey,
           'STANDINGS_INITIAL',
           reason,
         );
-        const refreshSuccessful = await this.sportsSyncStateService.isUnitSuccessful(
+        await this.sportsSyncStateService.markStepUnavailable(
           context.standingsStateKey,
-          'STEP:STANDINGS_REFRESH',
+          'STANDINGS_REFRESH',
+          reason,
         );
-        if (!refreshSuccessful) {
-          await this.sportsSyncStateService.markStepUnavailable(
-            context.standingsStateKey,
-            'STANDINGS_REFRESH',
-            reason,
-          );
-        }
-        await this.sportsSyncStateService
-          .refreshOverallStatus(context.standingsStateKey)
-          .catch(() => undefined);
+        await this.sportsSyncStateService.refreshOverallStatus(
+          context.standingsStateKey,
+        );
         unavailable += 1;
-        this.logger.debug(
-          `Initial standings skipped: league=${context.leagueId} season=${context.season} policy=NONE`,
-        );
         continue;
       }
+
+      let unitSuccessful = await this.sportsSyncStateService.isUnitSuccessful(
+        context.standingsStateKey,
+        'STEP:STANDINGS_INITIAL',
+      );
+
+      // A previous SUCCESS marker is reusable only while the corresponding
+      // snapshot and its complete stage coverage still exist in MongoDB.
+      if (unitSuccessful) {
+        try {
+          await this.espnStandingsService.assertStartupCollectionVerified(
+            context.leagueId,
+            context.season,
+          );
+          alreadyComplete += 1;
+          continue;
+        } catch (error) {
+          this.logger.warn(
+            `Standings integrity check reopened ${context.leagueId}/${context.season}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          await this.sportsSyncStateService.resetStepForRefresh(
+            context.standingsStateKey,
+            'STANDINGS_INITIAL',
+          );
+          await this.sportsSyncStateService.resetStepForRefresh(
+            context.standingsStateKey,
+            'STANDINGS_REFRESH',
+          );
+          unitSuccessful = false;
+        }
+      }
+
       if (
-        await this.sportsSyncStateService.isUnitUnavailable(
+        !unitSuccessful &&
+        (await this.sportsSyncStateService.isUnitUnavailable(
           context.standingsStateKey,
           'STEP:STANDINGS_INITIAL',
-        )
+        ))
       ) {
-        unavailable += 1;
-        continue;
+        // UNAVAILABLE is a terminal outcome only for explicit policy NONE.
+        // Required/optional competitions are reopened and retried.
+        await this.sportsSyncStateService.resetStepForRefresh(
+          context.standingsStateKey,
+          'STANDINGS_INITIAL',
+        );
+        await this.sportsSyncStateService.resetStepForRefresh(
+          context.standingsStateKey,
+          'STANDINGS_REFRESH',
+        );
       }
 
       try {
@@ -689,11 +797,20 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
           scheduledFor: new Date(),
           triggerEventId: `STARTUP_STANDINGS:${context.season}`,
         });
+
         if (
           job.status === EspnQueueStatus.PENDING ||
           job.status === EspnQueueStatus.PROCESSING ||
           job.status === EspnQueueStatus.FAILED
         ) {
+          if (
+            job.status === EspnQueueStatus.FAILED &&
+            String(job.lane) === 'QUARANTINE'
+          ) {
+            this.logger.error(
+              `Required startup standings job is quarantined for ${context.leagueId}/${context.season}: ${job.lastError ?? 'no error detail'}`,
+            );
+          }
           queued += 1;
         } else if (job.status === EspnQueueStatus.COMPLETED) {
           const nowSuccessful =
@@ -701,8 +818,30 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
               context.standingsStateKey,
               'STEP:STANDINGS_INITIAL',
             );
-          if (nowSuccessful) alreadyComplete += 1;
-          else queued += 1;
+          if (nowSuccessful) {
+            await this.espnStandingsService.assertStartupCollectionVerified(
+              context.leagueId,
+              context.season,
+            );
+            alreadyComplete += 1;
+          } else {
+            // The durable job completed previously, but its source data did
+            // not pass verification. The queue service will reopen this job.
+            const retryJob = await this.espnQueueService.addStandingsRefreshJob(
+              {
+                leagueId: context.leagueId,
+                season: context.season,
+                priority: context.priority,
+                scheduledFor: new Date(),
+                triggerEventId: `STARTUP_STANDINGS:${context.season}`,
+              },
+            );
+            if (retryJob.status === EspnQueueStatus.COMPLETED) {
+              skipped += 1;
+            } else {
+              queued += 1;
+            }
+          }
         } else {
           skipped += 1;
         }
@@ -724,51 +863,56 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
 
   private async runFixturePhase(
     contexts: StartupLeagueContext[],
-  ): Promise<void> {
+  ): Promise<{ leagues: number; verifiedMonths: number }> {
+    if (contexts.length === 0) return { leagues: 0, verifiedMonths: 0 };
+
     this.logger.log(
       `ESPN FIXTURE PHASE started: leagues=${contexts.length}, ` +
-        `concurrency=${this.startupFixtureConcurrency}, ` +
-        `granularity=MONTH`,
+        `concurrency=${this.startupFixtureConcurrency}, granularity=MONTH`,
     );
 
+    let contextCursor = 0;
+    let verifiedMonths = 0;
+
     while (true) {
-      const work: Array<{
-        context: StartupLeagueContext;
-        monthKey: string;
-      }> = [];
+      const work: Array<{ context: StartupLeagueContext; monthKey: string }> =
+        [];
+      let visited = 0;
 
-      /*
-       * Fill one bounded global work batch. The worker pool is shared across
-       * all leagues so a single league cannot consume more than the available
-       * startup concurrency indefinitely.
-       */
-      for (const context of contexts) {
-        if (work.length >= this.startupFixtureConcurrency) {
-          break;
-        }
-
-        const remaining = this.startupFixtureConcurrency - work.length;
+      // With one active league, use both bounded fixture slots on distinct
+      // months. With multiple leagues, round-robin preserves cross-league
+      // fairness and prevents one large competition from monopolising them.
+      if (contexts.length === 1 && this.startupFixtureConcurrency > 1) {
+        const context = contexts[0];
         const dueMonths =
           await this.sportsSyncStateService.getDueIncompleteMonths(
             context.fixtureStateKey,
-            remaining,
+            this.startupFixtureConcurrency,
           );
-
         for (const monthKey of dueMonths) {
-          work.push({
-            context,
-            monthKey,
-          });
+          work.push({ context, monthKey });
+        }
+      } else {
+        while (
+          visited < contexts.length &&
+          work.length < this.startupFixtureConcurrency
+        ) {
+          const context = contexts[contextCursor];
+          contextCursor = (contextCursor + 1) % contexts.length;
+          visited += 1;
 
-          if (work.length >= this.startupFixtureConcurrency) {
-            break;
-          }
+          const dueMonths =
+            await this.sportsSyncStateService.getDueIncompleteMonths(
+              context.fixtureStateKey,
+              1,
+            );
+          const monthKey = dueMonths[0];
+          if (monthKey) work.push({ context, monthKey });
         }
       }
 
       if (work.length > 0) {
         const startedAt = Date.now();
-
         const results = await Promise.allSettled(
           work.map(({ context, monthKey }) =>
             this.processFixtureMonth(
@@ -784,62 +928,43 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
 
         let succeeded = 0;
         let failed = 0;
-
         results.forEach((result, index) => {
           const item = work[index];
-
           if (result.status === 'fulfilled') {
             succeeded += 1;
+            verifiedMonths += 1;
             return;
           }
-
           failed += 1;
-
           this.logger.error(
-            `Fixture bootstrap failed for ${item.context.leagueId} ` +
-              `${item.monthKey}: ${
-                result.reason instanceof Error
-                  ? result.reason.message
-                  : String(result.reason)
-              }. The month will be retried by sync state.`,
+            `Fixture bootstrap failed for ${item.context.leagueId} ${item.monthKey}: ${
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason)
+            }. The month remains incomplete and will be retried.`,
           );
         });
 
         this.logger.log(
-          `ESPN fixture startup batch completed: ` +
-            `requested=${work.length}, ` +
-            `succeeded=${succeeded}, ` +
-            `failed=${failed}, ` +
-            `duration=${Date.now() - startedAt}ms`,
+          `ESPN fixture startup batch completed: requested=${work.length}, ` +
+            `verified=${succeeded}, failed=${failed}, duration=${Date.now() - startedAt}ms`,
         );
-
         continue;
       }
 
       let allComplete = true;
       let earliestRetryAt: Date | null = null;
-
       for (const context of contexts) {
         const progress =
           await this.sportsSyncStateService.getFixtureStartupProgress(
             context.fixtureStateKey,
           );
-
-        this.logger.log(
-          `ESPN fixture startup progress ${context.leagueId}: ` +
-            `${progress.successMonths}/${progress.totalMonths} months ` +
-            `(${progress.completionPercent.toFixed(1)}%)`,
-        );
-
-        if (!progress.complete) {
-          allComplete = false;
-        }
+        if (!progress.complete) allComplete = false;
 
         const nextRetryAt =
           await this.sportsSyncStateService.getNextIncompleteMonthRetryAt(
             context.fixtureStateKey,
           );
-
         if (
           nextRetryAt &&
           (!earliestRetryAt ||
@@ -857,39 +982,29 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
             ),
           ),
         );
-
-        const terminalFailures = (
-          await Promise.all(
-            contexts.map((context) =>
-              this.sportsSyncStateService.getFixtureStartupProgress(
-                context.fixtureStateKey,
-              ),
-            ),
-          )
-        ).reduce((total, progress) => total + progress.terminalFailedMonths, 0);
-        if (terminalFailures > 0) {
-          this.logger.warn(
-            `ESPN FIXTURE PHASE resolved with ${terminalFailures} terminal month failure(s); summary processing will continue for available fixtures.`,
+        for (const context of contexts) {
+          await this.sportsSyncStateService.assertFixtureStartupComplete(
+            context.leagueId,
+            context.season,
           );
-        } else {
-          this.logger.log('ESPN FIXTURE PHASE completed successfully');
         }
-        return;
+        this.logger.log(
+          `ESPN FIXTURE PHASE fully verified: leagues=${contexts.length}, months=${verifiedMonths}`,
+        );
+        return { leagues: contexts.length, verifiedMonths };
       }
 
       if (earliestRetryAt) {
-        const delay = Math.max(0, earliestRetryAt.getTime() - Date.now());
-
+        const delay = Math.max(1_000, earliestRetryAt.getTime() - Date.now());
         this.logger.warn(
-          `Fixture startup waiting for next retry at ` +
-            `${earliestRetryAt.toISOString()} (wait=${delay}ms)`,
+          `Fixture startup has incomplete months; next retry=${earliestRetryAt.toISOString()} wait=${Math.ceil(delay / 1000)}s`,
         );
-
-        await this.sleep(delay);
-        continue;
+        await this.sleep(Math.min(delay, 60_000));
+      } else {
+        // A processing unit may belong to a still-running owner after a
+        // failover. Keep the gate closed and inspect again without busy-looping.
+        await this.sleep(5_000);
       }
-
-      await this.sleep(1000);
     }
   }
 
@@ -908,24 +1023,39 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
         leagueId,
         monthKey,
       );
-
       const seasonScopedResponse = this.filterFixtureResponseToSeason(
         response,
         season,
         dateFrom,
         dateTo,
       );
+      const events = (seasonScopedResponse as { events: unknown[] }).events;
+      const expectedIds = [
+        ...new Set(
+          events.map((event) => String((event as { id: unknown }).id)),
+        ),
+      ];
 
-      await this.sportsCollectionService.collectEspnFixtures(
+      const collection = await this.sportsCollectionService.collectEspnFixtures(
         leagueId,
         seasonScopedResponse,
+        { suppressFollowUpTriggers: true, season },
+      );
+      const transformedUniqueCount = new Set(collection.fixtureIds).size;
+      if (transformedUniqueCount !== expectedIds.length) {
+        throw new Error(
+          `Fixture transformation mismatch for ${leagueId}/${season}/${monthKey}: receivedUnique=${expectedIds.length}, transformedUnique=${transformedUniqueCount}`,
+        );
+      }
+
+      await this.sportsCollectionService.assertEspnFixtureIdsPersisted(
+        leagueId,
+        season,
+        expectedIds,
       );
 
-      /*
-       * A successful ESPN month request is a successful synchronization even
-       * when the month contains zero fixtures. This is why MONTH units are
-       * not inferred from fixture-document existence.
-       */
+      // A valid empty ESPN events array is a verified empty month. A missing
+      // or malformed events array never reaches this success transition.
       await this.sportsSyncStateService.markMonthSuccess(stateKey, monthKey);
     } catch (error) {
       await this.sportsSyncStateService.markMonthFailed(
@@ -933,7 +1063,6 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
         monthKey,
         error,
       );
-
       throw error;
     }
   }
@@ -956,49 +1085,30 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     let queued = 0;
     const startupSummaryContexts: Array<{
       leagueId: string;
-      eventId: string;
       season: number;
       summaryStateKey: string;
+      kickoffWindowStart: Date;
+      kickoffWindowEnd: Date;
+      missingAtStart: number;
     }> = [];
 
-    const startupWindowStart = new Date();
-    const startupWindowEnd = new Date(
-      startupWindowStart.getTime() +
-        SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours *
-          60 *
-          60_000,
-    );
-
     this.logger.log(
-      `ESPN STARTUP SUMMARY PHASE started: recent-and-upcoming window=${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}h, ` +
-        `batchSize=${this.startupSummaryBatchSize}. Only recently played fixtures and fixtures through ${startupWindowEnd.toISOString()} are seeded; older historical enrichment does not block startup.`,
+      `ESPN STARTUP SUMMARY PHASE started: full season history through the provider's ${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}h upcoming availability horizon; enqueueBatch=${this.startupSummaryBatchSize}.`,
     );
 
-    // Fixture collection must complete before Summary state is reconciled.
     for (const context of contexts) {
       await this.sportsSyncStateService.assertFixtureStartupComplete(
         context.leagueId,
         context.season,
       );
-    }
 
-    const retryScheduledFor = new Date(
-      Date.now() +
-        SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.retryDelayMinutes * 60_000,
-    );
-    const jobs: Array<{
-      leagueId: string;
-      eventId: string;
-      season: number;
-      priority: number;
-      scheduledFor: Date;
-    }> = [];
-
-    for (const context of contexts) {
-      // Keep startup Summary work bounded to the last 24 hours plus the
-      // configured 72-hour upcoming horizon. Older historical enrichment is
-      // not a startup prerequisite and must not hold normal operations hostage.
-      const summaryWindowStart = new Date(Date.now() - 24 * 60 * 60_000);
+      const window = this.getStartupSummaryWindow(context);
+      if (!window) {
+        this.logger.debug(
+          `No startup Summary window is currently open for ${context.leagueId}/${context.season}; its season begins beyond the configured provider horizon.`,
+        );
+        continue;
+      }
 
       const state = await this.sportsSyncStateService.ensureSummaryRefreshState(
         {
@@ -1006,8 +1116,8 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
           season: context.season,
           priority: context.priority,
           trackingMode: 'WINDOW',
-          kickoffWindowStart: summaryWindowStart,
-          kickoffWindowEnd: startupWindowEnd,
+          kickoffWindowStart: window.start,
+          kickoffWindowEnd: window.end,
         },
       );
       await this.sportsSyncStateService.resetInterruptedUnits(state.stateKey);
@@ -1015,85 +1125,124 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       const eligibleEventIds =
         await this.sportsSyncStateService.getSummaryEventIdsInWindow(
           state.stateKey,
-          summaryWindowStart,
-          startupWindowEnd,
+          window.start,
+          window.end,
         );
       const refreshedState = await this.sportsSyncStateService.requireState(
         state.stateKey,
       );
-      const eligibleSummaryUnits = refreshedState.units.filter(
-        (unit) =>
-          unit.type === SportsSyncUnitType.STEP &&
-          typeof unit.stepKey === 'string' &&
-          unit.stepKey.startsWith('SUMMARY:') &&
-          eligibleEventIds.has(String(unit.stepKey).slice('SUMMARY:'.length)),
-      );
-      const summaryTotalAttempts =
-        SPORTS_DATA_COLLECTION_CONFIG.ESPN.queue.maxAttempts + 1;
-      const eligibleByEvent = new Map(
-        eligibleSummaryUnits.map((unit) => [
-          String(unit.stepKey).slice('SUMMARY:'.length),
-          unit,
-        ]),
-      );
+      const unitsByEvent = new Map<
+        string,
+        (typeof refreshedState.units)[number]
+      >();
+      for (const unit of refreshedState.units) {
+        if (
+          unit.type !== SportsSyncUnitType.STEP ||
+          typeof unit.stepKey !== 'string' ||
+          !unit.stepKey.startsWith('SUMMARY:')
+        ) {
+          continue;
+        }
+        unitsByEvent.set(unit.stepKey.slice('SUMMARY:'.length), unit);
+      }
 
-      const toQueue = [...eligibleByEvent.entries()].filter(
-        ([, unit]) =>
-          (unit.status === SportsSyncUnitStatus.PENDING &&
-            unit.attempts === 0) ||
-          ((unit.status === SportsSyncUnitStatus.PENDING ||
-            unit.status === SportsSyncUnitStatus.FAILED) &&
-            unit.attempts > 0 &&
-            unit.attempts < summaryTotalAttempts),
-      );
-      checked += eligibleSummaryUnits.length;
-      missingSummary += toQueue.length;
+      const missingAtStart =
+        await this.sportsSyncStateService.countMissingSummaryFixtures({
+          leagueId: context.leagueId,
+          season: context.season,
+          kickoffWindowStart: window.start,
+          kickoffWindowEnd: window.end,
+        });
+      checked += eligibleEventIds.size;
+      missingSummary += missingAtStart;
 
-      for (const [eventId, unit] of eligibleByEvent) {
+      let batch: string[] = [];
+      let missingUnits = 0;
+      const enqueueBatch = async (): Promise<void> => {
+        if (batch.length === 0) return;
+        const eventIds = batch;
+        batch = [];
+
+        const results = await Promise.allSettled(
+          eventIds.map((eventId) =>
+            this.espnQueueService.addSummaryRefreshJob({
+              leagueId: context.leagueId,
+              eventId,
+              season: context.season,
+              priority: context.priority,
+              scheduledFor: new Date(),
+              triggerEventId: `STARTUP_SUMMARY:${eventId}`,
+            }),
+          ),
+        );
+
+        for (let index = 0; index < results.length; index += 1) {
+          const result = results[index];
+          const eventId = eventIds[index];
+          if (result.status === 'rejected') {
+            throw new Error(
+              `Could not enqueue startup Summary ${context.leagueId}/${eventId}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+            );
+          }
+          if (
+            result.value.status === EspnQueueStatus.FAILED &&
+            String(result.value.lane) === 'QUARANTINE'
+          ) {
+            throw new Error(
+              `Startup Summary ${context.leagueId}/${eventId} is quarantined: ${result.value.lastError ?? 'no error detail'}`,
+            );
+          }
+          queued += 1;
+        }
+      };
+
+      for (const eventId of eligibleEventIds) {
+        const unit = unitsByEvent.get(eventId);
+        if (!unit) {
+          throw new Error(
+            `Summary reconciliation has no sync unit for persisted fixture ${context.leagueId}/${context.season}/${eventId}`,
+          );
+        }
+
         if (unit.status === SportsSyncUnitStatus.SUCCESS) {
           continue;
         }
-
-        startupSummaryContexts.push({
-          leagueId: context.leagueId,
-          eventId,
-          season: context.season,
-          summaryStateKey: state.stateKey,
-        });
-      }
-
-      for (const [eventId, unit] of toQueue) {
-        jobs.push({
-          leagueId: context.leagueId,
-          eventId,
-          season: context.season,
-          priority: context.priority,
-          scheduledFor:
-            unit.attempts > 0 ? retryScheduledFor : startupWindowStart,
-        });
-      }
-    }
-
-    // Persist jobs in small concurrent writes. The startup-only queue worker
-    // below executes these durable jobs before normal operations are released.
-    const enqueueBatchSize = Math.max(1, this.startupSummaryBatchSize);
-    for (let offset = 0; offset < jobs.length; offset += enqueueBatchSize) {
-      const batch = jobs.slice(offset, offset + enqueueBatchSize);
-      const results = await Promise.allSettled(
-        batch.map((job) =>
-          this.espnQueueService.addSummaryRefreshJob({
-            ...job,
-            triggerEventId: `STARTUP_SUMMARY:${job.eventId}`,
-          }),
-        ),
-      );
-      for (const result of results) {
-        if (result.status === 'fulfilled') queued += 1;
-        else
-          this.logger.warn(
-            `Could not queue startup Summary work: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+        if (unit.status === SportsSyncUnitStatus.UNAVAILABLE) {
+          throw new Error(
+            `Startup Summary is marked unavailable for ${context.leagueId}/${context.season}/${eventId}; it cannot satisfy the startup barrier`,
           );
+        }
+        if (unit.status === SportsSyncUnitStatus.PROCESSING) {
+          throw new Error(
+            `Startup Summary unit remains PROCESSING after interrupted-work recovery: ${context.leagueId}/${context.season}/${eventId}`,
+          );
+        }
+
+        batch.push(eventId);
+        missingUnits += 1;
+        if (batch.length >= this.startupSummaryBatchSize) {
+          await enqueueBatch();
+        }
       }
+      await enqueueBatch();
+      if (missingUnits !== missingAtStart) {
+        throw new Error(
+          `Summary integrity reconciliation mismatch for ${context.leagueId}/${context.season}: databaseMissing=${missingAtStart}, missingUnits=${missingUnits}. One or more fixture records may have invalid event IDs or inconsistent sync state.`,
+        );
+      }
+
+      startupSummaryContexts.push({
+        leagueId: context.leagueId,
+        season: context.season,
+        summaryStateKey: state.stateKey,
+        kickoffWindowStart: window.start,
+        kickoffWindowEnd: window.end,
+        missingAtStart,
+      });
+
+      this.logger.log(
+        `Startup Summary work prepared: league=${context.leagueId}, fixtures=${eligibleEventIds.size}, missing=${missingAtStart}, queued=${queued}`,
+      );
     }
 
     const workerResult =
@@ -1101,17 +1250,27 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
         startupSummaryContexts,
       );
 
-    // Summary jobs remain durable and continue through the normal/retry worker
-    // after startup. Prediction eligibility still enforces required data.
-    if (workerResult.failed > 0) {
-      this.logger.warn(`Startup Summary left ${workerResult.failed} item(s) for background recovery.`);
+    // The worker only returns after the database audit finds no missing
+    // usable Summary payload in any required startup window.
+    for (const context of startupSummaryContexts) {
+      const missing =
+        await this.sportsSyncStateService.countMissingSummaryFixtures({
+          leagueId: context.leagueId,
+          season: context.season,
+          kickoffWindowStart: context.kickoffWindowStart,
+          kickoffWindowEnd: context.kickoffWindowEnd,
+        });
+      if (missing > 0) {
+        throw new Error(
+          `Startup Summary phase ended with ${missing} missing payload(s) for ${context.leagueId}/${context.season}`,
+        );
+      }
     }
 
     this.logger.log(
-      `ESPN STARTUP SUMMARY PHASE resolved: checked=${checked}, ` +
-        `missing=${missingSummary}, queued=${queued}, ` +
-        `processed=${workerResult.succeeded}, ` +
-        `recent-and-upcoming-through-${SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours}hAhead.`,
+      `ESPN STARTUP SUMMARY PHASE verified: fixturesChecked=${checked}, ` +
+        `missingAtStart=${missingSummary}, queued=${queued}, ` +
+        `persistedAndVerified=${workerResult.succeeded}`,
     );
 
     return {
@@ -1128,15 +1287,34 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     dateFrom: string,
     dateTo: string,
   ): unknown {
-    if (!response || typeof response !== 'object') {
-      return response;
+    if (!response || typeof response !== 'object' || Array.isArray(response)) {
+      throw new Error('ESPN monthly scoreboard response was not an object');
     }
 
     const record = response as Record<string, unknown>;
     const events = record.events;
 
     if (!Array.isArray(events)) {
-      return response;
+      throw new Error(
+        'ESPN monthly scoreboard response omitted the events array',
+      );
+    }
+
+    for (const event of events) {
+      if (!event || typeof event !== 'object') {
+        throw new Error('ESPN monthly scoreboard contained a malformed event');
+      }
+      const eventRecord = event as Record<string, unknown>;
+      const eventId = this.getString(eventRecord.id);
+      const eventDate =
+        typeof eventRecord.date === 'string'
+          ? new Date(eventRecord.date)
+          : new Date(Number.NaN);
+      if (!eventId || Number.isNaN(eventDate.getTime())) {
+        throw new Error(
+          'ESPN monthly scoreboard contained an event without a valid ID or date',
+        );
+      }
     }
 
     const filteredEvents = events.filter((event) => {
@@ -1178,6 +1356,14 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
       ...record,
       events: filteredEvents,
     };
+  }
+
+  private getString(value: unknown): string | undefined {
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      return undefined;
+    }
+    const normalized = String(value).trim();
+    return normalized || undefined;
   }
 
   private toNumber(value: unknown): number | undefined {
@@ -1279,19 +1465,38 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private getStartupSummaryWindow(
+    context: StartupLeagueContext,
+  ): { start: Date; end: Date } | undefined {
+    const start = new Date(`${context.fixtureDateFrom}T00:00:00.000Z`);
+    const seasonEnd = new Date(`${context.fixtureDateTo}T23:59:59.999Z`);
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(seasonEnd.getTime()) ||
+      start.getTime() > seasonEnd.getTime()
+    ) {
+      throw new Error(
+        `Invalid Summary startup date window for ${context.leagueId}/${context.season}`,
+      );
+    }
+
+    const providerHorizon = new Date(
+      Date.now() +
+        SPORTS_DATA_COLLECTION_CONFIG.ESPN.summary.startupWindowHours *
+          60 *
+          60_000,
+    );
+    const end =
+      providerHorizon.getTime() < seasonEnd.getTime()
+        ? providerHorizon
+        : seasonEnd;
+
+    return start.getTime() <= end.getTime() ? { start, end } : undefined;
+  }
+
   // ============================================================
   // DATE HELPERS
   // ============================================================
-
-  private startOfUtcDay(date: Date): Date {
-    return new Date(
-      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-    );
-  }
-
-  private addUtcDays(date: Date, days: number): Date {
-    return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
-  }
 
   private toDateOnly(date: Date): string {
     return date.toISOString().slice(0, 10);
@@ -1311,4 +1516,3 @@ export class SportsStartupService implements OnModuleInit, OnModuleDestroy {
     });
   }
 }
-

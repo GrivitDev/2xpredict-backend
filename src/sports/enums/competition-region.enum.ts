@@ -15,4 +15,3 @@ export enum CompetitionRegion {
 
   WORLD = 'WORLD',
 }
-

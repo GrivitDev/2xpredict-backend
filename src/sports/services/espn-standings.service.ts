@@ -96,6 +96,75 @@ export class EspnStandingsService {
     this.logger.debug(`Standings skipped: league=${leagueId} season=${season} reason=not-applicable`);
   }
 
+  /**
+   * Startup completion check against the actual persisted standings snapshot.
+   * A sync-state SUCCESS marker alone is not sufficient evidence.
+   */
+  async assertStartupCollectionVerified(
+    leagueIdValue: string,
+    season: number,
+  ): Promise<void> {
+    const leagueId = this.normalize(leagueIdValue);
+    if (!leagueId || !Number.isInteger(season)) {
+      throw new Error('Standings verification requires leagueId and season');
+    }
+
+    if (getEspnStandingsPolicy(leagueId) === 'NONE') return;
+
+    const [collectionState, snapshot] = await Promise.all([
+      this.collectionStateModel
+        .findOne({ leagueId, season })
+        .lean()
+        .exec(),
+      this.espnStandingModel
+        .findOne({
+          leagueId,
+          season,
+          leagueName: { $exists: true },
+          fetchedAt: { $exists: true },
+        })
+        .select({ leagueName: 1, fetchedAt: 1, payload: 1 })
+        .lean()
+        .exec(),
+    ]);
+
+    if (!snapshot || !(snapshot.fetchedAt instanceof Date)) {
+      throw new Error(
+        `Standings verification failed: no persisted ESPN snapshot for ${leagueId}/${season}`,
+      );
+    }
+
+    if (collectionState?.status !== 'AVAILABLE') {
+      throw new Error(
+        `Standings verification failed for ${leagueId}/${season}: collection status=${collectionState?.status ?? 'MISSING'}`,
+      );
+    }
+
+    const missingStageIds = this.stringArray(collectionState.missingStageIds);
+    if (missingStageIds.length > 0) {
+      throw new Error(
+        `Standings verification incomplete for ${leagueId}/${season}; missing stages=${missingStageIds.join(', ')}`,
+      );
+    }
+
+    const payload = snapshot.payload as Record<string, unknown> | undefined;
+    if (!payload || Object.keys(payload).length === 0) {
+      throw new Error(
+        `Standings verification failed: persisted payload is empty for ${leagueId}/${season}`,
+      );
+    }
+
+    if (
+      getEspnStandingsPolicy(leagueId) === 'REQUIRED' &&
+      (Number(collectionState.tableCount ?? 0) < 1 ||
+        Number(collectionState.teamEntryCount ?? 0) < 1)
+    ) {
+      throw new Error(
+        `Standings verification incomplete: no populated table entries for ${leagueId}/${season}`,
+      );
+    }
+  }
+
   /** Called by the persistent queue worker. */
   async processQueuedRefresh(
     leagueIdValue: string,
@@ -359,6 +428,9 @@ export class EspnStandingsService {
    * used by the normal standings worker.
    */
   async refreshForSettlement(leagueIdValue: string, season: number, freshnessHours = 6): Promise<void> {
+    // Settlement may call this method directly rather than through the durable
+    // queue. Honour the global startup barrier before any normal ESPN request.
+    await this.espnQueueService.waitForNormalOperationsReady();
     const leagueId = this.normalize(leagueIdValue);
     if (!leagueId || !Number.isInteger(season)) return;
     if (getEspnStandingsPolicy(leagueId) === 'NONE') {
@@ -509,6 +581,7 @@ export class EspnStandingsService {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 
 
 
