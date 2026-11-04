@@ -59,6 +59,14 @@ export class BetLabTicketLeg {
   @Prop({ required: true, min: 1.01 })
   decimalOdds!: number;
 
+  /** Correlated same-fixture pricing group used by relationship-aware Bet Lab odds. */
+  @Prop({ type: String, enum: ['MATCH', 'SCORE', 'SHOTS'] })
+  fixturePricingGroup?: 'MATCH' | 'SCORE' | 'SHOTS';
+
+  /** Applied once at settlement only when every leg in the group wins. */
+  @Prop({ type: Number, min: 0.0000001 })
+  fixturePricingAdjustment?: number;
+
   @Prop({ required: true, type: String, enum: Object.values(BetLabOddsSource) })
   oddsSource!: BetLabOddsSource;
 
@@ -137,3 +145,4 @@ export class BetLabTicketLeg {
 
 export const BetLabTicketLegSchema =
   SchemaFactory.createForClass(BetLabTicketLeg);
+

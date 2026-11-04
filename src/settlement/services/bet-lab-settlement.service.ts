@@ -44,6 +44,8 @@ interface BetLabSettlementLeg {
   settlementMethod?: unknown;
   settlementNote?: unknown;
   decimalOdds?: unknown;
+  fixturePricingGroup?: unknown;
+  fixturePricingAdjustment?: unknown;
   legId?: unknown;
 }
 
@@ -625,6 +627,37 @@ export class BetLabSettlementService {
       if (!Number.isFinite(multiplier) || multiplier < 0)
         throw new Error('Calculated ticket return is invalid.');
     }
+    // Correlated selections were priced together when the ticket was created.
+    // Apply each relationship adjustment once, but only while every selection
+    // in that group is a full win. A push/void removes that leg and restores the
+    // remaining selections to their individual quoted prices.
+    const pricingGroups = new Map<
+      string,
+      { legs: BetLabSettlementLeg[]; adjustment?: number }
+    >();
+    for (const leg of legs) {
+      const group = String(leg.fixturePricingGroup ?? '').toUpperCase();
+      const eventId = this.asString(leg.eventId);
+      if (!eventId || !['MATCH', 'SCORE', 'SHOTS'].includes(group)) continue;
+      const key = `${eventId}:${group}`;
+      const entry = pricingGroups.get(key) ?? { legs: [] };
+      entry.legs.push(leg);
+      const adjustment = Number(leg.fixturePricingAdjustment);
+      if (Number.isFinite(adjustment) && adjustment > 0) {
+        entry.adjustment = adjustment;
+      }
+      pricingGroups.set(key, entry);
+    }
+    for (const entry of pricingGroups.values()) {
+      if (
+        entry.adjustment !== undefined &&
+        entry.legs.length > 1 &&
+        entry.legs.every((leg) => leg.status === BetLabLegStatus.WON)
+      ) {
+        multiplier *= entry.adjustment;
+      }
+    }
+
     const grossReturn = Math.round(stake * multiplier);
     if (!Number.isSafeInteger(grossReturn) || grossReturn < 0)
       throw new Error(
@@ -751,4 +784,5 @@ export class BetLabSettlementService {
     return error instanceof Error ? error.message : this.asString(error);
   }
 }
+
 

@@ -30,6 +30,14 @@ import { BetLabMarketService } from './bet-lab-market.service';
 import { BetLabWalletService } from './bet-lab-wallet.service';
 import { roundDecimal } from '../utils/odds.util';
 import { findBetLabSelectionCompatibilityError } from '../utils/bet-lab-selection-compatibility.util';
+import {
+  buildBetLabFixturePricingModel,
+  buildBetLabSelectionPricing,
+  calculateBetLabSlipPricing,
+  getBetLabPricingGroup,
+  type BetLabPricingMarket,
+  type BetLabSlipPricing,
+} from '../utils/bet-lab-pricing.util';
 import { AdminGateway } from '../../realtime/admin.gateway';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
 
@@ -149,6 +157,7 @@ export class BetLabTicketService {
       const quotes = await this.resolveSelectionQuotes(requests);
       const compatibilityError = findBetLabSelectionCompatibilityError(quotes);
       if (compatibilityError) throw new BadRequestException(compatibilityError);
+      const pricing = await this.calculateSlipPricing(quotes);
 
       const ticket = await this.placeTicketAtomic(
         userId,
@@ -157,6 +166,7 @@ export class BetLabTicketService {
         dto.idempotencyKey,
         fingerprint,
         quotes,
+        pricing,
       );
       await this.settlementTrigger.onTargetsCreated(
         [...new Set(requests.map((item) => item.eventId))],
@@ -239,6 +249,7 @@ export class BetLabTicketService {
     idempotencyKey: string,
     fingerprint: string,
     quotes: Awaited<ReturnType<BetLabTicketService['resolveSelectionQuotes']>>,
+    pricing?: BetLabSlipPricing,
   ) {
     const entitlement = await this.walletService.getCurrentEntitlement(userId);
     const session = await this.ticketModel.db.startSession();
@@ -287,9 +298,15 @@ export class BetLabTicketService {
           entitlement,
           session,
         );
-        const combinedOdds = this.calculateCombinedOdds(
-          quotes.map((quote) => quote.decimalOdds),
-        );
+        const combinedOdds = pricing
+          ? roundDecimal(pricing.combinedOdds, BET_LAB_CONFIG.odds.decimalPlaces)
+          : this.calculateCombinedOdds(quotes.map((quote) => quote.decimalOdds));
+        if (
+          !Number.isFinite(combinedOdds) ||
+          combinedOdds < BET_LAB_CONFIG.odds.minimumDecimalOdds
+        ) {
+          throw new BadRequestException('The combined selection price is invalid.');
+        }
         const potentialReturn = Math.round(stake * combinedOdds);
         if (
           !Number.isSafeInteger(potentialReturn) ||
@@ -301,43 +318,72 @@ export class BetLabTicketService {
         }
         const now = new Date();
         const ticketNumber = this.createTicketNumber();
-        const legSnapshots = quotes.map((quote) => ({
-          legId: randomUUID(),
-          eventId: quote.fixture.eventId,
-          leagueId: quote.fixture.leagueId,
-          leagueName: quote.fixture.leagueName,
-          fixtureDate: quote.fixture.fixtureDate,
-          homeTeamId: quote.fixture.homeTeamId,
-          homeTeamName: quote.fixture.homeTeamName,
-          awayTeamId: quote.fixture.awayTeamId,
-          awayTeamName: quote.fixture.awayTeamName,
-          marketCode: quote.market.code,
-          marketJsonVariable: quote.market.jsonVariable,
-          marketFullName: quote.market.fullName,
-          marketAbbreviation: quote.market.abbreviation,
-          selectionCode: quote.selection.code,
-          selectionJsonVariable: quote.selection.jsonVariable,
-          selectionFullName: quote.selection.fullName,
-          selectionAbbreviation: quote.selection.abbreviation,
-          settlementKey: quote.selection.settlementKey || quote.selection.code,
-          line: quote.selection.line,
-          handicap: quote.selection.handicap,
-          homeGoals: quote.selection.homeGoals,
-          awayGoals: quote.selection.awayGoals,
-          subjectId: quote.selection.subjectId,
-          subjectName: quote.selection.subjectName,
-          subjectTeamId: quote.selection.subjectTeamId,
-          decimalOdds: quote.decimalOdds,
-          oddsSource: quote.oddsSource,
-          priceType: quote.priceType,
-          bookmaker: quote.bookmaker ?? undefined,
-          providerUpdatedAt: quote.providerUpdatedAt ?? undefined,
-          oddsTimestampBasis: quote.oddsTimestampBasis,
-          oddsCapturedAt: quote.oddsCapturedAt,
-          oddsBasis: quote.oddsBasis ?? undefined,
-          oddsCalculationMethod: quote.oddsCalculationMethod ?? undefined,
-          status: BetLabLegStatus.OPEN,
-        }));
+        const adjustments = new Map(
+          (pricing?.adjustments ?? []).map((adjustment) => [
+            `${adjustment.eventId}:${adjustment.group}`,
+            adjustment.factor,
+          ]),
+        );
+        const adjustmentAssigned = new Set<string>();
+        const legSnapshots = quotes.map((quote) => {
+          const pricingGroup = getBetLabPricingGroup(String(quote.market.code));
+          const adjustmentKey = pricingGroup
+            ? `${quote.fixture.eventId}:${pricingGroup}`
+            : '';
+          const adjustment = adjustmentKey
+            ? adjustments.get(adjustmentKey)
+            : undefined;
+          const assignAdjustment = adjustment !== undefined
+            && !adjustmentAssigned.has(adjustmentKey);
+          if (assignAdjustment) adjustmentAssigned.add(adjustmentKey);
+
+          return {
+            legId: randomUUID(),
+            eventId: quote.fixture.eventId,
+            leagueId: quote.fixture.leagueId,
+            leagueName: quote.fixture.leagueName,
+            fixtureDate: quote.fixture.fixtureDate,
+            homeTeamId: quote.fixture.homeTeamId,
+            homeTeamName: quote.fixture.homeTeamName,
+            awayTeamId: quote.fixture.awayTeamId,
+            awayTeamName: quote.fixture.awayTeamName,
+            marketCode: quote.market.code,
+            marketJsonVariable: quote.market.jsonVariable,
+            marketFullName: quote.market.fullName,
+            marketAbbreviation: quote.market.abbreviation,
+            selectionCode: quote.selection.code,
+            selectionJsonVariable: quote.selection.jsonVariable,
+            selectionFullName: quote.selection.fullName,
+            selectionAbbreviation: quote.selection.abbreviation,
+            settlementKey: quote.selection.settlementKey || quote.selection.code,
+            line: quote.selection.line,
+            handicap: quote.selection.handicap,
+            homeGoals: quote.selection.homeGoals,
+            awayGoals: quote.selection.awayGoals,
+            subjectId: quote.selection.subjectId,
+            subjectName: quote.selection.subjectName,
+            subjectTeamId: quote.selection.subjectTeamId,
+            decimalOdds: quote.decimalOdds,
+            oddsSource: quote.oddsSource,
+            priceType: quote.priceType,
+            bookmaker: quote.bookmaker ?? undefined,
+            providerUpdatedAt: quote.providerUpdatedAt ?? undefined,
+            oddsTimestampBasis: quote.oddsTimestampBasis,
+            oddsCapturedAt: quote.oddsCapturedAt,
+            oddsBasis: quote.oddsBasis ?? undefined,
+            oddsCalculationMethod: quote.oddsCalculationMethod ?? undefined,
+            ...(adjustment !== undefined && pricingGroup
+              ? {
+                  fixturePricingGroup: pricingGroup,
+                  ...(assignAdjustment
+                    ? { fixturePricingAdjustment: adjustment }
+                    : {}),
+                }
+              : {}),
+            status: BetLabLegStatus.OPEN,
+          };
+        });
+
         const created = await this.ticketModel.create(
           [
             {
@@ -420,6 +466,84 @@ export class BetLabTicketService {
 
   private resolveSelectionQuotes(requests: BetLabSelectionRequest[]) {
     return this.marketService.getSelectionQuotes(requests);
+  }
+
+  /**
+   * Builds the same relationship-aware accumulator price shown by the frontend.
+   * Only fixtures with at least two selections in a correlated pricing group
+   * need the complete market snapshot; unrelated markets remain independent.
+   */
+  private async calculateSlipPricing(
+    quotes: Awaited<ReturnType<BetLabTicketService['resolveSelectionQuotes']>>,
+  ): Promise<BetLabSlipPricing> {
+    const quotesByEvent = new Map<string, typeof quotes>();
+    for (const quote of quotes) {
+      const eventId = String(quote.fixture.eventId);
+      const group = quotesByEvent.get(eventId) ?? [];
+      group.push(quote);
+      quotesByEvent.set(eventId, group);
+    }
+
+    const pricingEventIds = [...quotesByEvent.entries()]
+      .filter(([, fixtureQuotes]) => fixtureQuotes.filter(
+        (quote) => getBetLabPricingGroup(String(quote.market.code)) === 'MATCH',
+      ).length > 1)
+      .map(([eventId]) => eventId);
+
+    const snapshots = await Promise.all(
+      pricingEventIds.map(async (eventId) => {
+        const snapshot = await this.marketService.getMarketsForFixture(eventId);
+        const selectedQuotes = quotesByEvent.get(eventId) ?? [];
+        const selectedByKey = new Map(
+          selectedQuotes.map((quote) => [
+            `${quote.market.code}:${quote.selection.code}`,
+            quote,
+          ]),
+        );
+        const markets: BetLabPricingMarket[] = snapshot.markets.map((market) => ({
+          code: String(market.code),
+          selections: market.selections.map((selection) => {
+            const selectedQuote = selectedByKey.get(
+              `${market.code}:${selection.code}`,
+            );
+            return selectedQuote
+              ? {
+                  ...selection,
+                  decimalOdds: selectedQuote.decimalOdds,
+                  available: true,
+                  isStale: false,
+                }
+              : selection;
+          }),
+        }));
+        const model = buildBetLabFixturePricingModel(markets);
+        return [eventId, { markets, model }] as const;
+      }),
+    );
+    const snapshotByEvent = new Map(snapshots);
+
+    const pricingPicks = quotes.map((quote) => {
+      const eventId = String(quote.fixture.eventId);
+      const snapshot = snapshotByEvent.get(eventId);
+      const pricing = snapshot
+        ? buildBetLabSelectionPricing(
+            snapshot.markets,
+            String(quote.market.code),
+            String(quote.selection.code),
+            quote.decimalOdds,
+            snapshot.model,
+          )
+        : undefined;
+      return {
+        eventId,
+        marketCode: String(quote.market.code),
+        selectionCode: String(quote.selection.code),
+        odds: quote.decimalOdds,
+        pricing,
+      };
+    });
+
+    return calculateBetLabSlipPricing(pricingPicks);
   }
 
   private normalizeSelectionRequest(
