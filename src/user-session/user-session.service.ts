@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { ClientSession, Model, Types } from 'mongoose';
 import {
   UserSession,
   UserSessionDocument,
@@ -77,10 +77,10 @@ export class UserSessionService {
     );
   }
 
-  async deactivateAllUserSessions(userId: string) {
-    await this.sessionModel.updateMany(
+  async deactivateAllUserSessions(userId: string, session?: ClientSession) {
+    const update = this.sessionModel.updateMany(
       {
-        userId,
+        userId: new Types.ObjectId(userId),
         isActive: true,
       },
       {
@@ -89,6 +89,9 @@ export class UserSessionService {
         },
       },
     );
+
+    if (session) update.session(session);
+    await update.exec();
   }
 
   async updateActivity(sessionId: string) {
@@ -164,4 +167,3 @@ export class UserSessionService {
     );
   }
 }
-

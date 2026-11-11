@@ -23,7 +23,7 @@ export interface BetLabFixtureIdentity {
   statusDetail?: string;
   statusShortDetail?: string;
   collectedAt: Date;
-  summaryCollectedAt: Date;
+  sportsUpdatedAt: Date;
   payload: Record<string, unknown>;
 }
 
@@ -32,13 +32,30 @@ export interface BetLabSelectionQuote extends BetLabSelectionDefinition {
   decimalOdds: number | null;
   /** Exact source of the virtual-play odds snapshot. */
   oddsSource: BetLabOddsSource | null;
-  /** PROVIDER quotes come from the Odds module; ESTIMATED quotes are model-derived virtual prices. */
+  /** Both provider and estimated prices are calculated/stored by the Odds module. */
   priceType: BetLabPriceType | null;
   bookmaker: string | null;
   providerUpdatedAt: Date | null;
   oddsTimestampBasis: BetLabOddsTimestampBasis | null;
   oddsCapturedAt: Date | null;
+  /** MongoDB update timestamp of the exact persisted Odds quote row. */
+  oddsRecordUpdatedAt: Date | null;
   oddsFreshUntil?: Date | null;
+  fairOdds: number | null;
+  fairOddsBasis: 'MODEL' | 'PRIOR' | null;
+  marketFairOdds: number | null;
+  impliedProbability: number | null;
+  fairProbability: number | null;
+  valuePercent: number | null;
+  dataQuality: number | null;
+  sampleSize: number | null;
+  calculationVersion: string | null;
+  sourceRevision: number | null;
+  /** Sports fixture revision used by Odds when this exact price was calculated. */
+  fixtureSourceRevision: number | null;
+  sourceDataUpdatedAt: Date | null;
+  provider: 'ESPN' | 'THE_ODDS_API' | null;
+  isFresh: boolean;
   oddsBasis: 'BOOKMAKER_ONLY' | 'BOOKMAKER_PLUS_HISTORY' | 'HISTORICAL_ONLY' | 'PRIOR_ONLY' | null;
   oddsCalculationMethod: string | null;
   isStale: boolean;
@@ -54,6 +71,7 @@ export interface BetLabMarketWithQuotes {
   period: string;
   available: boolean;
   availableSelectionCount: number;
+  pricingEnabled: boolean;
   selections: BetLabSelectionQuote[];
   notes?: string;
 }
@@ -80,7 +98,27 @@ export interface BetLabMarketQuote {
   providerUpdatedAt: Date | null;
   oddsTimestampBasis: BetLabOddsTimestampBasis;
   oddsCapturedAt: Date;
+  /** MongoDB update timestamp of the exact persisted Odds quote row. */
+  oddsRecordUpdatedAt: Date | null;
+  oddsFreshUntil: Date | null;
+  fairOdds: number | null;
+  fairOddsBasis: 'MODEL' | 'PRIOR' | null;
+  marketFairOdds: number | null;
+  impliedProbability: number | null;
+  fairProbability: number | null;
+  valuePercent: number | null;
+  dataQuality: number | null;
+  sampleSize: number | null;
+  calculationVersion: string | null;
+  sourceRevision: number | null;
+  /** Sports fixture revision used by Odds when this exact price was calculated. */
+  fixtureSourceRevision: number | null;
+  sourceDataUpdatedAt: Date | null;
+  provider: 'ESPN' | 'THE_ODDS_API' | null;
+  isFresh: boolean;
   oddsBasis: 'BOOKMAKER_ONLY' | 'BOOKMAKER_PLUS_HISTORY' | 'HISTORICAL_ONLY' | 'PRIOR_ONLY' | null;
   oddsCalculationMethod: string | null;
 }
+
+
 

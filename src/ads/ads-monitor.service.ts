@@ -1,19 +1,25 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Ad } from './schemas/ad.schema';
 import { AdEvent } from './schemas/ad-event.schema';
 import { ExternalAdPolicyConfig } from './schemas/external-ad-policy.schema';
+import { SystemMonitorService } from '../system-monitor/system-monitor.service';
 
 type MonitorCheck = { name: string; status: 'OK' | 'FAILED'; value?: unknown; error?: string };
 
 @Injectable()
-export class AdsMonitorService {
+export class AdsMonitorService implements OnModuleInit {
+  onModuleInit(): void {
+    this.systemMonitor.registerModule('ads');
+  }
+
   constructor(
     @InjectModel(Ad.name) private readonly adModel: Model<Ad>,
     @InjectModel(AdEvent.name) private readonly eventModel: Model<AdEvent>,
     @InjectModel(ExternalAdPolicyConfig.name)
     private readonly policyModel: Model<ExternalAdPolicyConfig>,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   private async safeQuery<T>(
@@ -37,6 +43,19 @@ export class AdsMonitorService {
   }
 
   async getOverview() {
+    try {
+      return await this.buildOverview();
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('ads', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{ name: 'getOverview', status: 'FAILED', error: error instanceof Error ? error.message : String(error) }],
+      });
+      throw error;
+    }
+  }
+
+  private async buildOverview() {
     const checkedAt = new Date();
     const now = new Date();
     const last24Hours = new Date(now.getTime() - 24 * 60 * 60 * 1000);
@@ -95,7 +114,7 @@ export class AdsMonitorService {
     if (policyCount === 0) warnings.push('No external-ad policy configuration record exists; runtime defaults may apply.');
     if (checks.some((check) => check.status === 'FAILED')) warnings.push('One or more monitoring queries failed.');
 
-    return {
+    const overview = {
       module: 'ads',
       checkedAt,
       status: !databaseReady || warnings.length ? 'DEGRADED' : 'OK',
@@ -108,5 +127,19 @@ export class AdsMonitorService {
       checks,
       warnings,
     };
+    this.systemMonitor.reportMonitorSnapshot('ads', {
+      status: overview.status,
+      checkedAt,
+      checks,
+      warnings,
+      details: {
+        databaseConnected: databaseReady,
+        activeAds,
+        deliverableAds: currentlyDeliverableAds,
+        expiredActiveAds,
+        policyRecords: policyCount,
+      },
+    });
+    return overview;
   }
 }

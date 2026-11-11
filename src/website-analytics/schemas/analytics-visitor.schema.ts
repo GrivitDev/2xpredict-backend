@@ -43,7 +43,7 @@ export type AnalyticsVisitorDocument = HydratedDocument<AnalyticsVisitor>;
 export class AnalyticsVisitor {
   @Prop({ required: true, unique: true, index: true }) visitorId!: string;
   @Prop({ type: Types.ObjectId, ref: 'User', default: null, index: true }) userId?: Types.ObjectId | null;
-  @Prop({ enum: AnalyticsVisitorType, required: true, index: true }) visitorType!: AnalyticsVisitorType;
+  @Prop({ type: String, enum: AnalyticsVisitorType, required: true, index: true }) visitorType!: AnalyticsVisitorType;
 
   @Prop({ default: 0 }) totalSessions!: number;
   @Prop({ default: 0 }) totalPageViews!: number;
@@ -97,3 +97,4 @@ AnalyticsVisitorSchema.index({ lastSeenAt: -1 });
 AnalyticsVisitorSchema.index({ userId: 1, lastSeenAt: -1 });
 AnalyticsVisitorSchema.index({ visitorType: 1, lastSeenAt: -1 });
 AnalyticsVisitorSchema.index({ countryCode: 1, lastSeenAt: -1 });
+

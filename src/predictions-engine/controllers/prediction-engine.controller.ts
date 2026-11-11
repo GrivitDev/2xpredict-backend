@@ -71,6 +71,24 @@ export class PredictionEngineController {
     return this.monitor.getMarketDocuments(eventId);
   }
 
+  @Get('monitor/market-coverage/:eventId')
+  getMarketCoverage(@Param('eventId') eventId: string) {
+    return this.monitor.getMarketCoverageAudit(eventId);
+  }
+
+  @Get('monitor/market-coverage')
+  getMarketCoverageInventory(
+    @Query() query: Record<string, string | undefined>,
+  ) {
+    return this.monitor.getMarketCoverageInventory({
+      from: query.from,
+      to: query.to,
+      leagueId: query.leagueId,
+      page: this.numberOr(query.page, 1),
+      pageSize: this.numberOr(query.pageSize, 50),
+    });
+  }
+
   @Post('queue/sync')
   syncQueue(@Body() body: { force?: boolean } = {}) {
     return this.trigger.synchronizeQueue(body.force === true);
@@ -248,6 +266,7 @@ export class PredictionEngineController {
     return Number.isNaN(parsed.getTime()) ? undefined : parsed;
   }
 }
+
 
 
 

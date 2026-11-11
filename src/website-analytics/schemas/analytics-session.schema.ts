@@ -37,6 +37,7 @@ export class AnalyticsSession {
   userId?: Types.ObjectId | null;
 
   @Prop({
+    type: String,
     enum: AnalyticsVisitorType,
     required: true,
     index: true,
@@ -253,3 +254,4 @@ AnalyticsSessionSchema.index({
   exitPage: 1,
   startedAt: -1,
 });
+

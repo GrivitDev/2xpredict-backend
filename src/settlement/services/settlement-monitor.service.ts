@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { BetLabTicket } from '../../bet-lab/schemas/bet-lab-ticket.schema';
@@ -18,7 +18,9 @@ import {
 import { SettlementJobStatus } from '../enums/settlement-job-status.enum';
 import { SettlementWorkerService } from './settlement-worker.service';
 import { SETTLEMENT_CONFIG } from '../config/settlement.config';
+import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 import { SettlementMonitorAlert, SettlementMonitorHealth, SettlementMonitorHealthStatus } from '../interfaces/settlement-monitor.interface';
+import { collectSettlementCrossModuleHealth } from '../utils/settlement-cross-module-health.util';
 import {
   SettlementEventQuery,
   SettlementJobQuery,
@@ -26,7 +28,11 @@ import {
 } from '../interfaces/settlement-monitor.interface';
 
 @Injectable()
-export class SettlementMonitorService {
+export class SettlementMonitorService implements OnModuleInit {
+  onModuleInit(): void {
+    this.systemMonitor.registerModule('settlement');
+  }
+
   constructor(
     @InjectModel(SettlementJob.name)
     private readonly jobModel: Model<SettlementJobDocument>,
@@ -39,9 +45,23 @@ export class SettlementMonitorService {
     @InjectModel(BetLabTicket.name)
     private readonly betLabTicketModel: Model<BetLabTicket>,
     private readonly worker: SettlementWorkerService,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   async getOverview() {
+    try {
+      return await this.buildOverview();
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('settlement', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{ name: 'getOverview', status: 'FAILED', error: error instanceof Error ? error.message : String(error) }],
+      });
+      throw error;
+    }
+  }
+
+  private async buildOverview() {
     const [
       jobRows,
       runRows,
@@ -126,6 +146,9 @@ export class SettlementMonitorService {
           resultCounts: 1,
           unresolvedReasons: 1,
           nextRunAt: 1,
+          lockedAt: 1,
+          lockedBy: 1,
+          startedAt: 1,
           updatedAt: 1,
         })
         .lean()
@@ -187,7 +210,7 @@ export class SettlementMonitorService {
     const overview = {
       generatedAt: new Date(),
       architecture: {
-        trigger: 'Target creation and ESPN Summary updates, with an unresolved-target recovery scan',
+        trigger: 'Normalized Sports fixture, timeline and statistics changes; target creation and bounded partial retries',
         execution: 'Persistent MongoDB queue with event-woken worker',
         cronJobs: false,
         settlementOwner:
@@ -242,10 +265,40 @@ export class SettlementMonitorService {
       recentRuns,
       recentWarningsAndErrors: recentErrors,
     };
-    return {
-      ...overview,
-      health: await this.getHealth(jobsByStatus, predictionSelectionsByOutcome, betLabLegsByStatus),
-    };
+    const health = await this.getHealth(
+      jobsByStatus,
+      predictionSelectionsByOutcome,
+      betLabLegsByStatus,
+    );
+    const result = { ...overview, health };
+    this.systemMonitor.reportMonitorSnapshot('settlement', {
+      status: health.status,
+      checkedAt: health.checkedAt,
+      checks: health.alerts,
+      warnings: health.alerts
+        .filter((alert) => alert.severity === 'WARNING')
+        .map((alert) => alert.message),
+      details: {
+        workerInitialized: health.worker.initialized,
+        workerBusy: health.worker.busy,
+        dueQueuedJobs: health.queue.dueQueuedJobs,
+        staleProcessingJobs: health.queue.staleProcessingJobs,
+        failedJobs: health.queue.failedJobs,
+        partialJobs: health.queue.partialJobs,
+        unresolvedPredictionSelections: health.outcomes.unsettledPredictionSelections,
+        openBetLabLegs: health.outcomes.openBetLabLegs,
+        alertCount: health.alerts.length,
+        crossModuleStatus: health.crossModule.status,
+        crossModuleStatuses: {
+          sports: health.crossModule.modules.sports.status,
+          odds: health.crossModule.modules.odds.status,
+          predictionsEngine: health.crossModule.modules.predictionsEngine.status,
+          betLab: health.crossModule.modules.betLab.status,
+        },
+        crossModuleAlertCount: health.crossModule.alerts.length,
+      },
+    });
+    return result;
   }
 
   private async getHealth(
@@ -295,6 +348,9 @@ export class SettlementMonitorService {
       .reduce((sum, [, count]) => sum + count, 0);
     const openBetLabLegs = Number(betLabLegsByStatus.OPEN ?? 0);
     const overdueBetLabLegs = Number(overdueBetLabRows[0]?.count ?? 0);
+    const crossModule = collectSettlementCrossModuleHealth((moduleName) =>
+      this.systemMonitor.getModuleHealth(moduleName),
+    );
     const alerts: SettlementMonitorAlert[] = [];
 
     if (!worker.initialized) {
@@ -312,11 +368,11 @@ export class SettlementMonitorService {
       message: 'Settlement jobs are marked PROCESSING beyond the configured lease window.',
       count: staleProcessingJobs,
     });
-    if (dueQueuedJobs > 0 && !worker.busy && worker.initialized && (oldestDueQueuedAgeMs ?? 0) > 5 * 60_000) alerts.push({
+    if (dueQueuedJobs > 0 && worker.initialized && (oldestDueQueuedAgeMs ?? 0) > 5 * 60_000) alerts.push({
       code: 'DUE_QUEUE_BACKLOG', severity: 'WARNING',
-      message: 'Runnable settlement jobs have been waiting for more than five minutes while the worker is idle.',
+      message: 'Runnable settlement jobs have been waiting for more than five minutes.',
       count: dueQueuedJobs,
-      details: { oldestDueQueuedAgeMs },
+      details: { oldestDueQueuedAgeMs, workerBusy: worker.busy },
     });
     if (worker.busy && worker.activeJob && worker.activeJob.durationMs > 10 * 60_000) alerts.push({
       code: 'LONG_RUNNING_JOB', severity: 'WARNING',
@@ -366,6 +422,7 @@ export class SettlementMonitorService {
         oldestDueQueuedAgeMs,
       },
       outcomes: { unsettledPredictionSelections, openBetLabLegs },
+      crossModule,
       alerts,
     };
   }
@@ -445,3 +502,5 @@ export class SettlementMonitorService {
     );
   }
 }
+
+

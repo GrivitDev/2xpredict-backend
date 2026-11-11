@@ -1,30 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { Model } from 'mongoose';
-import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
-import {
-  SettlementJob,
-  SettlementJobDocument,
-} from '../schemas/settlement-job.schema';
+import { MarketPrediction } from '../../predictions-engine/schemas/market-prediction.schema';
+import { PredictionStatus } from '../../predictions-engine/enums/prediction-status.enum';
+import { PredictionSettlementOutcome } from '../enums/settlement-prediction-outcome.enum';
+import { BetLabTicket } from '../../bet-lab/schemas/bet-lab-ticket.schema';
+import { BetLabTicketStatus } from '../../bet-lab/enums/bet-lab-ticket-status.enum';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import { SettlementJob, SettlementJobDocument } from '../schemas/settlement-job.schema';
 import { SettlementJobStatus } from '../enums/settlement-job-status.enum';
 import { SETTLEMENT_CONFIG } from '../config/settlement.config';
-import { createSettlementSourceFingerprint } from '../utils/summary-fingerprint.util';
-import { isFixtureRefreshConfirmedFinished } from '../utils/fixture-lifecycle.util';
-
-interface FixtureRecord {
-  eventId?: unknown;
-  leagueId?: unknown;
-  completed?: unknown;
-  live?: unknown;
-  status?: unknown;
-  statusDetail?: unknown;
-  statusShortDetail?: unknown;
-  homeScore?: unknown;
-  awayScore?: unknown;
-  payload?: unknown;
-  collectedAt?: unknown;
-}
+import { createSettlementSourceFingerprint } from '../utils/sports-settlement-fingerprint.util';
+import { isSportsFixtureSettleable } from '../utils/fixture-lifecycle.util';
 
 @Injectable()
 export class SettlementQueueService {
@@ -33,8 +22,11 @@ export class SettlementQueueService {
   constructor(
     @InjectModel(SettlementJob.name)
     private readonly jobModel: Model<SettlementJobDocument>,
-    @InjectModel(EspnFixture.name)
-    private readonly fixtureModel: Model<EspnFixture>,
+    @InjectModel(MarketPrediction.name)
+    private readonly marketPredictionModel: Model<MarketPrediction>,
+    @InjectModel(BetLabTicket.name)
+    private readonly betLabTicketModel: Model<BetLabTicket>,
+    private readonly sportsRead: SportsDomainReadService,
   ) {
     this.signal.setMaxListeners(0);
   }
@@ -47,56 +39,129 @@ export class SettlementQueueService {
   }
 
   /**
-   * Queue settlement only after an ESPN fixture/scoreboard refresh has persisted
-   * an explicit finished state. Kickoff age and Summary status are not lifecycle
-   * signals. Target creation and Summary updates may re-evaluate a fixture, but
-   * cannot make an unfinished fixture eligible.
+   * Re-evaluate a Sports fixture whenever its lifecycle, period score, timeline
+   * or match statistics change. Only fixtures that are live, at half time, in
+   * extra time/penalties, or confirmed completed are eligible. We also require
+   * at least one unsettled Prediction or Bet Lab target before creating work.
    */
-  async enqueueForConfirmedFinishedFixture(
+  async enqueueForSportsFixtureChange(
     eventIdValue: string,
-    _leagueIdValue?: string,
-    triggerReason = 'FIXTURE_REFRESHED',
+    _competitionIdValue?: string,
+    triggerReason = 'SPORTS_DATA_CHANGED',
   ) {
     const eventId = String(eventIdValue ?? '').trim();
     if (!eventId) return { enqueued: false, reason: 'EMPTY_EVENT_ID' as const };
 
-    const fixture = (await this.fixtureModel
-      .findOne({ eventId })
-      .select({
-        eventId: 1,
-        leagueId: 1,
-        completed: 1,
-        live: 1,
-        status: 1,
-        statusDetail: 1,
-        homeScore: 1,
-        awayScore: 1,
-        payload: 1,
-        collectedAt: 1,
-      })
-      .lean()
-      .exec()) as unknown as FixtureRecord | null;
-
-    if (!fixture)
-      return { enqueued: false, reason: 'FIXTURE_NOT_FOUND' as const };
-    if (!isFixtureRefreshConfirmedFinished(fixture)) {
-      return {
-        enqueued: false,
-        reason: 'FIXTURE_NOT_CONFIRMED_FINISHED_BY_FIXTURE_REFRESH' as const,
-      };
+    const match = await this.sportsRead.getMatch(eventId);
+    if (!match) return { enqueued: false, reason: 'SPORTS_FIXTURE_NOT_FOUND' as const };
+    if (!isSportsFixtureSettleable(match.fixture)) {
+      return { enqueued: false, reason: 'FIXTURE_NOT_IN_SETTLEABLE_SPORTS_STATE' as const };
     }
 
-    const payload = this.asRecord(fixture.payload) ?? {};
+    const [hasPredictions, hasBetLabTickets] = await Promise.all([
+      this.marketPredictionModel.exists({
+        eventId,
+        selections: {
+          $elemMatch: {
+            status: { $nin: [PredictionStatus.UNAVAILABLE, PredictionStatus.FAILED] },
+            $or: [
+              { actualOutcome: { $nin: Object.values(PredictionSettlementOutcome) } },
+              {
+                actualOutcome: { $in: Object.values(PredictionSettlementOutcome) },
+                settlementPhase: { $in: ['IN_PLAY', 'HALF_TIME'] },
+              },
+            ],
+          },
+        },
+      }).exec(),
+      this.betLabTicketModel.exists({
+        status: { $in: [BetLabTicketStatus.OPEN, BetLabTicketStatus.PENDING_SETTLEMENT] },
+        // OPEN legs need grading; already-resolved IN_PLAY/HALF_TIME legs still
+        // need a full-time source recheck and accumulator payout finalization.
+        legs: { $elemMatch: { eventId } },
+      }).exec(),
+    ]);
+    if (!hasPredictions && !hasBetLabTickets) {
+      return { enqueued: false, reason: 'NO_UNSETTLED_TARGETS' as const };
+    }
+
     const now = new Date();
-    const sourceFingerprint = createSettlementSourceFingerprint(fixture);
-    const sourceAt =
-      this.toDate(payload.summaryCollectedAt ?? fixture.collectedAt) ?? now;
+    const fixture = match.fixture;
+    const sourceFingerprint = createSettlementSourceFingerprint(match);
+    const sourceDates = [
+      this.toDate(fixture.source?.collectedAt),
+      this.toDate(fixture.source?.providerUpdatedAt),
+      this.toDate(match.matchSummary?.lastCollectedAt),
+      this.toDate(match.matchFacts?.sourceCollectedAt),
+      this.toDate(match.matchFacts?.normalizedAt),
+      this.toDate(fixture.updatedAt),
+      this.toDate(fixture.createdAt),
+      ...match.timeline.flatMap((item) => [
+        this.toDate(item.source?.collectedAt),
+        this.toDate(item.source?.providerUpdatedAt),
+        this.toDate(item.updatedAt),
+        this.toDate(item.createdAt),
+      ]),
+    ].filter((value): value is Date => Boolean(value));
+    const sourceAt = sourceDates.length
+      ? new Date(Math.max(...sourceDates.map((value) => value.getTime())))
+      : now;
     const jobKey = `${eventId}:${sourceFingerprint}`;
-    const leagueId =
-      typeof fixture.leagueId === 'string' ||
-      typeof fixture.leagueId === 'number'
-        ? String(fixture.leagueId).toLowerCase()
-        : '';
+    const leagueId = String(fixture.competitionId ?? '').trim().toLowerCase();
+    const targetCreated = triggerReason === 'PREDICTION_CREATED' || triggerReason === 'BET_LAB_TICKET_CREATED';
+    // Startup reconciliation intentionally bypasses terminal-job cooldowns:
+    // it only supplies event IDs that still have unresolved business targets.
+    const forceReconciliation = targetCreated || triggerReason === 'STARTUP_RECONCILIATION';
+
+    // Coalesce frequent Sports outbox events into one active job per fixture.
+    // A processing job is asked to run once more after it finishes; queued/retry
+    // jobs are simply made due now because the worker always re-reads Sports.
+    const activeJob = await this.jobModel
+      .findOne({
+        eventId,
+        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PROCESSING] },
+      })
+      .sort({ updatedAt: -1 })
+      .exec();
+
+    if (activeJob?.status === SettlementJobStatus.PROCESSING) {
+      const sourceChanged = String(activeJob.sourceFingerprint ?? '') !== sourceFingerprint;
+      if (!forceReconciliation && !sourceChanged) {
+        return { enqueued: false, alreadyExists: true, reason: 'ACTIVE_JOB_ALREADY_PROCESSING' as const, jobKey: activeJob.jobKey };
+      }
+      if (activeJob.rerunRequested) {
+        return { enqueued: false, alreadyExists: true, reason: 'ACTIVE_JOB_RERUN_ALREADY_REQUESTED' as const, jobKey: activeJob.jobKey };
+      }
+      const marked = await this.jobModel.updateOne(
+        { _id: activeJob._id, status: SettlementJobStatus.PROCESSING, rerunRequested: { $ne: true } },
+        { $set: { rerunRequested: true, rerunTriggerReason: triggerReason } },
+      ).exec();
+      if ((marked.modifiedCount ?? 0) > 0) {
+        this.signal.emit('queued');
+        return { enqueued: true, alreadyExists: true, scheduledAt: now, reason: sourceChanged ? 'RERUN_REQUESTED_FOR_NEW_SPORTS_SOURCE' as const : 'RERUN_REQUESTED_FOR_NEW_TARGET' as const, jobKey: activeJob.jobKey };
+      }
+      return { enqueued: false, alreadyExists: true, reason: 'ACTIVE_JOB_STATE_CHANGED' as const, jobKey: activeJob.jobKey };
+    }
+
+    if (activeJob && [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY].includes(activeJob.status)) {
+      const resumed = await this.jobModel.updateOne(
+        { _id: activeJob._id, status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY] } },
+        {
+          $set: {
+            status: SettlementJobStatus.QUEUED,
+            nextRunAt: now,
+            priority: 1,
+            attempts: 0,
+            maximumAttempts: SETTLEMENT_CONFIG.queue.maximumAttempts,
+            triggerReason,
+            sourceSummaryCollectedAt: sourceAt,
+          },
+          $unset: { lastError: 1, completedAt: 1 },
+        },
+      ).exec();
+      if ((resumed.modifiedCount ?? 0) > 0) this.signal.emit('queued');
+      return { enqueued: (resumed.modifiedCount ?? 0) > 0, alreadyExists: true, reason: 'ACTIVE_JOB_COALESCED', scheduledAt: now, jobKey: activeJob.jobKey };
+    }
 
     let job = await this.jobModel
       .findOneAndUpdate(
@@ -107,6 +172,8 @@ export class SettlementQueueService {
             eventId,
             leagueId,
             sourceFingerprint,
+            // Kept as a storage-compatible field name for existing jobs. It now
+            // records the newest normalized Sports source timestamp.
             sourceSummaryCollectedAt: sourceAt,
             status: SettlementJobStatus.QUEUED,
             attempts: 0,
@@ -120,53 +187,8 @@ export class SettlementQueueService {
       )
       .exec();
 
-    if (!job)
-      throw new Error(`Could not queue settlement for event ${eventId}`);
+    if (!job) throw new Error(`Could not queue settlement for event ${eventId}`);
 
-    const targetCreated =
-      triggerReason === 'PREDICTION_CREATED' ||
-      triggerReason === 'BET_LAB_TICKET_CREATED';
-
-    // Only a genuinely new settlement target should request a follow-up pass
-    // while this exact source snapshot is processing. Routine scans of the same
-    // unresolved target must not schedule duplicate immediate runs.
-    if (job.status === SettlementJobStatus.PROCESSING) {
-      if (!targetCreated) {
-        return {
-          enqueued: false,
-          alreadyExists: true,
-          reason: 'ALREADY_PROCESSING_NO_NEW_TARGET' as const,
-          jobKey,
-        };
-      }
-      if (job.rerunRequested) {
-        return {
-          enqueued: false,
-          alreadyExists: true,
-          reason: 'RERUN_ALREADY_REQUESTED' as const,
-          jobKey,
-        };
-      }
-      const marked = await this.jobModel.updateOne(
-        { _id: job._id, status: SettlementJobStatus.PROCESSING, rerunRequested: { $ne: true } },
-        { $set: { rerunRequested: true, rerunTriggerReason: triggerReason } },
-      ).exec();
-      if ((marked.modifiedCount ?? 0) > 0) {
-        this.signal.emit('queued');
-        return {
-          enqueued: true,
-          alreadyExists: true,
-          scheduledAt: now,
-          reason: 'RERUN_REQUESTED_FOR_NEW_TARGET' as const,
-          jobKey,
-        };
-      }
-      job = (await this.jobModel.findById(job._id).exec()) ?? job;
-    }
-
-    // Incomplete or failed work must not become permanently inactive. New-target
-    // events bypass the cooldown; later fixture/summary/target events can reawaken
-    // the same source snapshot once its persisted recovery time has elapsed.
     const recoverableStatuses = [
       SettlementJobStatus.COMPLETED,
       SettlementJobStatus.PARTIAL,
@@ -174,25 +196,14 @@ export class SettlementQueueService {
       SettlementJobStatus.SKIPPED,
     ];
     if (recoverableStatuses.includes(job.status)) {
-      const bypassCooldown = targetCreated;
+      const bypassCooldown = forceReconciliation;
       const nextRunAt = this.toDate(job.nextRunAt);
       const recoveryDelayMs = this.recoveryDelayForStatus(job.status);
       const updatedAt = this.toDate((job as unknown as { updatedAt?: unknown }).updatedAt);
-      // Older queue records may not have nextRunAt populated. Use their update
-      // time plus a status-specific cooldown rather than retrying them every scan.
-      const effectiveRecoveryAt = nextRunAt ?? new Date(
-        (updatedAt?.getTime() ?? 0) + recoveryDelayMs,
-      );
+      const effectiveRecoveryAt = nextRunAt ?? new Date((updatedAt?.getTime() ?? 0) + recoveryDelayMs);
       if (!bypassCooldown && effectiveRecoveryAt.getTime() > now.getTime()) {
-        return {
-          enqueued: false,
-          alreadyExists: true,
-          reason: `${job.status}_RECOVERY_COOLDOWN`,
-          scheduledAt: effectiveRecoveryAt,
-          jobKey,
-        };
+        return { enqueued: false, alreadyExists: true, reason: `${job.status}_RECOVERY_COOLDOWN`, scheduledAt: effectiveRecoveryAt, jobKey };
       }
-
       const missingScheduleCutoff = new Date(now.getTime() - recoveryDelayMs);
       const recoveryFilter = {
         _id: job._id,
@@ -200,12 +211,7 @@ export class SettlementQueueService {
         ...(!bypassCooldown ? {
           $or: [
             { nextRunAt: { $lte: now } },
-            {
-              $and: [
-                { $or: [{ nextRunAt: { $exists: false } }, { nextRunAt: null }] },
-                { updatedAt: { $lte: missingScheduleCutoff } },
-              ],
-            },
+            { $and: [ { $or: [{ nextRunAt: { $exists: false } }, { nextRunAt: null }] }, { updatedAt: { $lte: missingScheduleCutoff } } ] },
           ],
         } : {}),
       };
@@ -217,153 +223,278 @@ export class SettlementQueueService {
             attempts: 0,
             maximumAttempts: SETTLEMENT_CONFIG.queue.maximumAttempts,
             nextRunAt: now,
-            triggerReason: targetCreated ? `NEW_TARGET_AFTER_${job.status}` : `RECOVERY_${triggerReason}`,
+            triggerReason: triggerReason === 'STARTUP_RECONCILIATION'
+              ? 'STARTUP_RECONCILIATION'
+              : targetCreated ? `NEW_TARGET_AFTER_${job.status}` : `RECOVERY_${triggerReason}`,
             rerunRequested: false,
           },
-          $unset: {
-            lockedAt: 1,
-            lockedBy: 1,
-            startedAt: 1,
-            completedAt: 1,
-            lastError: 1,
-            rerunTriggerReason: 1,
-          },
+          $unset: { lockedAt: 1, lockedBy: 1, startedAt: 1, completedAt: 1, lastError: 1, rerunTriggerReason: 1 },
         },
         { returnDocument: 'after' },
       ).exec();
       if (recoveredJob) {
         this.signal.emit('queued');
-        return {
-          enqueued: true,
-          alreadyExists: true,
-          reason: targetCreated ? 'REQUEUED_FOR_NEW_TARGET' : 'RECOVERED_TERMINAL_JOB',
-          scheduledAt: now,
-          jobKey,
-        };
+        return { enqueued: true, alreadyExists: true, reason: triggerReason === 'STARTUP_RECONCILIATION' ? 'REQUEUED_FOR_STARTUP_RECONCILIATION' : targetCreated ? 'REQUEUED_FOR_NEW_TARGET' : 'RECOVERED_TERMINAL_JOB', scheduledAt: now, jobKey };
       }
-      return {
-        enqueued: false,
-        alreadyExists: true,
-        reason: 'JOB_STATE_CHANGED_DURING_RECOVERY',
-        jobKey,
-      };
+      return { enqueued: false, alreadyExists: true, reason: 'JOB_STATE_CHANGED_DURING_RECOVERY', jobKey };
     }
 
-    if (job.status === SettlementJobStatus.QUEUED) {
-      // Newly eligible jobs are immediate.
-      await this.jobModel.updateOne(
-        { _id: job._id, status: SettlementJobStatus.QUEUED },
-        { $set: { nextRunAt: now } },
-      ).exec();
-      this.signal.emit('queued');
-      return {
-        enqueued: true,
-        alreadyExists: true,
-        scheduledAt: now,
-        reason: job.status,
-        jobKey,
-      };
+    this.signal.emit('queued');
+    return { enqueued: true, jobKey, reason: 'QUEUED' as const };
+  }
+
+  /**
+   * Catch-up reconciliation for targets that predate the durable Sports outbox
+   * integration or whose fixtures were not yet available at Settlement startup. It only discovers event IDs with unresolved
+   * Prediction selections or tickets that are still awaiting settlement. Each
+   * candidate is then revalidated against current Sports lifecycle and target
+   * state by enqueueForSportsFixtureChange before any work is created.
+   *
+   * The query is deliberately read-only; the only writes are the normal
+   * idempotent Settlement queue handoffs. Re-running after a partial failure is
+   * safe because active jobs are coalesced by fixture and source fingerprint.
+   */
+  async reconcileExistingUnsettledTargets(batchSize = 4): Promise<{
+    candidateEventIds: number;
+    queued: number;
+    skipped: number;
+    failed: number;
+    skippedReasons: Record<string, number>;
+  }> {
+    const unresolvedPredictionFilter = {
+      selections: {
+        $elemMatch: {
+          status: { $nin: [PredictionStatus.UNAVAILABLE, PredictionStatus.FAILED] },
+          $or: [
+            { actualOutcome: { $nin: Object.values(PredictionSettlementOutcome) } },
+            {
+              actualOutcome: { $in: Object.values(PredictionSettlementOutcome) },
+              settlementPhase: { $in: ['IN_PLAY', 'HALF_TIME'] },
+            },
+          ],
+        },
+      },
+    };
+    const unresolvedBetLabFilter = {
+      status: { $in: [BetLabTicketStatus.OPEN, BetLabTicketStatus.PENDING_SETTLEMENT] },
+      'legs.eventId': { $exists: true },
+    };
+
+    const [predictionEventIds, betLabEventIds] = await Promise.all([
+      this.marketPredictionModel.distinct('eventId', unresolvedPredictionFilter).exec(),
+      this.betLabTicketModel.distinct('legs.eventId', unresolvedBetLabFilter).exec(),
+    ]);
+    const eventIds = [...new Set(
+      [...predictionEventIds, ...betLabEventIds]
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean),
+    )];
+
+    const safeBatchSize = Math.min(16, Math.max(1, Math.floor(batchSize) || 4));
+    const skippedReasons: Record<string, number> = {};
+    let queued = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (let offset = 0; offset < eventIds.length; offset += safeBatchSize) {
+      const batch = eventIds.slice(offset, offset + safeBatchSize);
+      const results = await Promise.all(batch.map(async (eventId) => {
+        try {
+          return {
+            eventId,
+            result: await this.enqueueForSportsFixtureChange(
+              eventId,
+              undefined,
+              'STARTUP_RECONCILIATION',
+            ),
+          };
+        } catch (error) {
+          return { eventId, error };
+        }
+      }));
+
+      for (const item of results) {
+        if ('error' in item) {
+          failed += 1;
+          continue;
+        }
+        if (item.result.enqueued) {
+          queued += 1;
+          continue;
+        }
+        skipped += 1;
+        const reason = String(item.result.reason ?? 'UNKNOWN');
+        skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+      }
     }
 
-    if (job.status === SettlementJobStatus.RETRY) {
-      // Do not wake the worker for a retry that is still inside its backoff.
-      // The worker keeps a durable timer for nextRunAt; fresh fixture/target
-      // events can also wake it when a new pass is justified.
-      const retryAt = this.toDate(job.nextRunAt) ?? now;
-      const isDue = retryAt.getTime() <= now.getTime();
-      if (isDue) this.signal.emit('queued');
-      return {
-        enqueued: isDue,
-        alreadyExists: true,
-        scheduledAt: retryAt,
-        reason: isDue ? 'RETRY_DUE' : 'RETRY_BACKOFF',
-        jobKey,
-      };
+    if (failed > 0) {
+      throw new Error(
+        `Settlement startup reconciliation failed for ${failed} of ${eventIds.length} candidate fixtures; ${queued} were queued before the failure.`,
+      );
     }
 
     return {
-      enqueued: false,
-      alreadyExists: true,
-      scheduledAt: this.toDate(job.nextRunAt) ?? now,
-      reason: job.status,
-      jobKey,
+      candidateEventIds: eventIds.length,
+      queued,
+      skipped,
+      failed,
+      skippedReasons,
     };
   }
 
-  async recoverExpiredProcessingJobs(): Promise<number> {
-    const staleBefore = new Date(
-      Date.now() - SETTLEMENT_CONFIG.queue.processingLeaseMinutes * 60_000,
-    );
-    const stale = (await this.jobModel
-      .find({
-        status: SettlementJobStatus.PROCESSING,
-        lockedAt: { $lte: staleBefore },
-      })
-      .select({ _id: 1, attempts: 1, maximumAttempts: 1 })
-      .lean()
-      .exec()) as unknown as Array<{
-      _id: SettlementJobDocument['_id'];
-      attempts?: number;
-      maximumAttempts?: number;
-    }>;
-    let recovered = 0;
-    for (const item of stale) {
-      const terminal =
-        Number(item.attempts ?? 0) >=
-        Number(item.maximumAttempts ?? SETTLEMENT_CONFIG.queue.maximumAttempts);
-      const result = await this.jobModel
-        .updateOne(
-          {
-            _id: item._id,
-            status: SettlementJobStatus.PROCESSING,
-            lockedAt: { $lte: staleBefore },
-          },
-          {
-            $set: {
-              status: terminal
-                ? SettlementJobStatus.FAILED
-                : SettlementJobStatus.RETRY,
-              nextRunAt: terminal
-                ? new Date(Date.now() + SETTLEMENT_CONFIG.queue.failedRecoveryIntervalMs)
-                : new Date(),
-              lastError:
-                'Recovered an interrupted settlement worker lease during recovery.',
-              ...(terminal ? { completedAt: new Date() } : {}),
-            },
-            $unset: {
-              lockedAt: 1,
-              lockedBy: 1,
-              rerunRequested: 1,
-              rerunTriggerReason: 1,
-              ...(terminal ? {} : { completedAt: 1 }),
-            },
-          },
-        )
-        .exec();
-      recovered += result.modifiedCount ?? 0;
-    }
-    return recovered;
+  /** Backward-compatible method name; eligibility is now Sports lifecycle based. */
+  enqueueForConfirmedFinishedFixture(eventId: string, competitionId?: string, triggerReason = 'SPORTS_DATA_CHANGED') {
+    return this.enqueueForSportsFixtureChange(eventId, competitionId, triggerReason);
   }
 
+  /**
+   * Reclaims abandoned processing jobs. Recovery is safe across multiple
+   * instances because each transition is an atomic update guarded by the
+   * current PROCESSING state and expired lease timestamp.
+   */
+  async recoverExpiredProcessingJobs(): Promise<{
+    recoveredForRetry: number;
+    exhausted: number;
+    total: number;
+  }> {
+    const now = new Date();
+    const expiredBefore = new Date(
+      now.getTime() - SETTLEMENT_CONFIG.queue.processingLeaseMinutes * 60_000,
+    );
+    const expiredLeaseFilter = {
+      status: SettlementJobStatus.PROCESSING,
+      $or: [
+        { lockedAt: { $lte: expiredBefore } },
+        // `$in: [null]` covers both explicit null and legacy documents where
+        // lockedAt was never persisted; updatedAt prevents premature recovery.
+        { lockedAt: { $in: [null] }, updatedAt: { $lte: expiredBefore } },
+      ],
+    };
+    const recoveryError =
+      'Processing lease expired; the abandoned settlement job was recovered.';
+
+    const retryResult = await this.jobModel.updateMany(
+      {
+        ...expiredLeaseFilter,
+        $expr: {
+          $lt: [
+            { $ifNull: ['$attempts', 0] },
+            { $ifNull: ['$maximumAttempts', SETTLEMENT_CONFIG.queue.maximumAttempts] },
+          ],
+        },
+      },
+      {
+        $set: {
+          status: SettlementJobStatus.RETRY,
+          nextRunAt: now,
+          lastError: recoveryError,
+          triggerReason: 'EXPIRED_PROCESSING_LEASE_RECOVERY',
+        },
+        $unset: {
+          lockedAt: 1,
+          lockedBy: 1,
+          claimToken: 1,
+          startedAt: 1,
+          rerunRequested: 1,
+          rerunTriggerReason: 1,
+          completedAt: 1,
+        },
+      },
+    ).exec();
+
+    const exhaustedResult = await this.jobModel.updateMany(
+      {
+        ...expiredLeaseFilter,
+        $expr: {
+          $gte: [
+            { $ifNull: ['$attempts', 0] },
+            { $ifNull: ['$maximumAttempts', SETTLEMENT_CONFIG.queue.maximumAttempts] },
+          ],
+        },
+      },
+      {
+        $set: {
+          status: SettlementJobStatus.FAILED,
+          nextRunAt: new Date(
+            now.getTime() + SETTLEMENT_CONFIG.queue.failedRecoveryIntervalMs,
+          ),
+          lastError: recoveryError,
+          triggerReason: 'EXPIRED_PROCESSING_LEASE_EXHAUSTED',
+          completedAt: now,
+        },
+        $unset: {
+          lockedAt: 1,
+          lockedBy: 1,
+          claimToken: 1,
+          startedAt: 1,
+          rerunRequested: 1,
+          rerunTriggerReason: 1,
+        },
+      },
+    ).exec();
+
+    const recoveredForRetry = Number(retryResult.modifiedCount ?? 0);
+    const exhausted = Number(exhaustedResult.modifiedCount ?? 0);
+    if (recoveredForRetry > 0) this.signal.emit('queued');
+    return {
+      recoveredForRetry,
+      exhausted,
+      total: recoveredForRetry + exhausted,
+    };
+  }
+
+  /** Renews the current claim without changing the processing owner or token. */
   async renewProcessingLease(
-    jobId: SettlementJobDocument['_id'],
+    job: SettlementJobDocument,
     workerId: string,
   ): Promise<boolean> {
-    const result = await this.jobModel.updateOne(
+    const claimToken = String(job.claimToken ?? '').trim();
+    if (!claimToken) return false;
+    const renewed = await this.jobModel.updateOne(
       {
-        _id: jobId,
+        _id: job._id,
         status: SettlementJobStatus.PROCESSING,
         lockedBy: workerId,
+        claimToken,
       },
       { $set: { lockedAt: new Date() } },
     ).exec();
-    return (result.modifiedCount ?? 0) > 0;
+    return (renewed.modifiedCount ?? 0) > 0;
+  }
+
+  async ownsProcessingLease(
+    job: SettlementJobDocument,
+    workerId?: string,
+  ): Promise<boolean> {
+    const claimToken = String(job.claimToken ?? '').trim();
+    const lockedBy = String(workerId ?? job.lockedBy ?? '').trim();
+    if (!claimToken || !lockedBy) return false;
+    const found = await this.jobModel.exists({
+      _id: job._id,
+      status: SettlementJobStatus.PROCESSING,
+      lockedBy,
+      claimToken,
+    }).exec();
+    return Boolean(found);
+  }
+
+  async assertProcessingLease(
+    job: SettlementJobDocument,
+    workerId?: string,
+  ): Promise<void> {
+    if (!(await this.ownsProcessingLease(job, workerId))) {
+      throw new Error(
+        `Settlement processing lease was lost for job ${job.jobKey}; stale worker writes are blocked.`,
+      );
+    }
   }
 
   async claimNextDueJob(
     workerId: string,
   ): Promise<SettlementJobDocument | null> {
     const now = new Date();
+    const claimToken = randomUUID();
     return this.jobModel
       .findOneAndUpdate(
         {
@@ -377,16 +508,18 @@ export class SettlementQueueService {
             status: SettlementJobStatus.PROCESSING,
             lockedAt: now,
             lockedBy: workerId,
+            claimToken,
             startedAt: now,
           },
           $inc: { attempts: 1 },
-          $unset: { lastError: 1 },
+          $unset: { lastError: 1, completedAt: 1 },
         },
         {
           returnDocument: 'after',
           sort: { priority: 1, nextRunAt: 1, createdAt: 1 },
         },
       )
+      .select('+claimToken')
       .exec();
   }
 
@@ -405,8 +538,7 @@ export class SettlementQueueService {
     const completed = await this.jobModel
       .updateOne(
         {
-          _id: job._id,
-          status: SettlementJobStatus.PROCESSING,
+          ...this.claimFilter(job),
           rerunRequested: { $ne: true },
         },
         {
@@ -428,7 +560,7 @@ export class SettlementQueueService {
             lastDurationMs: input.durationMs,
             completedAt: new Date(),
           },
-          $unset: { lockedAt: 1, lockedBy: 1, lastError: 1 },
+          $unset: { lockedAt: 1, lockedBy: 1, claimToken: 1, lastError: 1 },
         },
       )
       .exec();
@@ -436,7 +568,10 @@ export class SettlementQueueService {
     // Close the narrow race where a new target marks rerunRequested between
     // the first check and the completion update.
     if ((completed.modifiedCount ?? 0) === 0) {
-      return this.requeueRequestedRun(job, input);
+      if (await this.requeueRequestedRun(job, input)) return true;
+      throw new Error(
+        `Settlement job ${job.jobKey} could not be completed because its processing lease is no longer owned by this worker.`,
+      );
     }
     return false;
   }
@@ -452,8 +587,7 @@ export class SettlementQueueService {
     const rerun = await this.jobModel
       .findOneAndUpdate(
         {
-          _id: job._id,
-          status: SettlementJobStatus.PROCESSING,
+          ...this.claimFilter(job),
           rerunRequested: true,
         },
         {
@@ -470,6 +604,7 @@ export class SettlementQueueService {
           $unset: {
             lockedAt: 1,
             lockedBy: 1,
+            claimToken: 1,
             lastError: 1,
             completedAt: 1,
             startedAt: 1,
@@ -485,10 +620,26 @@ export class SettlementQueueService {
     return true;
   }
 
+  private claimFilter(job: SettlementJobDocument): Record<string, any> {
+    const claimToken = String(job.claimToken ?? '').trim();
+    const lockedBy = String(job.lockedBy ?? '').trim();
+    if (!claimToken || !lockedBy) {
+      throw new Error(
+        `Settlement job ${job.jobKey} has no active claim token; refusing an unfenced state transition.`,
+      );
+    }
+    return {
+      _id: job._id,
+      status: SettlementJobStatus.PROCESSING,
+      lockedBy,
+      claimToken,
+    };
+  }
+
   async fail(
     job: SettlementJobDocument,
     error: unknown,
-  ): Promise<{ terminal: boolean; retryAt?: Date }> {
+  ): Promise<{ terminal: boolean; retryAt?: Date; leaseLost?: boolean }> {
     const now = new Date();
     const attempts = Number(job.attempts ?? 1);
     const maxAttempts = Number(job.maximumAttempts ?? SETTLEMENT_CONFIG.queue.maximumAttempts);
@@ -506,8 +657,7 @@ export class SettlementQueueService {
       const retryAt = terminal ? undefined : rerunRequested ? now : normalRetryAt;
       const result = await this.jobModel.updateOne(
         {
-          _id: job._id,
-          status: SettlementJobStatus.PROCESSING,
+          ...this.claimFilter(job),
           ...(rerunRequested
             ? { rerunRequested: true }
             : { rerunRequested: { $ne: true } }),
@@ -524,6 +674,7 @@ export class SettlementQueueService {
           $unset: {
             lockedAt: 1,
             lockedBy: 1,
+            claimToken: 1,
             rerunRequested: 1,
             rerunTriggerReason: 1,
             ...(terminal ? {} : { completedAt: 1 }),
@@ -538,48 +689,32 @@ export class SettlementQueueService {
 
     // A separate worker or completion handler may already have transitioned the
     // job. Do not overwrite that terminal/queued state.
-    return { terminal, retryAt: normalRetryAt };
+    const leaseLost = !(await this.ownsProcessingLease(job));
+    return { terminal, retryAt: leaseLost ? undefined : normalRetryAt, leaseLost };
   }
 
   async requeueFinishedFixture(
     eventIdValue: string,
-    _leagueIdValue?: string,
+    _competitionIdValue?: string,
   ): Promise<{ queued: boolean; jobKey?: string; reason: string }> {
     const eventId = String(eventIdValue ?? '').trim();
     if (!eventId) return { queued: false, reason: 'EMPTY_EVENT_ID' };
-    const fixture = (await this.fixtureModel
-      .findOne({ eventId })
-      .select({
-        eventId: 1,
-        leagueId: 1,
-        completed: 1,
-        status: 1,
-        statusDetail: 1,
-        homeScore: 1,
-        awayScore: 1,
-        live: 1,
-        payload: 1,
-        collectedAt: 1,
-      })
-      .lean()
-      .exec()) as unknown as FixtureRecord | null;
-    if (!fixture) return { queued: false, reason: 'FIXTURE_NOT_FOUND' };
-    if (!isFixtureRefreshConfirmedFinished(fixture)) {
-      return {
-        queued: false,
-        reason: 'FIXTURE_NOT_CONFIRMED_FINISHED_BY_FIXTURE_REFRESH',
-      };
+    const match = await this.sportsRead.getMatch(eventId);
+    if (!match) return { queued: false, reason: 'SPORTS_FIXTURE_NOT_FOUND' };
+    if (!isSportsFixtureSettleable(match.fixture)) {
+      return { queued: false, reason: 'FIXTURE_NOT_IN_SETTLEABLE_SPORTS_STATE' };
     }
 
-    const payload = this.asRecord(fixture.payload) ?? {};
-    const sourceFingerprint = createSettlementSourceFingerprint(fixture);
+    const fixture = match.fixture;
+    const sourceFingerprint = createSettlementSourceFingerprint(match);
     const jobKey = `${eventId}:${sourceFingerprint}`;
     const now = new Date();
-    const leagueId =
-      typeof fixture.leagueId === 'string' ||
-      typeof fixture.leagueId === 'number'
-        ? String(fixture.leagueId).toLowerCase()
-        : '';
+    const leagueId = String(fixture.competitionId ?? '').trim().toLowerCase();
+    const sourceAt = [
+      this.toDate(fixture.source?.collectedAt),
+      this.toDate(match.matchSummary?.lastCollectedAt),
+      this.toDate(match.matchFacts?.sourceCollectedAt),
+    ].filter((value): value is Date => Boolean(value)).sort((a, b) => b.getTime() - a.getTime())[0] ?? now;
 
     // Make requeue a single atomic transition. The previous read-modify-save
     // pattern could read a queued job, race with a worker claim, then save stale
@@ -593,9 +728,7 @@ export class SettlementQueueService {
               eventId,
               leagueId,
               sourceFingerprint,
-              sourceSummaryCollectedAt:
-                this.toDate(payload.summaryCollectedAt ?? fixture.collectedAt) ??
-                now,
+              sourceSummaryCollectedAt: sourceAt,
               status: SettlementJobStatus.QUEUED,
               attempts: 0,
               maximumAttempts: SETTLEMENT_CONFIG.queue.maximumAttempts,
@@ -609,6 +742,7 @@ export class SettlementQueueService {
             $unset: {
               lockedAt: 1,
               lockedBy: 1,
+              claimToken: 1,
               lastError: 1,
               lastDurationMs: 1,
               completedAt: 1,
@@ -659,6 +793,7 @@ export class SettlementQueueService {
             $unset: {
               lockedAt: 1,
               lockedBy: 1,
+              claimToken: 1,
               lastError: 1,
               lastDurationMs: 1,
               completedAt: 1,
@@ -714,11 +849,6 @@ export class SettlementQueueService {
     }
   }
 
-  private asRecord(value: unknown): Record<string, unknown> | undefined {
-    if (!value || typeof value !== 'object' || Array.isArray(value))
-      return undefined;
-    return value as Record<string, unknown>;
-  }
   private toDate(value: unknown): Date | undefined {
     if (!value) return undefined;
     if (value instanceof Date)
@@ -735,3 +865,7 @@ export class SettlementQueueService {
     return 'Unknown settlement error';
   }
 }
+
+
+
+

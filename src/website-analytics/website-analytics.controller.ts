@@ -20,6 +20,7 @@ import { WebsiteAnalyticsAggregationService } from './website-analytics-aggregat
 import { TrackEventsDto } from './dto/track-events.dto';
 
 import { TrackSessionDto } from './dto/track-session.dto';
+import { EndTrackSessionDto } from './dto/end-track-session.dto';
 
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
@@ -83,17 +84,7 @@ export class WebsiteAnalyticsController {
   @UseGuards(OptionalJwtAuthGuard)
   async endSession(
     @Body()
-    payload: {
-      sessionId: string;
-      visitorId?: string;
-      timestamp?: string;
-      path?: string;
-      durationMs?: number;
-      activeTimeMs?: number;
-      pageViews?: number;
-      eventCount?: number;
-      bounced?: boolean;
-    },
+    payload: EndTrackSessionDto,
 
     @Req()
     request: Request,
@@ -662,4 +653,5 @@ export class WebsiteAnalyticsController {
     return Math.min(Math.max(Math.floor(parsed), 1), 100);
   }
 }
+
 

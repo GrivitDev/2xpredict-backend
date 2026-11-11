@@ -47,6 +47,10 @@ export class SettlementJob {
   @Prop({ trim: true })
   lockedBy?: string;
 
+  /** Fencing token for one specific processing claim; never returned by admin list queries. */
+  @Prop({ type: String, trim: true, select: false })
+  claimToken?: string;
+
   @Prop({ type: Date })
   startedAt?: Date;
 
@@ -65,7 +69,7 @@ export class SettlementJob {
   @Prop({ type: Number, min: 0 })
   lastDurationMs?: number;
 
-  @Prop({ type: String, default: 'SUMMARY_UPDATED' })
+  @Prop({ type: String, default: 'SPORTS_DATA_CHANGED' })
   triggerReason!: string;
 
   /** A target arrived while this event's job was being processed. */
@@ -88,5 +92,7 @@ SettlementJobSchema.index(
   { unique: true, name: 'uniq_settlement_event_fingerprint' },
 );
 SettlementJobSchema.index({ status: 1, lockedAt: 1 });
+
+
 
 

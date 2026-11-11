@@ -4,10 +4,12 @@ import {
   AccessRequestUser,
   PredictionReadFilters,
 } from '../../prediction-access/interfaces/prediction-access.interface';
-import { PredictionMarket } from '../enums/prediction-market.enum';
 import { PredictionStatus } from '../enums/prediction-status.enum';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
-import { FOOTBALL_MARKET_CATALOG } from '../catalog/football-market-catalog';
+import {
+  FOOTBALL_MARKET_CATALOG,
+  isCanonicalPredictionMarketKey,
+} from '../catalog/football-market-catalog';
 
 /**
  * Compatibility facade for the existing prediction-engine routes. All reads
@@ -89,11 +91,10 @@ export class PredictionReadService {
   }
 
   private validateMarketFilters(input: PredictionReadFilters): void {
+    const requestedMarketKey = input.marketKey?.trim().toUpperCase();
     if (
-      input.marketKey?.trim() &&
-      !Object.values(PredictionMarket).includes(
-        input.marketKey as PredictionMarket,
-      )
+      requestedMarketKey &&
+      !isCanonicalPredictionMarketKey(requestedMarketKey)
     ) {
       throw new BadRequestException(`Unknown marketKey "${input.marketKey}".`);
     }
@@ -121,6 +122,7 @@ export class PredictionReadService {
     }
   }
 }
+
 
 
 

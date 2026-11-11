@@ -12,6 +12,8 @@ import { PromosModule } from '../promos/promos.module';
 import { BonusesModule } from '../bonuses/bonuses.module';
 import { WebsiteAnalyticsModule } from '../website-analytics/website-analytics.module';
 import { PredictionAccessModule } from '../prediction-access/prediction-access.module';
+import { NotificationsModule } from '../notifications/notifications.module';
+import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
 import { AdminUsersController } from './admin-users.controller';
 import { AdminUsersService } from './admin-users.service';
 import { AdminUserAudit, AdminUserAuditSchema } from './schemas/admin-user-audit.schema';
@@ -31,8 +33,18 @@ import { AdminUserAudit, AdminUserAuditSchema } from './schemas/admin-user-audit
     BonusesModule,
     WebsiteAnalyticsModule,
     PredictionAccessModule,
+    NotificationsModule,
   ],
   controllers: [AdminUsersController],
-  providers: [AdminUsersService, JwtAuthGuard, RolesGuard],
+  providers: [
+    adminRealtimeRegistrationProvider(
+      'admin-users',
+      'Administrative account operations, account diagnostics and cross-module user support.',
+    ),
+    AdminUsersService,
+    JwtAuthGuard,
+    RolesGuard,
+  ],
 })
 export class AdminUsersModule {}
+

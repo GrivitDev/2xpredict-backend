@@ -152,7 +152,7 @@ export class DailyBroadcastService {
         recent,
       );
       const content = renderPicksMessage(copy, picks, this.frontendUrl);
-      broadcast.content = content.slice(0, 3900);
+      broadcast.content = content;
       broadcast.styleTag = copy.styleTag;
       broadcast.sourceReferences = picks
         .map((pick) => pick.predictionCode)
@@ -366,7 +366,7 @@ export class DailyBroadcastService {
         this.promotionsUrl,
         this.frontendUrl,
       );
-      broadcast.content = content.slice(0, 3900);
+      broadcast.content = content;
       broadcast.styleTag = copy.styleTag;
       broadcast.sourceReferences = promos
         .map((promo: any) => promo.id)
@@ -726,35 +726,50 @@ function renderPicksMessage(
   picks: NormalizedPick[],
   frontendUrl: string,
 ): string {
-  const lines = [
-    `⚽ 2XPREDICT | ${copy.headline.toUpperCase()}`,
+  const safeHeadline = escapeTelegramHtml(copy.headline.toUpperCase());
+  const safeIntro = escapeTelegramHtml(copy.intro);
+  const safeClosing = escapeTelegramHtml(copy.closing);
+  const homeUrl = safeTelegramHref(frontendUrl);
+  const header = [
+    '⚽ <b>2XPREDICT</b>',
+    `<b>${safeHeadline}</b>`,
+    '━━━━━━━━━━━━━━━━━━',
+    safeIntro,
     '',
-    copy.intro,
+  ].join('\n');
+  const footer = [
     '',
-  ];
-  picks.forEach((pick, index) => {
-    lines.push(`${index + 1}. ${pick.title}`);
-    lines.push(`Kick-off: ${pick.fixtureDate}`);
-    for (const selection of pick.selections) {
-      const odds = selection.odds
-        ? ` | Odds: ${selection.odds.toFixed(2)}${selection.oddsSource ? ` (${selection.oddsSource})` : ''}`
+    '━━━━━━━━━━━━━━━━━━',
+    safeClosing,
+    '',
+    `🌐 <a href="${escapeTelegramHtml(homeUrl)}">Explore 2xPredict</a>`,
+    '<i>Predictions are estimates, not guarantees. Review the live market details and make responsible decisions.</i>',
+  ].join('\n');
+
+  const blocks: string[] = [];
+  for (const [index, pick] of picks.entries()) {
+    const selections = pick.selections.slice(0, 8).map((selection) => {
+      const odds = selection.odds && Number.isFinite(selection.odds)
+        ? ` · <b>${selection.odds.toFixed(2)}</b>${selection.oddsSource ? ` <i>(${escapeTelegramHtml(selection.oddsSource)})</i>` : ''}`
         : '';
-      lines.push(
-        `• ${selection.marketName}: ${selection.selectionName}${odds}`,
-      );
-    }
-    lines.push(`View: ${pick.url}`);
-    lines.push('');
-  });
-  lines.push(
-    copy.closing,
-    '',
-    `Explore 2xPredict: ${frontendUrl}`,
-    '',
-    'Predictions are estimates, not guarantees. Check the current details before making betting decisions.',
-  );
-  return lines.join('\n').slice(0, 3900);
+      return `  • ${escapeTelegramHtml(selection.marketName)}: <b>${escapeTelegramHtml(selection.selectionName)}</b>${odds}`;
+    });
+    const link = safeTelegramHref(pick.url, frontendUrl);
+    const block = [
+      `<b>${index + 1}. ${escapeTelegramHtml(pick.title)}</b>`,
+      `🕒 ${escapeTelegramHtml(pick.fixtureDate)}`,
+      ...selections,
+      `🔎 <a href="${escapeTelegramHtml(link)}">View match &amp; markets</a>`,
+    ].join('\n');
+    const candidate = `${header}${blocks.length ? '\n\n' : ''}${[...blocks, block].join('\n\n')}${footer}`;
+    if (candidate.length > 3900) break;
+    blocks.push(block);
+  }
+
+  const message = `${header}${blocks.join('\n\n')}${footer}`;
+  return message.length <= 4096 ? message : `${header}${footer}`;
 }
+
 function renderPromotionsMessage(
   copy: CreativeCopy,
   promos: Record<string, unknown>[],
@@ -762,106 +777,94 @@ function renderPromotionsMessage(
   frontendUrl: string,
 ): string {
   const header = [
-    `🎁 2XPREDICT | ${copy.headline.toUpperCase()}`,
+    '🎁 <b>2XPREDICT</b>',
+    `<b>${escapeTelegramHtml(copy.headline.toUpperCase())}</b>`,
+    '━━━━━━━━━━━━━━━━━━',
+    escapeTelegramHtml(copy.intro),
     '',
-    copy.intro,
-    '',
-  ];
+  ].join('\n');
+  const promoUrl = safeTelegramHref(promotionsUrl, frontendUrl);
+  const homeUrl = safeTelegramHref(frontendUrl);
   const footer = [
     '',
-    `Details and eligibility: ${promotionsUrl}`,
-    copy.closing,
-    '',
-    `Visit 2xPredict: ${frontendUrl}`,
-  ];
-  const lines = [...header];
-  let includedPromoCount = 0;
+    '━━━━━━━━━━━━━━━━━━',
+    `📣 <a href="${escapeTelegramHtml(promoUrl)}">View promotions &amp; eligibility</a>`,
+    escapeTelegramHtml(copy.closing),
+    `🌐 <a href="${escapeTelegramHtml(homeUrl)}">Visit 2xPredict</a>`,
+  ].join('\n');
+  const blocks: string[] = [];
 
   for (const promo of promos) {
-    const block: string[] = [
-      `${includedPromoCount + 1}. ${String(promo.name)}`,
+    const lines: string[] = [
+      `🎯 <b>${escapeTelegramHtml(String(promo.name ?? '2xPredict Promotion'))}</b>`,
     ];
-    if (promo.description) block.push(String(promo.description));
+    if (promo.description) lines.push(escapeTelegramHtml(String(promo.description)));
     if (promo.promotionKind === 'discount' && Number(promo.discountValue) > 0) {
-      const discountType = String(promo.discountType ?? '');
-      if (discountType === 'percentage') {
-        block.push(`Discount: ${Number(promo.discountValue)}%`);
-      } else if (
-        discountType === 'fixed_amount' &&
-        (promo.amountCurrency === 'NGN' || promo.amountCurrency === 'USD')
-      ) {
+      if (String(promo.discountType) === 'percentage') {
+        lines.push(`🏷️ <b>Discount:</b> ${Number(promo.discountValue)}%`);
+      } else if (String(promo.discountType) === 'fixed_amount' && ['NGN', 'USD'].includes(String(promo.amountCurrency))) {
         const symbol = promo.amountCurrency === 'USD' ? '$' : '₦';
-        block.push(
-          `Discount: ${symbol}${Number(promo.discountValue).toLocaleString()} off`,
-        );
+        lines.push(`🏷️ <b>Discount:</b> ${symbol}${Number(promo.discountValue).toLocaleString()} off`);
       }
-      if (
-        Number(promo.minPurchaseAmount) > 0 &&
-        (promo.amountCurrency === 'NGN' || promo.amountCurrency === 'USD')
-      ) {
+      if (Number(promo.minPurchaseAmount) > 0 && ['NGN', 'USD'].includes(String(promo.amountCurrency))) {
         const symbol = promo.amountCurrency === 'USD' ? '$' : '₦';
-        block.push(
-          `Minimum purchase: ${symbol}${Number(promo.minPurchaseAmount).toLocaleString()}`,
-        );
+        lines.push(`🧾 <b>Minimum purchase:</b> ${symbol}${Number(promo.minPurchaseAmount).toLocaleString()}`);
       }
-      if (
-        Number(promo.maxDiscountAmount) > 0 &&
-        (promo.amountCurrency === 'NGN' || promo.amountCurrency === 'USD')
-      ) {
+      if (Number(promo.maxDiscountAmount) > 0 && ['NGN', 'USD'].includes(String(promo.amountCurrency))) {
         const symbol = promo.amountCurrency === 'USD' ? '$' : '₦';
-        block.push(
-          `Maximum discount: ${symbol}${Number(promo.maxDiscountAmount).toLocaleString()}`,
-        );
+        lines.push(`🔖 <b>Maximum discount:</b> ${symbol}${Number(promo.maxDiscountAmount).toLocaleString()}`);
       }
     }
     if (promo.rewardType === 'subscription' && promo.rewardPlan) {
       const duration = Number(promo.rewardDurationDays);
-      block.push(
-        `Reward: ${String(promo.rewardPlan).toUpperCase()} subscription${duration > 0 ? ` for ${duration} days` : ''}`,
-      );
+      lines.push(`🏆 <b>Reward:</b> ${escapeTelegramHtml(String(promo.rewardPlan).toUpperCase())} subscription${duration > 0 ? ` for ${duration} days` : ''}`);
     }
-    if (
-      promo.rewardType === 'bet_lab_points' &&
-      Number(promo.pointsAmount) > 0
-    ) {
-      block.push(
-        `Reward: ${Number(promo.pointsAmount).toLocaleString()} Bet Lab points`,
-      );
+    if (promo.rewardType === 'bet_lab_points' && Number(promo.pointsAmount) > 0) {
+      lines.push(`💎 <b>Reward:</b> ${Number(promo.pointsAmount).toLocaleString()} Bet Lab points`);
     }
-    if (promo.promoCode) block.push(`Promo code: ${String(promo.promoCode)}`);
-    block.push(`Valid until: ${formatLagosDateTime(promo.endDate)}`);
+    if (promo.promoCode) lines.push(`🔑 <b>Promo code:</b> <code>${escapeTelegramHtml(String(promo.promoCode))}</code>`);
+    lines.push(`📅 <b>Valid until:</b> ${escapeTelegramHtml(formatLagosDateTime(promo.endDate))}`);
     if (Array.isArray(promo.eligiblePlans) && promo.eligiblePlans.length)
-      block.push(`Eligible plans: ${promo.eligiblePlans.join(', ')}`);
+      lines.push(`👥 <b>Eligible plans:</b> ${escapeTelegramHtml(promo.eligiblePlans.join(', '))}`);
     if (promo.requirement)
-      block.push(
-        `Requirement: ${formatPromoRequirement(String(promo.requirement))}`,
-      );
+      lines.push(`📌 <b>Requirement:</b> ${escapeTelegramHtml(formatPromoRequirement(String(promo.requirement)))}`);
     if (Array.isArray(promo.eligibilityRules) && promo.eligibilityRules.length)
-      block.push(
-        `Additional eligibility: ${promo.eligibilityRules.join('; ')}`,
-      );
-    if (promo.purpose === 'first_purchase')
-      block.push('Eligibility: first qualifying purchase only');
-    if (promo.purpose === 'referral' || promo.campaignType === 'referral')
-      block.push('Eligibility: referred users only');
-    if (Number(promo.perUserRedemptionLimit) > 0)
-      block.push(`Limit per user: ${Number(promo.perUserRedemptionLimit)}`);
-    if (Number(promo.totalRedemptionLimit) > 0)
-      block.push(`Campaign limit: ${Number(promo.totalRedemptionLimit)}`);
-    if (Number(promo.targetCount) > 1)
-      block.push(`Target count: ${Number(promo.targetCount)}`);
+      lines.push(`ℹ️ <b>Additional eligibility:</b> ${escapeTelegramHtml(promo.eligibilityRules.join('; '))}`);
+    if (promo.purpose === 'first_purchase') lines.push('Eligibility: first qualifying purchase only');
+    if (promo.purpose === 'referral' || promo.campaignType === 'referral') lines.push('Eligibility: referred users only');
+    if (Number(promo.perUserRedemptionLimit) > 0) lines.push(`Limit per user: ${Number(promo.perUserRedemptionLimit)}`);
+    if (Number(promo.totalRedemptionLimit) > 0) lines.push(`Campaign limit: ${Number(promo.totalRedemptionLimit)}`);
+    if (Number(promo.targetCount) > 1) lines.push(`Target count: ${Number(promo.targetCount)}`);
 
-    const separator = lines.length > header.length ? [''] : [];
-    const candidate = [...lines, ...separator, ...block, ...footer].join('\n');
-    // Keep each campaign's facts intact and preserve the public details link.
-    // If the Telegram length budget is tight, omit whole lower-priority campaigns
-    // rather than truncating conditions or the link at the end of the message.
+    const block = lines.join('\n');
+    const candidate = `${header}${blocks.length ? '\n\n' : ''}${[...blocks, block].join('\n\n')}${footer}`;
+    // Include only complete promotion cards; never truncate terms or HTML tags.
     if (candidate.length > 3900) break;
-    lines.push(...separator, ...block);
-    includedPromoCount += 1;
+    blocks.push(block);
   }
-  lines.push(...footer);
-  return lines.join('\n');
+
+  const message = `${header}${blocks.join('\n\n')}${footer}`;
+  return message.length <= 4096 ? message : `${header}${footer}`;
+}
+
+function escapeTelegramHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function safeTelegramHref(value: string, base?: string): string {
+  const fallback = 'https://www.2xpredict.com';
+  try {
+    const parsed = new URL(String(value || ''), base || fallback);
+    const allowedHost = new URL(base || fallback).hostname;
+    if (parsed.protocol !== 'https:' || parsed.hostname !== allowedHost) return fallback;
+    return parsed.toString();
+  } catch {
+    return fallback;
+  }
 }
 function isSafeCreativeCopy(copy: CreativeCopy): boolean {
   const text = `${copy.headline} ${copy.intro} ${copy.closing}`;
@@ -1049,3 +1052,4 @@ function safeError(error: unknown): string {
     .replace(/[\u0000-\u001F\u007F]/g, ' ')
     .slice(0, 1000);
 }
+

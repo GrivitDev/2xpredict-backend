@@ -79,4 +79,3 @@ export enum PriorityLeague {
   SINGAPOREAN_PREMIER_LEAGUE = 'sgp.1',
   AUSTRALIAN_A_LEAGUE = 'aus.1',
 }
-

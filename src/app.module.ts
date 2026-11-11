@@ -41,12 +41,16 @@ import { SystemMonitorModule } from './system-monitor/system-monitor.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { BonusesModule } from './bonuses/bonuses.module';
 import { CustomerCareModule } from './customer-care/customer-care.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { RateLimitingModule } from './common/rate-limiting/rate-limiting.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+
+    RateLimitingModule,
 
     ScheduleModule.forRoot(),
 
@@ -60,6 +64,8 @@ import { CustomerCareModule } from './customer-care/customer-care.module';
         monitorCommands: true,
       }),
     }),
+
+    NotificationsModule,
 
     AuthModule,
 

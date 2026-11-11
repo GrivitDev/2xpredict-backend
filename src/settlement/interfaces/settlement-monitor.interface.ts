@@ -66,7 +66,29 @@ export interface SettlementWorkerRuntimeStatus {
   lastJobEventId?: string;
   lastJobDurationMs?: number;
   lastJobError?: string;
+  targetReconciliationBusy?: boolean;
+  targetReconciliationRuns?: number;
+  targetReconciliationQueued?: number;
+  lastTargetReconciliationAt?: string;
+  lastTargetReconciliationError?: string;
   workerId: string;
+}
+
+export interface SettlementMonitoredModuleHealth {
+  status: string;
+  checkedAt?: string;
+}
+
+export interface SettlementCrossModuleHealth {
+  /** Health of the upstream modules participating in the prediction-to-settlement flow. */
+  status: SettlementMonitorHealthStatus;
+  modules: {
+    sports: SettlementMonitoredModuleHealth;
+    odds: SettlementMonitoredModuleHealth;
+    predictionsEngine: SettlementMonitoredModuleHealth;
+    betLab: SettlementMonitoredModuleHealth;
+  };
+  alerts: SettlementMonitorAlert[];
 }
 
 export interface SettlementMonitorHealth {
@@ -85,5 +107,8 @@ export interface SettlementMonitorHealth {
     unsettledPredictionSelections: number;
     openBetLabLegs: number;
   };
+  crossModule: SettlementCrossModuleHealth;
   alerts: SettlementMonitorAlert[];
 }
+
+

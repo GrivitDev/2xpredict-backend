@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { FOOTBALL_MARKET_CATALOG } from '../catalog/football-market-catalog';
 import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
 import { MarketDefinition } from '../interfaces/market-catalog.interface';
-import { PredictionModelInput } from '../interfaces/espn-prediction-context.interface';
+import { PredictionModelInput } from '../interfaces/prediction-match-context.interface';
 import {
   MarketPredictionCalculationResult,
   SelectionPredictionResult,
@@ -47,12 +47,11 @@ export class MarketPredictionCalculationService {
     private readonly specialEngine: SpecialMarketEngine,
   ) {}
 
-  calculateAll(
-    input: PredictionModelInput,
-    calibrations: Map<string, MarketCalibrationAssessment> = new Map(),
-  ): MarketPredictionCalculationResult[] {
-    // Resolve the general match result first. The same score matrices and
-    // supplied match payload remain the evidence base for every other market.
+  private readonly defaultProgressiveBatchSize = 8;
+
+  private getOrderedDefinitions(): MarketDefinition[] {
+    // Resolve core result markets first so early persisted batches expose the
+    // highest-value foundational markets before secondary statistics markets.
     const priority = (key: string): number => {
       if (key === PredictionMarket.MATCH_RESULT) return 0;
       if (key.startsWith('BOTH_TEAMS_TO_SCORE')) return 1;
@@ -61,10 +60,90 @@ export class MarketPredictionCalculationService {
       if (key.includes('OVER_UNDER') || key === PredictionMarket.GOALS_OVER_UNDER) return 4;
       return 5;
     };
-    const orderedDefinitions = [...FOOTBALL_MARKET_CATALOG].sort(
-      (a, b) => priority(String(a.key)) - priority(String(b.key)) || String(a.key).localeCompare(String(b.key)),
+    return [...FOOTBALL_MARKET_CATALOG].sort(
+      (a, b) => priority(String(a.key)) - priority(String(b.key))
+        || String(a.key).localeCompare(String(b.key)),
     );
-    return orderedDefinitions.map((definition) => this.calculateOne(definition, input, calibrations));
+  }
+
+  private calculateSafely(
+    definition: MarketDefinition,
+    input: PredictionModelInput,
+    calibrations: Map<string, MarketCalibrationAssessment>,
+  ): MarketPredictionCalculationResult {
+    try {
+      return this.calculateOne(definition, input, calibrations);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        marketKey: definition.key,
+        marketName: definition.fullName,
+        marketAbbreviation: definition.abbreviation,
+        family: definition.family,
+        period: definition.period,
+        model: definition.model,
+        status: PredictionStatus.FAILED,
+        selections: [],
+        sources: [],
+        calculationMethod: 'Market calculation failed in isolation.',
+        unavailableReason: message,
+        diagnostics: [`${String(definition.key)} calculation failed without blocking other markets: ${message}`],
+        dataQuality: 0,
+      };
+    }
+  }
+
+  calculateAll(
+    input: PredictionModelInput,
+    calibrations: Map<string, MarketCalibrationAssessment> = new Map(),
+  ): MarketPredictionCalculationResult[] {
+    return this.getOrderedDefinitions().map((definition) =>
+      this.calculateSafely(definition, input, calibrations),
+    );
+  }
+
+  /**
+   * Calculate each canonical market independently and persist-ready batches
+   * as soon as they are available. A failed market is recorded as FAILED and
+   * does not prevent later markets from being calculated.
+   */
+  async calculateProgressively(
+    input: PredictionModelInput,
+    calibrations: Map<string, MarketCalibrationAssessment> = new Map(),
+    onBatch: (
+      batch: MarketPredictionCalculationResult[],
+      progress: { processedMarkets: number; totalMarkets: number; batchNumber: number },
+    ) => Promise<void>,
+    batchSize = 8,
+  ): Promise<MarketPredictionCalculationResult[]> {
+    const definitions = this.getOrderedDefinitions();
+    const safeBatchSize = Number.isInteger(batchSize) && batchSize > 0
+      ? Math.min(25, batchSize)
+      : this.defaultProgressiveBatchSize;
+    const calculations: MarketPredictionCalculationResult[] = [];
+    let pending: MarketPredictionCalculationResult[] = [];
+    let batchNumber = 0;
+
+    for (let index = 0; index < definitions.length; index += 1) {
+      const calculation = this.calculateSafely(definitions[index], input, calibrations);
+      calculations.push(calculation);
+      pending.push(calculation);
+
+      const isFullBatch = pending.length >= safeBatchSize;
+      const isLastMarket = index === definitions.length - 1;
+      if (!isFullBatch && !isLastMarket) continue;
+
+      batchNumber += 1;
+      const batch = pending;
+      pending = [];
+      await onBatch(batch, {
+        processedMarkets: index + 1,
+        totalMarkets: definitions.length,
+        batchNumber,
+      });
+    }
+
+    return calculations;
   }
 
   private calculateOne(
@@ -100,50 +179,120 @@ export class MarketPredictionCalculationService {
       ? { ...definition, lines: mergedLines }
       : definition;
     let selections = expandMarketSelections(oddsAwareDefinition, input.context);
-    if (definition.selectionMode === 'PLAYER' && selections.length === 0) {
-      selections = [
-        {
-          key: 'ROSTER_UNAVAILABLE',
-          jsonVariable: 'rosterUnavailable',
-          fullName: 'Unavailable — ESPN roster not supplied',
-          abbreviation: 'N/A',
-        },
-      ];
+    if (definition.pricingEnabled === false) {
+      const disabledNote = definition.notes ?? 'The canonical Odds catalogue has disabled pricing for this market until its required Sports evidence is available.';
+      const disabledSelections = selections.map((selection) => ({
+        key: selection.key,
+        jsonVariable: selection.jsonVariable,
+        fullName: selection.fullName,
+        abbreviation: selection.abbreviation,
+        line: selection.line,
+        handicap: selection.handicap,
+        subjectId: selection.subjectId,
+        subjectName: selection.subjectName,
+        probability: null,
+        rawProbability: null,
+        probabilityPercent: null,
+        fairOdds: null,
+        confidence: null,
+        evidenceConfidence: null,
+        dataQuality: 0,
+        decimalOdds: null,
+        bookmakerOdds: null,
+        oddsPredictionReady: false,
+        status: PredictionStatus.UNAVAILABLE,
+        sources: [],
+        calculationMethod: 'Market intentionally disabled by the canonical Odds catalogue.',
+        diagnostics: [disabledNote, ...(definition.requiredData?.length ? [`Required Sports evidence: ${definition.requiredData.join(', ')}.`] : [])],
+        isFinalSelection: false,
+        recommendationEligible: false,
+      }));
+      return {
+        marketKey: definition.key,
+        marketName: definition.fullName,
+        marketAbbreviation: definition.abbreviation,
+        family: definition.family,
+        period: definition.period,
+        model: definition.model,
+        status: PredictionStatus.UNAVAILABLE,
+        selections: disabledSelections,
+        sources: [],
+        calculationMethod: 'Pricing disabled pending required normalized Sports evidence.',
+        unavailableReason: disabledNote,
+        diagnostics: [disabledNote, ...(definition.requiredData?.length ? [`Required Sports evidence: ${definition.requiredData.join(', ')}.`] : [])],
+        dataQuality: 0,
+      };
     }
 
-    // A market belongs to one catalog family. Invoke only that family handler
-    // instead of calling all eight engines for every market definition.
+    // The Odds module is a price/provenance source, not a substitute for an
+    // independent probability model. Do not publish score/period distributions
+    // when Sports supplies no independent goal evidence. Live period markets
+    // also stay unavailable until a live-period-conditioned model is available.
+    const goalEvidenceBlocked =
+      (definition.model === MarketModel.SCORE_MATRIX || definition.model === MarketModel.PERIOD_MATRIX)
+      && input.expectedGoals.evidenceLevel === 'INSUFFICIENT';
+    const livePeriodBlocked = input.context.fixture.live === true
+      && definition.model === MarketModel.PERIOD_MATRIX;
     let registeredEngine: MarketEngineOutput | undefined;
-    switch (String(definition.family).toUpperCase()) {
-      case 'RESULT':
-        registeredEngine = this.resultEngine.calculate(definition, selections, input);
-        break;
-      case 'GOALS':
-        registeredEngine = this.goalsEngine.calculate(definition, selections, input);
-        break;
-      case 'PERIOD':
-        registeredEngine = this.periodEngine.calculate(definition, selections, input);
-        break;
-      case 'HANDICAP':
-        registeredEngine = this.handicapEngine.calculate(definition, selections, input);
-        break;
-      case 'STATISTICS':
-        registeredEngine = this.statisticsEngine.calculate(definition, selections, input);
-        break;
-      case 'PLAYER':
-        registeredEngine = this.playerEngine.calculate(definition, selections, input);
-        break;
-      case 'COMBINATIONS':
-        registeredEngine = this.combinationEngine.calculate(definition, selections, input);
-        break;
-      case 'SPECIAL':
-        registeredEngine = this.specialEngine.calculate(definition, selections, input);
-        break;
+    if (goalEvidenceBlocked || livePeriodBlocked) {
+      const reason = livePeriodBlocked
+        ? 'Live first-half/second-half probabilities are withheld because the current engine does not yet condition period distributions on the live match clock and score.'
+        : 'Independent Sports goal evidence is insufficient. Default goal-rate priors and bookmaker prices are not used as stand-alone prediction probabilities.';
+      registeredEngine = {
+        handled: true,
+        selections: selections.map((selection) => ({
+          selection,
+          probability: null,
+          status: 'UNAVAILABLE' as const,
+          source: [],
+          method: 'Prediction withheld by evidence-quality gate',
+          diagnostics: [reason],
+          dataQuality: 0,
+        })),
+        calculationMethod: 'Unavailable: independent Sports evidence gate',
+        unavailableReason: reason,
+        dataQuality: 0,
+        diagnostics: [reason],
+      };
+    } else {
+      // A market belongs to one catalog family. Invoke only that family handler
+      // instead of calling all engines for every market definition.
+      switch (String(definition.family).toUpperCase()) {
+        case 'RESULT':
+          registeredEngine = this.resultEngine.calculate(definition, selections, input);
+          break;
+        case 'GOALS':
+          registeredEngine = this.goalsEngine.calculate(definition, selections, input);
+          break;
+        case 'EVENTS':
+          registeredEngine = definition.model === MarketModel.COUNT_MODEL
+            ? this.specialEngine.calculate(definition, selections, input)
+            : this.goalsEngine.calculate(definition, selections, input);
+          break;
+        case 'PERIOD':
+          registeredEngine = this.periodEngine.calculate(definition, selections, input);
+          break;
+        case 'HANDICAP':
+          registeredEngine = this.handicapEngine.calculate(definition, selections, input);
+          break;
+        case 'STATISTICS':
+          registeredEngine = this.statisticsEngine.calculate(definition, selections, input);
+          break;
+        case 'PLAYER':
+          registeredEngine = this.playerEngine.calculate(definition, selections, input);
+          break;
+        case 'COMBINATIONS':
+          registeredEngine = this.combinationEngine.calculate(definition, selections, input);
+          break;
+        case 'SPECIAL':
+          registeredEngine = this.specialEngine.calculate(definition, selections, input);
+          break;
+      }
     }
     if (registeredEngine && !registeredEngine.handled) registeredEngine = undefined;
-    // Defensive fallback: a catalog market with a valid Odds-module quote can
-    // still produce a transparent bookmaker-implied probability if no specialized
-    // market handler exists. Missing prices remain unavailable, never fabricated.
+    // A missing handler is an implementation gap, not permission to turn an
+    // Odds quote into a prediction. Preserve price visibility while withholding
+    // probability and recommendation eligibility.
     const engine: MarketEngineOutput = registeredEngine ?? {
       handled: true,
       selections: selections.map((selection) => ({
@@ -151,13 +300,13 @@ export class MarketPredictionCalculationService {
         probability: null,
         status: 'UNAVAILABLE' as const,
         source: [],
-        method: 'Odds-implied fallback; no specialized market handler registered',
-        diagnostics: ['No specialized handler was registered; the exact Odds-module quote will be used only as a low-confidence probability fallback.'],
+        method: 'No specialized prediction handler is registered',
+        diagnostics: ['The market has no specialized probability model. Odds-module prices remain separate and are not converted into predictions.'],
         dataQuality: 0,
       })),
-      calculationMethod: 'Odds-implied fallback for a catalog market without a specialized handler',
+      calculationMethod: 'Unavailable: specialized prediction handler missing',
       dataQuality: 0,
-      diagnostics: ['Specialized market handler missing; attempted exact selection-level Odds-module fallback.'],
+      diagnostics: ['Specialized prediction handler missing; no Odds-implied probability fallback is permitted.'],
     };
 
     const providerPrices = new Map<string, ProviderSelectionPrice>();
@@ -191,17 +340,14 @@ export class MarketPredictionCalculationService {
           output.status === 'CALCULATED' && output.probability !== null
             ? PredictionMathUtil.clamp(output.probability, 0.000001, 0.999999)
             : null;
-        const oddsImpliedProbability = providerPrice
-          ? PredictionMathUtil.clamp(1 / providerPrice.decimalOdds, 0.01, 0.99)
-          : null;
-        const usedOddsFallback = modelProbability === null && oddsImpliedProbability !== null;
-        const rawProbability = modelProbability ?? oddsImpliedProbability;
-        const probability =
-          rawProbability === null
-            ? null
-            : oddsAdjustedProbabilities.has(output.selection.key)
-              ? oddsAdjustedProbabilities.get(output.selection.key)!
-              : rawProbability;
+        // Keep model probabilities independent. Odds adjustments are applied
+        // only when a complete de-vigged outcome set exists and every model
+        // outcome in that group has already been calculated.
+        const probability = modelProbability === null
+          ? null
+          : oddsAdjustedProbabilities.has(output.selection.key)
+            ? oddsAdjustedProbabilities.get(output.selection.key)!
+            : modelProbability;
         // An estimated price is a value source, not independent evidence. Only
         // direct provider prices (or a real 1X2 market baseline already present
         // in the model input) can increase the confidence odds signal.
@@ -227,15 +373,7 @@ export class MarketPredictionCalculationService {
           input.marketOdds &&
           definition.model === MarketModel.SCORE_MATRIX
         ) {
-          sources.push(
-            input.marketOdds.source === 'ESPN_PICKCENTER'
-              ? PredictionSource.ESPN_PICKCENTER
-              : input.marketOdds.source === 'ESPN_EVENT_ODDS'
-                ? PredictionSource.ESPN_EVENT_ODDS
-                : input.marketOdds.source === 'STORED_PROVIDER'
-                  ? PredictionSource.PROVIDER_ODDS
-                  : PredictionSource.ESPN_ODDS,
-          );
+          sources.push(PredictionSource.PROVIDER_ODDS);
         }
         return {
           key: output.selection.key,
@@ -256,7 +394,6 @@ export class MarketPredictionCalculationService {
               ? null
               : Number((probability * 100).toFixed(2)),
           // Offered decimal odds and their provenance are owned by OddsService.
-          // The reciprocal probability fallback is a model fair-price estimate, not a bookmaker quote.
           // fairOdds is the model fair price for this calculated probability;
           // the offered decimalOdds and source remain separately preserved.
           fairOdds: probability !== null && probability > 0
@@ -290,14 +427,12 @@ export class MarketPredictionCalculationService {
               ? PredictionStatus.UNAVAILABLE
               : PredictionStatus.CALCULATED,
           sources: [...new Set(sources)],
-          calculationMethod: usedOddsFallback
-            ? `${output.method} (Odds-module implied-probability fallback)`
-            : output.method,
+          calculationMethod: output.method,
           settlementProfile: output.settlementProfile,
           diagnostics: [
             ...output.diagnostics,
-            ...(usedOddsFallback
-              ? [`The market-specific model could not calculate this selection; used Odds-module implied probability ${((oddsImpliedProbability ?? 0) * 100).toFixed(2)}% instead. This is a lower-evidence fallback, not a guarantee.`]
+            ...(modelProbability === null && providerPrice
+              ? ['An Odds-module quote exists, but the specialized Sports-based model did not calculate this selection; the quote is retained as price information only and is not converted into a prediction probability.']
               : []),
             ...(!providerPrice
               ? ['No valid Odds-module quote is ready for this exact market, selection, and line; the selection is not emitted as a calculated prediction.']
@@ -306,7 +441,7 @@ export class MarketPredictionCalculationService {
             !oddsAdjustedProbabilities.has(output.selection.key) &&
             definition.key === PredictionMarket.GOALS_OVER_UNDER
               ? [
-                  'An ESPN bookmaker price was found, but the opposing price for this exact line was unavailable; probability was not blended from a one-sided price.',
+                  'A provider bookmaker price was found, but the opposing price for this exact line was unavailable; probability was not blended from a one-sided price.',
                 ]
               : []),
             ...(confidenceResult?.notes ?? []),
@@ -495,6 +630,9 @@ export class MarketPredictionCalculationService {
       PredictionMarket.BOTH_TEAMS_TO_SCORE_FIRST_HALF,
       PredictionMarket.BOTH_TEAMS_TO_SCORE_SECOND_HALF,
       PredictionMarket.ODD_EVEN_TOTAL_GOALS,
+      PredictionMarket.HALF_TIME_GOALS_ODD_EVEN,
+      PredictionMarket.TOTAL_CORNERS_ODD_EVEN,
+      PredictionMarket.TOTAL_CARDS_ODD_EVEN,
       PredictionMarket.FIRST_HALF_GOALS_OVER_UNDER,
       PredictionMarket.SECOND_HALF_GOALS_OVER_UNDER,
       PredictionMarket.HOME_TEAM_GOALS_OVER_UNDER,
@@ -504,7 +642,9 @@ export class MarketPredictionCalculationService {
       PredictionMarket.HALF_TIME_EUROPEAN_HANDICAP,
       PredictionMarket.TOTAL_CORNERS_OVER_UNDER,
       PredictionMarket.HOME_CORNERS_OVER_UNDER,
+      PredictionMarket.HOME_TEAM_CORNERS_OVER_UNDER,
       PredictionMarket.AWAY_CORNERS_OVER_UNDER,
+      PredictionMarket.AWAY_TEAM_CORNERS_OVER_UNDER,
       PredictionMarket.TOTAL_CARDS_OVER_UNDER,
       PredictionMarket.TOTAL_YELLOW_CARDS_OVER_UNDER,
       PredictionMarket.TOTAL_RED_CARDS_OVER_UNDER,
@@ -551,20 +691,16 @@ export class MarketPredictionCalculationService {
       );
       const modelValues = group.map((output) => Math.max(0, Number(output.probability ?? 0)));
       const modelTotal = modelValues.reduce((sum, value) => sum + value, 0);
+      if (!modelComplete || !Number.isFinite(modelTotal) || modelTotal <= 0) continue;
       const impliedValues = groupPrices.map((price) => 1 / Number(price!.decimalOdds));
       const impliedTotal = impliedValues.reduce((sum, value) => sum + value, 0);
       if (!Number.isFinite(impliedTotal) || impliedTotal <= 0) continue;
 
       const providerNormal = impliedValues.map((value) => value / impliedTotal);
-      const hasCompleteModelDistribution = modelComplete && modelTotal > 0;
-      const modelNormal = hasCompleteModelDistribution
-        ? modelValues.map((value) => value / modelTotal)
-        : providerNormal;
+      const modelNormal = modelValues.map((value) => value / modelTotal);
       const blended = modelNormal.map((modelProbability, index) => {
         const price = groupPrices[index]!;
-        const marketWeight = hasCompleteModelDistribution
-          ? (price.priceType === 'PROVIDER' ? weight : Math.min(weight, 0.08))
-          : 1;
+        const marketWeight = price.priceType === 'PROVIDER' ? weight : Math.min(weight, 0.08);
         return PredictionMathUtil.clamp(
           modelProbability * (1 - marketWeight) + providerNormal[index] * marketWeight,
           0.0001,
@@ -581,9 +717,9 @@ export class MarketPredictionCalculationService {
   }
 
   /**
-   * Blend ESPN over/under prices only when both sides are available at the
-   * exact same full-time total-goals line. Each line remains complementary,
-   * and the bookmaker's proportional overround is normalized before blending.
+   * Blend Odds-module over/under prices only when both sides and both
+   * independent model probabilities exist at the exact same line. Each line
+   * remains complementary and the bookmaker overround is normalized first.
    */
   private blendCompleteGoalsOverUnderOdds(
     definition: MarketDefinition,
@@ -621,7 +757,10 @@ export class MarketPredictionCalculationService {
       if (
         !overPrice || !underPrice ||
         (overPrice.priceType !== 'PROVIDER' && overPrice.priceType !== 'ESTIMATED') ||
-        (underPrice.priceType !== 'PROVIDER' && underPrice.priceType !== 'ESTIMATED')
+        (underPrice.priceType !== 'PROVIDER' && underPrice.priceType !== 'ESTIMATED') ||
+        group.over.status !== 'CALCULATED' || group.under.status !== 'CALCULATED' ||
+        group.over.probability === null || group.under.probability === null ||
+        !Number.isFinite(Number(group.over.probability)) || !Number.isFinite(Number(group.under.probability))
       ) continue;
       const overOdds = overPrice.decimalOdds;
       const underOdds = underPrice.decimalOdds;
@@ -633,13 +772,10 @@ export class MarketPredictionCalculationService {
       if (!Number.isFinite(impliedTotal) || impliedTotal <= 0) continue;
 
       const marketOverProbability = rawOver / impliedTotal;
-      const modelOverProbability = group.over.probability !== null
-        && Number.isFinite(Number(group.over.probability))
-        ? PredictionMathUtil.clamp(group.over.probability, 0, 1)
-        : marketOverProbability;
-      const modelWeight = group.over.probability !== null && group.under.probability !== null
-        ? (overPrice.priceType === 'PROVIDER' && underPrice.priceType === 'PROVIDER' ? weight : Math.min(weight, 0.08))
-        : 0;
+      const modelOverProbability = PredictionMathUtil.clamp(Number(group.over.probability), 0, 1);
+      const modelWeight = overPrice.priceType === 'PROVIDER' && underPrice.priceType === 'PROVIDER'
+        ? weight
+        : Math.min(weight, 0.08);
       const blendedOver = PredictionMathUtil.clamp(
         modelOverProbability * (1 - modelWeight) + marketOverProbability * modelWeight,
         0.0001,
@@ -653,6 +789,7 @@ export class MarketPredictionCalculationService {
     return adjusted;
   }
 }
+
 
 
 

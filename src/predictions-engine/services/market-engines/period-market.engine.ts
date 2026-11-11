@@ -3,7 +3,7 @@ import {
   MarketDefinition,
   ExpandedMarketSelection,
 } from '../../interfaces/market-catalog.interface';
-import { PredictionModelInput } from '../../interfaces/espn-prediction-context.interface';
+import { PredictionModelInput } from '../../interfaces/prediction-match-context.interface';
 import {
   MarketEngineOutput,
   SelectionModelOutput,
@@ -22,6 +22,7 @@ import {
 export class PeriodMarketEngine {
   private readonly supported = new Set<string>([
     PredictionMarket.HALF_TIME_RESULT,
+    PredictionMarket.HALF_TIME_GOALS_ODD_EVEN,
     PredictionMarket.SECOND_HALF_RESULT,
     PredictionMarket.HALF_TIME_FULL_TIME,
     PredictionMarket.FIRST_HALF_DOUBLE_CHANCE,
@@ -62,11 +63,14 @@ export class PeriodMarketEngine {
         'Period-specific independent Poisson score distributions',
         [PredictionSource.POISSON_SCORE_MODEL, PredictionSource.DERIVED_MARKET],
         this.dataQuality(input),
-        definition.key === PredictionMarket.HALF_TIME_FULL_TIME
-          ? [
-              'Half-time and second-half score increments are combined to estimate the nine HT/FT outcomes.',
-            ]
-          : [],
+        [
+          ...(input.expectedGoals.observedPeriodSplit
+            ? [`Team-specific first-half goal shares are derived from ${input.expectedGoals.homePeriodSplitSamples} home-team and ${input.expectedGoals.awayPeriodSplitSamples} away-team Sports period-score samples.`]
+            : ['At least one team lacks four usable Sports period-score samples; a 45% first-half share is assumed for that team and period-market quality is reduced by 45%.']),
+          ...(definition.key === PredictionMarket.HALF_TIME_FULL_TIME
+            ? ['Half-time and second-half score increments are combined to estimate the nine HT/FT outcomes.']
+            : []),
+        ],
       );
     });
 
@@ -77,7 +81,7 @@ export class PeriodMarketEngine {
         'Period-specific independent Poisson score distributions',
       dataQuality: this.dataQuality(input),
       diagnostics: [
-        'First-half and second-half rates are split from full-match expected goals; this is a model assumption rather than an ESPN-provided prediction.',
+        'First-half and second-half rates use team-specific Sports period-score observations where at least four samples are available; otherwise the configured 45% share is an explicit assumption and period-market data quality is reduced by 45%.',
       ],
     };
   }
@@ -94,6 +98,10 @@ export class PeriodMarketEngine {
 
     if (marketKey === String(PredictionMarket.HALF_TIME_RESULT))
       return resultProbability(first, key);
+    if (marketKey === String(PredictionMarket.HALF_TIME_GOALS_ODD_EVEN)) {
+      const odd = totalGoalsProbability(first, (total) => total % 2 === 1);
+      return key === 'ODD' ? odd : key === 'EVEN' ? 1 - odd : null;
+    }
     if (marketKey === String(PredictionMarket.SECOND_HALF_RESULT))
       return resultProbability(second, key);
     if (marketKey === String(PredictionMarket.FIRST_HALF_DOUBLE_CHANCE)) {
@@ -251,13 +259,18 @@ export class PeriodMarketEngine {
         input.expectedGoals.awaySamples,
       ) / 8,
     );
-    return PredictionMathUtil.clamp(
+    const baseQuality = PredictionMathUtil.clamp(
       0.2 +
         sample * 0.5 +
         Math.min(0.2, input.expectedGoals.leagueSamples / 600),
       0,
       1,
     );
+    // Same conservative quality penalty as the Odds pricing model when
+    // period splits are assumed instead of supported by four observations
+    // for each team. The probability still remains explicitly model-based.
+    return input.expectedGoals.observedPeriodSplit ? baseQuality : baseQuality * 0.55;
   }
 }
+
 

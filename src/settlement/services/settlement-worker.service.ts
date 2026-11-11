@@ -39,14 +39,32 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
   private lastDrainStartedAt?: Date;
   private lastDrainCompletedAt?: Date;
   private lastDrainErrorAt?: Date;
-  private activeJob?: { jobKey: string; eventId: string; leagueId: string; startedAt: Date; attempt: number };
+  private activeJob?: {
+    jobKey: string;
+    eventId: string;
+    leagueId: string;
+    startedAt: Date;
+    attempt: number;
+  };
   private lastJobAt?: Date;
-  private lastJobStatus?: 'COMPLETED' | 'PARTIAL' | 'SKIPPED' | 'RETRY' | 'FAILED';
+  private lastJobStatus?:
+    | 'COMPLETED'
+    | 'PARTIAL'
+    | 'SKIPPED'
+    | 'RETRY'
+    | 'FAILED';
   private lastJobKey?: string;
   private lastJobEventId?: string;
   private lastJobDurationMs?: number;
   private lastJobError?: string;
   private startupRetryTimer?: ReturnType<typeof setTimeout>;
+  private leaseRecoveryTimer?: ReturnType<typeof setInterval>;
+  private targetReconciliationTimer?: ReturnType<typeof setInterval>;
+  private targetReconciliationBusy = false;
+  private targetReconciliationRuns = 0;
+  private targetReconciliationQueued = 0;
+  private lastTargetReconciliationAt?: Date;
+  private lastTargetReconciliationError?: string;
   private readonly onQueued = () => this.wake(0);
 
   constructor(
@@ -95,16 +113,44 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       lastJobEventId: this.lastJobEventId,
       lastJobDurationMs: this.lastJobDurationMs,
       lastJobError: this.lastJobError,
+      targetReconciliationBusy: this.targetReconciliationBusy,
+      targetReconciliationRuns: this.targetReconciliationRuns,
+      targetReconciliationQueued: this.targetReconciliationQueued,
+      lastTargetReconciliationAt: this.lastTargetReconciliationAt?.toISOString(),
+      lastTargetReconciliationError: this.lastTargetReconciliationError,
       workerId: this.workerId,
     };
   }
 
   onModuleInit(): void {
-    this.adminGateway.setModuleOperationalStatus('settlement', 'STARTING', 'Settlement worker initialized; startup recovery is running.');
-    this.systemMonitor.reportModuleHealth('settlement', 'UNKNOWN', { source: 'worker-lifecycle', message: 'Settlement queue worker initialized; startup recovery is running.' });
+    this.adminGateway.setModuleOperationalStatus(
+      'settlement',
+      'STARTING',
+      'Settlement worker initialized; startup recovery is running.',
+    );
+    this.systemMonitor.reportModuleHealth('settlement', 'UNKNOWN', {
+      source: 'worker-lifecycle',
+      message:
+        'Settlement queue worker initialized; startup recovery is running.',
+    });
     this.queue.onEnqueued(this.onQueued);
-    // Jobs are discovered by fixture-refresh, target-creation and Summary-update events.
-    // Startup is limited to recovering interrupted worker leases.
+    // The periodic sweeper repairs PROCESSING jobs abandoned by a crashed or
+    // disconnected instance, even when this worker has no runnable jobs.
+    this.leaseRecoveryTimer = setInterval(
+      () => void this.recoverAbandonedLeases(),
+      SETTLEMENT_CONFIG.queue.leaseHeartbeatIntervalMs,
+    );
+    this.leaseRecoveryTimer.unref?.();
+    // Target reconciliation is a level-triggered safety net for cases where a
+    // Prediction or Bet Lab write committed but its immediate queue handoff did
+    // not. It is intentionally separate from the lease sweeper.
+    this.targetReconciliationTimer = setInterval(
+      () => void this.reconcileUnsettledTargets(),
+      SETTLEMENT_CONFIG.queue.targetReconciliationIntervalMs,
+    );
+    this.targetReconciliationTimer.unref?.();
+    // Sports outbox events remain the primary trigger. Startup and recurring
+    // reconciliation repair pre-existing and missed Prediction/Bet Lab handoffs.
     void this.startupRecovery();
   }
 
@@ -112,6 +158,77 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     this.queue.offEnqueued(this.onQueued);
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
     if (this.startupRetryTimer) clearTimeout(this.startupRetryTimer);
+    if (this.leaseRecoveryTimer) clearInterval(this.leaseRecoveryTimer);
+    if (this.targetReconciliationTimer) clearInterval(this.targetReconciliationTimer);
+  }
+
+  private async reconcileUnsettledTargets(): Promise<void> {
+    if (!this.initialized || this.targetReconciliationBusy) return;
+    this.targetReconciliationBusy = true;
+    this.targetReconciliationRuns += 1;
+    try {
+      const result = await this.queue.reconcileExistingUnsettledTargets();
+      this.lastTargetReconciliationAt = new Date();
+      this.lastTargetReconciliationError = undefined;
+      this.targetReconciliationQueued += result.queued;
+      if (result.queued > 0) {
+        this.logger.warn(
+          `Settlement target reconciliation queued ${result.queued} job(s) from ${result.candidateEventIds} unresolved fixture target(s).`,
+        );
+        this.wake(0);
+      }
+    } catch (error) {
+      const message = this.errorMessage(error);
+      this.lastTargetReconciliationAt = new Date();
+      this.lastTargetReconciliationError = message;
+      this.logger.error(`Settlement target reconciliation failed: ${message}`);
+      this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', {
+        source: 'target-reconciliation',
+        message,
+        details: {
+          run: this.targetReconciliationRuns,
+          intervalMs: SETTLEMENT_CONFIG.queue.targetReconciliationIntervalMs,
+        },
+      });
+      this.systemMonitor.reportError({
+        module: 'settlement',
+        source: 'target-reconciliation',
+        operation: 'reconcile-unsettled-targets',
+        message,
+        occurredAt: new Date(),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    } finally {
+      this.targetReconciliationBusy = false;
+    }
+  }
+
+  private async recoverAbandonedLeases(): Promise<void> {
+    try {
+      const recovered = await this.queue.recoverExpiredProcessingJobs();
+      if (recovered.total > 0) {
+        this.logger.warn(
+          `Settlement lease recovery reclaimed ${recovered.recoveredForRetry} job(s) for retry and marked ${recovered.exhausted} exhausted job(s) failed.`,
+        );
+        this.wake(0);
+        try {
+          await this.eventLog.write({
+            level: SettlementEventLevel.WARN,
+            action: 'SETTLEMENT_EXPIRED_LEASES_RECOVERED',
+            message: `Recovered ${recovered.total} abandoned settlement processing lease(s).`,
+            metadata: recovered,
+          });
+        } catch (loggingError) {
+          this.logger.warn(`Could not persist Settlement lease recovery event: ${this.errorMessage(loggingError)}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Settlement expired-lease recovery failed: ${this.errorMessage(error)}`);
+      this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', {
+        source: 'worker-lease-recovery',
+        message: this.errorMessage(error),
+      });
+    }
   }
 
   private async startupRecovery(): Promise<void> {
@@ -122,17 +239,41 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       // SETTLEMENT_HISTORICAL_RESETTLE_ON_STARTUP=true is explicitly enabled.
       // Complete it before enabling the queue drain so normal settlement cannot
       // race the controlled historical correction.
-      const historicalResettlement = await this.processor.runHistoricalResettlementOnce();
+      const historicalResettlement =
+        await this.processor.runHistoricalResettlementOnce();
+      // Catch up records created before Sports outbox delivery was activated.
+      // Only unresolved Prediction/Bet Lab event IDs are scanned; every fixture
+      // is re-read and checked by SettlementQueueService before being queued.
+      const targetReconciliation =
+        await this.queue.reconcileExistingUnsettledTargets();
       this.initialized = true;
       this.lastStartupSuccessAt = new Date();
       this.lastStartupError = undefined;
       // Start queue draining before any monitoring or audit operations that may fail.
       this.wake(0);
-      this.adminGateway.setModuleOperationalStatus('settlement', 'READY', 'Settlement worker recovery completed.', { recoveredLeases: recovered, historicalResettlement });
-      this.adminGateway.publishModuleEvent('settlement', 'settlement:worker-ready', { recoveredLeases: recovered, historicalResettlement, occurredAt: new Date().toISOString() });
-      this.systemMonitor.reportModuleHealth('settlement', 'HEALTHY', { source: 'worker-recovery', message: 'Settlement worker recovery completed.', details: { recoveredLeases: recovered, historicalResettlement } });
+      this.adminGateway.setModuleOperationalStatus(
+        'settlement',
+        'READY',
+        'Settlement worker recovery completed.',
+        { recoveredLeases: recovered, historicalResettlement, targetReconciliation },
+      );
+      this.adminGateway.publishModuleEvent(
+        'settlement',
+        'settlement:worker-ready',
+        {
+          recoveredLeases: recovered,
+          historicalResettlement,
+          targetReconciliation,
+          occurredAt: new Date().toISOString(),
+        },
+      );
+      this.systemMonitor.reportModuleHealth('settlement', 'HEALTHY', {
+        source: 'worker-recovery',
+        message: 'Settlement worker recovery completed.',
+        details: { recoveredLeases: recovered, historicalResettlement, targetReconciliation },
+      });
       this.logger.log(
-        `Settlement worker initialized. Recovered abandoned leases=${recovered}; historical resettlement=${JSON.stringify(historicalResettlement)}.`,
+        `Settlement worker initialized. Recovered abandoned leases=${JSON.stringify(recovered)}; historical resettlement=${JSON.stringify(historicalResettlement)}; startup target reconciliation=${JSON.stringify(targetReconciliation)}.`,
       );
       // Queue readiness must not depend on an audit-event insert succeeding.
       try {
@@ -141,7 +282,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
           action: 'SETTLEMENT_WORKER_READY',
           message:
             'Event-triggered settlement worker completed startup recovery.',
-          metadata: { recoveredLeases: recovered, historicalResettlement },
+          metadata: { recoveredLeases: recovered, historicalResettlement, targetReconciliation },
         });
       } catch (loggingError) {
         this.logger.warn(
@@ -162,10 +303,32 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
 
       this.logger.error(`Settlement startup recovery failed: ${message}`);
       try {
-        this.adminGateway.setModuleOperationalStatus('settlement', 'DEGRADED', message);
-        this.adminGateway.publishModuleEvent('settlement', 'settlement:worker-error', { phase: 'startup-recovery', message, occurredAt: new Date().toISOString() });
-        this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', { source: 'worker-recovery', message });
-        this.systemMonitor.reportError({ module: 'settlement', source: 'worker-recovery', operation: 'startup-recovery', message, occurredAt: new Date(), stack: error instanceof Error ? error.stack : undefined });
+        this.adminGateway.setModuleOperationalStatus(
+          'settlement',
+          'DEGRADED',
+          message,
+        );
+        this.adminGateway.publishModuleEvent(
+          'settlement',
+          'settlement:worker-error',
+          {
+            phase: 'startup-recovery',
+            message,
+            occurredAt: new Date().toISOString(),
+          },
+        );
+        this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', {
+          source: 'worker-recovery',
+          message,
+        });
+        this.systemMonitor.reportError({
+          module: 'settlement',
+          source: 'worker-recovery',
+          operation: 'startup-recovery',
+          message,
+          occurredAt: new Date(),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
       } catch (monitoringError) {
         this.logger.warn(
           `Could not update Settlement startup monitoring state: ${this.errorMessage(monitoringError)}`,
@@ -211,8 +374,19 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     this.lastDrainStartedAt = new Date();
     let processed = 0;
     try {
-      this.systemMonitor.reportActivity({ module: 'settlement', source: 'worker', operation: 'drain', status: 'INFO', message: 'Settlement queue drain started.', occurredAt: new Date() });
-      this.adminGateway.publishModuleEvent('settlement', 'settlement:drain-started', { occurredAt: new Date().toISOString() });
+      this.systemMonitor.reportActivity({
+        module: 'settlement',
+        source: 'worker',
+        operation: 'drain',
+        status: 'INFO',
+        message: 'Settlement queue drain started.',
+        occurredAt: new Date(),
+      });
+      this.adminGateway.publishModuleEvent(
+        'settlement',
+        'settlement:drain-started',
+        { occurredAt: new Date().toISOString() },
+      );
       while (processed < SETTLEMENT_CONFIG.queue.maximumJobsPerDrain) {
         const job = await this.queue.claimNextDueJob(this.workerId);
         if (!job) break;
@@ -223,10 +397,32 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       this.drainFailures += 1;
       this.lastDrainErrorAt = new Date();
-      this.adminGateway.setModuleOperationalStatus('settlement', 'DEGRADED', this.errorMessage(error));
-      this.adminGateway.publishModuleEvent('settlement', 'settlement:worker-error', { phase: 'drain', message: this.errorMessage(error), occurredAt: new Date().toISOString() });
-      this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', { source: 'worker', message: this.errorMessage(error) });
-      this.systemMonitor.reportError({ module: 'settlement', source: 'worker', operation: 'drain', message: this.errorMessage(error), occurredAt: new Date(), stack: error instanceof Error ? error.stack : undefined });
+      this.adminGateway.setModuleOperationalStatus(
+        'settlement',
+        'DEGRADED',
+        this.errorMessage(error),
+      );
+      this.adminGateway.publishModuleEvent(
+        'settlement',
+        'settlement:worker-error',
+        {
+          phase: 'drain',
+          message: this.errorMessage(error),
+          occurredAt: new Date().toISOString(),
+        },
+      );
+      this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', {
+        source: 'worker',
+        message: this.errorMessage(error),
+      });
+      this.systemMonitor.reportError({
+        module: 'settlement',
+        source: 'worker',
+        operation: 'drain',
+        message: this.errorMessage(error),
+        occurredAt: new Date(),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       this.logger.error(
         `Settlement worker drain failed: ${this.errorMessage(error)}`,
       );
@@ -265,20 +461,57 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
 
   private async processJob(job: SettlementJobDocument): Promise<void> {
     const startedAt = Date.now();
-    this.activeJob = { jobKey: job.jobKey, eventId: job.eventId, leagueId: job.leagueId, startedAt: new Date(startedAt), attempt: job.attempts };
-    this.adminGateway.publishModuleEvent('settlement', 'settlement:job-started', { jobKey: job.jobKey, eventId: job.eventId, leagueId: job.leagueId, attempt: job.attempts, occurredAt: new Date().toISOString() });
-    const leaseHeartbeat = setInterval(() => {
-      void this.queue.renewProcessingLease(job._id, this.workerId).then((renewed) => {
+    this.activeJob = {
+      jobKey: job.jobKey,
+      eventId: job.eventId,
+      leagueId: job.leagueId,
+      startedAt: new Date(startedAt),
+      attempt: job.attempts,
+    };
+    this.adminGateway.publishModuleEvent(
+      'settlement',
+      'settlement:job-started',
+      {
+        jobKey: job.jobKey,
+        eventId: job.eventId,
+        leagueId: job.leagueId,
+        attempt: job.attempts,
+        occurredAt: new Date().toISOString(),
+      },
+    );
+
+    let heartbeatBusy = false;
+    let leaseLost = false;
+    const heartbeatTimer = setInterval(async () => {
+      if (heartbeatBusy || leaseLost) return;
+      heartbeatBusy = true;
+      try {
+        const renewed = await this.queue.renewProcessingLease(job, this.workerId);
         if (!renewed) {
-          this.logger.warn(`Settlement lease is no longer owned by this worker for job ${job.jobKey}.`);
+          leaseLost = true;
+          this.logger.error(
+            `Settlement worker ${this.workerId} lost ownership of job ${job.jobKey}; further queue state changes are fenced.`,
+          );
         }
-      }).catch((error) => {
-        this.logger.warn(`Could not renew Settlement lease for ${job.jobKey}: ${this.errorMessage(error)}`);
-      });
+      } catch (heartbeatError) {
+        // A transient heartbeat error is not proof that ownership changed.
+        // If the lease really expires, recovery changes the token and fences us.
+        this.logger.warn(
+          `Settlement lease heartbeat failed for ${job.jobKey}: ${this.errorMessage(heartbeatError)}`,
+        );
+      } finally {
+        heartbeatBusy = false;
+      }
     }, SETTLEMENT_CONFIG.queue.leaseHeartbeatIntervalMs);
-    leaseHeartbeat.unref?.();
+    heartbeatTimer.unref?.();
+
     try {
+      await this.queue.assertProcessingLease(job, this.workerId);
       const result = await this.processor.process(job);
+      await this.queue.assertProcessingLease(job, this.workerId);
+      if (leaseLost) {
+        throw new Error(`Settlement processing lease was lost for job ${job.jobKey}.`);
+      }
       const durationMs = Date.now() - startedAt;
       const rerunQueued = await this.queue.complete(job, {
         partial: result.partial,
@@ -316,8 +549,6 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
         durationMs,
         referenceKey: job.jobKey,
       });
-      // A successful processor/queue cycle proves the worker has recovered.
-      // Partial target outcomes remain visible in queue counts and unresolvedReasons.
       this.systemMonitor.reportModuleHealth('settlement', 'HEALTHY', {
         source: 'worker',
         message: result.skipped
@@ -325,7 +556,13 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
           : result.partial
             ? `Settlement worker recovered and processed ${job.jobKey}; unresolved targets remain.`
             : `Settlement processing successfully completed job ${job.jobKey}.`,
-        details: { eventId: job.eventId, partial: result.partial, skipped: result.skipped === true, durationMs, counts: result.counts },
+        details: {
+          eventId: job.eventId,
+          partial: result.partial,
+          skipped: result.skipped === true,
+          durationMs,
+          counts: result.counts,
+        },
       });
       this.adminGateway.setModuleOperationalStatus(
         'settlement',
@@ -335,11 +572,21 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
           : result.partial
             ? `Settlement worker is running; event ${job.eventId} still has unresolved targets.`
             : `Settlement worker completed event ${job.eventId}.`,
-        { eventId: job.eventId, partial: result.partial, skipped: result.skipped === true, durationMs, counts: result.counts },
+        {
+          eventId: job.eventId,
+          partial: result.partial,
+          skipped: result.skipped === true,
+          durationMs,
+          counts: result.counts,
+        },
       );
       this.adminGateway.publishModuleEvent(
         'settlement',
-        rerunQueued ? 'settlement:job-requeued' : result.skipped ? 'settlement:job-skipped' : 'settlement:job-completed',
+        rerunQueued
+          ? 'settlement:job-requeued'
+          : result.skipped
+            ? 'settlement:job-skipped'
+            : 'settlement:job-completed',
         {
           jobKey: job.jobKey,
           eventId: job.eventId,
@@ -354,6 +601,13 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       );
     } catch (error) {
       const outcome = await this.queue.fail(job, error);
+      if (outcome.leaseLost) {
+        this.logger.warn(
+          `Settlement job ${job.jobKey} was no longer owned by this worker; stale completion/failure was rejected.`,
+        );
+        this.wake(0);
+        return;
+      }
       const message = this.errorMessage(error);
       this.jobsFailed += 1;
       if (outcome.terminal) this.jobsTerminalFailed += 1;
@@ -364,20 +618,41 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       this.lastJobDurationMs = Date.now() - startedAt;
       this.lastJobError = message;
       this.lastJobStatus = outcome.terminal ? 'FAILED' : 'RETRY';
-      this.adminGateway.publishModuleEvent('settlement', 'settlement:job-failed', { jobKey: job.jobKey, eventId: job.eventId, terminal: outcome.terminal, retryAt: outcome.retryAt?.toISOString(), message, occurredAt: new Date().toISOString() });
+      this.adminGateway.publishModuleEvent(
+        'settlement',
+        'settlement:job-failed',
+        {
+          jobKey: job.jobKey,
+          eventId: job.eventId,
+          terminal: outcome.terminal,
+          retryAt: outcome.retryAt?.toISOString(),
+          message,
+          occurredAt: new Date().toISOString(),
+        },
+      );
       this.systemMonitor.reportError({
-        module: 'settlement', source: 'worker', operation: 'process-job', message,
-        occurredAt: new Date(), stack: error instanceof Error ? error.stack : undefined,
+        module: 'settlement',
+        source: 'worker',
+        operation: 'process-job',
+        message,
+        occurredAt: new Date(),
+        stack: error instanceof Error ? error.stack : undefined,
         referenceKey: job.jobKey,
       });
       this.systemMonitor.reportActivity({
-        module: 'settlement', source: 'worker', operation: 'process-job', status: 'FAILED',
+        module: 'settlement',
+        source: 'worker',
+        operation: 'process-job',
+        status: 'FAILED',
         message: `Settlement job ${job.jobKey} failed; ${outcome.terminal ? 'terminal failure' : 'retry scheduled'}.`,
-        occurredAt: new Date(), durationMs: Date.now() - startedAt, referenceKey: job.jobKey,
+        occurredAt: new Date(),
+        durationMs: Date.now() - startedAt,
+        referenceKey: job.jobKey,
       });
       if (outcome.terminal) {
         this.systemMonitor.reportModuleHealth('settlement', 'DEGRADED', {
-          source: 'worker', message: `Settlement job ${job.jobKey} exhausted retries: ${message}`,
+          source: 'worker',
+          message: `Settlement job ${job.jobKey} exhausted retries: ${message}`,
         });
       }
       this.logger.error(
@@ -408,8 +683,8 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
       if (outcome.retryAt)
         this.wake(Math.max(0, outcome.retryAt.getTime() - Date.now()));
     } finally {
+      clearInterval(heartbeatTimer);
       this.activeJob = undefined;
-      clearInterval(leaseHeartbeat);
     }
   }
 
@@ -417,3 +692,5 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
+

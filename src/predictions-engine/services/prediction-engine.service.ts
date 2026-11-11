@@ -12,12 +12,15 @@ import { MarketPrediction } from '../schemas/market-prediction.schema';
 import { PredictionRun } from '../schemas/prediction-run.schema';
 import { PredictionRunStatus } from '../enums/prediction-run-status.enum';
 import { PredictionStatus } from '../enums/prediction-status.enum';
-import { PredictionDataService } from './prediction-data.service';
+import {
+  PredictionDataService,
+  PredictionSourceRevisionChangedError,
+} from './prediction-data.service';
+import type { PredictionModelInput } from '../interfaces/prediction-match-context.interface';
 import { ExpectedGoalsService } from './expected-goals.service';
 import { MarketOddsService } from './market-odds.service';
 import { MarketPredictionCalculationService } from './market-prediction-calculation.service';
 import { PredictionMathUtil } from '../utils/prediction-math.util';
-import { PredictionModelInput } from '../interfaces/espn-prediction-context.interface';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
 import { PickCenterService } from './pick-center.service';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
@@ -25,6 +28,8 @@ import { getMarketDefinition } from '../catalog/football-market-catalog';
 import { MarketCalibrationService } from './market-calibration.service';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
 import { OddsReadService } from '../../odds/services/odds-read.service';
+import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
+import { hasReusableFinalMarketSnapshot } from '../utils/prediction-market-snapshot.util';
 
 @Injectable()
 export class PredictionEngineService {
@@ -47,9 +52,8 @@ export class PredictionEngineService {
   ) {}
 
   async generateForFixture(eventId: string): Promise<any> {
-    // Prediction generation is not coupled to the ESPN collection queue. The
-    // Odds module controls selection readiness; generation only excludes matches
-    // that have already finished.
+    // Prediction generation consumes canonical Sports facts and Odds-module prices.
+    // Sports owns fixture collection; the Odds module gates exact selection readiness.
     const startedAt = new Date();
     const runId = randomUUID();
     const modelVersion = PREDICTION_ENGINE_CONFIG.modelVersion;
@@ -60,22 +64,17 @@ export class PredictionEngineService {
       level: 'INFO',
       eventId,
       runId,
-      message: `Prediction generation started for ESPN event ${eventId}.`,
+      message: `Prediction generation started for Sports fixture ${eventId}.`,
     });
 
     try {
       const context =
         await this.predictionDataService.loadForPrediction(eventId);
-      if (this.isFinishedFixture(context)) {
-        throw new UnprocessableEntityException(
-          'Prediction generation is unavailable for a fixture that has finished.',
-        );
-      }
-      if (!this.isInPredictionWindow(context)) {
-        throw new UnprocessableEntityException(
-          `Only unfinished fixtures within the next ${PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours} hours and active live fixtures can be forecast.`,
-        );
-      }
+      // Loading match evidence can take time. Recheck the canonical Sports
+      // fixture before doing any model work so a kickoff transition wins.
+      await this.predictionDataService.assertFixtureStillPreMatch(
+        context.fixture.eventId,
+      );
 
       // The Odds module is authoritative. This gate also protects direct/admin
       // calls that bypass the durable prediction queue worker.
@@ -94,21 +93,10 @@ export class PredictionEngineService {
         PREDICTION_ENGINE_CONFIG.model.maxGoals,
       );
 
-      const liveState = context.fixture.live
-        ? this.getLiveMatchState(context)
-        : null;
-      let scoreMatrix = liveState
-        ? this.buildLiveFullTimeMatrix(expectedGoals, liveState)
-        : scoreMatrixBase;
-      if (liveState) {
-        expectedGoals.evidence.push(
-          `In-play score-conditioned forecast: current score ${liveState.homeScore}-${liveState.awayScore}; estimated elapsed minute ${liveState.elapsedMinutes}. Remaining goal expectation is scaled to the estimated time remaining.`,
-        );
-      }
-      // Do not reapply a potentially pre-match 1X2 quote to a live score matrix.
-      // The exact market quotes still flow through selection-level Odds readiness.
+      // All market calculations are pre-match. Live score conditioning has
+      // deliberately been removed; fixtures cannot be forecast after kickoff.
+      let scoreMatrix = scoreMatrixBase;
       if (
-        !context.fixture.live &&
         marketOdds &&
         marketOdds.home !== undefined &&
         marketOdds.draw !== undefined &&
@@ -131,15 +119,14 @@ export class PredictionEngineService {
         );
       }
 
-      const firstHalfShare = PREDICTION_ENGINE_CONFIG.model.firstHalfGoalShare;
       const firstHalfMatrix = PredictionMathUtil.scoreMatrix(
-        expectedGoals.home * firstHalfShare,
-        expectedGoals.away * firstHalfShare,
+        expectedGoals.home * expectedGoals.homeFirstHalfGoalShare,
+        expectedGoals.away * expectedGoals.awayFirstHalfGoalShare,
         PREDICTION_ENGINE_CONFIG.model.maxGoals,
       );
       const secondHalfMatrix = PredictionMathUtil.scoreMatrix(
-        expectedGoals.home * (1 - firstHalfShare),
-        expectedGoals.away * (1 - firstHalfShare),
+        expectedGoals.home * (1 - expectedGoals.homeFirstHalfGoalShare),
+        expectedGoals.away * (1 - expectedGoals.awayFirstHalfGoalShare),
         PREDICTION_ENGINE_CONFIG.model.maxGoals,
       );
 
@@ -158,6 +145,8 @@ export class PredictionEngineService {
         eventId: context.fixture.eventId,
         leagueId: context.fixture.leagueId,
         fixtureDate: context.fixture.fixtureDate,
+        retentionExpiresAt: context.fixture.retentionExpiresAt ?? null,
+        fixtureSourceRevision: context.fixtureSourceRevision,
         status: PredictionRunStatus.PROCESSING,
         modelVersion,
         startedAt,
@@ -188,94 +177,166 @@ export class PredictionEngineService {
       // Calibration rebuilds run in the independent maintenance cycle, not
       // inside every fixture calculation. Each market run consumes the latest
       // successfully persisted assessments without waiting for a full rebuild.
-      const calculations = this.marketCalculationService.calculateAll(
-        input,
-        calibrationAssessments,
-      );
       const generatedAt = new Date();
       const sourceSummaryCollectedAt = context.fixture.summaryCollectedAt
         ? new Date(context.fixture.summaryCollectedAt)
         : null;
-      const bulkOperations: AnyBulkWriteOperation<MarketPrediction>[] =
-        calculations.map(
-          (calculation): AnyBulkWriteOperation<MarketPrediction> => ({
-            updateOne: {
-              filter: {
-                eventId: context.fixture.eventId,
-                marketKey: calculation.marketKey,
-                modelVersion,
-              },
-              update: {
-                $set: {
-                  eventId: context.fixture.eventId,
-                  leagueId: context.fixture.leagueId,
-                  fixtureDate: context.fixture.fixtureDate,
-                  live: context.fixture.live === true,
-                  completed: context.fixture.completed === true,
-                  homeTeamId: context.fixture.homeTeamId,
-                  awayTeamId: context.fixture.awayTeamId,
-                  homeTeamName: context.homeTeam.name,
-                  awayTeamName: context.awayTeam.name,
-                  marketKey: calculation.marketKey,
-                  marketJsonVariable:
-                    getMarketDefinition(calculation.marketKey)?.jsonVariable ??
-                    calculation.marketKey,
-                  marketName: calculation.marketName,
-                  marketAbbreviation: calculation.marketAbbreviation,
-                  family: calculation.family as MarketPrediction['family'],
-                  period: calculation.period,
-                  status: calculation.status,
-                  selections: calculation.selections.map((selection) => ({
-                    ...selection,
-                    decimalOdds: selection.decimalOdds ?? undefined,
-                    bookmakerOdds: selection.bookmakerOdds ?? undefined,
-                    oddsUpdatedAt: selection.oddsUpdatedAt ?? undefined,
-                    oddsBasis: selection.oddsBasis ?? undefined,
-                    oddsCalculationMethod:
-                      selection.oddsCalculationMethod ?? undefined,
-                    oddsProvider: selection.oddsProvider ?? undefined,
-                    bookmaker: selection.bookmaker ?? undefined,
-                    diagnostics: selection.diagnostics ?? [],
-                  })) as MarketPrediction['selections'],
-                  sources: calculation.sources,
-                  modelVersion,
-                  calculationMethod: calculation.calculationMethod,
-                  dataQuality: calculation.dataQuality,
-                  diagnostics: calculation.diagnostics,
-                  expectedGoals: {
-                    home: expectedGoals.home,
-                    away: expectedGoals.away,
-                  },
-                  ...(sourceSummaryCollectedAt &&
-                  Number.isFinite(sourceSummaryCollectedAt.getTime())
-                    ? { sourceSummaryCollectedAt }
-                    : { sourceSummaryCollectedAt: null }),
-                  generatedAt,
-                },
-              },
-              upsert: true,
-            },
-          }),
-        );
+      const existingMarketRows = (await this.marketPredictionModel
+        .find({ eventId: context.fixture.eventId, modelVersion })
+        .select({ marketKey: 1, status: 1, fixtureSourceRevision: 1, selections: 1 })
+        .lean()
+        .exec()) as Array<Record<string, any>>;
+      const existingByMarketKey = new Map(
+        existingMarketRows.map((row) => [String(row.marketKey), row]),
+      );
+      let persistedMarketDocuments = 0;
+      let preservedMarketDocuments = 0;
+      let persistenceBatches = 0;
 
-      if (bulkOperations.length) {
-        await this.marketPredictionModel.bulkWrite(bulkOperations, {
-          ordered: false,
-        });
-        const hasSettlementTarget = calculations.some(
-          (calculation) =>
-            (calculation.status === PredictionStatus.CALCULATED ||
-              calculation.status === PredictionStatus.PARTIAL) &&
-            calculation.selections.some(
-              (selection) =>
-                selection.status !== PredictionStatus.UNAVAILABLE &&
-                selection.status !== PredictionStatus.FAILED,
-            ),
-        );
-        if (hasSettlementTarget) {
+      const calculations = await this.marketCalculationService.calculateProgressively(
+        input,
+        calibrationAssessments,
+        async (batch, progress) => {
+          // A fixture may change while a long catalogue is being calculated.
+          // Validate before each commit batch so only the current Sports revision
+          // can be written, even when earlier market batches have already landed.
+          await this.predictionDataService.assertFixtureStillPreMatch(
+            context.fixture.eventId,
+          );
+          await this.predictionDataService.assertFixtureSourceRevision(
+            context.fixture.eventId,
+            context.fixtureSourceRevision,
+          );
+
+          const operations: AnyBulkWriteOperation<MarketPrediction>[] = [];
+          for (const calculation of batch) {
+            const marketKey = String(calculation.marketKey);
+            const canonicalMarket = FOOTBALL_MARKET_BY_PREDICTION_KEY.get(marketKey);
+            const existing = existingByMarketKey.get(marketKey);
+            const hasFinalSelection = calculation.status === PredictionStatus.CALCULATED
+              && calculation.selections.some((selection) =>
+                selection.status === PredictionStatus.CALCULATED
+                && selection.isFinalSelection === true
+                && selection.recommendationEligible === true
+                && selection.oddsPredictionReady === true
+                && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED'),
+              );
+
+            // Keep an existing good market only if its Sports revision and its
+            // exact current Odds quote have not changed. A newly available price
+            // or better model result will replace it immediately in this batch.
+            if (!hasFinalSelection
+              && getMarketDefinition(marketKey)?.pricingEnabled !== false
+              && canonicalMarket
+              && hasReusableFinalMarketSnapshot(
+                existing,
+                canonicalMarket.id,
+                context.fixtureSourceRevision,
+                context.storedOdds ?? [],
+              )) {
+              preservedMarketDocuments += 1;
+              continue;
+            }
+
+            operations.push({
+              updateOne: {
+                filter: {
+                  eventId: context.fixture.eventId,
+                  marketKey: calculation.marketKey,
+                  modelVersion,
+                },
+                update: {
+                  $set: {
+                    eventId: context.fixture.eventId,
+                    leagueId: context.fixture.leagueId,
+                    fixtureDate: context.fixture.fixtureDate,
+                    retentionExpiresAt: context.fixture.retentionExpiresAt ?? null,
+                    fixtureSourceRevision: context.fixtureSourceRevision,
+                    live: false,
+                    completed: false,
+                    homeTeamId: context.fixture.homeTeamId,
+                    awayTeamId: context.fixture.awayTeamId,
+                    homeTeamName: context.homeTeam.name,
+                    awayTeamName: context.awayTeam.name,
+                    marketKey: calculation.marketKey,
+                    marketJsonVariable:
+                      getMarketDefinition(calculation.marketKey)?.jsonVariable
+                      ?? calculation.marketKey,
+                    marketName: calculation.marketName,
+                    marketAbbreviation: calculation.marketAbbreviation,
+                    family: calculation.family as MarketPrediction['family'],
+                    period: calculation.period,
+                    status: calculation.status,
+                    selections: calculation.selections.map((selection) => ({
+                      ...selection,
+                      decimalOdds: selection.decimalOdds ?? undefined,
+                      bookmakerOdds: selection.bookmakerOdds ?? undefined,
+                      oddsUpdatedAt: selection.oddsUpdatedAt ?? undefined,
+                      oddsBasis: selection.oddsBasis ?? undefined,
+                      oddsCalculationMethod: selection.oddsCalculationMethod ?? undefined,
+                      oddsProvider: selection.oddsProvider ?? undefined,
+                      bookmaker: selection.bookmaker ?? undefined,
+                      diagnostics: selection.diagnostics ?? [],
+                    })) as MarketPrediction['selections'],
+                    sources: calculation.sources,
+                    modelVersion,
+                    calculationMethod: calculation.calculationMethod,
+                    dataQuality: calculation.dataQuality,
+                    diagnostics: calculation.diagnostics,
+                    expectedGoals: {
+                      home: expectedGoals.home,
+                      away: expectedGoals.away,
+                    },
+                    ...(sourceSummaryCollectedAt && Number.isFinite(sourceSummaryCollectedAt.getTime())
+                      ? { sourceSummaryCollectedAt }
+                      : { sourceSummaryCollectedAt: null }),
+                    generatedAt,
+                  },
+                },
+                upsert: true,
+              },
+            });
+          }
+
+          if (operations.length) {
+            await this.marketPredictionModel.bulkWrite(operations, { ordered: false });
+            persistedMarketDocuments += operations.length;
+            persistenceBatches += 1;
+          }
+          this.logger.debug(
+            `Progressive market generation for ${context.fixture.eventId}: ${progress.processedMarkets}/${progress.totalMarkets} markets calculated; ${persistedMarketDocuments} market documents written and ${preservedMarketDocuments} current snapshots preserved across ${persistenceBatches} persistence batches.`,
+          );
+        },
+        8,
+      );
+
+      // Revalidate once more before dependent settlement and Pick Center work.
+      await this.predictionDataService.assertFixtureStillPreMatch(
+        context.fixture.eventId,
+      );
+      await this.predictionDataService.assertFixtureSourceRevision(
+        context.fixture.eventId,
+        context.fixtureSourceRevision,
+      );
+      const hasSettlementTarget = calculations.some(
+        (calculation) =>
+          (calculation.status === PredictionStatus.CALCULATED ||
+            calculation.status === PredictionStatus.PARTIAL) &&
+          calculation.selections.some(
+            (selection) =>
+              selection.status !== PredictionStatus.UNAVAILABLE &&
+              selection.status !== PredictionStatus.FAILED,
+          ),
+      );
+      if (hasSettlementTarget) {
+        try {
           await this.settlementTrigger.onTargetsCreated(
             [context.fixture.eventId],
             'PREDICTION_CREATED',
+          );
+        } catch (settlementError) {
+          this.logger.error(
+            `Settlement handoff failed for persisted prediction fixture ${context.fixture.eventId}; recurring reconciliation will retry: ${settlementError instanceof Error ? settlementError.message : String(settlementError)}`,
           );
         }
       }
@@ -370,21 +431,24 @@ export class PredictionEngineService {
           selection.priceType === 'PROVIDER' &&
           selection.isFinalSelection !== true,
       ).length;
-      const oddsFallbackSelections = calculations
-        .flatMap((item) => item.selections)
-        .filter((selection) => String(selection.calculationMethod ?? '').includes('Odds-module implied-probability fallback'))
-        .length;
+      const pricedButUnmodelledSelections = finalSelections.filter(
+        (selection) => selection.status === PredictionStatus.UNAVAILABLE
+          && selection.oddsPredictionReady === true
+          && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED'),
+      ).length;
       const diagnostics = [
         ...expectedGoals.evidence,
+        `Sports fixture source revision used: ${context.fixtureSourceRevision}.`,
         `Core evidence assessment: ${expectedGoals.evidenceLevel}; independent statistical evidence ${expectedGoals.independentEvidenceAvailable ? 'available' : 'unavailable'}.`,
         `Evidence counts: home form ${expectedGoals.homeRecentFormSamples}; away form ${expectedGoals.awayRecentFormSamples}; H2H ${expectedGoals.historicalHeadToHeadMatches}; league scored fixtures ${expectedGoals.leagueSamples}; matched standings for both teams ${expectedGoals.standingsStrengthAvailable ? 'yes' : 'no'}.`,
-        `Market selection audit: ${providerMissingCount} calculated candidates use estimated Odds-module prices; ${providerPricedNonFinalAlternatives} other provider-priced candidates were not chosen as their market's single final outcome; ${oddsFallbackSelections} selections used the Odds-module implied-probability fallback.`,
-        `Summary odds baseline: ${marketOdds?.source ?? 'none'}.`,
+        `Market selection audit: ${providerMissingCount} calculated candidates use estimated Odds-module prices; ${providerPricedNonFinalAlternatives} other provider-priced candidates were not chosen as their market's single final outcome; ${pricedButUnmodelledSelections} Odds-ready quotes were retained as prices but withheld from prediction because no independent model probability was available.`,
+        `Odds-module 1X2 baseline: ${marketOdds?.source ?? 'none'}.`,
         context.summaryAvailable
-          ? 'ESPN Summary evidence: available.'
-          : 'ESPN Summary evidence: missing; fixture-history fallback mode was used, and markets without sufficient evidence remain unavailable.',
+          ? 'Normalized Sports match projection: available.'
+          : 'Normalized Sports match projection: unavailable; only markets with independently sufficient historical evidence can be calculated.',
         `Active calibrated markets: ${[...calibrationAssessments.values()].filter((item) => item.active).length}.`,
         `Markets calculated: ${calculatedMarkets}; partial: ${partialMarkets}; unavailable: ${unavailableMarkets}; failed: ${failedMarkets}.`,
+        `Progressive persistence: ${persistedMarketDocuments} market documents written; ${preservedMarketDocuments} current market snapshots preserved; ${persistenceBatches} database batches.`,
         `Selections meeting the evidence-confidence threshold (>= ${minimumConfidence}/98): ${qualifiedConfidenceCount}/${perMarketConfidence.length}.`,
         `Fresh provider-odds coverage across calculated final selections: ${(oddsCoverage * 100).toFixed(1)}%.`,
         ...calculations
@@ -399,6 +463,8 @@ export class PredictionEngineService {
       const runSummary = {
         runId,
         eventId: context.fixture.eventId,
+        retentionExpiresAt: context.fixture.retentionExpiresAt ?? null,
+        fixtureSourceRevision: context.fixtureSourceRevision,
         status,
         modelVersion,
         startedAt,
@@ -409,6 +475,9 @@ export class PredictionEngineService {
         partialMarkets,
         unavailableMarkets,
         failedMarkets,
+        persistedMarketDocuments,
+        preservedMarketDocuments,
+        persistenceBatches,
         totalSelections,
         calculatedSelections,
         generalConfidence,
@@ -428,6 +497,13 @@ export class PredictionEngineService {
         )
         .exec();
 
+      await this.predictionDataService.assertFixtureStillPreMatch(
+        context.fixture.eventId,
+      );
+      await this.predictionDataService.assertFixtureSourceRevision(
+        context.fixture.eventId,
+        context.fixtureSourceRevision,
+      );
       const pickCenterResult = await this.pickCenterService.rebuildForEvent(
         context.fixture.eventId,
         runSummary,
@@ -452,6 +528,9 @@ export class PredictionEngineService {
       return {
         ...runSummary,
         savedMarketDocuments: savedMarkets.length,
+        persistedMarketDocuments,
+        preservedMarketDocuments,
+        persistenceBatches,
         oddsBaseline: marketOdds,
         expectedGoals,
         pickCenter: pickCenterResult,
@@ -470,6 +549,17 @@ export class PredictionEngineService {
           })
           .exec()
           .catch(() => undefined);
+      }
+      if (error instanceof PredictionSourceRevisionChangedError) {
+        await this.monitor.recordEvent({
+          type: 'PREDICTION_PARTIAL',
+          level: 'WARNING',
+          eventId,
+          runId,
+          message: `Prediction run for ${eventId} was superseded by a newer Sports fixture revision and will be recalculated.`,
+          metadata: { retryable: true, sourceRevisionChanged: true },
+        });
+        throw error;
       }
       if (
         error instanceof NotFoundException ||
@@ -490,128 +580,8 @@ export class PredictionEngineService {
     }
   }
 
-  private isInPredictionWindow(context: PredictionModelInput['context']): boolean {
-    if (context.fixture.live === true) return true;
-    const fixtureDate = context.fixture.fixtureDate instanceof Date
-      ? context.fixture.fixtureDate.getTime()
-      : new Date(context.fixture.fixtureDate).getTime();
-    if (!Number.isFinite(fixtureDate)) return false;
-    const now = Date.now();
-    const horizon = now + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000;
-    return fixtureDate >= now && fixtureDate <= horizon;
-  }
-
-  private isFinishedFixture(context: PredictionModelInput['context']): boolean {
-    const fixture = context.fixture;
-    if (fixture.completed === true) return true;
-    const statusText = [
-      fixture.status,
-      fixture.statusDetail,
-      fixture.statusShortDetail,
-    ].filter(Boolean).join(' ');
-    if (/postpon|\bpst\b|cancel|\bcanc\b|abandon|suspend|interrupt|delay|no[_ -]?contest/i.test(statusText)) {
-      return true;
-    }
-    return /(^|[^A-Z])(FINAL|FINISHED|FULL[ _-]?TIME|AFTER EXTRA TIME|AFTER PENALTIES|STATUS_FINAL|FT|AET|PEN)([^A-Z]|$)/i.test(statusText);
-  }
-
-  private getLiveMatchState(context: PredictionModelInput['context']): {
-    homeScore: number;
-    awayScore: number;
-    elapsedMinutes: number;
-  } | null {
-    const toScore = (value: unknown): number | null => {
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.floor(value);
-      if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)) && Number(value) >= 0) return Math.floor(Number(value));
-      return null;
-    };
-
-    let homeScore = toScore(context.fixture.homeScore);
-    let awayScore = toScore(context.fixture.awayScore);
-    const roots: Array<Record<string, any>> = [context.summary, context.fixture.payload];
-    const statusCandidates: Array<Record<string, any>> = [];
-
-    for (const root of roots) {
-      const header = root.header && typeof root.header === 'object' ? root.header : {};
-      const competitionLists = [
-        Array.isArray(header.competitions) ? header.competitions : [],
-        Array.isArray(root.competitions) ? root.competitions : [],
-      ];
-      for (const list of competitionLists) {
-        for (const competition of list) {
-          if (!competition || typeof competition !== 'object') continue;
-          const status = competition.status && typeof competition.status === 'object' ? competition.status : {};
-          statusCandidates.push(status);
-          const competitors = Array.isArray(competition.competitors) ? competition.competitors : [];
-          for (const competitor of competitors) {
-            if (!competitor || typeof competitor !== 'object') continue;
-            const side = String(competitor.homeAway ?? '').toLowerCase();
-            const score = toScore(competitor.score);
-            if (score === null) continue;
-            if (side === 'home' && homeScore === null) homeScore = score;
-            if (side === 'away' && awayScore === null) awayScore = score;
-          }
-        }
-      }
-      if (root.status && typeof root.status === 'object') statusCandidates.push(root.status);
-    }
-
-    if (homeScore === null || awayScore === null) return null;
-
-    let elapsedMinutes: number | null = null;
-    for (const status of statusCandidates) {
-      const period = toScore(status.period);
-      const clock = String(status.displayClock ?? status.clock ?? '').trim();
-      const match = clock.match(/^(?:(\d+):)?(\d{1,3}):(\d{2})$/);
-      if (match) {
-        const hours = match[1] === undefined ? 0 : Number(match[1]);
-        const minutes = Number(match[2]);
-        const seconds = Number(match[3]);
-        let parsed = hours * 60 + minutes + seconds / 60;
-        // Some feeds express the second-half clock as minutes since halftime.
-        if (period === 2 && parsed < 45) parsed += 45;
-        elapsedMinutes = Math.min(90, Math.max(0, parsed));
-        break;
-      }
-      if (period !== null) {
-        if (period <= 1) elapsedMinutes = 25;
-        else if (period === 2) elapsedMinutes = 65;
-        else elapsedMinutes = 90;
-        break;
-      }
-    }
-
-    if (elapsedMinutes === null) {
-      const kickoff = context.fixture.fixtureDate instanceof Date
-        ? context.fixture.fixtureDate.getTime()
-        : new Date(context.fixture.fixtureDate).getTime();
-      elapsedMinutes = Number.isFinite(kickoff)
-        ? Math.min(90, Math.max(0, (Date.now() - kickoff) / 60_000))
-        : 45;
-    }
-
-    return { homeScore, awayScore, elapsedMinutes: Math.round(elapsedMinutes * 10) / 10 };
-  }
-
-  private buildLiveFullTimeMatrix(
-    expectedGoals: PredictionModelInput['expectedGoals'],
-    liveState: { homeScore: number; awayScore: number; elapsedMinutes: number },
-  ): number[][] {
-    const remainingShare = Math.max(0, 90 - liveState.elapsedMinutes) / 90;
-    const remaining = PredictionMathUtil.scoreMatrix(
-      expectedGoals.home * remainingShare,
-      expectedGoals.away * remainingShare,
-      PREDICTION_ENGINE_CONFIG.model.maxGoals,
-    );
-    const rows = liveState.homeScore + remaining.length;
-    const columns = liveState.awayScore + (remaining[0]?.length ?? 0);
-    const finalMatrix = Array.from({ length: rows }, () => Array(columns).fill(0) as number[]);
-    for (let remainingHome = 0; remainingHome < remaining.length; remainingHome += 1) {
-      for (let remainingAway = 0; remainingAway < remaining[remainingHome].length; remainingAway += 1) {
-        finalMatrix[liveState.homeScore + remainingHome][liveState.awayScore + remainingAway] += remaining[remainingHome][remainingAway];
-      }
-    }
-    return finalMatrix;
-  }
 }
+
+
+
 

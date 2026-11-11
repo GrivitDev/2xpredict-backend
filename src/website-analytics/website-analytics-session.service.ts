@@ -6,6 +6,7 @@ import { AnalyticsVisitor, AnalyticsVisitorDocument, AnalyticsRecentSession } fr
 import { AnalyticsDailyAggregate, AnalyticsDailyDocument } from './schemas/analytics-daily.schema';
 import { AnalyticsVisitorType } from './enums/analytics-visitor-type.enum';
 import { TrackSessionDto } from './dto/track-session.dto';
+import { EndTrackSessionDto } from './dto/end-track-session.dto';
 
 const MAX_REMEMBERED_SESSIONS = 60;
 const MAX_RECENT_SESSIONS = 20;
@@ -120,16 +121,7 @@ export class WebsiteAnalyticsSessionService {
 
   async endSession(
     sessionId: string,
-    payload?: {
-      timestamp?: string;
-      path?: string;
-      durationMs?: number;
-      activeTimeMs?: number;
-      pageViews?: number;
-      eventCount?: number;
-      bounced?: boolean;
-      visitorId?: string;
-    },
+    payload?: EndTrackSessionDto,
     userId?: string,
     visitorId?: string,
   ) {
@@ -277,3 +269,4 @@ export class WebsiteAnalyticsSessionService {
     catch { return ''; }
   }
 }
+

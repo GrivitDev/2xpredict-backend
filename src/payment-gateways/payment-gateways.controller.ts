@@ -5,6 +5,7 @@ import {
   Get,
   Headers,
   Param,
+  Patch,
   Post,
   Query,
   Req,
@@ -14,6 +15,8 @@ import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { EmailVerifiedGuard } from '../common/guards/email-verified.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import { GetUser } from '../common/decorators/get-user.decorator';
 import { PaymentGatewaysService } from './payment-gateways.service';
 import { InitializePaymentDto } from './dto/initialize-payment.dto';
@@ -49,6 +52,18 @@ export class PaymentGatewaysController {
     });
   }
 
+  @Get('paystack/initialization/:reference')
+  @UseGuards(JwtAuthGuard)
+  getInitialization(
+    @GetUser() user: { _id: string },
+    @Param('reference') reference: string,
+  ) {
+    if (!reference || reference.length > 120) {
+      throw new BadRequestException('A valid payment reference is required.');
+    }
+    return this.paymentGatewaysService.getInitialization(reference, user._id);
+  }
+
   @Get('paystack/verify')
   @UseGuards(JwtAuthGuard)
   verifyPayment(
@@ -59,6 +74,16 @@ export class PaymentGatewaysController {
       throw new BadRequestException('A valid payment reference is required.');
     }
     return this.paymentGatewaysService.verifyPayment('paystack', reference, user._id);
+  }
+
+  @Roles('admin')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Patch('paystack/reconcile/:reference')
+  reconcilePayment(@Param('reference') reference: string) {
+    if (!reference || reference.length > 120) {
+      throw new BadRequestException('A valid payment reference is required.');
+    }
+    return this.paymentGatewaysService.reconcilePayment(reference);
   }
 
   @Post('paystack/webhook')
@@ -73,3 +98,4 @@ export class PaymentGatewaysController {
     );
   }
 }
+

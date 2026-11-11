@@ -14,19 +14,19 @@ export class Promo {
   @Prop({ required: true, trim: true }) name!: string;
   @Prop({ default: '' }) description?: string;
   @Prop({ unique: true, sparse: true, uppercase: true, trim: true, index: true }) promoCode?: string;
-  @Prop({ enum: PromoCampaignType, required: true, index: true }) campaignType!: PromoCampaignType;
+  @Prop({ type: String, enum: PromoCampaignType, required: true, index: true }) campaignType!: PromoCampaignType;
   @Prop({ enum: PromoPromotionKind, type: String, default: PromoPromotionKind.REWARD, index: true }) promotionKind!: PromoPromotionKind;
   @Prop({ enum: PromoPurpose, type: String, default: PromoPurpose.GENERAL, index: true }) purpose!: PromoPurpose;
   @Prop({ default: true, index: true }) isActive!: boolean;
   @Prop({ required: true, index: true }) startDate!: Date;
   @Prop({ required: true, index: true }) endDate!: Date;
-  @Prop({ enum: PromoRequirement, required: true, default: PromoRequirement.REGISTER }) requirement!: PromoRequirement;
+  @Prop({ type: String, enum: PromoRequirement, required: true, default: PromoRequirement.REGISTER }) requirement!: PromoRequirement;
   @Prop({ required: true, default: 1, min: 1 }) targetCount!: number;
 
   /** Existing referral/reward claim limit. 0 means unlimited. */
   @Prop({ default: 1, min: 0 }) maxClaims!: number;
   @Prop({ enum: RewardType, type: String, default: RewardType.SUBSCRIPTION }) rewardType!: RewardType;
-  @Prop({ enum: ['regular', 'vip', 'premium'] }) rewardPlan?: 'regular' | 'vip' | 'premium';
+  @Prop({ type: String, enum: ['regular', 'vip', 'premium'] }) rewardPlan?: 'regular' | 'vip' | 'premium';
   @Prop({ type: Number, min: 1, max: 365, default: 30 }) rewardDurationDays?: number;
   @Prop({ type: Number, min: 1, default: undefined }) pointsAmount?: number;
 
@@ -49,3 +49,4 @@ export class Promo {
 
 export const PromoSchema = SchemaFactory.createForClass(Promo);
 PromoSchema.index({ campaignType: 1, promotionKind: 1, isActive: 1, startDate: 1, endDate: 1 });
+

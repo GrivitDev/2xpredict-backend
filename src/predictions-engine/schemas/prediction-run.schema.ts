@@ -16,6 +16,10 @@ export class PredictionRun {
   @Prop({ required: true, type: Date, index: true })
   fixtureDate!: Date;
 
+  /** Exact retention deadline copied from the canonical Sports fixture. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date | null;
+
   @Prop({
     required: true,
     type: String,
@@ -26,6 +30,10 @@ export class PredictionRun {
 
   @Prop({ required: true, trim: true })
   modelVersion!: string;
+
+  /** Exact Sports fixture revision used by this prediction run. */
+  @Prop({ type: Number, min: 0, default: 0 })
+  fixtureSourceRevision!: number;
 
   @Prop({ required: true, type: Date, index: true })
   startedAt!: Date;
@@ -57,6 +65,15 @@ export class PredictionRun {
   @Prop({ type: Number, default: 0 })
   calculatedSelections!: number;
 
+  @Prop({ type: Number, min: 0, default: 0 })
+  persistedMarketDocuments!: number;
+
+  @Prop({ type: Number, min: 0, default: 0 })
+  preservedMarketDocuments!: number;
+
+  @Prop({ type: Number, min: 0, default: 0 })
+  persistenceBatches!: number;
+
   @Prop({ type: Number, min: 0, max: 98 })
   generalConfidence?: number;
 
@@ -86,3 +103,9 @@ PredictionRunSchema.index({ leagueId: 1, fixtureDate: 1 });
 
 
 
+
+
+PredictionRunSchema.index(
+  { retentionExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_prediction_run_retention' },
+);

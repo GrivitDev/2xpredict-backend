@@ -1,13 +1,12 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Interval } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { ConnectionStates, Model } from 'mongoose';
 import { CustomerCareJob } from '../schemas/customer-care-job.schema';
 import { DailyBroadcastService } from './daily-broadcast.service';
-import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 import { SupportEscalationService } from './support-escalation.service';
-import { TelegramService } from '../../telegram/telegram.service';
+import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 
 interface WorkerJob {
   _id: unknown;
@@ -21,13 +20,11 @@ interface WorkerJob {
 }
 
 @Injectable()
-export class CustomerCareWorkerService implements OnModuleDestroy {
+export class CustomerCareWorkerService implements OnModuleDestroy, OnModuleInit {
   private readonly logger = new Logger(CustomerCareWorkerService.name);
   private readonly broadcastHour: number;
   private running = false;
-  private supportNotificationsRunning = false;
   private stopped = false;
-  private lastDatabaseDownAlertAt = 0;
 
   constructor(
     @InjectModel(CustomerCareJob.name)
@@ -36,7 +33,6 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
     private readonly escalation: SupportEscalationService,
     private readonly config: ConfigService,
     private readonly systemMonitor: SystemMonitorService,
-    private readonly telegram: TelegramService,
   ) {
     const configured = Number(
       this.config.get<string>('CUSTOMER_CARE_BROADCAST_HOUR') ?? 8,
@@ -47,49 +43,34 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
         : 8;
   }
 
+  async onModuleInit(): Promise<void> {
+    // Retire legacy job rows from the removed private/admin Telegram notifier.
+    // Keep this best-effort so a temporary database outage does not block startup.
+    try {
+      await this.jobs.updateMany(
+        {
+          type: { $in: ['SUPPORT_NOTIFICATION', 'INCIDENT_ALERT'] },
+          status: { $in: ['PENDING', 'PROCESSING'] },
+        },
+        {
+          $set: {
+            status: 'FAILED',
+            lastError: 'Private/admin Telegram notifications are disabled. Only AI public-channel broadcasts are supported.',
+          },
+          $unset: { leaseExpiresAt: 1 },
+        },
+      ).exec();
+    } catch (error) {
+      this.logger.warn(
+        `Could not retire legacy private/admin Telegram jobs during startup: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   onModuleDestroy(): void {
     this.stopped = true;
   }
 
-  /** Support notifications are processed quickly; broadcasts keep their existing five-minute cadence. */
-  @Interval(2_000)
-  async tickSupportNotifications(): Promise<void> {
-    if (this.stopped || this.supportNotificationsRunning) return;
-    if (this.jobs.db.readyState !== ConnectionStates.connected) return;
-    this.supportNotificationsRunning = true;
-    try {
-      const job = await this.claimSupportNotificationJob();
-      if (job) await this.processJob(job);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Customer Care support-notification tick failed: ${message}`);
-    } finally {
-      this.supportNotificationsRunning = false;
-    }
-  }
-
-  private async claimSupportNotificationJob(): Promise<WorkerJob | null> {
-    const now = new Date();
-    return this.jobs.findOneAndUpdate(
-      {
-        type: 'SUPPORT_NOTIFICATION',
-        attempts: { $lt: 4 },
-        $or: [
-          { status: 'PENDING', scheduledAt: { $lte: now } },
-          { status: 'PROCESSING', leaseExpiresAt: { $lte: now } },
-        ],
-      },
-      {
-        $set: {
-          status: 'PROCESSING',
-          leaseExpiresAt: new Date(now.getTime() + 4 * 60_000),
-          lastError: '',
-        },
-        $inc: { attempts: 1 },
-      },
-      { returnDocument: 'after', sort: { scheduledAt: 1, createdAt: 1 } },
-    ).lean<WorkerJob>().exec();
-  }
 
   /** Five-minute durable-job tick. Event creation remains unchanged; queued work is picked up on the next tick. */
   @Interval(5 * 60_000)
@@ -98,11 +79,9 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
     this.running = true;
     try {
       // MongoDB-backed jobs cannot be claimed or persisted during a database
-      // outage. Report the outage through System Monitor and use a throttled,
-      // direct admin Telegram fallback because the durable alert queue is also
-      // unavailable while MongoDB is down.
+      // outage. Report the outage through System Monitor; broadcast jobs resume
+      // automatically when the database connection is restored.
       if (this.jobs.db.readyState !== ConnectionStates.connected) {
-        const nowMs = Date.now();
         const readyState = this.jobs.db.readyState;
         this.systemMonitor.reportModuleHealth('database', 'FAILED', {
           source: 'customer-care-worker',
@@ -120,22 +99,6 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
             checkedAt: new Date(),
           },
         );
-        if (nowMs - this.lastDatabaseDownAlertAt >= 15 * 60_000) {
-          this.lastDatabaseDownAlertAt = nowMs;
-          const delivered = (await this.telegram.sendMessage(
-            [
-              '2XPREDICT — DATABASE SERVICE ALERT',
-              '',
-              'MongoDB is unavailable, so Customer Care durable jobs and broadcasts are paused.',
-              `Mongoose readyState: ${readyState}`,
-              'The Customer Care worker will resume when the database connection is restored.',
-            ].join('\n'),
-          )) as boolean;
-          if (!delivered)
-            this.logger.warn(
-              'Database-outage fallback alert could not be delivered to the admin Telegram channel.',
-            );
-        }
         return;
       }
 
@@ -217,6 +180,7 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
     return this.jobs
       .findOneAndUpdate(
         {
+          type: { $in: ['DAILY_PICKS', 'PROMOTION'] },
           attempts: { $lt: 4 },
           $or: [
             { status: 'PENDING', scheduledAt: { $lte: now } },
@@ -244,15 +208,6 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
         result = await this.broadcasts.publishDailyPicks(job.dateKey);
       else if (job.type === 'PROMOTION')
         result = await this.broadcasts.publishDailyPromotions(job.dateKey);
-      else if (job.type === 'INCIDENT_ALERT')
-        result = await this.escalation.retryTelegramAlert(
-          String(job.sourceId || ''),
-        );
-      else if (job.type === 'SUPPORT_NOTIFICATION')
-        result = await this.escalation.deliverSupportNotification(
-          String(job.sourceId || ''),
-          job.payload ?? {},
-        );
       else
         throw new Error(
           `Unsupported Customer Care job type: ${String(job.type)}`,
@@ -291,19 +246,19 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
       }
       if (result.requiresAdminReview === true) {
         // An ambiguous public-channel delivery must never be blindly replayed.
-        // Preserve the broadcast's manual-review flag and alert the admin through
-        // the same durable incident/Telegram path used for technical incidents.
+        // Preserve the broadcast's manual-review flag and record an incident
+        // for the existing Customer Care admin workspace. No Telegram alert is sent.
         await this.escalation.createIncident({
           category: 'TELEGRAM_BROADCAST_DELIVERY',
           severity: 'HIGH',
-          summary: `The ${String(job.type)} Telegram broadcast requires manual delivery verification before any retry.`,
+          summary: `The ${String(job.type)} public-channel broadcast requires manual delivery verification before any retry.`,
           evidence: [
             `Job: ${String(job.jobKey)}.`,
             `Broadcast ID: ${safeText(result.broadcastId, 'unknown')}.`,
-            `Reason: ${safeText(result.reason, 'Telegram delivery outcome is ambiguous.').slice(0, 250)}.`,
+            `Reason: ${safeText(result.reason, 'Public-channel delivery outcome is ambiguous.').slice(0, 250)}.`,
           ],
           attemptedActions: [
-            'The worker stopped automatic replay because Telegram may already have accepted the post.',
+            'The worker stopped automatic replay because the public channel may already have accepted the post.',
             'Administrator must inspect the public channel before confirming a retry.',
           ],
           fingerprint: `CUSTOMER_CARE_BROADCAST_REVIEW:${String(job.jobKey)}`,
@@ -353,7 +308,7 @@ export class CustomerCareWorkerService implements OnModuleDestroy {
       this.logger.error(
         `Customer Care job ${String(job.jobKey)} failed (attempt ${attempts}): ${message}`,
       );
-      if (!canRetry && job.type !== 'INCIDENT_ALERT') {
+      if (!canRetry) {
         await this.escalation
           .createIncident({
             category: 'CUSTOMER_CARE_WORKER',
@@ -404,3 +359,4 @@ function lagosHour(value: Date): number {
   }).format(value);
   return Number(hour) % 24;
 }
+

@@ -3,8 +3,7 @@ import {
   MarketDefinition,
   MarketSelectionDefinition,
 } from '../interfaces/market-catalog.interface';
-import { PredictionMatchContext } from '../interfaces/espn-prediction-context.interface';
-import { EspnPayloadUtil } from './espn-payload.util';
+import { PredictionMatchContext } from '../interfaces/prediction-match-context.interface';
 
 function lineSlug(line: number): string {
   return String(line).replace('-', 'MINUS_').replace('.', '_');
@@ -211,71 +210,14 @@ export function expandMarketSelections(
   }
 
   if (definition.selectionMode === 'PLAYER') {
-    const summary = EspnPayloadUtil.asRecord(context.summary);
-    const rosterTeams = EspnPayloadUtil.asArray(summary.rosters);
-    const selections: ExpandedMarketSelection[] = [];
-    const seen = new Set<string>();
-    for (const teamRoster of rosterTeams) {
-      const team = EspnPayloadUtil.asRecord(teamRoster);
-      const roster = EspnPayloadUtil.asArray(team.roster);
-      const teamId = String(EspnPayloadUtil.asRecord(team.team).id ?? '');
-      for (const rawPlayer of roster) {
-        const player = EspnPayloadUtil.asRecord(rawPlayer);
-        const athlete = EspnPayloadUtil.asRecord(player.athlete);
-        const athleteId = String(athlete.id ?? '');
-        const athleteName = EspnPayloadUtil.firstNonEmpty(
-          athlete.displayName,
-          athlete.fullName,
-          athlete.name,
-        );
-        if (!athleteId || !athleteName || seen.has(athleteId)) continue;
-        if (player.active === false) continue;
-        seen.add(athleteId);
-        const shortName = String(athlete.shortName ?? athleteName);
-        if (definition.lines?.length) {
-          for (const line of definition.lines) {
-            selections.push({
-              key: `PLAYER_${athleteId}_OVER_${lineSlug(line)}`,
-              jsonVariable: `player${athleteId}Over${lineVariable(line)}`,
-              fullName: `${athleteName} Over ${line}`,
-              abbreviation: `${shortName} O${line}`,
-              line,
-              subjectId: athleteId,
-              subjectName: athleteName,
-              subjectAbbreviation: shortName,
-              subjectTeamId: teamId,
-            });
-            selections.push({
-              key: `PLAYER_${athleteId}_UNDER_${lineSlug(line)}`,
-              jsonVariable: `player${athleteId}Under${lineVariable(line)}`,
-              fullName: `${athleteName} Under ${line}`,
-              abbreviation: `${shortName} U${line}`,
-              line,
-              subjectId: athleteId,
-              subjectName: athleteName,
-              subjectAbbreviation: shortName,
-              subjectTeamId: teamId,
-            });
-          }
-        } else {
-          selections.push({
-            key: `PLAYER_${athleteId}`,
-            jsonVariable: `player${athleteId}`,
-            fullName: athleteName,
-            abbreviation: shortName,
-            subjectId: athleteId,
-            subjectName: athleteName,
-            subjectAbbreviation: shortName,
-            subjectTeamId: teamId,
-          });
-        }
-      }
-    }
-    return selections;
+    // Canonical player markets remain disabled until Sports exposes validated
+    // per-appearance athlete history. A roster alone is not probability evidence.
+    return [];
   }
 
   return definition.selections.map((selection) => ({ ...selection }));
 }
+
 
 
 

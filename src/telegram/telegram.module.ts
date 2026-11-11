@@ -1,12 +1,16 @@
 import { Module } from '@nestjs/common';
-import { TelegramService } from './telegram.service';
-import { UserHandler } from './handlers/user.handler';
-import { PaymentHandler } from './handlers/payment.handler';
+import { ConfigModule } from '@nestjs/config';
 import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
+import { TelegramService } from './telegram.service';
+
 @Module({
+  imports: [ConfigModule],
   providers: [
-    adminRealtimeRegistrationProvider('telegram', 'Telegram: notification delivery and integration operations.'),
-    TelegramService, UserHandler, PaymentHandler,
+    adminRealtimeRegistrationProvider(
+      'telegram',
+      'Telegram: AI-generated public-channel broadcasts only.',
+    ),
+    TelegramService,
   ],
   exports: [TelegramService],
 })

@@ -6,12 +6,12 @@ import { MongooseModule } from '@nestjs/mongoose';
 
 import { PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
+import { PaymentProcessingWorker } from './payment-processing.worker';
 
 import { Payment, PaymentSchema } from './schemas/payment.schema';
 
 import { UsersModule } from '../users/users.module';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
-import { TelegramModule } from '../telegram/telegram.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { ReferralsModule } from '../referrals/referrals.module';
 import { PlanConfigModule } from '../plan-config/plan-config.module';
@@ -30,7 +30,6 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
 
     UsersModule,
     SubscriptionsModule,
-    TelegramModule,
     RealtimeModule,
     ReferralsModule,
     PlanConfigModule,
@@ -42,6 +41,7 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
   providers: [
     adminRealtimeRegistrationProvider('payments', 'Payments: manual payments, gateway updates and payment processing events.'),
     PaymentsService,
+    PaymentProcessingWorker,
     JwtAuthGuard,
     EmailVerifiedGuard,
     RolesGuard,
@@ -49,4 +49,6 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
   exports: [PaymentsService],
 })
 export class PaymentsModule {}
+
+
 

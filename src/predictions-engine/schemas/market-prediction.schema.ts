@@ -186,6 +186,10 @@ export class MarketSelectionPrediction {
   @Prop({ type: String, trim: true })
   settlementSourceFingerprint?: string;
 
+  /** Whether the market outcome became final in-play, at half-time or full-time. */
+  @Prop({ type: String, enum: ['IN_PLAY', 'HALF_TIME', 'FULL_TIME'] })
+  settlementPhase?: 'IN_PLAY' | 'HALF_TIME' | 'FULL_TIME';
+
   /** Append-only audit trail for controlled historical outcome corrections. */
   @Prop({ type: [Object], default: [] })
   settlementHistory?: Array<Record<string, unknown>>;
@@ -271,6 +275,10 @@ export class MarketPrediction {
   @Prop({ required: true, trim: true })
   modelVersion!: string;
 
+  /** Exact Sports fixture revision used as the source snapshot for this market calculation. */
+  @Prop({ type: Number, min: 0, default: 0 })
+  fixtureSourceRevision!: number;
+
   @Prop({ required: true, trim: true })
   calculationMethod!: string;
 
@@ -286,6 +294,10 @@ export class MarketPrediction {
   /** Unknown remains null; this must not be backfilled with generic fixture collection time. */
   @Prop({ type: Date, required: false, default: null, index: true })
   sourceSummaryCollectedAt?: Date | null;
+
+  /** Exact retention deadline copied from the canonical Sports fixture. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date | null;
 
   @Prop({ type: Date, required: true, index: true })
   generatedAt!: Date;
@@ -311,6 +323,12 @@ MarketPredictionSchema.index({
   'selections.probability': -1,
 });
 MarketPredictionSchema.index({ 'selections.actualOutcome': 1, marketKey: 1 });
+MarketPredictionSchema.index(
+  { retentionExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_prediction_market_retention' },
+);
+
+
 
 
 

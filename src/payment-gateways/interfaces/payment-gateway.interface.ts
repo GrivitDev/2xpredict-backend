@@ -18,7 +18,11 @@ export interface InitializePaymentResult {
   reference: string;
 }
 
-export type PaymentVerificationStatus = 'success' | 'pending' | 'failed';
+export type PaymentVerificationStatus =
+  | 'success'
+  | 'pending'
+  | 'failed'
+  | 'unknown';
 
 export interface VerifyPaymentResult {
   success: boolean;
@@ -26,6 +30,9 @@ export interface VerifyPaymentResult {
   status: PaymentVerificationStatus;
 
   transactionId?: string;
+
+  /** Reference returned by the provider; required before approval. */
+  reference?: string;
 
   message?: string;
 
@@ -65,6 +72,7 @@ export interface PaymentGateway {
    * success
    * pending
    * failed
+   * unknown (the provider did not return a conclusive transaction state)
    */
   verifyPayment(reference: string): Promise<VerifyPaymentResult>;
 
@@ -79,4 +87,5 @@ export interface PaymentGateway {
    */
   parseWebhook(payload: any): Promise<WebhookEvent>;
 }
+
 

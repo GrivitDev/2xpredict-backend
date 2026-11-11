@@ -59,6 +59,9 @@ export class BetLabController {
         fullName: market.fullName,
         abbreviation: market.abbreviation,
         available: market.available,
+        pricingEnabled: market.pricingEnabled,
+        availableSelectionCount: market.availableSelectionCount,
+        notes: market.notes,
         selections: market.selections.map((selection) => ({
           code: selection.code,
           jsonVariable: selection.jsonVariable,
@@ -66,6 +69,20 @@ export class BetLabController {
           abbreviation: selection.abbreviation,
           available: selection.available,
           decimalOdds: selection.decimalOdds,
+          fairOdds: selection.fairOdds,
+          fairOddsBasis: selection.fairOddsBasis,
+          marketFairOdds: selection.marketFairOdds,
+          impliedProbability: selection.impliedProbability,
+          fairProbability: selection.fairProbability,
+          valuePercent: selection.valuePercent,
+          dataQuality: selection.dataQuality,
+          sampleSize: selection.sampleSize,
+          calculationVersion: selection.calculationVersion,
+          sourceRevision: selection.sourceRevision,
+          sourceDataUpdatedAt: selection.sourceDataUpdatedAt,
+          provider: selection.provider,
+          oddsFreshUntil: selection.oddsFreshUntil,
+          isFresh: selection.isFresh,
           /** Odds price the user sees belongs to the virtual Bet Lab game. */
           oddsMode: 'VIRTUAL_GAME' as const,
           oddsSource: selection.oddsSource,
@@ -111,3 +128,4 @@ export class BetLabController {
     return this.statisticsService.getUserStatistics(authenticatedUserId(user));
   }
 }
+

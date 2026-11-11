@@ -14,10 +14,9 @@ import { UserSessionModule } from '../user-session/user-session.module'; // ✅ 
 import { JwtStrategy } from './strategies/jwt.strategy';
 
 import { OtpModule } from '../otp/otp.module';
-import { TelegramModule } from '../telegram/telegram.module';
 import { ReferralsModule } from '../referrals/referrals.module';
 import { PromosModule } from '../promos/promos.module';
-import { EmailModule } from '../notifications/email.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { CommonModule } from '../common/common.module';
 
 @Module({
@@ -26,9 +25,8 @@ import { CommonModule } from '../common/common.module';
     UserSessionModule,
     ReferralsModule,
     OtpModule,
-    TelegramModule,
     PromosModule,
-    EmailModule,
+    NotificationsModule,
     CommonModule,
 
     PassportModule.register({
@@ -58,4 +56,3 @@ import { CommonModule } from '../common/common.module';
   exports: [PassportModule, JwtStrategy],
 })
 export class AuthModule {}
-

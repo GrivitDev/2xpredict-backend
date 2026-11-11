@@ -315,7 +315,7 @@ export class MarketCalibrationService {
    */
   async refreshAllIfStale(force = false): Promise<Record<string, unknown>> {
     const now = Date.now();
-    if (!force && now - this.lastRefreshCheckAt < 5 * 60_000) {
+    if (!force && now - this.lastRefreshCheckAt < PREDICTION_ENGINE_CONFIG.calibration.checkIntervalMs) {
       return { skipped: true, reason: 'CHECK_THROTTLED' };
     }
     this.lastRefreshCheckAt = now;
@@ -388,5 +388,6 @@ export class MarketCalibrationService {
       .exec();
   }
 }
+
 
 

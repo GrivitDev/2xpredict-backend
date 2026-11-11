@@ -65,6 +65,7 @@ export class InternalAd {
   image!: string;
 
   @Prop({
+    type: String,
     enum: DisplayLevel,
     default: DisplayLevel.MEDIUM,
     index: true,
@@ -97,3 +98,4 @@ export class InternalAd {
 }
 
 export const InternalAdSchema = SchemaFactory.createForClass(InternalAd);
+

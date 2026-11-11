@@ -7,6 +7,10 @@ export type PlanConfigDocument = HydratedDocument<PlanConfig>;
   timestamps: true,
 })
 export class PlanConfig {
+  /** Stable singleton key; legacy records are adopted on first read. */
+  @Prop({ type: String, enum: ['primary'], default: undefined })
+  configKey?: 'primary';
+
   // ===========================
   // Nigeria Pricing
   // ===========================
@@ -109,3 +113,12 @@ export class PlanConfig {
 }
 
 export const PlanConfigSchema = SchemaFactory.createForClass(PlanConfig);
+PlanConfigSchema.index(
+  { configKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { configKey: { $type: 'string' } },
+    name: 'plan_config_singleton_key_unique',
+  },
+);
+

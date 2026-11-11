@@ -17,6 +17,10 @@ export class PredictionSlipLeg {
   @Prop({ required: true, type: Date })
   fixtureDate!: Date;
 
+  /** Exact season-relative expiry for this fixture leg. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date | null;
+
   @Prop({ required: true, trim: true })
   marketPredictionId!: string;
 
@@ -96,6 +100,16 @@ export class PredictionSlipLeg {
 
   @Prop({ type: Date })
   settledAt?: Date;
+
+  /** Provenance is retained so a changed Sports source can revise only provisional outcomes. */
+  @Prop({ type: String, enum: ['IN_PLAY', 'HALF_TIME', 'FULL_TIME'] })
+  settlementPhase?: 'IN_PLAY' | 'HALF_TIME' | 'FULL_TIME';
+
+  @Prop({ type: String, trim: true })
+  settlementSourceFingerprint?: string;
+
+  @Prop({ type: [Object], default: [] })
+  settlementHistory?: Array<Record<string, unknown>>;
 }
 export const PredictionSlipLegSchema =
   SchemaFactory.createForClass(PredictionSlipLeg);
@@ -104,6 +118,10 @@ export const PredictionSlipLegSchema =
 export class PredictionSlip {
   @Prop({ required: true, unique: true, trim: true, index: true })
   slipCode!: string;
+
+  /** Latest expiry among all legs; a mixed-season slip cannot expire early. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date | null;
 
   @Prop({ required: true, trim: true })
   name!: string;
@@ -204,6 +222,10 @@ export class PredictionSlip {
   @Prop({ type: Date })
   publishedAt?: Date;
 
+  /** Timestamp at which the slip's selected legs and prices became immutable. */
+  @Prop({ type: Date, index: true })
+  snapshotFrozenAt?: Date;
+
   @Prop({ type: String, trim: true })
   fingerprint?: string;
 
@@ -251,3 +273,10 @@ PredictionSlipSchema.index({
 
 
 
+
+
+
+PredictionSlipSchema.index(
+  { retentionExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_prediction_slip_retention' },
+);

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Promo } from './schemas/promo.schema';
@@ -7,17 +7,23 @@ import { PromoRewardStatus } from './constants/promo-reward-status';
 import { PromoParticipant } from './schemas/promo-participant.schema';
 import { PromoRedemption, PromoRedemptionStatus } from './schemas/promo-redemption.schema';
 import { PromoClaim, PromoClaimStatus } from './schemas/promo-claim.schema';
+import { SystemMonitorService } from '../system-monitor/system-monitor.service';
 
 type MonitorCheck = { name: string; status: 'OK' | 'FAILED'; value?: unknown; error?: string };
 
 @Injectable()
-export class PromosMonitorService {
+export class PromosMonitorService implements OnModuleInit {
+  onModuleInit(): void {
+    this.systemMonitor.registerModule('promos');
+  }
+
   constructor(
     @InjectModel(Promo.name) private readonly promoModel: Model<Promo>,
     @InjectModel(PromoReward.name) private readonly rewardModel: Model<PromoReward>,
     @InjectModel(PromoParticipant.name) private readonly participantModel: Model<PromoParticipant>,
     @InjectModel(PromoRedemption.name) private readonly redemptionModel: Model<PromoRedemption>,
     @InjectModel(PromoClaim.name) private readonly claimModel: Model<PromoClaim>,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   private async safeQuery<T>(checks: MonitorCheck[], name: string, query: () => Promise<T>, fallback: T): Promise<T> {
@@ -32,6 +38,19 @@ export class PromosMonitorService {
   }
 
   async getOverview() {
+    try {
+      return await this.buildOverview();
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('promos', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{ name: 'getOverview', status: 'FAILED', error: error instanceof Error ? error.message : String(error) }],
+      });
+      throw error;
+    }
+  }
+
+  private async buildOverview() {
     const checkedAt = new Date();
     const now = new Date();
     const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
@@ -73,7 +92,7 @@ export class PromosMonitorService {
     if (pendingRewards + approvedRewards > 0) warnings.push(`${pendingRewards + approvedRewards} reward(s) are not yet marked paid.`);
     if (checks.some((check) => check.status === 'FAILED')) warnings.push('One or more monitoring queries failed.');
 
-    return {
+    const overview = {
       module: 'promos',
       checkedAt,
       status: !databaseReady || warnings.length ? 'DEGRADED' : 'OK',
@@ -88,5 +107,19 @@ export class PromosMonitorService {
       checks,
       warnings,
     };
+    this.systemMonitor.reportMonitorSnapshot('promos', {
+      status: overview.status,
+      checkedAt,
+      checks,
+      warnings,
+      details: {
+        databaseConnected: databaseReady,
+        activeCampaigns: activePromos,
+        expiredActiveCampaigns: expiredActive,
+        staleReservations,
+        unpaidRewards: pendingRewards + approvedRewards,
+      },
+    });
+    return overview;
   }
 }

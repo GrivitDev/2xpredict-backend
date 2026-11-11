@@ -15,6 +15,7 @@ export class Subscription {
   email!: string;
 
   @Prop({
+    type: String,
     enum: ['regular', 'vip', 'premium'],
     required: true,
   })
@@ -49,4 +50,5 @@ export class Subscription {
 
 export const SubscriptionSchema = SchemaFactory.createForClass(Subscription);
 SubscriptionSchema.index({ sourceReference: 1 }, { unique: true, sparse: true });
+
 

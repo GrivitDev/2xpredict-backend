@@ -1,10 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
 import { MarketModel } from '../enums/market-model.enum';
-import {
+import type {
   ExpectedGoalsModel,
   PredictionMatchContext,
-} from '../interfaces/espn-prediction-context.interface';
+} from '../interfaces/prediction-match-context.interface';
 
 export interface ConfidenceResult {
   /** Evidence quality score from 0 to 98; it is not the probability of winning. */
@@ -56,7 +56,7 @@ export class PredictionConfidenceService {
     const isScoreBasedModel = marketModel === MarketModel.SCORE_MATRIX || marketModel === MarketModel.PERIOD_MATRIX;
     const isCountModel = marketModel === MarketModel.COUNT_MODEL;
     const isEventRateModel = marketModel === MarketModel.EVENT_RATE;
-    const requiresRoster = marketModel === MarketModel.PLAYER_MODEL;
+    const requiresPlayerEvidence = marketModel === MarketModel.PLAYER_MODEL;
     const historySignal = Math.min(1, Math.sqrt(Math.min(homeMatches, awayMatches) / cfg.historicalMatchesPerTeam));
     const leagueCount = Math.max(completedLeagueMatches.length, modelEvidence?.leagueSamples ?? 0);
     const leagueSignal = Math.min(1, leagueCount / cfg.leagueMatches);
@@ -70,18 +70,19 @@ export class PredictionConfidenceService {
     const standingsSignal = modelEvidence
       ? (modelEvidence.standingsStrengthAvailable ? 1 : 0)
       : (context.hasStandings ? 0.5 : 0);
-    // Roster availability is relevant to player-specific markets only. A
-    // missing current-fixture roster must not lower match-result confidence.
-    const rosterSignal = requiresRoster ? (context.hasRosters ? 1 : 0) : 0;
-    // An absent Summary is unknown, not evidence that stored historical
-    // fixtures are stale. Give it neutral freshness credit; do not assume fresh.
-    const freshnessSignal = context.summaryAgeHours === null
+    // Player markets require validated player appearance denominators, not a
+    // guessed roster/lineup flag. The current Sports read contract does not
+    // expose that evidence, so this signal remains false until it genuinely does.
+    const playerEvidenceSignal = requiresPlayerEvidence
+      ? (context.hasPlayerAppearanceEvidence ? 1 : 0)
+      : 0;
+    const freshnessSignal = context.sportsDataAgeHours === null
       ? 0.5
-      : context.summaryAgeHours <= 6
+      : context.sportsDataAgeHours <= 6
         ? 1
-        : context.summaryAgeHours <= 24
+        : context.sportsDataAgeHours <= 24
           ? 0.8
-          : context.summaryAgeHours <= cfg.sourceSummaryStaleHours
+          : context.sportsDataAgeHours <= cfg.sourceDataStaleHours
             ? 0.55
             : 0.15;
     const marketSignal = Math.max(0, Math.min(1, Number.isFinite(marketSpecificDataQuality) ? marketSpecificDataQuality : 0));
@@ -93,41 +94,36 @@ export class PredictionConfidenceService {
       headToHead: h2hSignal,
       recentForm: formSignal,
       standings: standingsSignal,
-      rosters: rosterSignal,
+      playerEvidence: playerEvidenceSignal,
       freshness: freshnessSignal,
       marketSpecificData: marketSignal,
     };
 
     // Confidence measures evidence coverage, not outcome probability. When a
-    // signal is irrelevant (rosters for a goals market), remove its weight and
-    // renormalize instead of silently rewarding or penalizing missing data.
-    // Confidence follows the evidence domain used by the market. A market
-    // based on corner/card/shots observations should not be scored as if it
-    // depended on goal-score history; player/event markets have their own
-    // relevant evidence requirements too.
+    // signal is irrelevant to a market, remove its weight and renormalize.
     const weights = isScoreBasedModel
       ? {
           history: 0.35, league: 0.10, odds: 0.12, h2h: 0.05,
-          form: 0.16, standings: 0.08, roster: 0, freshness: 0.04, market: 0.05,
+          form: 0.16, standings: 0.08, playerEvidence: 0, freshness: 0.04, market: 0.05,
         }
       : isCountModel
         ? {
             history: 0.05, league: 0.05, odds: 0.12, h2h: 0,
-            form: 0.02, standings: 0, roster: 0, freshness: 0.04, market: 0.72,
+            form: 0.02, standings: 0, playerEvidence: 0, freshness: 0.04, market: 0.72,
           }
         : isEventRateModel
           ? {
               history: 0.02, league: 0.02, odds: 0.12, h2h: 0,
-              form: 0, standings: 0, roster: 0, freshness: 0.04, market: 0.80,
+              form: 0, standings: 0, playerEvidence: 0, freshness: 0.04, market: 0.80,
             }
-          : requiresRoster
+          : requiresPlayerEvidence
             ? {
                 history: 0.02, league: 0.02, odds: 0.12, h2h: 0,
-                form: 0, standings: 0, roster: 0.26, freshness: 0.04, market: 0.54,
+                form: 0, standings: 0, playerEvidence: 0.26, freshness: 0.04, market: 0.54,
               }
             : {
                 history: 0.35, league: 0.10, odds: 0.12, h2h: 0.05,
-                form: 0.16, standings: 0.08, roster: 0, freshness: 0.04, market: 0.05,
+                form: 0.16, standings: 0.08, playerEvidence: 0, freshness: 0.04, market: 0.05,
               };
     const confidenceWeightTotal = Object.values(weights).reduce((sum, weight) => sum + weight, 0);
     const weightedEvidence = (
@@ -137,7 +133,7 @@ export class PredictionConfidenceService {
       + h2hSignal * weights.h2h
       + formSignal * weights.form
       + standingsSignal * weights.standings
-      + rosterSignal * weights.roster
+      + playerEvidenceSignal * weights.playerEvidence
       + freshnessSignal * weights.freshness
       + marketSignal * weights.market
     ) / confidenceWeightTotal;
@@ -146,26 +142,26 @@ export class PredictionConfidenceService {
     const qualityWeights = isScoreBasedModel
       ? {
           history: 0.35, league: 0.16, odds: 0.12, h2h: 0.05,
-          form: 0.16, standings: 0.07, roster: 0, freshness: 0.03, market: 0.03,
+          form: 0.16, standings: 0.07, playerEvidence: 0, freshness: 0.03, market: 0.03,
         }
       : isCountModel
         ? {
             history: 0.05, league: 0.05, odds: 0.12, h2h: 0,
-            form: 0.02, standings: 0, roster: 0, freshness: 0.04, market: 0.72,
+            form: 0.02, standings: 0, playerEvidence: 0, freshness: 0.04, market: 0.72,
           }
         : isEventRateModel
           ? {
               history: 0.02, league: 0.02, odds: 0.12, h2h: 0,
-              form: 0, standings: 0, roster: 0, freshness: 0.04, market: 0.80,
+              form: 0, standings: 0, playerEvidence: 0, freshness: 0.04, market: 0.80,
             }
-          : requiresRoster
+          : requiresPlayerEvidence
             ? {
                 history: 0.02, league: 0.02, odds: 0.12, h2h: 0,
-                form: 0, standings: 0, roster: 0.26, freshness: 0.04, market: 0.54,
+                form: 0, standings: 0, playerEvidence: 0.26, freshness: 0.04, market: 0.54,
               }
             : {
                 history: 0.35, league: 0.16, odds: 0.12, h2h: 0.05,
-                form: 0.16, standings: 0.07, roster: 0, freshness: 0.03, market: 0.03,
+                form: 0.16, standings: 0.07, playerEvidence: 0, freshness: 0.03, market: 0.03,
               };
     const qualityWeightTotal = Object.values(qualityWeights).reduce((sum, weight) => sum + weight, 0);
     const dataQuality = Math.max(0, Math.min(1, (
@@ -175,7 +171,7 @@ export class PredictionConfidenceService {
       + h2hSignal * qualityWeights.h2h
       + formSignal * qualityWeights.form
       + standingsSignal * qualityWeights.standings
-      + rosterSignal * qualityWeights.roster
+      + playerEvidenceSignal * qualityWeights.playerEvidence
       + freshnessSignal * qualityWeights.freshness
       + marketSignal * qualityWeights.market
     ) / qualityWeightTotal));
@@ -188,14 +184,17 @@ export class PredictionConfidenceService {
     }
     if (isScoreBasedModel && leagueCount < 30) notes.push(`Limited completed league score sample (${leagueCount}); league-baseline uncertainty is higher.`);
     if (!hasUsableMatchOdds) notes.push('No fresh provider quote was available for this market; bookmaker value cannot be established from this market result.');
-    if (!context.summaryAvailable) notes.push('The current ESPN Summary is missing. Recent form and head-to-head are reconstructed from dated prior ESPN fixtures when available; target-summary absence alone does not block a market supported by historical evidence.');
-    if (context.summaryAgeHours === null) notes.push('Current Summary freshness is unknown; no freshness bonus was assumed.');
-    else if (context.summaryAgeHours > cfg.sourceSummaryStaleHours) notes.push('ESPN Summary is older than the configured freshness window.');
+    if (!context.summaryAvailable) notes.push('The current normalized Sports match projection is unavailable; markets without an independent historical data path remain unavailable.');
+    if (context.sportsDataAgeHours === null) notes.push('Normalized Sports fixture freshness is unknown; no freshness bonus was assumed.');
+    else if (context.sportsDataAgeHours > cfg.sourceDataStaleHours) notes.push('Normalized Sports fixture data is older than the configured freshness window.');
     if (isScoreBasedModel && !standingsSignal) notes.push('Usable points-per-game standings strength was not matched for both target teams.');
-    if (requiresRoster && !context.hasRosters) notes.push('Roster evidence was unavailable; player-specific markets may remain unavailable.');
-    if (isScoreBasedModel && modelEvidence?.evidenceLevel === 'INSUFFICIENT') notes.push('Independent core statistical evidence was insufficient. The market calculation may use the Odds-module quote as a low-evidence fallback; treat confidence as limited.');
+    if (requiresPlayerEvidence && !context.hasPlayerAppearanceEvidence) {
+      notes.push('Validated pre-match player appearance rates are unavailable from the current Sports read contract; player-specific probabilities remain withheld.');
+    }
+    if (isScoreBasedModel && modelEvidence?.evidenceLevel === 'INSUFFICIENT') {
+      notes.push('Independent core statistical evidence was insufficient. Score-based predictions are withheld; Odds-module quotes remain separate price information and are not substituted for model probabilities.');
+    }
 
     return { confidence, evidenceConfidence: confidence, dataQuality, signals, notes };
   }
 }
-

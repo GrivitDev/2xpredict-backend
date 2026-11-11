@@ -5,14 +5,7 @@ import { EmailVerifiedGuard } from '../common/guards/email-verified.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
 import { OddsModule } from '../odds/odds.module';
-import {
-  EspnFixture,
-  EspnFixtureSchema,
-} from '../sports/schemas/espn/espn-fixture.schema';
-import {
-  EspnLeague,
-  EspnLeagueSchema,
-} from '../sports/schemas/espn/espn-league.schema';
+import { SportsModule } from '../sports/sports.module';
 import { BetLabAdminController } from './controllers/bet-lab-admin.controller';
 import { BetLabController } from './controllers/bet-lab.controller';
 import { BetLabWalletController } from './controllers/bet-lab-wallet.controller';
@@ -51,10 +44,9 @@ import { SettlementModule } from '../settlement/settlement.module';
   imports: [
     SubscriptionsModule,
     OddsModule,
+    SportsModule,
     forwardRef(() => SettlementModule),
     MongooseModule.forFeature([
-      { name: EspnFixture.name, schema: EspnFixtureSchema },
-      { name: EspnLeague.name, schema: EspnLeagueSchema },
       { name: BetLabWallet.name, schema: BetLabWalletSchema },
       { name: BetLabWalletLedger.name, schema: BetLabWalletLedgerSchema },
       { name: BetLabTicket.name, schema: BetLabTicketSchema },
@@ -93,3 +85,4 @@ import { SettlementModule } from '../settlement/settlement.module';
   ],
 })
 export class BetLabModule {}
+

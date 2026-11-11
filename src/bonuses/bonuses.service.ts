@@ -22,6 +22,7 @@ import { BulkGrantPointsBonusDto } from './dto/bulk-grant-points-bonus.dto';
 import { BulkGrantSubscriptionBonusDto } from './dto/bulk-grant-subscription-bonus.dto';
 import { BonusBulkGrantJob } from './schemas/bonus-bulk-grant-job.schema';
 import { BonusBulkJobStatus } from './enums/bonus-bulk-job-status.enum';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -39,6 +40,7 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
     private readonly usersService: UsersService,
     private readonly walletService: BetLabWalletService,
     private readonly subscriptionsService: SubscriptionsService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   async grantPoints(dto: GrantPointsBonusDto, adminId: string) {
@@ -72,6 +74,17 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
       );
       grant.status = BonusStatus.GRANTED;
       await grant.save();
+    }
+    if (grant.status === BonusStatus.GRANTED) {
+      // Stable event keys make this safe on retries and repair a crash between
+      // persisting the grant and enqueueing its notification.
+      await this.notificationEvents.bonusGranted({
+        userId: grant.userId,
+        grantId: String(grant._id),
+        kind: 'points',
+        points: Number(grant.points),
+        reason: grant.reason,
+      });
     }
     return this.present(grant);
   }
@@ -110,6 +123,26 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
     if (grant.status !== BonusStatus.GRANTED) {
       grant.status = BonusStatus.GRANTED;
       await grant.save();
+    }
+    if (grant.status === BonusStatus.GRANTED) {
+      // Stable event keys make this safe on retries and repair a crash between
+      // persisting the grant and enqueueing its notification.
+      await this.notificationEvents.bonusGranted({
+        userId: grant.userId,
+        grantId: String(grant._id),
+        kind: 'subscription',
+        plan: grant.plan,
+        durationDays: grant.durationDays,
+        reason: grant.reason,
+      });
+      if (grant.expiresAt) {
+        await this.notificationEvents.bonusExpiryScheduled({
+          userId: grant.userId,
+          grantId: String(grant._id),
+          plan: String(grant.plan ?? 'subscription'),
+          expiresAt: grant.expiresAt,
+        });
+      }
     }
     return this.present(grant);
   }
@@ -172,12 +205,10 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
       const userId = String(user?._id ?? user?.id ?? '');
       let plan = 'free';
       try {
-        const current = await (this.subscriptionsService as any).getUserPlan(userId);
-        if (typeof current === 'string' && ['free', 'regular', 'vip', 'premium'].includes(current.toLowerCase())) {
-          plan = current.toLowerCase();
-        } else if (current && typeof current.currentPlan === 'string') {
-          plan = current.currentPlan.toLowerCase();
-        }
+        // getUserPlan() returns the canonical PlanType string. Keep this
+        // consumer aligned with that contract instead of supporting the old
+        // object-shaped response that the service no longer returns.
+        plan = await this.subscriptionsService.getUserPlan(userId);
       } catch {
         plan = 'free';
       }
@@ -371,7 +402,7 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
         try {
           const recipientPlan = (job as any).recipientPlan as string | null | undefined;
           if (recipientPlan) {
-            const currentPlan = String(await (this.subscriptionsService as any).getUserPlan(userId) ?? 'free').toLowerCase();
+            const currentPlan = String(await this.subscriptionsService.getUserPlan(userId) ?? 'free').toLowerCase();
             if (currentPlan !== recipientPlan) {
               job.lastUserId = userId;
               job.processedUsers += 1;
@@ -495,6 +526,16 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
     grant.revokedBy = adminId;
     grant.revocationReason = reason.trim();
     await grant.save();
+    await this.notificationEvents.cancelPendingEvent({
+      recipientId: grant.userId,
+      dedupeKey: `bonus:${String(grant._id)}:expired`,
+      reason: 'The bonus was revoked before its scheduled expiry notification.',
+    });
+    await this.notificationEvents.bonusRevoked({
+      userId: grant.userId,
+      grantId: String(grant._id),
+      reason: grant.revocationReason,
+    });
     return this.present(grant);
   }
 
@@ -574,3 +615,6 @@ export class BonusesService implements OnModuleInit, OnModuleDestroy {
     return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 11000);
   }
 }
+
+
+

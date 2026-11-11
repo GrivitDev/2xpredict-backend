@@ -74,7 +74,7 @@ export class User {
   // ======================
   // ACCOUNT STATUS (NEW)
   // ======================
-  @Prop({ enum: UserStatus, default: UserStatus.ACTIVE, index: true })
+  @Prop({ type: String, enum: UserStatus, default: UserStatus.ACTIVE, index: true })
   status!: UserStatus;
 
   // ======================
@@ -83,6 +83,10 @@ export class User {
   @Prop({ default: false })
   isVerified!: boolean;
 
+  // True while the first-verification referral/promo onboarding effects are pending.
+  @Prop({ type: Boolean, default: false, select: false })
+  verificationOnboardingPending!: boolean;
+
   // Retained for backwards compatibility only. Unverified registrations do not expire.
   @Prop({ type: Date, default: null })
   verificationExpiresAt?: Date | null;
@@ -90,17 +94,34 @@ export class User {
   // ======================
   // ROLE
   // ======================
-  @Prop({ enum: UserRole, default: UserRole.USER, index: true })
+  @Prop({ type: String, enum: UserRole, default: UserRole.USER, index: true })
   role!: UserRole;
 
   // ======================
   // PASSWORD RESET
   // ======================
-  @Prop()
+  @Prop({ select: false })
   passwordResetToken?: string;
 
-  @Prop()
+  @Prop({ select: false })
   passwordResetExpires?: Date;
+
+  @Prop({ type: Date, default: undefined, select: false })
+  passwordResetRequestedAt?: Date;
+
+  @Prop({ type: Number, default: 0, select: false })
+  passwordResetAttempts!: number;
+
+  @Prop({ type: Date, default: undefined, select: false })
+  passwordResetLockedUntil?: Date;
+
+  // ======================
+  // AUTHENTICATION VERSION
+  // ======================
+  // Incremented on password changes/resets to invalidate any token issued
+  // during a concurrent login/password-change race.
+  @Prop({ type: Number, default: 0, select: false })
+  authVersion!: number;
 
   // ======================
   // LOGIN TRACKING (NEW)
@@ -110,6 +131,12 @@ export class User {
 
   @Prop({ default: 0 })
   loginCount!: number;
+
+  @Prop({ type: Number, default: 0, select: false })
+  loginFailedAttempts!: number;
+
+  @Prop({ type: Date, default: undefined, select: false })
+  loginLockedUntil?: Date;
 
   // ======================
   // BAN SYSTEM (NEW)
@@ -156,3 +183,4 @@ export class User {
 }
 
 export const UserSchema = SchemaFactory.createForClass(User);
+

@@ -27,11 +27,13 @@ export class SystemMonitorController {
     const system = systemResult as Record<string, any>;
     const databaseStatus = String((database as any)?.status ?? 'UNKNOWN');
     const currentStatus = String(system.system?.status ?? 'ONLINE');
-    const overallStatus = databaseStatus === 'FAILED'
+    const overallStatus = databaseStatus === 'FAILED' || currentStatus === 'FAILED'
       ? 'FAILED'
       : databaseStatus === 'DEGRADED' || currentStatus === 'DEGRADED'
         ? 'DEGRADED'
-        : currentStatus;
+        : databaseStatus === 'UNKNOWN' && currentStatus === 'ONLINE'
+          ? 'UNKNOWN'
+          : currentStatus;
     return {
       ...system,
       system: { ...(system.system ?? {}), status: overallStatus },
@@ -42,6 +44,7 @@ export class SystemMonitorController {
       },
     };
   }
+  @Get('coverage') getCoverage() { return this.systemMonitorService.getCoverage(); }
   @Get('modules') getModules(@Query('status') status?: string, @Query('level') level?: 'deep' | 'health', @Query('critical') critical?: string) {
     const flag = critical === undefined ? undefined : critical === 'true';
     return this.systemMonitorService.getModules({ status, level, critical: flag });
@@ -64,3 +67,5 @@ export class SystemMonitorController {
     return this.databaseTracker.getOperations({ collection: name, limit: limit ? Number(limit) : undefined });
   }
 }
+
+

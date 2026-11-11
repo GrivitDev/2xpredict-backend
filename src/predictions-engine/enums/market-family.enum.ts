@@ -7,4 +7,6 @@ export enum MarketFamily {
   PLAYER = 'PLAYER',
   COMBINATIONS = 'COMBINATIONS',
   SPECIAL = 'SPECIAL',
+  EVENTS = 'EVENTS',
 }
+

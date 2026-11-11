@@ -156,7 +156,7 @@ export interface PredictionEngineDashboard {
     withoutSportyBetCode: number;
   };
   marketEngineWindow: {
-    forwardHours: number;
+    coverageScope: 'ALL_RETAINED_UPCOMING_FIXTURES';
     fixtures: number;
     withSummary: number;
     missingSummary: number;
@@ -179,7 +179,7 @@ export interface PredictionEngineDashboard {
     }>;
   };
   generationWindows: {
-    marketEnginesForwardHours: number;
+    marketEnginesCoverageScope: 'ALL_RETAINED_UPCOMING_FIXTURES';
     curatedAndSlipForwardHours: number;
     includeLiveFixtures: boolean;
     oddsModuleReadinessRequired: boolean;

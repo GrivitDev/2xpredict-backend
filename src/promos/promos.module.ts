@@ -1,4 +1,4 @@
-import { Module, forwardRef } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Promo, PromoSchema } from './schemas/promo.schema';
@@ -30,7 +30,7 @@ import { BetLabModule } from '../bet-lab/bet-lab.module';
       { name: Payment.name, schema: PaymentSchema },
       { name: Subscription.name, schema: SubscriptionSchema },
     ]),
-    forwardRef(() => ReferralsModule),
+    ReferralsModule,
     SubscriptionsModule,
     UsersModule,
     BetLabModule,

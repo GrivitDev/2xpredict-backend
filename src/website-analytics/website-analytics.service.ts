@@ -56,19 +56,6 @@ interface NormalizedEvent {
   screenHeight: number;
 }
 
-interface AnalyticsAdminGateway {
-  registerModule(
-    name: string,
-    details: { message: string; operationalStatus: string },
-  ): void;
-  publishModuleEvent(
-    moduleName: string,
-    eventName: string,
-    payload: Record<string, unknown>,
-  ): void;
-  emitAnalyticsUpdate(result: { accepted: number; duplicate: number }): void;
-}
-
 interface DailyAggregateSnapshot {
   dayKey: string;
   pageViewCounts?: unknown;
@@ -86,10 +73,6 @@ interface DailyAggregateSnapshot {
 export class WebsiteAnalyticsService implements OnModuleInit {
   private readonly logger = new Logger(WebsiteAnalyticsService.name);
 
-  private get analyticsGateway(): AnalyticsAdminGateway {
-    return this.adminGateway as unknown as AnalyticsAdminGateway;
-  }
-
   constructor(
     @InjectModel(AnalyticsVisitor.name)
     private readonly visitorModel: Model<AnalyticsVisitorDocument>,
@@ -99,7 +82,7 @@ export class WebsiteAnalyticsService implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    this.analyticsGateway.registerModule('website-analytics', {
+    this.adminGateway.registerModule('website-analytics', {
       message:
         'Website analytics ingestion and aggregation service initialized.',
       operationalStatus: 'READY',
@@ -154,7 +137,7 @@ export class WebsiteAnalyticsService implements OnModuleInit {
     await this.updateDailyAggregates(normalized);
 
     const result = { accepted: accepted.length, duplicate };
-    this.analyticsGateway.publishModuleEvent(
+    this.adminGateway.publishModuleEvent(
       'website-analytics',
       'analytics:ingestion-update',
       {
@@ -163,7 +146,7 @@ export class WebsiteAnalyticsService implements OnModuleInit {
         occurredAt: new Date().toISOString(),
       },
     );
-    this.analyticsGateway.emitAnalyticsUpdate(result);
+    this.adminGateway.emitAnalyticsUpdate(result);
     return result;
   }
 
@@ -851,3 +834,4 @@ export class WebsiteAnalyticsService implements OnModuleInit {
     return error instanceof Error ? error.stack : undefined;
   }
 }
+

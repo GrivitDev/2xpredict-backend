@@ -1,7 +1,14 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  ConflictException,
+  InternalServerErrorException,
+  Logger,
+  OnModuleInit,
+} from '@nestjs/common';
 
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { QueryFilter, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 
 import { Payment, PaymentDocument } from './schemas/payment.schema';
@@ -11,23 +18,39 @@ import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { AdminGateway } from '../realtime/admin.gateway';
 import { ReferralsService } from '../referrals/referrals.service';
 import { PlanConfigService } from '../plan-config/plan-config.service';
-import { EmailService } from '../notifications/email.service';
-import { TelegramService } from '../telegram/telegram.service';
 import { UsersService } from '../users/users.service';
 import { PromosService, PromoPricingResult } from '../promos/promos.service';
+import { PromoEngineService } from '../promos/promo-engine.service';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 const ACTIVE_PAYMENT_TYPES = [
   'subscription',
   'vip_upgrade',
   'premium_upgrade',
 ] as const satisfies readonly Payment['type'][];
+type ActivePaymentType = (typeof ACTIVE_PAYMENT_TYPES)[number];
 type PaidPlan = 'regular' | 'vip' | 'premium';
 
+interface PaymentAdminSummaryGroup {
+  _id?: {
+    status?: string;
+    currency?: string;
+    type?: string;
+    target?: string;
+  };
+  count?: number;
+  amount?: number;
+}
+
+function isActivePaymentType(type: string): type is ActivePaymentType {
+  return ACTIVE_PAYMENT_TYPES.some((activeType) => activeType === type);
+}
+
 @Injectable()
-export class PaymentsService {
+export class PaymentsService implements OnModuleInit {
   constructor(
     @InjectModel(Payment.name)
-    private paymentModel: Model<PaymentDocument>,
+    private paymentModel: Model<Payment>,
 
     private usersService: UsersService,
 
@@ -36,14 +59,297 @@ export class PaymentsService {
     private adminGateway: AdminGateway,
 
     private referralsService: ReferralsService,
-
-    private telegramService: TelegramService,
+    private readonly promoEngineService: PromoEngineService,
 
     private readonly planConfigService: PlanConfigService,
 
-    private emailService: EmailService,
     private readonly promosService: PromosService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
+
+  private readonly logger = new Logger(PaymentsService.name);
+
+  private static readonly PROCESSING_LEASE_MS = 2 * 60 * 1000;
+  private static readonly PROCESSING_HEARTBEAT_MS = 30 * 1000;
+
+  /** The active-request unique index is business-critical, not a best-effort index. */
+  async onModuleInit(): Promise<void> {
+    await this.paymentModel.collection.createIndex(
+      { activeRequestKey: 1 },
+      {
+        unique: true,
+        sparse: true,
+        name: 'uniq_payment_active_request_key',
+      },
+    );
+  }
+
+  private activeRequestKey(userId: string): string {
+    // A user may have only one unresolved subscription purchase/upgrade at a
+    // time. Different pending targets must not race and create overlapping terms.
+    return `v1|${String(userId).trim()}|paid-subscription-purchase`;
+  }
+
+  private isDuplicateKeyError(error: unknown): boolean {
+    return Boolean(
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: unknown }).code === 11000,
+    );
+  }
+
+  private errorMessage(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.slice(0, 1000);
+  }
+
+  private async createPaymentAndReservePromo(
+    paymentData: Record<string, any>,
+    promoReservation?: {
+      promoId?: string;
+      userId: string;
+      paymentReference: string;
+      baseAmount: number;
+      discountAmount: number;
+      finalAmount: number;
+      pointsReward?: number;
+      currency: 'NGN' | 'USD';
+    },
+  ): Promise<PaymentDocument> {
+    const session = await this.paymentModel.db.startSession();
+    let createdPayment: PaymentDocument | null = null;
+
+    try {
+      await session.withTransaction(async () => {
+        const [payment] = await this.paymentModel.create([paymentData], {
+          session,
+        });
+        createdPayment = payment;
+
+        if (promoReservation?.promoId) {
+          await this.promosService.reserveRedemption(promoReservation, session);
+        }
+      });
+    } catch (error: unknown) {
+      if (this.isDuplicateKeyError(error)) {
+        throw new ConflictException(
+          'You already have an active payment request for this plan. Complete or resolve it before starting another.',
+        );
+      }
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+
+    if (!createdPayment) {
+      throw new InternalServerErrorException(
+        'Payment request could not be created.',
+      );
+    }
+
+    return createdPayment;
+  }
+
+  private emitPaymentUpdateSafely(payment: PaymentDocument): void {
+    try {
+      this.adminGateway.emitPaymentUpdate(payment);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Payment ${payment.reference} was saved but its realtime update could not be emitted: ${this.errorMessage(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Payment rows act as a small durable outbox for payment notifications.
+   * Events are uniquely keyed in NotificationEventsService, so retries are safe
+   * even when the event was inserted but this payment row was not updated.
+   */
+  private async dispatchPaymentNotificationOutbox(
+    paymentId: string,
+  ): Promise<boolean> {
+    try {
+      let payment = await this.paymentModel.findById(paymentId).exec();
+      if (!payment || !payment.notificationOutboxPending) return true;
+
+      if (!payment.paymentSubmittedNotificationQueuedAt) {
+        const queued = await this.notificationEvents.paymentSubmitted({
+          userId: payment.userId,
+          reference: payment.reference,
+          amount: payment.amount,
+          currency: payment.currency,
+          paymentType: payment.type,
+          target: payment.target,
+        });
+        if (!queued) return false;
+
+        await this.paymentModel
+          .updateOne(
+            {
+              _id: payment._id,
+              $or: [
+                { paymentSubmittedNotificationQueuedAt: null },
+                { paymentSubmittedNotificationQueuedAt: { $exists: false } },
+              ],
+            },
+            { $set: { paymentSubmittedNotificationQueuedAt: new Date() } },
+          )
+          .exec();
+      }
+
+      payment = await this.paymentModel.findById(paymentId).exec();
+      if (!payment) return false;
+
+      if (
+        payment.status === 'approved' &&
+        !payment.paymentSuccessfulNotificationQueuedAt
+      ) {
+        const subscription =
+          await this.subscriptionsService.findBySourceReference(
+            `payment:${String(payment._id)}`,
+          );
+        // Every approved payment in this flow must have its source-linked
+        // subscription term. Do not mark the notification outbox complete when
+        // that record cannot yet be read; the worker will retry instead.
+        if (!subscription) return false;
+
+        const queued = await this.notificationEvents.paymentSuccessful({
+          userId: payment.userId,
+          reference: payment.reference,
+          amount: payment.amount,
+          currency: payment.currency,
+          paymentType: payment.type,
+          target: payment.target,
+          ...(subscription
+            ? {
+                subscription: {
+                  plan: subscription.plan,
+                  isActive: Boolean(subscription.isActive),
+                  startDate: new Date(subscription.startDate),
+                  expiryDate: new Date(subscription.expiryDate),
+                },
+              }
+            : {}),
+        });
+        if (!queued) return false;
+
+        await this.paymentModel
+          .updateOne(
+            {
+              _id: payment._id,
+              status: 'approved',
+              $or: [
+                { paymentSuccessfulNotificationQueuedAt: null },
+                { paymentSuccessfulNotificationQueuedAt: { $exists: false } },
+              ],
+            },
+            { $set: { paymentSuccessfulNotificationQueuedAt: new Date() } },
+          )
+          .exec();
+      }
+
+      if (
+        payment.status === 'rejected' &&
+        !payment.paymentRejectedNotificationQueuedAt
+      ) {
+        const gatewayReason =
+          payment.gatewayResponse && typeof payment.gatewayResponse === 'object'
+            ? String(
+                payment.gatewayResponse.message ??
+                  payment.gatewayResponse.reason ??
+                  '',
+              )
+            : '';
+        const queued = await this.notificationEvents.paymentRejected({
+          userId: payment.userId,
+          reference: payment.reference,
+          amount: payment.amount,
+          currency: payment.currency,
+          paymentType: payment.type,
+          target: payment.target,
+          reason: payment.adminNote || gatewayReason || undefined,
+        });
+        if (!queued) return false;
+
+        await this.paymentModel
+          .updateOne(
+            {
+              _id: payment._id,
+              status: 'rejected',
+              $or: [
+                { paymentRejectedNotificationQueuedAt: null },
+                { paymentRejectedNotificationQueuedAt: { $exists: false } },
+              ],
+            },
+            { $set: { paymentRejectedNotificationQueuedAt: new Date() } },
+          )
+          .exec();
+      }
+
+      const latest = await this.paymentModel
+        .findById(paymentId)
+        .select(
+          'status paymentSubmittedNotificationQueuedAt paymentSuccessfulNotificationQueuedAt paymentRejectedNotificationQueuedAt',
+        )
+        .lean()
+        .exec();
+      if (!latest?.paymentSubmittedNotificationQueuedAt) return false;
+
+      const terminalNotificationQueued =
+        (latest.status !== 'approved' ||
+          Boolean(latest.paymentSuccessfulNotificationQueuedAt)) &&
+        (latest.status !== 'rejected' ||
+          Boolean(latest.paymentRejectedNotificationQueuedAt));
+
+      if (terminalNotificationQueued) {
+        // Include the observed state in the update filter. If the payment
+        // becomes approved/rejected after the snapshot above, this update will
+        // no longer match and the next worker pass will enqueue its final event.
+        await this.paymentModel
+          .updateOne(
+            {
+              _id: paymentId,
+              status: latest.status,
+              notificationOutboxPending: true,
+            },
+            { $set: { notificationOutboxPending: false } },
+          )
+          .exec();
+        return true;
+      }
+
+      return false;
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Payment notification outbox remains pending for ${paymentId}: ${this.errorMessage(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /** Retry notification events that were not persisted before a process failure. */
+  async recoverPendingPaymentNotifications(limit = 20): Promise<number> {
+    const batchSize = Math.max(
+      1,
+      Math.min(100, Math.floor(Number(limit) || 20)),
+    );
+    const pending = await this.paymentModel
+      .find({ notificationOutboxPending: true })
+      .sort({ updatedAt: 1, createdAt: 1 })
+      .limit(batchSize)
+      .select('_id')
+      .lean()
+      .exec();
+
+    let completed = 0;
+    for (const payment of pending) {
+      if (await this.dispatchPaymentNotificationOutbox(String(payment._id))) {
+        completed += 1;
+      }
+    }
+    return completed;
+  }
 
   private validatePaymentTypeAndTarget(type: string, target: string): void {
     if (
@@ -104,7 +410,6 @@ export class PaymentsService {
     email: string;
     type: 'subscription' | 'vip_upgrade' | 'premium_upgrade';
     target: string;
-
     transferReference?: string;
     proofImageUrl?: string;
     proofPublicId?: string;
@@ -112,99 +417,73 @@ export class PaymentsService {
     promoCode?: string;
   }) {
     this.validatePaymentTypeAndTarget(dto.type, dto.target);
-    const existingPending = await this.paymentModel.findOne({
-      userId: dto.userId,
-      type: dto.type,
-      target: dto.target,
-      status: 'pending',
-    });
 
-    if (existingPending) {
-      throw new BadRequestException(
-        'You already have a pending payment request',
+    const activePayment = await this.findActivePaymentForUser(dto.userId);
+    if (activePayment) {
+      throw new ConflictException(
+        'You already have an active payment request for this plan. Resolve it before submitting another.',
       );
     }
 
     const pricing = await this.calculateGatewayPaymentAmount({
-      userId: dto.userId, type: dto.type, target: dto.target, promoCode: dto.promoCode,
+      userId: dto.userId,
+      type: dto.type,
+      target: dto.target,
+      promoCode: dto.promoCode,
     });
-    const { amount, currency } = pricing;
-
     const reference = randomUUID();
 
-    const payment = await this.paymentModel.create({
-      userId: dto.userId,
-      email: dto.email,
+    const payment: PaymentDocument = await this.createPaymentAndReservePromo(
+      {
+        userId: dto.userId,
+        email: dto.email,
+        amount: pricing.amount,
+        baseAmount: pricing.baseAmount,
+        discountAmount: pricing.discountAmount,
+        promoCode: pricing.promoCode,
+        promoId: pricing.promoId,
+        discountType: pricing.discountType,
+        discountValue: pricing.discountValue,
+        pointsReward: pricing.pointsReward,
+        currency: pricing.currency,
+        type: dto.type,
+        target: dto.target,
+        reference,
+        status: 'pending',
+        gateway: 'manual',
+        gatewayInitializationStatus: 'not_applicable',
+        activeRequestKey: this.activeRequestKey(dto.userId),
+        notificationOutboxPending: true,
+        transferReference: dto.transferReference || '',
+        proofImageUrl: dto.proofImageUrl || '',
+        proofPublicId: dto.proofPublicId || '',
+        proofMessage: dto.proofMessage || '',
+        processedAt: null,
+        processedBy: null,
+        adminNote: '',
+      },
+      {
+        promoId: pricing.promoId,
+        userId: dto.userId,
+        paymentReference: reference,
+        baseAmount: pricing.baseAmount,
+        discountAmount: pricing.discountAmount,
+        finalAmount: pricing.amount,
+        pointsReward: pricing.pointsReward,
+        currency: pricing.currency,
+      },
+    );
 
-      amount,
-      baseAmount: pricing.baseAmount,
-      discountAmount: pricing.discountAmount,
-      promoCode: pricing.promoCode,
-      promoId: pricing.promoId,
-      discountType: pricing.discountType,
-      discountValue: pricing.discountValue,
-      pointsReward: pricing.pointsReward,
-      currency,
-
-      type: dto.type,
-      target: dto.target,
-
-      reference,
-
-      status: 'pending',
-
-      transferReference: dto.transferReference || '',
-      proofImageUrl: dto.proofImageUrl || '',
-      proofPublicId: dto.proofPublicId || '',
-      proofMessage: dto.proofMessage || '',
-
-      processedAt: undefined,
-      processedBy: undefined,
-      adminNote: '',
-    });
+    await this.dispatchPaymentNotificationOutbox(String(payment._id));
 
     try {
-      await this.promosService.reserveRedemption({
-        promoId: pricing.promoId, userId: dto.userId, paymentReference: reference,
-        baseAmount: pricing.baseAmount, discountAmount: pricing.discountAmount,
-        finalAmount: amount, pointsReward: pricing.pointsReward, currency,
-      });
-    } catch (error) {
-      await this.paymentModel.deleteOne({ reference }).exec();
-      throw error;
+      this.adminGateway.emitNewPayment(payment);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Payment ${payment.reference} was created but its realtime event could not be emitted: ${this.errorMessage(error)}`,
+      );
     }
 
-    await this.emailService.sendPaymentReceivedEmail({
-      email: payment.email,
-
-      amount: payment.amount,
-      currency: payment.currency,
-
-      paymentType:
-        payment.type === 'subscription'
-          ? `${payment.target.toUpperCase()} Subscription`
-          : payment.type === 'vip_upgrade'
-            ? 'VIP Upgrade'
-            : 'Premium Upgrade',
-
-      reference: payment.reference,
-    });
-
-    await this.telegramService.notifyNewPayment({
-      fullName: dto.email,
-      email: dto.email,
-
-      amount,
-      currency,
-
-      type: dto.type,
-
-      target: dto.target,
-
-      proofImageUrl: dto.proofImageUrl,
-    });
-
-    this.adminGateway.emitNewPayment(payment);
     return {
       message: 'Payment submitted',
       reference,
@@ -279,15 +558,10 @@ export class PaymentsService {
   // =====================================
   async createGatewayPaymentRecord(dto: {
     userId: string;
-
     email: string;
-
     type: 'subscription' | 'vip_upgrade' | 'premium_upgrade';
-
     target: string;
-
     gateway: 'paystack';
-
     amount: number;
     baseAmount: number;
     discountAmount: number;
@@ -297,103 +571,176 @@ export class PaymentsService {
     discountValue?: number;
     pointsReward?: number;
     currency: 'NGN' | 'USD';
-
     gatewayAmount: number;
-
     gatewayCurrency: 'NGN';
-
     exchangeRate?: number;
   }) {
     this.validatePaymentTypeAndTarget(dto.type, dto.target);
-    const existingPending = await this.paymentModel.findOne({
-      userId: dto.userId,
-      type: dto.type,
-      target: dto.target,
-      status: 'pending',
-    });
 
-    if (existingPending) {
-      throw new BadRequestException(
-        'You already have a pending payment. If not activated, try again after 30 minutes or contact the admin.',
+    const activePayment = await this.findActivePaymentForUser(dto.userId);
+    if (activePayment) {
+      throw new ConflictException({
+        message:
+          'You already have an active payment request. Check its status before creating another.',
+        reference: activePayment.reference,
+        paymentStatus: activePayment.status,
+        initializationStatus: String(activePayment.gatewayInitializationStatus),
+      });
+    }
+
+    const reference = randomUUID();
+    const payment = await this.createPaymentAndReservePromo(
+      {
+        userId: dto.userId,
+        email: dto.email,
+        amount: dto.amount,
+        baseAmount: dto.baseAmount,
+        discountAmount: dto.discountAmount,
+        promoId: dto.promoId,
+        promoCode: dto.promoCode,
+        discountType: dto.discountType,
+        discountValue: dto.discountValue,
+        pointsReward: dto.pointsReward ?? 0,
+        currency: dto.currency,
+        gatewayAmount: dto.gatewayAmount,
+        gatewayCurrency: dto.gatewayCurrency,
+        exchangeRate: dto.exchangeRate,
+        type: dto.type,
+        target: dto.target,
+        reference,
+        gateway: dto.gateway,
+        status: 'pending',
+        gatewayInitializationStatus: 'initializing',
+        gatewayInitializationAttemptedAt: new Date(),
+        gatewayAuthorizationUrl: null,
+        gatewayInitializationLastError: null,
+        activeRequestKey: this.activeRequestKey(dto.userId),
+        notificationOutboxPending: true,
+        transferReference: '',
+        proofImageUrl: '',
+        proofPublicId: '',
+        proofMessage: '',
+        adminNote: '',
+        gatewayResponse: null,
+      },
+      {
+        promoId: dto.promoId,
+        userId: dto.userId,
+        paymentReference: reference,
+        baseAmount: dto.baseAmount,
+        discountAmount: dto.discountAmount,
+        finalAmount: dto.amount,
+        pointsReward: dto.pointsReward,
+        currency: dto.currency,
+      },
+    );
+
+    await this.dispatchPaymentNotificationOutbox(String(payment._id));
+
+    try {
+      this.adminGateway.emitNewPayment(payment);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Gateway payment ${payment.reference} was created but its realtime event could not be emitted: ${this.errorMessage(error)}`,
       );
     }
 
-    const payment = await this.paymentModel.create({
-      userId: dto.userId,
-
-      email: dto.email,
-
-      // Final customer amount after server-side discount calculation
-      amount: dto.amount,
-      baseAmount: dto.baseAmount,
-      discountAmount: dto.discountAmount,
-      promoId: dto.promoId,
-      promoCode: dto.promoCode,
-      discountType: dto.discountType,
-      discountValue: dto.discountValue,
-      pointsReward: dto.pointsReward ?? 0,
-
-      // Original customer currency
-      currency: dto.currency,
-
-      // Actual amount sent to gateway
-      gatewayAmount: dto.gatewayAmount,
-
-      // Gateway currency
-      gatewayCurrency: dto.gatewayCurrency,
-
-      // Exchange rate used
-      exchangeRate: dto.exchangeRate,
-
-      type: dto.type,
-
-      target: dto.target,
-
-      reference: randomUUID(),
-
-      gateway: dto.gateway,
-
-      status: 'pending',
-
-      transferReference: '',
-      proofImageUrl: '',
-      proofPublicId: '',
-      proofMessage: '',
-      adminNote: '',
-
-      gatewayTransactionId: '',
-      gatewayResponse: null,
-    });
-
-    try {
-      await this.promosService.reserveRedemption({
-        promoId: dto.promoId, userId: dto.userId, paymentReference: payment.reference,
-        baseAmount: dto.baseAmount, discountAmount: dto.discountAmount,
-        finalAmount: dto.amount, pointsReward: dto.pointsReward, currency: dto.currency,
-      });
-    } catch (error) {
-      await this.paymentModel.deleteOne({ reference: payment.reference }).exec();
-      throw error;
-    }
-
-    await this.telegramService.notifyNewPayment({
-      fullName: dto.email,
-
-      email: dto.email,
-
-      amount: dto.amount,
-
-      currency: dto.currency,
-
-      type: dto.type,
-
-      target: dto.target,
-    });
-
-    this.adminGateway.emitNewPayment(payment);
-
     return payment;
   }
+
+  async findActivePaymentForUser(userId: string) {
+    return this.paymentModel
+      .findOne({
+        userId,
+        status: { $in: ['pending', 'processing'] },
+      })
+      .sort({ createdAt: -1 })
+      .exec();
+  }
+
+  async getGatewayInitialization(reference: string, userId: string) {
+    const payment = await this.paymentModel
+      .findOne({ reference, userId })
+      .exec();
+    if (!payment || payment.gateway !== 'paystack') {
+      throw new BadRequestException('Paystack payment record not found.');
+    }
+
+    const gatewayAuthorizationUrl: unknown = payment.gatewayAuthorizationUrl;
+
+    return {
+      reference: payment.reference,
+      paymentStatus: payment.status,
+      initializationStatus: String(payment.gatewayInitializationStatus),
+      authorizationUrl:
+        payment.gatewayInitializationStatus === 'initialized'
+          ? typeof gatewayAuthorizationUrl === 'string'
+            ? gatewayAuthorizationUrl
+            : null
+          : null,
+      initializedAt: (payment.gatewayInitializedAt as Date | null) ?? null,
+      message:
+        payment.gatewayInitializationStatus === 'initialized'
+          ? 'Continue with the existing payment session.'
+          : payment.gatewayInitializationStatus === 'unknown' ||
+              payment.gatewayInitializationStatus === 'initializing'
+            ? 'The gateway initialization result is not yet confirmed. Verify this reference before starting another payment.'
+            : 'This payment session is not available for continuation.',
+    };
+  }
+
+  async markGatewayInitializationSucceeded(
+    reference: string,
+    authorizationUrl: string,
+  ) {
+    const payment = await this.paymentModel
+      .findOneAndUpdate(
+        {
+          reference,
+          status: 'pending',
+          gateway: 'paystack',
+          gatewayInitializationStatus: { $in: ['initializing', 'unknown'] },
+        },
+        {
+          $set: {
+            gatewayInitializationStatus: 'initialized',
+            gatewayAuthorizationUrl: authorizationUrl,
+            gatewayInitializedAt: new Date(),
+            gatewayInitializationLastError: null,
+          },
+        },
+        { returnDocument: 'after' },
+      )
+      .exec();
+
+    if (payment) return payment;
+
+    const existing = await this.findPaymentByReference(reference);
+    if (existing?.gatewayInitializationStatus === 'initialized')
+      return existing;
+    throw new ConflictException(
+      'The payment state changed before gateway initialization could be saved.',
+    );
+  }
+
+  async markGatewayInitializationUnknown(reference: string, error: unknown) {
+    return this.paymentModel
+      .findOneAndUpdate(
+        { reference, status: 'pending', gateway: 'paystack' },
+        {
+          $set: {
+            gatewayInitializationStatus: 'unknown',
+            gatewayInitializationLastError: this.errorMessage(error).slice(
+              0,
+              500,
+            ),
+          },
+        },
+        { returnDocument: 'after' },
+      )
+      .exec();
+  }
+
   // =====================================
   // FIND PAYMENT
   // =====================================
@@ -404,268 +751,396 @@ export class PaymentsService {
   }
 
   // =====================================
-  // APPROVE VERIFIED GATEWAY PAYMENT
+  // PAYMENT APPROVAL STATE MACHINE
   // =====================================
+  private async processPaymentApproval(
+    reference: string,
+    source: 'manual' | 'paystack',
+    details: {
+      gatewayTransactionId?: string;
+      gatewayResponse?: Record<string, any>;
+      adminId?: string;
+    } = {},
+  ): Promise<PaymentDocument> {
+    const beforeClaim = await this.paymentModel.findOne({ reference }).exec();
+    if (!beforeClaim) throw new BadRequestException('Payment not found.');
+
+    if (beforeClaim.status === 'approved') return beforeClaim;
+    if (beforeClaim.status === 'rejected') {
+      throw new ConflictException('This payment has already been rejected.');
+    }
+    this.validatePaymentTypeAndTarget(beforeClaim.type, beforeClaim.target);
+
+    if (source === 'paystack' && !details.gatewayTransactionId) {
+      throw new BadRequestException(
+        'A verified gateway transaction ID is required to approve payment.',
+      );
+    }
+    if (source === 'manual' && beforeClaim.gateway !== 'manual') {
+      throw new ConflictException(
+        'Gateway payments cannot be manually approved.',
+      );
+    }
+    if (source === 'paystack' && beforeClaim.gateway !== 'paystack') {
+      throw new ConflictException('This payment does not belong to Paystack.');
+    }
+
+    const now = new Date();
+    const processingToken = randomUUID();
+    const leaseExpiry = new Date(
+      now.getTime() + PaymentsService.PROCESSING_LEASE_MS,
+    );
+
+    const claimFilter: QueryFilter<Payment> = {
+      reference,
+      $or: [
+        { status: 'pending' },
+        {
+          status: 'processing',
+          $or: [
+            { processingLeaseExpiresAt: null },
+            { processingLeaseExpiresAt: { $exists: false } },
+            { processingLeaseExpiresAt: { $lte: now } },
+          ],
+        },
+      ],
+    };
+
+    const claimUpdate: Record<string, any> = {
+      $set: {
+        status: 'processing',
+        processingToken,
+        processingLeaseExpiresAt: leaseExpiry,
+        approvalSource: source,
+        processingLastError: null,
+        ...(source === 'manual' && details.adminId
+          ? { processedBy: details.adminId }
+          : {}),
+        ...(source === 'paystack' && details.gatewayTransactionId
+          ? { gatewayTransactionId: details.gatewayTransactionId }
+          : {}),
+        ...(details.gatewayResponse
+          ? { gatewayResponse: details.gatewayResponse }
+          : {}),
+      },
+      $inc: { processingAttempts: 1 },
+    };
+
+    const payment = await this.paymentModel
+      .findOneAndUpdate(claimFilter, claimUpdate, {
+        returnDocument: 'after',
+      })
+      .exec();
+
+    if (!payment) {
+      const current = await this.paymentModel.findOne({ reference }).exec();
+      if (!current) throw new BadRequestException('Payment not found.');
+      if (current.status === 'approved') return current;
+      if (current.status === 'rejected') {
+        throw new ConflictException('This payment has already been rejected.');
+      }
+      if (current.status === 'processing') return current;
+      throw new ConflictException(
+        'Payment state changed. Refresh the payment and retry.',
+      );
+    }
+
+    const heartbeat = setInterval(() => {
+      const nextLease = new Date(
+        Date.now() + PaymentsService.PROCESSING_LEASE_MS,
+      );
+      void this.paymentModel
+        .updateOne(
+          {
+            _id: payment._id,
+            status: 'processing',
+            processingToken,
+          },
+          { $set: { processingLeaseExpiresAt: nextLease } },
+        )
+        .exec()
+        .catch((error) => {
+          this.logger.error(
+            `Could not renew payment processing lease for ${reference}: ${this.errorMessage(error)}`,
+          );
+        });
+    }, PaymentsService.PROCESSING_HEARTBEAT_MS);
+    heartbeat.unref?.();
+
+    try {
+      let plan: PaidPlan;
+      if (payment.type === 'subscription') {
+        plan = payment.target.trim() as PaidPlan;
+      } else {
+        plan = payment.type === 'vip_upgrade' ? 'vip' : 'premium';
+        if (payment.target !== plan) {
+          throw new BadRequestException(`Invalid ${plan} upgrade target.`);
+        }
+      }
+
+      const config = await this.planConfigService.get();
+      const durationDays =
+        payment.type === 'subscription' ? config.subscriptionDurationDays : 30;
+
+      await this.subscriptionsService.activatePlan({
+        userId: payment.userId,
+        email: payment.email,
+        plan,
+        amount: payment.amount,
+        durationDays,
+        sourceReference: `payment:${String(payment._id)}`,
+      });
+
+      const referral =
+        plan === 'regular'
+          ? await this.referralsService.markRegularSubscription(payment.userId)
+          : plan === 'vip'
+            ? await this.referralsService.markVipSubscription(payment.userId)
+            : await this.referralsService.markPremiumSubscription(
+                payment.userId,
+              );
+
+      if (referral) {
+        // Kept in the payment orchestration layer so ReferralsModule has no
+        // reverse dependency on PromosModule. Payment retries safely repeat
+        // this evaluation if a previous attempt stopped before completion.
+        await this.promoEngineService.checkUserPromos(
+          String(referral.referrerId),
+        );
+      }
+
+      await this.promosService.completeSuccessfulRedemption({
+        promoId: payment.promoId,
+        userId: payment.userId,
+        reference: payment.reference,
+        pointsReward: payment.pointsReward,
+      });
+
+      const approved = await this.paymentModel
+        .findOneAndUpdate(
+          {
+            _id: payment._id,
+            status: 'processing',
+            processingToken,
+          },
+          {
+            $set: {
+              status: 'approved',
+              processedAt: new Date(),
+              notificationOutboxPending: true,
+              ...(source === 'manual' && details.adminId
+                ? { processedBy: details.adminId }
+                : {}),
+            },
+            $unset: {
+              activeRequestKey: 1,
+              processingToken: 1,
+              processingLeaseExpiresAt: 1,
+              processingLastError: 1,
+            },
+          },
+          { returnDocument: 'after' },
+        )
+        .exec();
+
+      if (!approved) {
+        const latest = await this.paymentModel.findById(payment._id).exec();
+        if (latest?.status === 'approved') return latest;
+        throw new ConflictException(
+          'Payment processing ownership changed before approval could be committed.',
+        );
+      }
+
+      await this.dispatchPaymentNotificationOutbox(String(approved._id));
+      this.emitPaymentUpdateSafely(approved);
+      return approved;
+    } catch (error: unknown) {
+      const attempt = Number(payment.processingAttempts ?? 1);
+      const retryDelayMs = Math.min(
+        15 * 60 * 1000,
+        15_000 * Math.max(1, Math.min(attempt, 60)),
+      );
+      try {
+        await this.paymentModel
+          .updateOne(
+            {
+              _id: payment._id,
+              status: 'processing',
+              processingToken,
+            },
+            {
+              $set: {
+                processingLastError: this.errorMessage(error),
+                processingLeaseExpiresAt: new Date(Date.now() + retryDelayMs),
+              },
+            },
+          )
+          .exec();
+      } catch (leaseError: unknown) {
+        this.logger.error(
+          `Could not schedule payment ${reference} for retry: ${this.errorMessage(leaseError)}`,
+        );
+      }
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }
+
   async approveGatewayPayment(
     reference: string,
     gatewayTransactionId: string,
     gatewayResponse: Record<string, any>,
   ) {
-    const payment = await this.paymentModel.findOne({
-      reference,
+    return this.processPaymentApproval(reference, 'paystack', {
+      gatewayTransactionId,
+      gatewayResponse,
     });
+  }
+
+  private async rejectPaymentReference(
+    reference: string,
+    options: {
+      source: 'manual' | 'paystack';
+      adminId?: string;
+      adminNote?: string;
+      gatewayResponse?: Record<string, any>;
+      initializationFailed?: boolean;
+    },
+  ) {
+    const session = await this.paymentModel.db.startSession();
+    let payment: PaymentDocument | null = null;
+
+    try {
+      payment = await session.withTransaction(
+        async (): Promise<PaymentDocument> => {
+          const current = await this.paymentModel
+            .findOne({ reference })
+            .session(session)
+            .exec();
+          if (!current) throw new BadRequestException('Payment not found.');
+          if (current.status === 'rejected') {
+            // Repair a pre-existing rejected record whose promo release may have
+            // been interrupted before the transaction boundary was introduced.
+            await this.promosService.releaseRedemption(reference, session);
+            await this.paymentModel
+              .updateOne(
+                { _id: current._id, status: 'rejected' },
+                { $set: { notificationOutboxPending: true } },
+                { session },
+              )
+              .exec();
+            return current;
+          }
+          if (current.status === 'approved') {
+            return current;
+          }
+          if (current.status !== 'pending') {
+            throw new ConflictException(
+              'Payment approval is already being processed and cannot be rejected concurrently.',
+            );
+          }
+          if (options.source === 'manual' && current.gateway !== 'manual') {
+            throw new ConflictException(
+              'Gateway payments cannot be manually rejected.',
+            );
+          }
+          if (options.source === 'paystack' && current.gateway !== 'paystack') {
+            throw new ConflictException(
+              'This payment does not belong to Paystack.',
+            );
+          }
+
+          const rejected = await this.paymentModel
+            .findOneAndUpdate(
+              { _id: current._id, status: 'pending' },
+              {
+                $set: {
+                  status: 'rejected',
+                  processedAt: new Date(),
+                  notificationOutboxPending: true,
+                  ...(options.adminId ? { processedBy: options.adminId } : {}),
+                  ...(options.adminNote !== undefined
+                    ? { adminNote: options.adminNote }
+                    : {}),
+                  ...(options.gatewayResponse !== undefined
+                    ? { gatewayResponse: options.gatewayResponse }
+                    : {}),
+                  ...(options.initializationFailed
+                    ? { gatewayInitializationStatus: 'failed' }
+                    : {}),
+                },
+                $unset: {
+                  activeRequestKey: 1,
+                  processingToken: 1,
+                  processingLeaseExpiresAt: 1,
+                },
+              },
+              { returnDocument: 'after', session },
+            )
+            .exec();
+
+          if (!rejected) {
+            throw new ConflictException(
+              'Payment state changed before rejection could be committed.',
+            );
+          }
+
+          await this.promosService.releaseRedemption(reference, session);
+          return rejected;
+        },
+      );
+    } finally {
+      await session.endSession();
+    }
 
     if (!payment) {
-      throw new BadRequestException('Payment not found.');
+      throw new InternalServerErrorException(
+        'Payment rejection could not be completed.',
+      );
     }
 
-    if (payment.status === 'approved') return payment;
-
-    if (payment.status !== 'pending') {
-      throw new BadRequestException('Payment has already been processed.');
+    if (payment.status === 'rejected') {
+      await this.dispatchPaymentNotificationOutbox(String(payment._id));
+      this.emitPaymentUpdateSafely(payment);
     }
 
-    this.validatePaymentTypeAndTarget(payment.type, payment.target);
-
-    // Entitlements are granted idempotently by payment reference first. The
-    // payment is marked approved only after the core entitlement operation succeeds.
-    const config = await this.planConfigService.get();
-
-    // =====================================
-    // SUBSCRIPTION
-    // =====================================
-    if (payment.type === 'subscription') {
-      const plan = payment.target?.trim();
-
-      if (plan !== 'regular' && plan !== 'vip' && plan !== 'premium') {
-        throw new BadRequestException('Invalid subscription plan.');
-      }
-
-      const subscription = await this.subscriptionsService.activatePlan({
-        userId: payment.userId,
-        email: payment.email,
-        plan,
-        amount: payment.amount,
-        durationDays: config.subscriptionDurationDays,
-        sourceReference: `payment:${String(payment._id)}`,
-      });
-
-      await this.emailService.sendSubscriptionActivatedEmail({
-        email: payment.email,
-
-        plan: subscription.plan,
-
-        amount: payment.amount,
-        currency: payment.currency,
-
-        activatedDate: subscription.startDate,
-
-        expiryDate: subscription.expiryDate,
-      });
-
-      if (plan === 'regular') {
-        await this.referralsService.markRegularSubscription(payment.userId);
-      }
-
-      if (plan === 'vip') {
-        await this.referralsService.markVipSubscription(payment.userId);
-      }
-      if (plan === 'premium') {
-        await this.referralsService.markPremiumSubscription(payment.userId);
-      }
-    }
-
-    // =====================================
-    // VIP / PREMIUM UPGRADE
-    // =====================================
-    if (payment.type === 'vip_upgrade' || payment.type === 'premium_upgrade') {
-      const plan: PaidPlan = payment.type === 'vip_upgrade' ? 'vip' : 'premium';
-      if (payment.target !== plan) {
-        throw new BadRequestException(`Invalid ${plan} upgrade target.`);
-      }
-
-      const subscription = await this.subscriptionsService.activatePlan({
-        userId: payment.userId,
-        email: payment.email,
-        plan,
-        amount: payment.amount,
-        durationDays: 30,
-        sourceReference: `payment:${String(payment._id)}`,
-      });
-
-      await this.emailService.sendSubscriptionActivatedEmail({
-        email: payment.email,
-        plan: subscription.plan,
-        amount: payment.amount,
-        currency: payment.currency,
-        activatedDate: subscription.startDate,
-        expiryDate: subscription.expiryDate,
-      });
-
-      if (plan === 'vip') {
-        await this.referralsService.markVipSubscription(payment.userId);
-      } else {
-        await this.referralsService.markPremiumSubscription(payment.userId);
-      }
-    }
-
-    await this.promosService.completeSuccessfulRedemption({
-      promoId: payment.promoId, userId: payment.userId, reference: payment.reference, pointsReward: payment.pointsReward,
-    });
-
-    payment.status = 'approved';
-    payment.gatewayTransactionId = gatewayTransactionId;
-    payment.gatewayResponse = gatewayResponse;
-    payment.processedAt = new Date();
-    await payment.save();
-
-    this.adminGateway.emitPaymentUpdate(payment);
     return payment;
   }
 
-  // =====================================
-  // REJECT GATEWAY PAYMENT
-  // =====================================
   async rejectGatewayPayment(
     reference: string,
     gatewayResponse?: Record<string, any>,
+    initializationFailed = false,
   ) {
-    const payment = await this.paymentModel.findOne({
-      reference,
+    return this.rejectPaymentReference(reference, {
+      source: 'paystack',
+      gatewayResponse,
+      initializationFailed,
     });
-
-    if (!payment) {
-      throw new BadRequestException('Payment not found.');
-    }
-
-    if (payment.status !== 'pending') {
-      return payment;
-    }
-
-    this.validatePaymentTypeAndTarget(payment.type, payment.target);
-
-    payment.status = 'rejected';
-
-    payment.gatewayResponse = gatewayResponse ?? null;
-
-    payment.processedAt = new Date();
-
-    await payment.save();
-    await this.promosService.releaseRedemption(payment.reference);
-
-    return payment;
   }
 
   // =====================================
   // APPROVE MANUAL PAYMENT
   // =====================================
   async approvePayment(paymentId: string, adminId: string) {
-    const payment = await this.paymentModel.findById(paymentId);
+    const payment = await this.paymentModel.findById(paymentId).exec();
+    if (!payment) throw new BadRequestException('Payment not found.');
 
-    if (!payment) {
-      throw new BadRequestException('Payment not found');
-    }
-
-    if (payment.status !== 'pending') {
-      throw new BadRequestException('Already processed');
-    }
-
-    this.validatePaymentTypeAndTarget(payment.type, payment.target);
-
-    // Grant the entitlement first; sourceReference makes retries idempotent.
-    const config = await this.planConfigService.get();
-
-    // =====================================
-    // SUBSCRIPTION
-    // =====================================
-    if (payment.type === 'subscription') {
-      const plan = payment.target?.trim();
-
-      if (plan !== 'regular' && plan !== 'vip' && plan !== 'premium') {
-        throw new BadRequestException('Invalid subscription plan');
-      }
-
-      const subscription = await this.subscriptionsService.activatePlan({
-        userId: payment.userId,
-        email: payment.email,
-        plan,
-        amount: payment.amount,
-        durationDays: config.subscriptionDurationDays,
-        sourceReference: `payment:${String(payment._id)}`,
-      });
-
-      await this.emailService.sendSubscriptionActivatedEmail({
-        email: payment.email,
-
-        plan: subscription.plan,
-
-        amount: payment.amount,
-        currency: payment.currency,
-
-        activatedDate: subscription.startDate,
-
-        expiryDate: subscription.expiryDate,
-      });
-
-      if (plan === 'regular') {
-        await this.referralsService.markRegularSubscription(payment.userId);
-      }
-
-      if (plan === 'vip') {
-        await this.referralsService.markVipSubscription(payment.userId);
-      }
-      if (plan === 'premium') {
-        await this.referralsService.markPremiumSubscription(payment.userId);
-      }
-    }
-
-    // =====================================
-    // VIP / PREMIUM UPGRADE
-    // =====================================
-    if (payment.type === 'vip_upgrade' || payment.type === 'premium_upgrade') {
-      const plan: PaidPlan = payment.type === 'vip_upgrade' ? 'vip' : 'premium';
-      if (payment.target !== plan) {
-        throw new BadRequestException(`Invalid ${plan} upgrade target.`);
-      }
-
-      const subscription = await this.subscriptionsService.activatePlan({
-        userId: payment.userId,
-        email: payment.email,
-        plan,
-        amount: payment.amount,
-        durationDays: 30,
-        sourceReference: `payment:${String(payment._id)}`,
-      });
-
-      await this.emailService.sendSubscriptionActivatedEmail({
-        email: payment.email,
-        plan: subscription.plan,
-        amount: payment.amount,
-        currency: payment.currency,
-        activatedDate: subscription.startDate,
-        expiryDate: subscription.expiryDate,
-      });
-
-      if (plan === 'vip') {
-        await this.referralsService.markVipSubscription(payment.userId);
-      } else {
-        await this.referralsService.markPremiumSubscription(payment.userId);
-      }
-    }
-
-    await this.promosService.completeSuccessfulRedemption({
-      promoId: payment.promoId, userId: payment.userId, reference: payment.reference, pointsReward: payment.pointsReward,
-    });
-
-    payment.status = 'approved';
-    payment.processedAt = new Date();
-    payment.processedBy = adminId;
-    await payment.save();
-    this.adminGateway.emitPaymentUpdate(payment);
+    const approved = await this.processPaymentApproval(
+      payment.reference,
+      'manual',
+      {
+        adminId,
+      },
+    );
 
     return {
-      message: 'Payment approved',
-      payment,
+      message:
+        approved.status === 'approved'
+          ? 'Payment approved'
+          : 'Payment approval is already being processed.',
+      payment: approved,
     };
   }
 
@@ -685,45 +1160,14 @@ export class PaymentsService {
   // REJECT MANUAL PAYMENT
   // =====================================
   async rejectPayment(paymentId: string, adminId: string, adminNote?: string) {
-    const payment = await this.paymentModel.findById(paymentId);
+    const payment = await this.paymentModel.findById(paymentId).exec();
+    if (!payment) throw new BadRequestException('Payment not found.');
 
-    if (!payment) {
-      throw new BadRequestException('Payment not found');
-    }
-
-    if (payment.status !== 'pending') {
-      throw new BadRequestException('Already processed');
-    }
-
-    this.validatePaymentTypeAndTarget(payment.type, payment.target);
-
-    payment.status = 'rejected';
-
-    payment.processedAt = new Date();
-
-    payment.processedBy = adminId;
-
-    payment.adminNote = adminNote || '';
-
-    await payment.save();
-    await this.promosService.releaseRedemption(payment.reference);
-
-    await this.emailService.sendPaymentRejectedEmail({
-      email: payment.email,
-
-      paymentType:
-        payment.type === 'subscription'
-          ? `${payment.target.toUpperCase()} Subscription`
-          : payment.type === 'vip_upgrade'
-            ? 'VIP Upgrade'
-            : 'Premium Upgrade',
-
-      amount: payment.amount,
-      currency: payment.currency,
-
-      reason: payment.adminNote,
+    return this.rejectPaymentReference(payment.reference, {
+      source: 'manual',
+      adminId,
+      adminNote: adminNote || '',
     });
-    return payment;
   }
 
   // =====================================
@@ -731,7 +1175,10 @@ export class PaymentsService {
   // =====================================
   async getPendingPayments() {
     return this.paymentModel
-      .find({ status: 'pending', type: { $in: ACTIVE_PAYMENT_TYPES } })
+      .find({
+        status: { $in: ['pending', 'processing'] },
+        type: { $in: ACTIVE_PAYMENT_TYPES },
+      })
       .sort({
         createdAt: -1,
       });
@@ -772,6 +1219,7 @@ export class PaymentsService {
 
     const approved = payments.filter((p) => p.status === 'approved');
     const pending = payments.filter((p) => p.status === 'pending');
+    const processing = payments.filter((p) => p.status === 'processing');
     const rejected = payments.filter((p) => p.status === 'rejected');
 
     const approvedNGN = approved.filter((p) => p.currency === 'NGN');
@@ -859,7 +1307,8 @@ export class PaymentsService {
 
       approvedPayments: approved.length,
 
-      pendingPayments: pending.length,
+      pendingPayments: pending.length + processing.length,
+      processingPayments: processing.length,
 
       rejectedPayments: rejected.length,
     };
@@ -872,20 +1321,42 @@ export class PaymentsService {
   async getUserPaymentAdminSummary(userId: string) {
     const match = { userId, type: { $in: ACTIVE_PAYMENT_TYPES } };
     const [groups, latestPayments] = await Promise.all([
-      this.paymentModel.aggregate([
-        { $match: match },
-        {
-          $group: {
-            _id: { status: '$status', currency: '$currency', type: '$type', target: '$target' },
-            count: { $sum: 1 },
-            amount: { $sum: { $cond: [{ $eq: ['$status', 'approved'] }, '$amount', 0] } },
+      this.paymentModel
+        .aggregate<PaymentAdminSummaryGroup>([
+          { $match: match },
+          {
+            $group: {
+              _id: {
+                status: '$status',
+                currency: '$currency',
+                type: '$type',
+                target: '$target',
+              },
+              count: { $sum: 1 },
+              amount: {
+                $sum: {
+                  $cond: [{ $eq: ['$status', 'approved'] }, '$amount', 0],
+                },
+              },
+            },
           },
-        },
-      ]).exec(),
-      this.paymentModel.find(match).sort({ createdAt: -1 }).limit(10).lean().exec(),
+        ])
+        .exec(),
+      this.paymentModel
+        .find(match)
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean()
+        .exec(),
     ]);
 
-    const counts = { total: 0, approved: 0, pending: 0, rejected: 0 };
+    const counts = {
+      total: 0,
+      approved: 0,
+      pending: 0,
+      processing: 0,
+      rejected: 0,
+    };
     const totalRevenue = { NGN: 0, USD: 0 };
     const subscriptionRevenue = { NGN: 0, USD: 0 };
     const plans = {
@@ -893,7 +1364,7 @@ export class PaymentsService {
       vip: { NGN: 0, USD: 0 },
       premium: { NGN: 0, USD: 0 },
     };
-    for (const group of groups as any[]) {
+    for (const group of groups) {
       const status = String(group._id?.status ?? '').toLowerCase();
       const currency = String(group._id?.currency ?? '').toUpperCase();
       const type = String(group._id?.type ?? '');
@@ -903,35 +1374,64 @@ export class PaymentsService {
       counts.total += count;
       if (status === 'approved') counts.approved += count;
       if (status === 'pending') counts.pending += count;
+      if (status === 'processing') {
+        counts.processing += count;
+        counts.pending += count;
+      }
       if (status === 'rejected') counts.rejected += count;
-      if (status !== 'approved' || !(currency in totalRevenue)) continue;
-      (totalRevenue as any)[currency] += amount;
-      if (!ACTIVE_PAYMENT_TYPES.includes(type as any)) continue;
-      (subscriptionRevenue as any)[currency] += amount;
-      if (type === 'subscription' && target in plans) (plans as any)[target][currency] += amount;
-      if (type === 'vip_upgrade') (plans.vip as any)[currency] += amount;
-      if (type === 'premium_upgrade') (plans.premium as any)[currency] += amount;
+      if (status !== 'approved' || (currency !== 'NGN' && currency !== 'USD')) {
+        continue;
+      }
+      totalRevenue[currency] += amount;
+      if (!isActivePaymentType(type)) continue;
+      subscriptionRevenue[currency] += amount;
+      if (type === 'subscription') {
+        if (target === 'regular' || target === 'vip' || target === 'premium') {
+          plans[target][currency] += amount;
+        }
+      } else if (type === 'vip_upgrade') {
+        plans.vip[currency] += amount;
+      } else if (type === 'premium_upgrade') {
+        plans.premium[currency] += amount;
+      }
     }
     return {
       latestPayments,
       totalPayments: counts.total,
       approvedPayments: counts.approved,
       pendingPayments: counts.pending,
+      processingPayments: counts.processing,
       rejectedPayments: counts.rejected,
-      revenue: { total: totalRevenue, subscriptions: subscriptionRevenue, plans },
+      revenue: {
+        total: totalRevenue,
+        subscriptions: subscriptionRevenue,
+        plans,
+      },
     };
   }
 
   // Paginated full payment history for the admin profile's History tab.
   async getUserPaymentHistory(userId: string, pageValue = 1, limitValue = 10) {
     const page = Math.max(1, Math.floor(Number(pageValue) || 1));
-    const limit = Math.min(100, Math.max(1, Math.floor(Number(limitValue) || 10)));
+    const limit = Math.min(
+      100,
+      Math.max(1, Math.floor(Number(limitValue) || 10)),
+    );
     const filter = { userId, type: { $in: ACTIVE_PAYMENT_TYPES } };
     const [items, total] = await Promise.all([
-      this.paymentModel.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean().exec(),
+      this.paymentModel
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean()
+        .exec(),
       this.paymentModel.countDocuments(filter).exec(),
     ]);
-    return { items, pagination: { page, limit, total, pages: Math.ceil(total / limit) } };
+    return {
+      items,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    };
   }
 
   async getLatestUserPayments(userId: string, limit = 10) {
@@ -984,24 +1484,97 @@ export class PaymentsService {
   }
 
   // =====================================
-  // DELETE EXPIRED GATEWAY PAYMENTS
+  // MARK UNCERTAIN GATEWAY INITIALIZATIONS
   // =====================================
-  // Deletes only gateway payments that have
-  // remained pending for more than 30 minutes.
-  //
-  // Manual payment requests are NOT deleted.
-  // Approved and rejected payments are NOT deleted.
-  // =====================================
-  async deleteExpiredPendingGatewayPayments(): Promise<number> {
+  // Kept under the old public method name for compatibility with any external
+  // caller, but it never deletes a payment. An old Paystack request may have
+  // succeeded even when the HTTP response was lost; its reference must remain
+  // available for verification and recovery.
+  async markExpiredGatewayInitializationsUnknown(): Promise<number> {
     const expirationTime = new Date(Date.now() - 30 * 60 * 1000);
-    const expired = await this.paymentModel.find({
-      status: 'pending', type: { $in: ACTIVE_PAYMENT_TYPES }, gateway: { $in: ['paystack'] }, createdAt: { $lt: expirationTime },
-    }).select('reference').lean().exec();
-    if (!expired.length) return 0;
-    for (const payment of expired) await this.promosService.releaseRedemption(payment.reference);
-    const result = await this.paymentModel.deleteMany({
-      reference: { $in: expired.map((payment) => payment.reference) }, status: 'pending', gateway: { $in: ['paystack'] },
-    }).exec();
-    return result.deletedCount ?? 0;
+    const result = await this.paymentModel
+      .updateMany(
+        {
+          status: 'pending',
+          gateway: 'paystack',
+          gatewayInitializationStatus: 'initializing',
+          createdAt: { $lt: expirationTime },
+        },
+        {
+          $set: {
+            gatewayInitializationStatus: 'unknown',
+            gatewayInitializationLastError:
+              'Initialization response was not recorded. Verify the existing reference before retrying.',
+          },
+        },
+      )
+      .exec();
+    return result.modifiedCount ?? 0;
+  }
+
+  /** Backwards-compatible alias; stale gateway payments are never deleted. */
+  async deleteExpiredPendingGatewayPayments(): Promise<number> {
+    return this.markExpiredGatewayInitializationsUnknown();
+  }
+
+  /** Resume processing records whose worker lease expired after a crash. */
+  async recoverStalePaymentProcessing(limit = 10): Promise<number> {
+    const now = new Date();
+    const stale = await this.paymentModel
+      .find({
+        status: 'processing',
+        $or: [
+          { processingLeaseExpiresAt: null },
+          { processingLeaseExpiresAt: { $exists: false } },
+          { processingLeaseExpiresAt: { $lte: now } },
+        ],
+      })
+      .sort({ processingLeaseExpiresAt: 1, createdAt: 1 })
+      .limit(Math.max(1, Math.min(50, Math.floor(limit))))
+      .select(
+        'reference approvalSource gateway gatewayTransactionId gatewayResponse processedBy',
+      )
+      .lean()
+      .exec();
+
+    let recovered = 0;
+    for (const item of stale) {
+      const approvalSource = item.approvalSource as unknown;
+      const gateway = item.gateway as unknown;
+      const source: 'manual' | 'paystack' =
+        approvalSource === 'paystack' || approvalSource === 'manual'
+          ? approvalSource
+          : gateway === 'paystack'
+            ? 'paystack'
+            : 'manual';
+      const gatewayResponse = item.gatewayResponse as unknown;
+      const safeGatewayResponse =
+        typeof gatewayResponse === 'object' &&
+        gatewayResponse !== null &&
+        !Array.isArray(gatewayResponse)
+          ? (gatewayResponse as Record<string, any>)
+          : undefined;
+      try {
+        const payment = await this.processPaymentApproval(
+          item.reference,
+          source,
+          {
+            ...(item.gatewayTransactionId
+              ? { gatewayTransactionId: item.gatewayTransactionId }
+              : {}),
+            ...(safeGatewayResponse
+              ? { gatewayResponse: safeGatewayResponse }
+              : {}),
+            ...(item.processedBy ? { adminId: item.processedBy } : {}),
+          },
+        );
+        if (payment.status === 'approved') recovered += 1;
+      } catch (error) {
+        this.logger.error(
+          `Could not recover payment ${item.reference}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+    return recovered;
   }
 }

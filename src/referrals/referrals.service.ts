@@ -1,4 +1,4 @@
-import { BadRequestException, forwardRef, Inject, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 
 import { InjectModel } from '@nestjs/mongoose';
 
@@ -8,9 +8,8 @@ import { Referral, ReferralDocument } from './schemas/referral.schema';
 
 import { PromoRequirement } from '../promos/constants/promo-requirements';
 
-import { PromoEngineService } from '../promos/promo-engine.service';
-
 import { UsersService } from '../users/users.service';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 @Injectable()
 export class ReferralsService {
@@ -20,8 +19,7 @@ export class ReferralsService {
 
     private readonly usersService: UsersService,
 
-    @Inject(forwardRef(() => PromoEngineService))
-    private readonly promoEngineService: PromoEngineService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   // ============================================================
@@ -29,206 +27,143 @@ export class ReferralsService {
   // ============================================================
 
   async createReferral(referrerId: string, referredUserId: string) {
-    // ----------------------------------------------------------
-    // PREVENT SELF REFERRAL
-    // ----------------------------------------------------------
+    if (referrerId === referredUserId) return null;
 
-    if (referrerId === referredUserId) {
-      return null;
+    const [referrer, referredUser] = await Promise.all([
+      this.usersService.findById(referrerId),
+      this.usersService.findById(referredUserId),
+    ]);
+    if (!referrer) throw new BadRequestException('Referrer not found');
+    if (!referredUser) throw new BadRequestException('Referred user not found');
+
+    const session = await this.referralModel.db.startSession();
+    let referral: ReferralDocument | null = null;
+
+    try {
+      await session.withTransaction(async () => {
+        const existing = await this.referralModel
+          .findOne({ referredUserId })
+          .session(session)
+          .exec();
+
+        if (existing) {
+          referral = existing;
+          return;
+        }
+
+        const [created] = await this.referralModel.create(
+          [
+            {
+              referrerId,
+              referredUserId,
+              registered: true,
+              regularSubscription: false,
+              vipSubscription: false,
+              premiumSubscription: false,
+              rewardClaimed: false,
+            },
+          ],
+          { session },
+        );
+
+        const updatedReferrer = await this.usersService.incrementSuccessfulReferrals(
+          referrerId,
+          session,
+        );
+        if (!updatedReferrer) {
+          throw new BadRequestException('Referrer is no longer available.');
+        }
+
+        referral = created;
+      });
+    } catch (error) {
+      if (!this.isDuplicateKeyError(error)) throw error;
+      // A concurrent verification request may have created the referral first.
+      referral = await this.referralModel.findOne({ referredUserId }).exec();
+      if (!referral) throw error;
+    } finally {
+      await session.endSession();
     }
 
-    // ----------------------------------------------------------
-    // VERIFY REFERRER EXISTS
-    // ----------------------------------------------------------
-
-    const referrer = await this.usersService.findById(referrerId);
-
-    if (!referrer) {
-      throw new BadRequestException('Referrer not found');
+    if (!referral) {
+      throw new BadRequestException('Referral could not be created.');
     }
 
-    // ----------------------------------------------------------
-    // VERIFY REFERRED USER EXISTS
-    // ----------------------------------------------------------
-
-    const referredUser = await this.usersService.findById(referredUserId);
-
-    if (!referredUser) {
-      throw new BadRequestException('Referred user not found');
-    }
-
-    // ----------------------------------------------------------
-    // PREVENT DUPLICATE REFERRAL
-    // ----------------------------------------------------------
-    //
-    // referredUserId is also unique in the Referral schema.
-    //
-    // This protects the system if this method is accidentally
-    // called more than once.
-    //
-
-    const existing = await this.referralModel.findOne({
+    // The notification service uses a stable event key, so repeating this call
+    // repairs an interrupted notification without producing duplicate notices.
+    const actualReferrerId = String(referral.referrerId);
+    await this.notificationEvents.referralRegistered({
+      referrerId: actualReferrerId,
       referredUserId,
+      referredName: String(
+        (referredUser as any).fullName ??
+          (referredUser as any).username ??
+          '',
+      ),
     });
-
-    if (existing) {
-      // If the referral already exists, do NOT increment
-      // successfulReferrals again.
-
-      return existing;
-    }
-
-    // ----------------------------------------------------------
-    // CREATE REFERRAL RECORD
-    // ----------------------------------------------------------
-
-    const referral = await this.referralModel.create({
-      referrerId,
-
-      referredUserId,
-
-      registered: true,
-
-      regularSubscription: false,
-
-      vipSubscription: false,
-
-      premiumSubscription: false,
-
-      rewardClaimed: false,
-    });
-
-    // ----------------------------------------------------------
-    // INCREMENT SUCCESSFUL REFERRALS
-    // ----------------------------------------------------------
-    //
-    // This is the missing piece from the previous implementation.
-    //
-    // At this point:
-    //
-    // 1. The referred user exists
-    // 2. OTP verification has completed
-    // 3. The referral record has been created
-    //
-    // Therefore this referral is now successful.
-    //
-
-    await this.usersService.incrementSuccessfulReferrals(referrerId);
-
-    // ----------------------------------------------------------
-    // NOTIFY PROMO ENGINE
-    // ----------------------------------------------------------
-    //
-    // The promo engine will:
-    //
-    // 1. Find campaigns the referrer joined
-    // 2. Count qualified referrals
-    // 3. Calculate progress
-    // 4. Grant rewards when thresholds are reached
-    //
-
-    await this.promoEngineService.checkUserPromos(referrerId);
-
-    // ----------------------------------------------------------
-    // RETURN REFERRAL
-    // ----------------------------------------------------------
 
     return referral;
+  }
+
+  private isDuplicateKeyError(error: unknown): boolean {
+    return Boolean(
+      error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        (error as { code?: unknown }).code === 11000,
+    );
   }
 
   // ============================================================
   // MARK REGULAR SUBSCRIPTION
   // ============================================================
 
-  async markRegularSubscription(userId: string) {
-    const referral = await this.referralModel.findOne({
+  private async markSubscriptionMilestone(
+    userId: string,
+    field: 'regularSubscription' | 'vipSubscription' | 'premiumSubscription',
+    plan: 'regular' | 'vip' | 'premium',
+  ) {
+    // The milestone is an idempotent fact update. The payment-processing
+    // workflow evaluates referral campaigns after this method returns, so a
+    // retried payment can safely repeat the evaluation if a previous attempt
+    // stopped between these operations.
+    const referral = await this.referralModel
+      .findOneAndUpdate(
+        { referredUserId: userId },
+        { $set: { [field]: true } },
+        { returnDocument: 'after' },
+      )
+      .exec();
+
+    if (!referral) return null;
+
+    await this.notificationEvents.referralSubscription({
+      referrerId: referral.referrerId.toString(),
       referredUserId: userId,
+      plan,
     });
-
-    if (!referral) {
-      return null;
-    }
-
-    // ----------------------------------------------------------
-    // ALREADY PROCESSED
-    // ----------------------------------------------------------
-
-    if (referral.regularSubscription) {
-      return referral;
-    }
-
-    // ----------------------------------------------------------
-    // MARK ACTION
-    // ----------------------------------------------------------
-
-    referral.regularSubscription = true;
-
-    await referral.save();
-
-    // ----------------------------------------------------------
-    // NOTIFY PROMO ENGINE
-    // ----------------------------------------------------------
-
-    await this.promoEngineService.checkUserPromos(
-      referral.referrerId.toString(),
-    );
 
     return referral;
   }
 
-  // ============================================================
-  // MARK VIP SUBSCRIPTION
-  // ============================================================
+  async markRegularSubscription(userId: string) {
+    return this.markSubscriptionMilestone(
+      userId,
+      'regularSubscription',
+      'regular',
+    );
+  }
 
   async markVipSubscription(userId: string) {
-    const referral = await this.referralModel.findOne({
-      referredUserId: userId,
-    });
-
-    if (!referral) {
-      return null;
-    }
-
-    // ----------------------------------------------------------
-    // ALREADY PROCESSED
-    // ----------------------------------------------------------
-
-    if (referral.vipSubscription) {
-      return referral;
-    }
-
-    // ----------------------------------------------------------
-    // MARK ACTION
-    // ----------------------------------------------------------
-
-    referral.vipSubscription = true;
-
-    await referral.save();
-
-    // ----------------------------------------------------------
-    // NOTIFY PROMO ENGINE
-    // ----------------------------------------------------------
-
-    await this.promoEngineService.checkUserPromos(
-      referral.referrerId.toString(),
-    );
-
-    return referral;
+    return this.markSubscriptionMilestone(userId, 'vipSubscription', 'vip');
   }
 
-  // ============================================================
-  // MARK PREMIUM SUBSCRIPTION
-  // ============================================================
-
   async markPremiumSubscription(userId: string) {
-    const referral = await this.referralModel.findOne({ referredUserId: userId });
-    if (!referral) return null;
-    if (referral.premiumSubscription) return referral;
-
-    referral.premiumSubscription = true;
-    await referral.save();
-    await this.promoEngineService.checkUserPromos(referral.referrerId.toString());
-    return referral;
+    return this.markSubscriptionMilestone(
+      userId,
+      'premiumSubscription',
+      'premium',
+    );
   }
 
   // ============================================================
@@ -422,3 +357,5 @@ export class ReferralsService {
     };
   }
 }
+
+

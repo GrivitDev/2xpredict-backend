@@ -1,5 +1,6 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { AdminGateway } from '../../realtime/admin.gateway';
+import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
@@ -12,7 +13,10 @@ import { CuratedPrediction } from '../schemas/curated-prediction.schema';
 import { PredictionEngineEvent } from '../schemas/prediction-engine-event.schema';
 import { PredictionEngineState } from '../schemas/prediction-engine-state.schema';
 import { MarketCalibration } from '../schemas/market-calibration.schema';
-import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import { SportsDataChangeEventService } from '../../sports/services/sports-data-change-event.service';
+import type { SportsFixtureRecord } from '../../sports/interfaces/sports-domain.interface';
+import { OddsReadService } from '../../odds/services/odds-read.service';
 import { PredictionEventLevel } from '../enums/prediction-event-level.enum';
 import { EngineEventType } from '../enums/engine-event-type.enum';
 import { PredictionQueueStatus } from '../enums/prediction-queue-status.enum';
@@ -21,6 +25,8 @@ import { PredictionStatus } from '../enums/prediction-status.enum';
 import { SlipStatus } from '../enums/slip-status.enum';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
 import { PredictionEngineDashboard } from '../interfaces/prediction-monitor.interface';
+import { FOOTBALL_MARKET_CATALOG } from '../catalog/football-market-catalog';
+import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
 
 export type PredictionOperationStatus = 'RUNNING' | 'HEALTHY' | 'DEGRADED' | 'UNKNOWN';
 
@@ -92,14 +98,17 @@ export class PredictionEngineMonitorService implements OnModuleInit {
     private readonly eventModel: Model<PredictionEngineEvent>,
     @InjectModel(PredictionEngineState.name)
     private readonly stateModel: Model<PredictionEngineState>,
-    @InjectModel(EspnFixture.name)
-    private readonly fixtureModel: Model<EspnFixture>,
+    private readonly sportsRead: SportsDomainReadService,
+    private readonly sportsRevisions: SportsDataChangeEventService,
+    private readonly oddsRead: OddsReadService,
     @InjectModel(MarketCalibration.name)
     private readonly calibrationModel: Model<MarketCalibration>,
     private readonly adminGateway: AdminGateway,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   onModuleInit(): void {
+    this.systemMonitor.registerModule('predictions-engine');
     this.adminGateway.registerModule('predictions-engine', {
       message:
         'Prediction Engine monitor initialized; queue synchronization, worker state and prediction run events are streamed.',
@@ -227,7 +236,7 @@ export class PredictionEngineMonitorService implements OnModuleInit {
       level: result.missingSummary
         ? PredictionEventLevel.WARNING
         : PredictionEventLevel.INFO,
-      message: `Queue sync scanned ${result.scannedFixtures} fixtures, found ${result.eligibleFixtures} with Summary, queued ${result.enqueued}, refreshed ${result.refreshed}, missing Summary ${result.missingSummary}.`,
+      message: `Full-season queue reconciliation scanned ${result.scannedFixtures} retained upcoming fixtures, found ${result.eligibleFixtures} Odds-ready fixtures, queued ${result.enqueued}, refreshed ${result.refreshed}, and found ${result.missingSummary} without a normalized Sports freshness timestamp.`,
       metadata: result,
     });
   }
@@ -770,13 +779,98 @@ export class PredictionEngineMonitorService implements OnModuleInit {
   }
 
   async dashboard(): Promise<PredictionEngineDashboard> {
+    try {
+      return await this.buildDashboard();
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('predictions-engine', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{ name: 'dashboard', status: 'FAILED', error: error instanceof Error ? error.message : String(error) }],
+      });
+      throw error;
+    }
+  }
+
+  private async buildDashboard(): Promise<PredictionEngineDashboard> {
     const now = new Date();
     const staleBeforeDate = new Date(
-      now.getTime() -
-        PREDICTION_ENGINE_CONFIG.model.sourceSummaryStaleHours * 3_600_000,
+      now.getTime() - PREDICTION_ENGINE_CONFIG.model.sourceDataStaleHours * 3_600_000,
     );
-    const staleBeforeIso = staleBeforeDate.toISOString();
     const last24h = new Date(now.getTime() - 86_400_000);
+    const readFixturePages = async (query: {
+      state?: SportsFixtureRecord['status']['state'];
+      from?: Date;
+      to?: Date;
+      retainedOnly?: boolean;
+    }): Promise<{ items: SportsFixtureRecord[]; total: number }> => {
+      const items: SportsFixtureRecord[] = [];
+      let cursor: string | undefined;
+      do {
+        const result = await this.sportsRead.getFixtures({
+          ...query,
+          limit: 500,
+          ...(cursor ? { cursor } : {}),
+        });
+        items.push(...(result.items ?? []));
+        if (result.nextCursor && result.nextCursor === cursor) {
+          throw new Error('Sports fixture pagination returned a repeated cursor while building the Predictions Engine dashboard.');
+        }
+        cursor = result.nextCursor;
+      } while (cursor);
+      return { items, total: items.length };
+    };
+    const [upcomingSports, liveSports, completedSports] = await Promise.all([
+      // The market engine now covers every retained fixture with a future kickoff.
+      readFixturePages({ from: now, retainedOnly: true }),
+      Promise.all((['LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES'] as const).map((state) =>
+        readFixturePages({ state, retainedOnly: true }),
+      )),
+      this.sportsRead.countFixtures({ state: 'COMPLETED', retainedOnly: true }),
+    ]);
+    const terminalFixtureStates = new Set(['COMPLETED', 'POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED']);
+    const upcomingSportsItems = upcomingSports.items.filter((fixture) =>
+      !terminalFixtureStates.has(String(fixture.status?.state ?? '').toUpperCase())
+      && fixture.status?.isFinal !== true
+      && new Date(fixture.kickoffAt).getTime() >= now.getTime(),
+    );
+    const liveSportsItems = liveSports.flatMap((item) => item.items);
+    const liveSportsTotal = liveSportsItems.length;
+    const upcomingSportsTotal = upcomingSportsItems.length;
+    const completedSportsTotal = completedSports;
+    const sportsSourceDate = (fixture: SportsFixtureRecord): Date | null => {
+      const value = fixture.source?.collectedAt ?? fixture.source?.providerUpdatedAt ?? fixture.updatedAt;
+      if (value instanceof Date && Number.isFinite(value.getTime())) return value;
+      if (typeof value === 'string' || typeof value === 'number') {
+        const parsed = new Date(value);
+        return Number.isFinite(parsed.getTime()) ? parsed : null;
+      }
+      return null;
+    };
+    const upcomingSportsReadyCount = upcomingSportsItems.filter((fixture) => sportsSourceDate(fixture) !== null).length;
+    const liveSportsReadyCount = liveSportsItems.filter((fixture) => sportsSourceDate(fixture) !== null).length;
+    const sportsWindowFixtures = upcomingSportsItems.concat(liveSportsItems);
+    const marketWindowTotal = upcomingSportsTotal + liveSportsTotal;
+    const marketWindowWithSportsData = upcomingSportsReadyCount + liveSportsReadyCount;
+    const marketWindowMissingSportsData = Math.max(0, marketWindowTotal - marketWindowWithSportsData);
+    const staleSportsFixtures = sportsWindowFixtures.filter((fixture) => {
+      const sourceDate = sportsSourceDate(fixture);
+      return !sourceDate || sourceDate.getTime() < staleBeforeDate.getTime();
+    }).length;
+    const oddsReadiness = new Map<string, { ready?: boolean }>();
+    // Keep readiness lookup batches bounded even when the retained season
+    // inventory contains many thousands of upcoming fixtures.
+    for (let offset = 0; offset < sportsWindowFixtures.length; offset += 500) {
+      const batchIds = sportsWindowFixtures
+        .slice(offset, offset + 500)
+        .map((fixture) => String(fixture.id));
+      const batchReadiness = await this.oddsRead.getPredictionReadinessForEvents(batchIds);
+      for (const [eventId, readiness] of batchReadiness) {
+        oddsReadiness.set(eventId, readiness);
+      }
+    }
+    const missingOddsSportsFixtures = sportsWindowFixtures.filter((fixture) =>
+      oddsReadiness.get(String(fixture.id))?.ready !== true,
+    ).length;
     const state: PredictionEngineState | null = await this.stateModel
       .findOne({ key: 'main' })
       .lean()
@@ -816,31 +910,11 @@ export class PredictionEngineMonitorService implements OnModuleInit {
       recentEvents,
       calibrationDocuments,
     ] = await Promise.all([
-      this.fixtureModel.countDocuments({
-        fixtureDate: { $gte: now },
-        live: false,
-        completed: { $ne: true },
-      }),
-      this.fixtureModel.countDocuments({
-        fixtureDate: { $gte: now },
-        live: false,
-        completed: { $ne: true },
-        'payload.summary': { $exists: true, $ne: null },
-      }),
-      this.fixtureModel.countDocuments({
-        fixtureDate: { $gte: now },
-        live: false,
-        completed: { $ne: true },
-        $or: [
-          { 'payload.summary': { $exists: false } },
-          { 'payload.summary': null },
-        ],
-      }),
-      this.fixtureModel.countDocuments({
-        live: true,
-        completed: { $ne: true },
-      }),
-      this.fixtureModel.countDocuments({ completed: true }),
+      upcomingSportsTotal,
+      upcomingSportsReadyCount,
+      Math.max(0, upcomingSportsTotal - upcomingSportsReadyCount),
+      liveSportsTotal,
+      completedSportsTotal,
       this.marketModel.countDocuments({ modelVersion: activeModelVersion }),
       this.marketModel.countDocuments({
         modelVersion: activeModelVersion,
@@ -1237,27 +1311,8 @@ export class PredictionEngineMonitorService implements OnModuleInit {
           },
         ])
         .exec(),
-      this.fixtureModel.countDocuments({
-        fixtureDate: { $gte: now },
-        live: false,
-        completed: { $ne: true },
-        $or: [
-          { 'payload.summary.odds': { $exists: false } },
-          { 'payload.summary.odds': null },
-          { 'payload.summary.pickcenter': { $exists: false } },
-          { 'payload.summary.pickcenter': null },
-        ],
-      }),
-      this.fixtureModel.countDocuments({
-        fixtureDate: { $gte: now },
-        live: false,
-        completed: { $ne: true },
-        $or: [
-          { 'payload.summaryCollectedAt': { $lt: staleBeforeDate } },
-          { 'payload.summaryCollectedAt': { $lt: staleBeforeIso } },
-          { 'payload.summary.meta.lastUpdatedAt': { $lt: staleBeforeIso } },
-        ],
-      }),
+      missingOddsSportsFixtures,
+      staleSportsFixtures,
       this.runModel
         .distinct('eventId', {
           modelVersion: activeModelVersion,
@@ -1310,10 +1365,6 @@ export class PredictionEngineMonitorService implements OnModuleInit {
     const curatedHorizon = new Date(
       now.getTime() +
         PREDICTION_ENGINE_CONFIG.curatedPredictions.horizonHours * 3_600_000,
-    );
-    const marketEngineHorizon = new Date(
-      now.getTime() +
-        PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 3_600_000,
     );
     const [
       curatedTotal,
@@ -1416,32 +1467,9 @@ export class PredictionEngineMonitorService implements OnModuleInit {
           status: { $in: [SlipStatus.READY, SlipStatus.PUBLISHED] },
         })
         .exec(),
-      this.fixtureModel
-        .countDocuments({
-          fixtureDate: { $gte: now, $lte: marketEngineHorizon },
-          live: { $ne: true },
-          completed: { $ne: true },
-        })
-        .exec(),
-      this.fixtureModel
-        .countDocuments({
-          fixtureDate: { $gte: now, $lte: marketEngineHorizon },
-          live: { $ne: true },
-          completed: { $ne: true },
-          'payload.summary': { $exists: true, $ne: null },
-        })
-        .exec(),
-      this.fixtureModel
-        .countDocuments({
-          fixtureDate: { $gte: now, $lte: marketEngineHorizon },
-          live: { $ne: true },
-          completed: { $ne: true },
-          $or: [
-            { 'payload.summary': { $exists: false } },
-            { 'payload.summary': null },
-          ],
-        })
-        .exec(),
+      marketWindowTotal,
+      marketWindowWithSportsData,
+      marketWindowMissingSportsData,
     ]);
     const eventIdKey = (value: unknown): string => {
       if (value == null) return '';
@@ -1577,7 +1605,7 @@ export class PredictionEngineMonitorService implements OnModuleInit {
       });
     }
 
-    return {
+    const dashboard: PredictionEngineDashboard = {
       generatedAt: now.toISOString(),
       runtime,
       engine: {
@@ -1789,11 +1817,11 @@ export class PredictionEngineMonitorService implements OnModuleInit {
         withoutSportyBetCode: Math.max(0, totalSlips - slipsWithCode),
       },
       marketEngineWindow: {
-        forwardHours: PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours,
+        coverageScope: 'ALL_RETAINED_UPCOMING_FIXTURES',
         fixtures: marketEngineWindowFixtures,
         withSummary: marketEngineWindowWithSummary,
         missingSummary: marketEngineWindowMissingSummary,
-        waitingForOdds: queueMap[PredictionQueueStatus.WAITING_FOR_ODDS] ?? 0,
+        waitingForOdds: missingOddsSportsFixtures,
       },
       calibration: {
         lastCycleStatus:
@@ -1850,8 +1878,7 @@ export class PredictionEngineMonitorService implements OnModuleInit {
         }),
       },
       generationWindows: {
-        marketEnginesForwardHours:
-          PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours,
+        marketEnginesCoverageScope: 'ALL_RETAINED_UPCOMING_FIXTURES',
         curatedAndSlipForwardHours:
           PREDICTION_ENGINE_CONFIG.curatedPredictions.horizonHours,
         includeLiveFixtures: true,
@@ -1919,6 +1946,33 @@ export class PredictionEngineMonitorService implements OnModuleInit {
       markets,
       recentEvents: recentEvents as unknown as Record<string, unknown>[],
     };
+
+    const monitorAlerts = dashboard.runtime?.alerts ?? [];
+    const failedAlerts = monitorAlerts.filter((alert) => alert.severity === 'ERROR');
+    const status = failedAlerts.length > 0
+      ? 'FAILED'
+      : monitorAlerts.length > 0
+        ? 'DEGRADED'
+        : 'HEALTHY';
+    this.systemMonitor.reportMonitorSnapshot('predictions-engine', {
+      status,
+      checkedAt: now,
+      checks: monitorAlerts,
+      warnings: monitorAlerts
+        .filter((alert) => alert.severity === 'WARNING')
+        .map((alert) => alert.message),
+      details: {
+        engineEnabled: dashboard.engine.enabled,
+        workerRunning: dashboard.engine.workerRunning,
+        pendingQueueItems: dashboard.queue.pending,
+        retryQueueItems: dashboard.queue.retry,
+        failedQueueItems: dashboard.queue.failed,
+        failedRuns: dashboard.runs.failed,
+        activeOperations: dashboard.runtime?.operations.filter((item) => item.activeRuns > 0).length ?? 0,
+        alertCount: monitorAlerts.length,
+      },
+    });
+    return dashboard;
   }
 
   private lagosDateKey(now: Date): string {
@@ -1986,6 +2040,712 @@ export class PredictionEngineMonitorService implements OnModuleInit {
       .sort({ marketKey: 1 })
       .lean()
       .exec();
+  }
+
+  /**
+   * Read-only, market-by-market coverage audit for one fixture.
+   * It compares the active prediction catalogue, persisted market results,
+   * current Odds quotes, and Pick Center output without triggering generation
+   * or changing any prediction.
+   */
+  async getMarketCoverageAudit(eventId: string): Promise<Record<string, unknown>> {
+    const normalizedEventId = String(eventId ?? '').trim();
+    if (!normalizedEventId) {
+      return {
+        eventId: normalizedEventId,
+        generatedAt: new Date(),
+        error: 'A non-empty Sports fixture eventId is required.',
+      };
+    }
+
+    const [marketDocuments, oddsQuotes, pickCenter, currentFixtureSourceRevision] = await Promise.all([
+      this.marketModel
+        .find({
+          eventId: normalizedEventId,
+          modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
+        })
+        .lean()
+        .exec() as Promise<any[]>,
+      this.oddsRead.getFixturePrices(normalizedEventId),
+      this.pickCenterModel
+        .findOne({ eventId: normalizedEventId })
+        .lean()
+        .exec() as Promise<any>,
+      this.sportsRevisions.getCurrentRevision('FIXTURE', normalizedEventId),
+    ]);
+
+    const documentsByMarket = new Map<string, any>();
+    for (const document of marketDocuments) {
+      const key = String(document.marketKey ?? '').trim().toUpperCase();
+      if (key) documentsByMarket.set(key, document);
+    }
+
+    const pickSelections: any[] = Array.isArray(pickCenter?.selectedMarkets)
+      ? pickCenter.selectedMarkets
+      : [];
+    const selectedByMarket = new Map<string, any>();
+    for (const selection of pickSelections) {
+      const key = String(selection?.marketKey ?? '').trim().toUpperCase();
+      if (key && !selectedByMarket.has(key)) selectedByMarket.set(key, selection);
+    }
+
+    const sameLine = (left: unknown, right: unknown): boolean => {
+      const leftMissing = left === undefined || left === null || left === '';
+      const rightMissing = right === undefined || right === null || right === '';
+      if (leftMissing || rightMissing) return leftMissing && rightMissing;
+      const leftNumber = Number(left);
+      const rightNumber = Number(right);
+      return Number.isFinite(leftNumber)
+        && Number.isFinite(rightNumber)
+        && Math.abs(leftNumber - rightNumber) < 0.001;
+    };
+    const quoteMatchesSelection = (quote: any, selection: any): boolean =>
+      String(quote?.selectionKey ?? '').trim().toUpperCase()
+        === String(selection?.key ?? '').trim().toUpperCase()
+      && sameLine(quote?.line, selection?.line);
+    const hasUsableOdds = (quote: any): boolean =>
+      quote?.predictionReady === true
+      && quote?.isFresh === true
+      && (quote?.priceType === 'PROVIDER' || quote?.priceType === 'ESTIMATED')
+      && Number.isFinite(Number(quote?.decimalOdds))
+      && Number(quote.decimalOdds) >= PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds
+      && Number(quote.decimalOdds) <= PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds
+      && Boolean(String(quote?.oddsCalculationMethod ?? '').trim())
+      && ['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY']
+        .includes(String(quote?.oddsBasis ?? ''));
+
+    const markets = FOOTBALL_MARKET_CATALOG.map((definition) => {
+      const marketKey = String(definition.key).toUpperCase();
+      const canonicalMarket = FOOTBALL_MARKET_BY_PREDICTION_KEY.get(marketKey as any);
+      const document = documentsByMarket.get(marketKey);
+      const selections: any[] = Array.isArray(document?.selections)
+        ? document.selections
+        : [];
+      const marketQuotes = canonicalMarket
+        ? oddsQuotes.filter((quote: any) => String(quote.marketId) === String(canonicalMarket.id))
+        : [];
+      const freshQuotes = marketQuotes.filter((quote: any) => quote.isFresh === true);
+      const usableQuotes = marketQuotes.filter(hasUsableOdds);
+      const calculatedSelections = selections.filter((selection) =>
+        String(selection?.status ?? '').toUpperCase() === 'CALCULATED'
+        && Number.isFinite(Number(selection?.probability))
+        && Number(selection.probability) > 0
+        && Number(selection.probability) < 1,
+      );
+      const finalSelections = selections.filter((selection) => selection?.isFinalSelection === true);
+      const oddsReadySelections = selections.filter((selection) => selection?.oddsPredictionReady === true);
+      const selectionsWithMatchingUsableQuote = calculatedSelections.filter((selection) =>
+        marketQuotes.some((quote: any) => quoteMatchesSelection(quote, selection) && hasUsableOdds(quote)),
+      );
+      const matchedUsableQuoteIdentities = new Set<string>();
+      for (const quote of usableQuotes) {
+        if (selections.some((selection) => quoteMatchesSelection(quote, selection))) {
+          matchedUsableQuoteIdentities.add(
+            `${String(quote.selectionKey).toUpperCase()}::${quote.line == null ? '-' : Number(quote.line).toFixed(3)}`,
+          );
+        }
+      }
+      const readyQuotesWithoutModelSelection = Math.max(0, usableQuotes.length - matchedUsableQuoteIdentities.size);
+      const selectedInPickCenter = selectedByMarket.get(marketKey);
+      const finalSelection = finalSelections.length === 1 ? finalSelections[0] : undefined;
+      const finalSelectionInPickCenter = Boolean(
+        finalSelection
+        && selectedInPickCenter
+        && String(selectedInPickCenter.selectionKey ?? '').toUpperCase() === String(finalSelection.key ?? '').toUpperCase()
+        && String(selectedInPickCenter.marketPredictionId ?? '') === String(document?._id ?? ''),
+      );
+      const pricingEnabled = definition.pricingEnabled !== false;
+
+      let coverageState: string;
+      let blockingReason: string | null = null;
+      if (!canonicalMarket) {
+        coverageState = 'CANONICAL_ODDS_MAPPING_MISSING';
+        blockingReason = 'The prediction market has no matching market ID in the canonical Odds catalogue.';
+      } else if (!pricingEnabled) {
+        coverageState = 'CATALOG_DISABLED';
+        blockingReason = definition.notes ?? 'Pricing is intentionally disabled for this market.';
+      } else if (!document) {
+        coverageState = usableQuotes.length
+          ? 'ODDS_READY_BUT_PREDICTION_DOCUMENT_MISSING'
+          : 'PREDICTION_DOCUMENT_MISSING';
+        blockingReason = usableQuotes.length
+          ? 'Fresh prediction-ready Odds quotes exist, but the active model version has no persisted prediction document for this market.'
+          : 'No persisted market prediction exists for the active model version.';
+      } else if (Number(document.fixtureSourceRevision ?? -1) !== currentFixtureSourceRevision) {
+        coverageState = 'PREDICTION_SOURCE_REVISION_STALE';
+        blockingReason = `The prediction was generated from Sports fixture revision ${document.fixtureSourceRevision ?? 'missing'}, while the current revision is ${currentFixtureSourceRevision}. Recalculation is required.`;
+      } else if (finalSelections.length > 1) {
+        coverageState = 'MULTIPLE_FINAL_SELECTIONS';
+        blockingReason = 'More than one final selection is stored for this market; the one-selection-per-market invariant is violated.';
+      } else if (finalSelectionInPickCenter) {
+        coverageState = 'PICK_CENTER_SELECTED';
+      } else if (finalSelections.length === 1) {
+        coverageState = 'FINAL_SELECTION_NOT_IN_PICK_CENTER';
+        blockingReason = 'The market has one final selection, but the matching selection is absent from the current Pick Center snapshot.';
+      } else if (usableQuotes.length > 0 && calculatedSelections.length === 0) {
+        coverageState = 'ODDS_READY_BUT_MODEL_UNAVAILABLE';
+        blockingReason = 'Fresh prediction-ready Odds quotes exist, but the market model produced no calculated probability.';
+      } else if (calculatedSelections.length > 0 && usableQuotes.length > 0 && selectionsWithMatchingUsableQuote.length === 0) {
+        coverageState = 'MODEL_SELECTIONS_NOT_ODDS_MATCHED';
+        blockingReason = 'The model calculated probabilities, but none of the emitted selection keys and lines match a fresh prediction-ready Odds quote.';
+      } else if (calculatedSelections.length > 0) {
+        coverageState = 'CALCULATED_NO_FINAL_SELECTION';
+        blockingReason = 'The model calculated candidate probabilities, but no single candidate passed the market engine final-selection checks.';
+      } else if (marketQuotes.length === 0) {
+        coverageState = 'NO_ODDS_QUOTES';
+        blockingReason = 'The Odds module has no active quote for this canonical market and fixture.';
+      } else if (freshQuotes.length === 0) {
+        coverageState = 'ODDS_QUOTES_STALE';
+        blockingReason = 'Stored Odds quotes exist, but none is currently marked fresh.';
+      } else if (usableQuotes.length === 0) {
+        coverageState = 'ODDS_QUOTES_NOT_PREDICTION_READY';
+        blockingReason = 'Fresh quotes exist, but none satisfies the Odds readiness, price, provenance, and calculation-method checks.';
+      } else {
+        coverageState = 'ODDS_QUOTES_NOT_USABLE';
+        blockingReason = 'No quote passed the current Odds readiness and technical price validation checks.';
+      }
+
+      const documentDiagnostics = Array.isArray(document?.diagnostics)
+        ? document.diagnostics.filter((item: unknown) => typeof item === 'string').slice(0, 6)
+        : [];
+      const selectionDiagnostics = selections
+        .flatMap((selection) => Array.isArray(selection?.diagnostics) ? selection.diagnostics : [])
+        .filter((item: unknown) => typeof item === 'string');
+      const uniqueSelectionDiagnostics = [...new Set(selectionDiagnostics)].slice(0, 6);
+
+      return {
+        marketKey,
+        marketId: canonicalMarket?.id ?? null,
+        marketName: definition.fullName,
+        abbreviation: definition.abbreviation,
+        family: definition.family,
+        model: definition.model,
+        selectionMode: definition.selectionMode,
+        period: definition.period,
+        pricingEnabled,
+        requiredData: definition.requiredData ?? [],
+        minimumSampleSize: definition.minimumSampleSize ?? null,
+        catalogueNotes: definition.notes ?? null,
+        prediction: {
+          documentPresent: Boolean(document),
+          fixtureSourceRevision: document?.fixtureSourceRevision ?? null,
+          fixtureSourceRevisionCurrent: document
+            ? Number(document.fixtureSourceRevision ?? -1) === currentFixtureSourceRevision
+            : null,
+          status: document?.status ?? null,
+          selectionCount: selections.length,
+          calculatedSelectionCount: calculatedSelections.length,
+          oddsReadySelectionCount: oddsReadySelections.length,
+          finalSelectionCount: finalSelections.length,
+          finalSelections: finalSelections.map((selection) => ({
+            selectionKey: String(selection.key ?? ''),
+            line: selection.line ?? null,
+            probability: selection.probability ?? null,
+            confidence: selection.confidence ?? null,
+            decimalOdds: selection.decimalOdds ?? null,
+            priceType: selection.priceType ?? null,
+            oddsBasis: selection.oddsBasis ?? null,
+          })),
+          calculatedSelectionsWithMatchingUsableOdds: selectionsWithMatchingUsableQuote.length,
+          diagnostics: [...documentDiagnostics, ...uniqueSelectionDiagnostics].slice(0, 10),
+        },
+        odds: {
+          quoteCount: marketQuotes.length,
+          freshQuoteCount: freshQuotes.length,
+          predictionReadyQuoteCount: marketQuotes.filter((quote: any) => quote.predictionReady === true).length,
+          freshPredictionReadyQuoteCount: usableQuotes.length,
+          readyQuotesWithoutModelSelection,
+        },
+        pickCenter: {
+          selected: Boolean(selectedInPickCenter),
+          selectionKey: selectedInPickCenter?.selectionKey ?? null,
+          matchesFinalSelection: finalSelectionInPickCenter,
+        },
+        coverageState,
+        blockingReason,
+      };
+    });
+
+    const count = (predicate: (market: any) => boolean): number => markets.filter(predicate).length;
+    const totals = {
+      catalogMarketCount: markets.length,
+      pricingEnabledMarketCount: count((market) => market.pricingEnabled),
+      canonicalMappingMissingCount: count((market) => market.coverageState === 'CANONICAL_ODDS_MAPPING_MISSING'),
+      predictionDocumentsFound: marketDocuments.length,
+      marketsWithPredictionDocument: count((market) => market.prediction.documentPresent),
+      marketsWithStaleSourceRevision: count((market) => market.coverageState === 'PREDICTION_SOURCE_REVISION_STALE'),
+      marketsWithoutPredictionDocument: count((market) => !market.prediction.documentPresent && market.pricingEnabled),
+      marketsWithFreshPredictionReadyOdds: count((market) => market.odds.freshPredictionReadyQuoteCount > 0),
+      marketsWithCalculatedProbability: count((market) => market.prediction.calculatedSelectionCount > 0),
+      marketsWithOneFinalSelection: count((market) => market.prediction.finalSelectionCount === 1),
+      marketsWithMultipleFinalSelections: count((market) => market.prediction.finalSelectionCount > 1),
+      marketsSelectedInPickCenter: count((market) => market.pickCenter.matchesFinalSelection),
+      marketsFinalButMissingFromPickCenter: count((market) => market.coverageState === 'FINAL_SELECTION_NOT_IN_PICK_CENTER'),
+      marketsWithOddsReadyQuotesButNoCalculatedProbability: count((market) => market.coverageState === 'ODDS_READY_BUT_MODEL_UNAVAILABLE'),
+      marketsCalculatedButWithoutFinalSelection: count((market) => market.coverageState === 'CALCULATED_NO_FINAL_SELECTION'),
+      marketsWithModelToOddsSelectionMismatch: count((market) => market.coverageState === 'MODEL_SELECTIONS_NOT_ODDS_MATCHED'),
+      freshPredictionReadyQuotesWithoutModelSelection: markets.reduce((sum, market) => sum + market.odds.readyQuotesWithoutModelSelection, 0),
+    };
+
+    return {
+      eventId: normalizedEventId,
+      generatedAt: new Date(),
+      modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
+      fixture: marketDocuments[0]
+        ? {
+            leagueId: marketDocuments[0].leagueId ?? null,
+            fixtureDate: marketDocuments[0].fixtureDate ?? null,
+            homeTeamName: marketDocuments[0].homeTeamName ?? null,
+            awayTeamName: marketDocuments[0].awayTeamName ?? null,
+            live: marketDocuments[0].live === true,
+            completed: marketDocuments[0].completed === true,
+            predictionSourceRevision: marketDocuments[0].fixtureSourceRevision ?? null,
+            currentSourceRevision: currentFixtureSourceRevision,
+            sourceRevisionCurrent: Number(marketDocuments[0].fixtureSourceRevision ?? -1) === currentFixtureSourceRevision,
+          }
+        : {
+            currentSourceRevision: currentFixtureSourceRevision,
+            predictionSourceRevision: null,
+            sourceRevisionCurrent: null,
+          },
+      pickCenterSnapshot: pickCenter
+        ? {
+            status: pickCenter.status ?? null,
+            selectedMarketCount: pickCenter.selectedMarketCount ?? pickSelections.length,
+            updatedAt: pickCenter.updatedAt ?? null,
+          }
+        : null,
+      totals,
+      markets,
+      note: 'Read-only audit. It does not generate predictions, refresh Odds, or mutate Pick Center.',
+    };
+  }
+
+  /**
+   * Read-only coverage inventory across a bounded page of retained future
+   * fixtures. Unlike the single-fixture audit, this endpoint shows which
+   * canonical markets repeatedly stop at the same pipeline stage.
+   *
+   * It reads the durable prediction queue as the fixture inventory, so fixtures
+   * with no generated MarketPrediction documents are still represented.
+   */
+  async getMarketCoverageInventory(input: {
+    from?: string;
+    to?: string;
+    leagueId?: string;
+    page?: number;
+    pageSize?: number;
+  } = {}): Promise<Record<string, unknown>> {
+    const generatedAt = new Date();
+    const from = input.from ? new Date(input.from) : generatedAt;
+    const to = input.to
+      ? new Date(input.to)
+      : new Date(generatedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+      throw new BadRequestException('Market coverage dates must be valid ISO date values.');
+    }
+    if (to.getTime() < from.getTime()) {
+      throw new BadRequestException('Market coverage "to" date must be on or after the "from" date.');
+    }
+
+    const page = Math.max(1, Math.floor(Number(input.page) || 1));
+    const pageSize = Math.max(1, Math.min(100, Math.floor(Number(input.pageSize) || 50)));
+    const filter: Record<string, any> = {
+      fixtureDate: { $gte: from, $lte: to },
+    };
+    const leagueId = String(input.leagueId ?? '').trim().toLowerCase();
+    if (leagueId) filter.leagueId = leagueId;
+
+    const [totalFixtures, queueRows] = await Promise.all([
+      this.queueModel.countDocuments(filter).exec(),
+      this.queueModel
+        .find(filter)
+        .select({
+          eventId: 1,
+          leagueId: 1,
+          fixtureDate: 1,
+          status: 1,
+          attempts: 1,
+          modelVersion: 1,
+          reason: 1,
+          errorMessage: 1,
+          oddsUpdatedAt: 1,
+          summaryCollectedAt: 1,
+          lastProcessedSummaryAt: 1,
+          fixtureSourceRevision: 1,
+          lastProcessedFixtureSourceRevision: 1,
+        })
+        .sort({ fixtureDate: 1, eventId: 1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .lean()
+        .exec() as Promise<any[]>,
+    ]);
+
+    const eventIds = queueRows
+      .map((row) => String(row.eventId ?? '').trim())
+      .filter(Boolean);
+    if (!eventIds.length) {
+      return {
+        generatedAt,
+        modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
+        range: { from, to, leagueId: leagueId || null },
+        pagination: {
+          page,
+          pageSize,
+          totalFixtures,
+          totalPages: Math.ceil(totalFixtures / pageSize),
+          hasMore: page * pageSize < totalFixtures,
+        },
+        totals: {
+          fixturesAudited: 0,
+          catalogMarketCount: FOOTBALL_MARKET_CATALOG.length,
+          marketFixturePairs: 0,
+          pricingEnabledMarketFixturePairs: 0,
+          marketsWithPredictionDocument: 0,
+          marketsWithFreshPredictionReadyOdds: 0,
+          marketsWithCalculatedProbability: 0,
+          marketsWithOneFinalSelection: 0,
+          marketsSelectedInPickCenter: 0,
+          marketsWithStaleSourceRevision: 0,
+          coverageStateCounts: {},
+        },
+        coverageByMarket: [],
+        fixtures: [],
+        note: 'Read-only page-level coverage summary. No prediction, Odds, Pick Center, or queue records were changed.',
+      };
+    }
+
+    const [marketDocuments, oddsQuotes, pickRows, fixtureRevisionsByEvent] = await Promise.all([
+      this.marketModel
+        .find({
+          eventId: { $in: eventIds },
+          modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
+        })
+        .lean()
+        .exec() as Promise<any[]>,
+      this.oddsRead.getPricesForFixtures(eventIds),
+      this.pickCenterModel
+        .find({ eventId: { $in: eventIds } })
+        .lean()
+        .exec() as Promise<any[]>,
+      this.sportsRevisions.getCurrentRevisions('FIXTURE', eventIds),
+    ]);
+
+    const documentsByEvent = new Map<string, Map<string, any>>();
+    for (const document of marketDocuments) {
+      const eventId = String(document.eventId ?? '').trim();
+      const marketKey = String(document.marketKey ?? '').trim().toUpperCase();
+      if (!eventId || !marketKey) continue;
+      const byMarket = documentsByEvent.get(eventId) ?? new Map<string, any>();
+      byMarket.set(marketKey, document);
+      documentsByEvent.set(eventId, byMarket);
+    }
+
+    const quotesByEvent = new Map<string, any[]>();
+    for (const quote of oddsQuotes as any[]) {
+      const eventId = String(quote.eventId ?? '').trim();
+      if (!eventId) continue;
+      const rows = quotesByEvent.get(eventId) ?? [];
+      rows.push(quote);
+      quotesByEvent.set(eventId, rows);
+    }
+
+    const picksByEvent = new Map<string, any>();
+    for (const pick of pickRows) picksByEvent.set(String(pick.eventId ?? ''), pick);
+
+    const sameLine = (left: unknown, right: unknown): boolean => {
+      const leftMissing = left === undefined || left === null || left === '';
+      const rightMissing = right === undefined || right === null || right === '';
+      if (leftMissing || rightMissing) return leftMissing && rightMissing;
+      const leftNumber = Number(left);
+      const rightNumber = Number(right);
+      return Number.isFinite(leftNumber)
+        && Number.isFinite(rightNumber)
+        && Math.abs(leftNumber - rightNumber) < 0.001;
+    };
+    const quoteMatchesSelection = (quote: any, selection: any): boolean =>
+      String(quote?.selectionKey ?? '').trim().toUpperCase()
+        === String(selection?.key ?? '').trim().toUpperCase()
+      && sameLine(quote?.line, selection?.line);
+    const hasUsableOdds = (quote: any): boolean =>
+      quote?.predictionReady === true
+      && quote?.isFresh === true
+      && (quote?.priceType === 'PROVIDER' || quote?.priceType === 'ESTIMATED')
+      && Number.isFinite(Number(quote?.decimalOdds))
+      && Number(quote.decimalOdds) >= PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds
+      && Number(quote.decimalOdds) <= PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds
+      && Boolean(String(quote?.oddsCalculationMethod ?? '').trim())
+      && ['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY']
+        .includes(String(quote?.oddsBasis ?? ''));
+
+    const marketAggregates = new Map<string, {
+      marketKey: string;
+      marketId: string | null;
+      marketName: string;
+      family: string;
+      pricingEnabled: boolean;
+      fixturesAudited: number;
+      predictionDocumentsFound: number;
+      fixturesWithFreshReadyOdds: number;
+      fixturesWithCalculatedProbability: number;
+      fixturesWithOneFinalSelection: number;
+      fixturesSelectedInPickCenter: number;
+      coverageStates: Record<string, number>;
+    }>();
+
+    for (const definition of FOOTBALL_MARKET_CATALOG) {
+      const marketKey = String(definition.key).trim().toUpperCase();
+      const canonicalMarket = FOOTBALL_MARKET_BY_PREDICTION_KEY.get(marketKey as any);
+      marketAggregates.set(marketKey, {
+        marketKey,
+        marketId: canonicalMarket?.id ?? null,
+        marketName: definition.fullName,
+        family: String(definition.family),
+        pricingEnabled: definition.pricingEnabled !== false,
+        fixturesAudited: 0,
+        predictionDocumentsFound: 0,
+        fixturesWithFreshReadyOdds: 0,
+        fixturesWithCalculatedProbability: 0,
+        fixturesWithOneFinalSelection: 0,
+        fixturesSelectedInPickCenter: 0,
+        coverageStates: {},
+      });
+    }
+
+    const coverageStateCounts: Record<string, number> = {};
+    const fixtures: Array<Record<string, unknown>> = [];
+    let marketFixturePairs = 0;
+    let pricingEnabledMarketFixturePairs = 0;
+    let marketsWithPredictionDocument = 0;
+    let marketsWithFreshPredictionReadyOdds = 0;
+    let marketsWithCalculatedProbability = 0;
+    let marketsWithOneFinalSelection = 0;
+    let marketsSelectedInPickCenter = 0;
+    let marketsWithStaleSourceRevision = 0;
+
+    for (const queueRow of queueRows) {
+      const eventId = String(queueRow.eventId ?? '').trim();
+      const currentFixtureSourceRevision = fixtureRevisionsByEvent.get(eventId) ?? 0;
+      const documents = documentsByEvent.get(eventId) ?? new Map<string, any>();
+      const fixtureQuotes = quotesByEvent.get(eventId) ?? [];
+      const pickCenter = picksByEvent.get(eventId);
+      const pickSelections: any[] = Array.isArray(pickCenter?.selectedMarkets)
+        ? pickCenter.selectedMarkets
+        : [];
+      const selectedByMarket = new Map<string, any>();
+      for (const selection of pickSelections) {
+        const key = String(selection?.marketKey ?? '').trim().toUpperCase();
+        if (key && !selectedByMarket.has(key)) selectedByMarket.set(key, selection);
+      }
+
+      const fixtureStateCounts: Record<string, number> = {};
+      const problemMarkets: Array<Record<string, unknown>> = [];
+      let fixtureSelectedCount = 0;
+      let fixtureFinalSelectionCount = 0;
+      let fixtureCalculatedCount = 0;
+      let fixtureReadyOddsCount = 0;
+      let fixtureDocumentCount = 0;
+
+      for (const definition of FOOTBALL_MARKET_CATALOG) {
+        marketFixturePairs += 1;
+        const marketKey = String(definition.key).trim().toUpperCase();
+        const aggregate = marketAggregates.get(marketKey)!;
+        aggregate.fixturesAudited += 1;
+        const canonicalMarket = FOOTBALL_MARKET_BY_PREDICTION_KEY.get(marketKey as any);
+        const document = documents.get(marketKey);
+        const selections: any[] = Array.isArray(document?.selections) ? document.selections : [];
+        const marketQuotes = canonicalMarket
+          ? fixtureQuotes.filter((quote: any) => String(quote.marketId) === String(canonicalMarket.id))
+          : [];
+        const freshQuotes = marketQuotes.filter((quote: any) => quote.isFresh === true);
+        const usableQuotes = marketQuotes.filter(hasUsableOdds);
+        const calculatedSelections = selections.filter((selection) =>
+          String(selection?.status ?? '').toUpperCase() === 'CALCULATED'
+          && Number.isFinite(Number(selection?.probability))
+          && Number(selection.probability) > 0
+          && Number(selection.probability) < 1,
+        );
+        const finalSelections = selections.filter((selection) => selection?.isFinalSelection === true);
+        const matchingCalculatedSelections = calculatedSelections.filter((selection) =>
+          usableQuotes.some((quote: any) => quoteMatchesSelection(quote, selection)),
+        );
+        const selectedInPickCenter = selectedByMarket.get(marketKey);
+        const oneFinal = finalSelections.length === 1;
+        const finalSelection = oneFinal ? finalSelections[0] : undefined;
+        const finalSelectionInPickCenter = Boolean(
+          finalSelection
+          && selectedInPickCenter
+          && String(selectedInPickCenter.selectionKey ?? '').trim().toUpperCase()
+            === String(finalSelection.key ?? '').trim().toUpperCase()
+          && String(selectedInPickCenter.marketPredictionId ?? '') === String(document?._id ?? ''),
+        );
+
+        let coverageState: string;
+        if (!canonicalMarket) coverageState = 'CANONICAL_ODDS_MAPPING_MISSING';
+        else if (definition.pricingEnabled === false) coverageState = 'CATALOG_DISABLED';
+        else if (!document) coverageState = usableQuotes.length
+          ? 'ODDS_READY_BUT_PREDICTION_DOCUMENT_MISSING'
+          : 'PREDICTION_DOCUMENT_MISSING';
+        else if (Number(document.fixtureSourceRevision ?? -1) !== currentFixtureSourceRevision) coverageState = 'PREDICTION_SOURCE_REVISION_STALE';
+        else if (finalSelections.length > 1) coverageState = 'MULTIPLE_FINAL_SELECTIONS';
+        else if (finalSelectionInPickCenter) coverageState = 'PICK_CENTER_SELECTED';
+        else if (oneFinal) coverageState = 'FINAL_SELECTION_NOT_IN_PICK_CENTER';
+        else if (usableQuotes.length > 0 && calculatedSelections.length === 0) coverageState = 'ODDS_READY_BUT_MODEL_UNAVAILABLE';
+        else if (calculatedSelections.length > 0 && usableQuotes.length > 0 && matchingCalculatedSelections.length === 0) coverageState = 'MODEL_SELECTIONS_NOT_ODDS_MATCHED';
+        else if (calculatedSelections.length > 0) coverageState = 'CALCULATED_NO_FINAL_SELECTION';
+        else if (marketQuotes.length === 0) coverageState = 'NO_ODDS_QUOTES';
+        else if (freshQuotes.length === 0) coverageState = 'ODDS_QUOTES_STALE';
+        else if (usableQuotes.length === 0) coverageState = 'ODDS_QUOTES_NOT_PREDICTION_READY';
+        else coverageState = 'ODDS_QUOTES_NOT_USABLE';
+
+        fixtureStateCounts[coverageState] = (fixtureStateCounts[coverageState] ?? 0) + 1;
+        coverageStateCounts[coverageState] = (coverageStateCounts[coverageState] ?? 0) + 1;
+        aggregate.coverageStates[coverageState] = (aggregate.coverageStates[coverageState] ?? 0) + 1;
+        if (document) {
+          aggregate.predictionDocumentsFound += 1;
+          fixtureDocumentCount += 1;
+          marketsWithPredictionDocument += 1;
+          if (Number(document.fixtureSourceRevision ?? -1) !== currentFixtureSourceRevision) {
+            marketsWithStaleSourceRevision += 1;
+          }
+        }
+        if (usableQuotes.length) {
+          aggregate.fixturesWithFreshReadyOdds += 1;
+          fixtureReadyOddsCount += 1;
+          marketsWithFreshPredictionReadyOdds += 1;
+        }
+        if (calculatedSelections.length) {
+          aggregate.fixturesWithCalculatedProbability += 1;
+          fixtureCalculatedCount += 1;
+          marketsWithCalculatedProbability += 1;
+        }
+        if (oneFinal) {
+          aggregate.fixturesWithOneFinalSelection += 1;
+          fixtureFinalSelectionCount += 1;
+          marketsWithOneFinalSelection += 1;
+        }
+        if (finalSelectionInPickCenter) {
+          aggregate.fixturesSelectedInPickCenter += 1;
+          fixtureSelectedCount += 1;
+          marketsSelectedInPickCenter += 1;
+        }
+        if (definition.pricingEnabled !== false) pricingEnabledMarketFixturePairs += 1;
+        if (coverageState !== 'PICK_CENTER_SELECTED' && coverageState !== 'CATALOG_DISABLED') {
+          problemMarkets.push({
+            marketKey,
+            marketName: definition.fullName,
+            family: definition.family,
+            coverageState,
+            predictionDocumentPresent: Boolean(document),
+            usableOddsQuoteCount: usableQuotes.length,
+            calculatedSelectionCount: calculatedSelections.length,
+            finalSelectionCount: finalSelections.length,
+            blockingReason: !canonicalMarket
+              ? 'Canonical Odds market mapping is missing.'
+              : !document
+                ? usableQuotes.length
+                  ? 'Fresh prediction-ready Odds quotes exist, but the active model-version prediction document is missing.'
+                  : 'No active model-version prediction document exists for this fixture and market.'
+                : Number(document.fixtureSourceRevision ?? -1) !== currentFixtureSourceRevision
+                  ? `Prediction source revision ${document.fixtureSourceRevision ?? 'missing'} is stale; current Sports fixture revision is ${currentFixtureSourceRevision}.`
+                  : finalSelections.length > 1
+                  ? 'The one-final-selection-per-market invariant is violated.'
+                  : oneFinal
+                    ? 'The market engine final selection is absent from the Pick Center snapshot.'
+                    : usableQuotes.length && !calculatedSelections.length
+                      ? 'Odds are ready, but the specialized market model emitted no probability.'
+                      : calculatedSelections.length && usableQuotes.length && !matchingCalculatedSelections.length
+                        ? 'Calculated outcomes do not match any fresh prediction-ready Odds selection and line.'
+                        : calculatedSelections.length
+                          ? 'Calculated probabilities exist, but no final selection was emitted.'
+                          : marketQuotes.length === 0
+                            ? 'No active Odds quotes exist for this market.'
+                            : freshQuotes.length === 0
+                              ? 'Stored Odds quotes are stale.'
+                              : 'No fresh quote satisfies the Odds prediction-readiness and technical validity checks.',
+          });
+        }
+      }
+
+      fixtures.push({
+        eventId,
+        leagueId: queueRow.leagueId ?? null,
+        fixtureDate: queueRow.fixtureDate ?? null,
+        queue: {
+          status: queueRow.status ?? null,
+          attempts: Number(queueRow.attempts ?? 0),
+          reason: queueRow.reason ?? null,
+          errorMessage: queueRow.errorMessage ?? null,
+          modelVersion: queueRow.modelVersion ?? null,
+          summaryCollectedAt: queueRow.summaryCollectedAt ?? null,
+          lastProcessedSummaryAt: queueRow.lastProcessedSummaryAt ?? null,
+          oddsUpdatedAt: queueRow.oddsUpdatedAt ?? null,
+          fixtureSourceRevision: queueRow.fixtureSourceRevision ?? null,
+          lastProcessedFixtureSourceRevision: queueRow.lastProcessedFixtureSourceRevision ?? null,
+          currentFixtureSourceRevision,
+          sourceRevisionCurrent: Number(queueRow.fixtureSourceRevision ?? -1) === currentFixtureSourceRevision,
+        },
+        predictionDocumentsFound: fixtureDocumentCount,
+        freshPredictionReadyMarkets: fixtureReadyOddsCount,
+        calculatedMarkets: fixtureCalculatedCount,
+        marketsWithOneFinalSelection: fixtureFinalSelectionCount,
+        pickCenterSnapshot: {
+          exists: Boolean(pickCenter),
+          selectedMarketCount: Number(pickCenter?.selectedMarketCount ?? pickSelections.length),
+          status: pickCenter?.status ?? null,
+          updatedAt: pickCenter?.updatedAt ?? null,
+        },
+        selectedInPickCenter: fixtureSelectedCount,
+        coverageStateCounts: fixtureStateCounts,
+        problemMarkets: problemMarkets.slice(0, 40),
+        problemMarketCount: problemMarkets.length,
+      });
+    }
+
+    const coverageByMarket = [...marketAggregates.values()].map((item) => ({
+      ...item,
+      coverageRate: item.pricingEnabled && item.fixturesAudited
+        ? Number((item.fixturesSelectedInPickCenter / item.fixturesAudited).toFixed(4))
+        : null,
+    })).sort((left, right) =>
+      (left.coverageRate ?? 1) - (right.coverageRate ?? 1)
+      || left.marketKey.localeCompare(right.marketKey),
+    );
+
+    return {
+      generatedAt,
+      modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
+      range: { from, to, leagueId: leagueId || null },
+      pagination: {
+        page,
+        pageSize,
+        totalFixtures,
+        totalPages: Math.ceil(totalFixtures / pageSize),
+        hasMore: page * pageSize < totalFixtures,
+        note: 'Coverage totals and per-market rates in this response describe the current page, not every fixture in the full date range.',
+      },
+      totals: {
+        fixturesAudited: queueRows.length,
+        catalogMarketCount: FOOTBALL_MARKET_CATALOG.length,
+        marketFixturePairs,
+        pricingEnabledMarketFixturePairs,
+        marketsWithPredictionDocument,
+        marketsWithFreshPredictionReadyOdds,
+        marketsWithCalculatedProbability,
+        marketsWithOneFinalSelection,
+        marketsSelectedInPickCenter,
+        marketsWithStaleSourceRevision,
+        pickCenterCoverageRate: pricingEnabledMarketFixturePairs
+          ? Number((marketsSelectedInPickCenter / pricingEnabledMarketFixturePairs).toFixed(4))
+          : 0,
+        coverageStateCounts,
+      },
+      coverageByMarket,
+      fixtures,
+      note: 'Read-only page-level coverage summary. It uses the durable prediction queue so fixtures with no market prediction documents remain visible, and compares persisted prediction revisions with the current Sports fixture revision. It does not enqueue work, generate predictions, refresh Odds, or mutate Pick Center.',
+    };
   }
 
   private errorMessage(error: unknown): string {

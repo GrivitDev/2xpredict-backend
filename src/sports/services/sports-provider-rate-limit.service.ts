@@ -10,7 +10,7 @@ import {
 
 import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 
-export type SportsProvider = 'espn' | 'football-data' | 'odds-api' | 'youtube';
+export type SportsProvider = 'espn' | 'odds-api' | 'youtube';
 
 export type SportsProviderRequestLane = 'live' | 'normal';
 
@@ -113,9 +113,6 @@ export class SportsProviderRateLimitService {
         SPORTS_DATA_COLLECTION_CONFIG.ESPN.rateLimit.minIntervalSeconds,
     },
 
-    'football-data': {
-      minIntervalSeconds: 60,
-    },
 
     'odds-api': {
       minIntervalSeconds: 60,
@@ -412,22 +409,6 @@ export class SportsProviderRateLimitService {
         this.endpointStartTails.delete(key);
       }
     }
-  }
-
-  // ============================================================
-  // RELEASE SLOT
-  // ============================================================
-
-  /**
-   * Kept for compatibility with existing callers. Endpoint throttling is
-   * now process-local and is released when the request-start gate advances.
-   */
-  async releaseSlot(
-    _provider: SportsProvider,
-    _endpoint: string,
-    _lockedUntil?: Date,
-  ): Promise<void> {
-    return;
   }
 
   // ============================================================
@@ -927,7 +908,6 @@ export class SportsProviderRateLimitService {
       .exec();
 
     const dailyPeriod = this.getDailyPeriod(now);
-    const monthlyPeriod = this.getMonthlyPeriod(now);
 
     if (
       state?.quotaBlockedUntil instanceof Date &&
@@ -1050,29 +1030,6 @@ export class SportsProviderRateLimitService {
   }
 
   // ============================================================
-  // EXPIRED LEGACY LOCKS
-  // ============================================================
-
-  async clearExpiredLocks(): Promise<number> {
-    const result = await this.rateLimitModel
-      .updateMany(
-        {
-          lockedUntil: {
-            $lte: new Date(),
-          },
-        },
-        {
-          $unset: {
-            lockedUntil: 1,
-          },
-        },
-      )
-      .exec();
-
-    return result.modifiedCount ?? 0;
-  }
-
-  // ============================================================
   // HELPERS
   // ============================================================
 
@@ -1147,5 +1104,7 @@ export class SportsProviderRateLimitService {
     });
   }
 }
+
+
 
 

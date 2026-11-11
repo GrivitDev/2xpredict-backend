@@ -1,7 +1,12 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { ClientSession, Model, Types } from 'mongoose';
 import { User, UserStatus } from './schemas/user.schema';
+
+const LOGIN_FAILURE_LIMIT = 8;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const PASSWORD_RESET_FAILURE_LIMIT = 5;
+const PASSWORD_RESET_LOCK_MS = 15 * 60 * 1000;
 
 @Injectable()
 export class UsersService {
@@ -106,10 +111,13 @@ export class UsersService {
   // FINDERS
   // =========================
   async findByEmail(email: string) {
-    return this.userModel.findOne({
-      email: email.trim().toLowerCase(),
-      isDeleted: false,
-    });
+    return this.userModel
+      .findOne({
+        email: email.trim().toLowerCase(),
+        isDeleted: false,
+      })
+      .select('-passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil')
+      .exec();
   }
 
   async findByUsername(username: string) {
@@ -125,25 +133,105 @@ export class UsersService {
         email: email.trim().toLowerCase(),
         isDeleted: false,
       })
-      .select('+password');
+      .select('+password +authVersion +loginFailedAttempts +loginLockedUntil -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil')
+      .exec();
+  }
+
+  async findByEmailForPasswordReset(email: string) {
+    return this.userModel
+      .findOne({
+        email: email.trim().toLowerCase(),
+        isDeleted: false,
+      })
+      .select('+passwordResetToken +passwordResetExpires +passwordResetRequestedAt +passwordResetAttempts +passwordResetLockedUntil')
+      .exec();
+  }
+
+  /**
+   * Atomically claims the per-account password-reset cooldown and replaces the
+   * outstanding token. Concurrent requests from different IP addresses cannot
+   * overwrite one another's reset token during the cooldown window.
+   */
+  async claimPasswordResetRequest(
+    email: string,
+    tokenHash: string,
+    expiresAt: Date,
+    requestedAt: Date,
+    cooldownCutoff: Date,
+  ) {
+    return this.userModel.findOneAndUpdate(
+      {
+        email: email.trim().toLowerCase(),
+        isDeleted: false,
+        $and: [
+          {
+            $or: [
+              { passwordResetRequestedAt: { $exists: false } },
+              { passwordResetRequestedAt: null },
+              { passwordResetRequestedAt: { $lte: cooldownCutoff } },
+            ],
+          },
+          {
+            $or: [
+              { passwordResetLockedUntil: { $exists: false } },
+              { passwordResetLockedUntil: null },
+              { passwordResetLockedUntil: { $lte: requestedAt } },
+            ],
+          },
+        ],
+      },
+      {
+        $set: {
+          passwordResetToken: tokenHash,
+          passwordResetExpires: expiresAt,
+          passwordResetRequestedAt: requestedAt,
+          passwordResetAttempts: 0,
+        },
+        $unset: { passwordResetLockedUntil: 1 },
+      },
+      { returnDocument: 'after' },
+    ).exec();
   }
 
   async findById(userId: string) {
     if (!Types.ObjectId.isValid(userId)) return null;
     return this.userModel
       .findOne({ _id: userId, isDeleted: false })
-      .select('-passwordResetToken -passwordResetExpires')
+      .select('-passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
+  }
+
+  /** Authentication-only lookup; keeps the internal token version out of API profile responses. */
+  async findByIdForAuth(userId: string) {
+    if (!Types.ObjectId.isValid(userId)) return null;
+    return this.userModel
+      .findOne({ _id: userId, isDeleted: false })
+      .select('+authVersion -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
+  }
+
+  /** OTP-only lookup for the internal first-verification recovery flag. */
+  async findByIdForVerification(userId: string) {
+    if (!Types.ObjectId.isValid(userId)) return null;
+    return this.userModel
+      .findOne({ _id: userId, isDeleted: false })
+      .select('+verificationOnboardingPending -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
       .exec();
   }
 
   async findByIdWithPassword(userId: string) {
     return this.userModel
       .findOne({ _id: userId, isDeleted: false })
-      .select('+password');
+      .select('+password -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
   }
 
   /** Changes email only after the caller has verified the current and new addresses. */
-  async changeEmailAndVerify(userId: string, email: string) {
+  async changeEmailAndVerify(
+    userId: string,
+    email: string,
+    firstVerification = false,
+  ) {
     return this.userModel.findOneAndUpdate(
       { _id: userId, isDeleted: false },
       {
@@ -151,17 +239,25 @@ export class UsersService {
           email: email.trim().toLowerCase(),
           isVerified: true,
           status: UserStatus.ACTIVE,
+          ...(firstVerification ? { verificationOnboardingPending: true } : {}),
         },
         $unset: { verificationExpiresAt: 1 },
       },
       { returnDocument: 'after', runValidators: true },
-    ).exec();
+    ).select('+verificationOnboardingPending').exec();
   }
 
   async clearPendingPromoCode(userId: string) {
     await this.userModel.updateOne(
       { _id: userId, isDeleted: false },
       { $unset: { pendingPromoCode: 1 } },
+    ).exec();
+  }
+
+  async completeVerificationOnboarding(userId: string) {
+    return this.userModel.updateOne(
+      { _id: userId, isDeleted: false, verificationOnboardingPending: true },
+      { $set: { verificationOnboardingPending: false } },
     ).exec();
   }
 
@@ -219,9 +315,10 @@ export class UsersService {
   // VERIFICATION
   // =========================
   async verifyUser(email: string) {
-    return this.userModel.findOneAndUpdate(
+    const normalizedEmail = email.trim().toLowerCase();
+    const updated = await this.userModel.findOneAndUpdate(
       {
-        email: email.trim().toLowerCase(),
+        email: normalizedEmail,
         isDeleted: false,
         isVerified: false,
       },
@@ -229,38 +326,42 @@ export class UsersService {
         $set: {
           isVerified: true,
           status: UserStatus.ACTIVE,
+          verificationOnboardingPending: true,
         },
+        // Keep pendingPromoCode until referral/promo onboarding side effects
+        // finish; the OTP workflow clears it after successful completion.
         $unset: {
           verificationExpiresAt: 1,
-          pendingPromoCode: 1,
         },
       },
       { returnDocument: 'after' },
-    );
+    ).select('+verificationOnboardingPending').exec();
+
+    // Returning the already-verified account allows a claimed OTP workflow to
+    // resume safely when a process stopped after the account update.
+    if (updated) return updated;
+    return this.userModel.findOne({
+      email: normalizedEmail,
+      isDeleted: false,
+      isVerified: true,
+    }).select('+verificationOnboardingPending').exec();
   }
 
   // =========================
   // REFERRAL TRACKING
   // =========================
 
-  async incrementSuccessfulReferrals(userId: string) {
-    return this.userModel.findOneAndUpdate(
-      {
-        _id: userId,
-
-        isDeleted: false,
-      },
-
-      {
-        $inc: {
-          successfulReferrals: 1,
-        },
-      },
-
-      {
-        returnDocument: 'after',
-      },
+  async incrementSuccessfulReferrals(
+    userId: string,
+    session?: ClientSession,
+  ) {
+    const query = this.userModel.findOneAndUpdate(
+      { _id: userId, isDeleted: false },
+      { $inc: { successfulReferrals: 1 } },
+      { returnDocument: 'after' },
     );
+    if (session) query.session(session);
+    return query.exec();
   }
   // =========================
   // ADMIN CONTROL
@@ -325,19 +426,163 @@ export class UsersService {
   // =========================
   // LOGIN TRACKING
   // =========================
-  async updateLoginInfo(userId: string) {
-    return this.userModel.findByIdAndUpdate(
-      userId,
+  async recordLoginFailure(userId: string) {
+    const now = new Date();
+    const lockUntil = new Date(now.getTime() + LOGIN_LOCK_MS);
+    const lockExpired = {
+      $and: [
+        { $ne: [{ $ifNull: ['$loginLockedUntil', null] }, null] },
+        { $lte: ['$loginLockedUntil', now] },
+      ],
+    };
+    const attemptsExpression = {
+      $cond: [
+        lockExpired,
+        1,
+        { $add: [{ $ifNull: ['$loginFailedAttempts', 0] }, 1] },
+      ],
+    };
+
+    return this.userModel.findOneAndUpdate(
+      { _id: userId, isDeleted: false },
+      [
+        { $set: { loginFailedAttempts: attemptsExpression } },
+        {
+          $set: {
+            loginLockedUntil: {
+              $cond: [
+                { $gte: ['$loginFailedAttempts', LOGIN_FAILURE_LIMIT] },
+                lockUntil,
+                { $cond: [lockExpired, null, '$loginLockedUntil'] },
+              ],
+            },
+          },
+        },
+      ] as any,
+      { returnDocument: 'after' },
+    ).exec();
+  }
+
+  async updateLoginInfo(
+    userId: string,
+    expectedAuthVersion: number,
+    expectedPasswordHash: string,
+  ) {
+    const versionConditions =
+      expectedAuthVersion === 0
+        ? [{ authVersion: 0 }, { authVersion: { $exists: false } }]
+        : [{ authVersion: expectedAuthVersion }];
+
+    return this.userModel.findOneAndUpdate(
+      {
+        _id: userId,
+        isDeleted: false,
+        password: expectedPasswordHash,
+        $or: versionConditions,
+      },
       {
         $set: {
           lastLoginAt: new Date(),
+          loginFailedAttempts: 0,
+          authVersion: expectedAuthVersion,
         },
-        $inc: {
-          loginCount: 1,
-        },
+        $unset: { loginLockedUntil: 1 },
+        $inc: { loginCount: 1 },
       },
       { returnDocument: 'after' },
-    );
+    ).exec();
+  }
+
+  async recordPasswordResetFailure(userId: string, expectedTokenHash: string) {
+    const now = new Date();
+    const lockUntil = new Date(now.getTime() + PASSWORD_RESET_LOCK_MS);
+    const lockExpired = {
+      $and: [
+        { $ne: [{ $ifNull: ['$passwordResetLockedUntil', null] }, null] },
+        { $lte: ['$passwordResetLockedUntil', now] },
+      ],
+    };
+    const attemptsExpression = {
+      $cond: [
+        lockExpired,
+        1,
+        { $add: [{ $ifNull: ['$passwordResetAttempts', 0] }, 1] },
+      ],
+    };
+
+    return this.userModel.findOneAndUpdate(
+      { _id: userId, passwordResetToken: expectedTokenHash, isDeleted: false },
+      [
+        { $set: { passwordResetAttempts: attemptsExpression } },
+        {
+          $set: {
+            passwordResetLockedUntil: {
+              $cond: [
+                { $gte: ['$passwordResetAttempts', PASSWORD_RESET_FAILURE_LIMIT] },
+                lockUntil,
+                { $cond: [lockExpired, null, '$passwordResetLockedUntil'] },
+              ],
+            },
+          },
+        },
+      ] as any,
+      { returnDocument: 'after' },
+    ).exec();
+  }
+
+  async consumePasswordResetToken(
+    userId: string,
+    expectedTokenHash: string,
+    newPasswordHash: string,
+    now: Date,
+    session: ClientSession,
+  ) {
+    return this.userModel.findOneAndUpdate(
+      {
+        _id: userId,
+        isDeleted: false,
+        passwordResetToken: expectedTokenHash,
+        passwordResetExpires: { $gt: now },
+        $or: [
+          { passwordResetLockedUntil: { $exists: false } },
+          { passwordResetLockedUntil: null },
+          { passwordResetLockedUntil: { $lte: now } },
+        ],
+      },
+      {
+        $set: {
+          password: newPasswordHash,
+          passwordResetAttempts: 0,
+        },
+        $inc: { authVersion: 1 },
+        $unset: {
+          passwordResetToken: 1,
+          passwordResetExpires: 1,
+          passwordResetLockedUntil: 1,
+        },
+      },
+      { returnDocument: 'after', session },
+    ).exec();
+  }
+
+  async updatePasswordIfCurrent(
+    userId: string,
+    expectedPasswordHash: string,
+    newPasswordHash: string,
+    session: ClientSession,
+  ) {
+    return this.userModel.findOneAndUpdate(
+      {
+        _id: userId,
+        isDeleted: false,
+        password: expectedPasswordHash,
+      },
+      {
+        $set: { password: newPasswordHash },
+        $inc: { authVersion: 1 },
+      },
+      { returnDocument: 'after', session },
+    ).exec();
   }
 
   // =========================

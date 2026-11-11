@@ -1,7 +1,9 @@
 import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import { SportsDomainCollectionService } from '../../sports/services/sports-domain-collection.service';
+import type { SportsMatchReadModel } from '../../sports/interfaces/sports-read.interface';
 import { MarketPrediction } from '../../predictions-engine/schemas/market-prediction.schema';
 import { PredictionSettlementOutcome } from '../enums/settlement-prediction-outcome.enum';
 import { SettlementJobDocument } from '../schemas/settlement-job.schema';
@@ -14,110 +16,91 @@ import { SettlementEventLevel } from '../enums/settlement-event-level.enum';
 import {
   SettlementProcessResult,
   SettlementTargetCounts,
+  SettlementPhase,
 } from '../interfaces/settlement-context.interface';
 import { FootballMatchFactsService } from './football-match-facts.service';
 import { PredictionSettlementService } from './prediction-settlement.service';
 import { BetLabSettlementService } from './bet-lab-settlement.service';
 import { SettlementEventLogService } from './settlement-event-log.service';
-import { EspnService } from '../../sports/providers/espn.service';
-import { SportsCollectionService } from '../../sports/services/sports-collection.service';
+import { SettlementQueueService } from './settlement-queue.service';
+import { isSportsFixtureFinished, isSportsFixtureSettleable } from '../utils/fixture-lifecycle.util';
 import { SETTLEMENT_CONFIG } from '../config/settlement.config';
-import { isFixtureRefreshConfirmedFinished } from '../utils/fixture-lifecycle.util';
 
 @Injectable()
 export class SettlementProcessorService {
   private readonly logger = new Logger(SettlementProcessorService.name);
+
   constructor(
-    @InjectModel(EspnFixture.name)
-    private readonly fixtureModel: Model<EspnFixture>,
     @InjectModel(SettlementRun.name)
     private readonly runModel: Model<SettlementRunDocument>,
     @InjectModel(MarketPrediction.name)
     private readonly marketPredictionModel: Model<MarketPrediction>,
+    private readonly sportsRead: SportsDomainReadService,
+    @Inject(forwardRef(() => SportsDomainCollectionService))
+    private readonly sportsCollection: SportsDomainCollectionService,
     private readonly factsService: FootballMatchFactsService,
     private readonly predictionSettlementService: PredictionSettlementService,
     private readonly betLabSettlementService: BetLabSettlementService,
     private readonly eventLog: SettlementEventLogService,
-    private readonly espnService: EspnService,
-    @Inject(forwardRef(() => SportsCollectionService))
-    private readonly sportsCollectionService: SportsCollectionService,
+    private readonly queue: SettlementQueueService,
   ) {}
 
   async process(job: SettlementJobDocument): Promise<SettlementProcessResult> {
+    await this.queue.assertProcessingLease(job);
     const started = Date.now();
-    const eventId = String(job.eventId);
-    const fixture = (await this.fixtureModel
-      .findOne({ eventId })
-      .lean()
-      .exec()) as unknown as EspnFixture | null;
-    if (!fixture)
-      throw new Error(`Settlement fixture ${eventId} was not found.`);
+    const eventId = String(job.eventId ?? '').trim();
+    if (!eventId) throw new Error('Settlement job does not contain an event ID.');
 
-    // Drain protection for jobs persisted by earlier queue versions. A Summary
-    // response or elapsed kickoff time cannot authorize settlement.
-    if (!isFixtureRefreshConfirmedFinished(fixture)) {
-      const reason =
-        'Settlement skipped: the persisted ESPN fixture refresh has not confirmed a finished result.';
-      const counts: SettlementTargetCounts = {
-        predictionMarketsFound: 0,
-        predictionSelectionsSettled: 0,
-        predictionSelectionsSkipped: 0,
-        predictionSelectionsUnresolved: 0,
-        betLabTicketsFound: 0,
-        betLabLegsSettled: 0,
-        betLabTicketsFinalized: 0,
-        betLabLegsUnresolved: 0,
-      };
+    // Sports is the sole lifecycle and factual source. This read never calls a
+    // provider; fixture, timeline and statistics updates arrive through Sports.
+    let match = await this.sportsRead.getMatch(eventId);
+    if (!match) throw new Error(`Normalized Sports fixture ${eventId} was not found.`);
+
+    const counts: SettlementTargetCounts = this.emptyCounts();
+    const unresolvedReasons: string[] = [];
+    if (!isSportsFixtureSettleable(match.fixture)) {
+      const reason = `Settlement skipped because Sports fixture state ${match.fixture.status?.state ?? 'UNKNOWN'} is not settleable.`;
       await this.eventLog.write({
         level: SettlementEventLevel.WARN,
-        action: 'SETTLEMENT_SKIPPED_UNCONFIRMED_FIXTURE_LIFECYCLE',
+        action: 'SETTLEMENT_SKIPPED_NON_SETTLEABLE_SPORTS_STATE',
         message: reason,
         eventId,
         jobKey: job.jobKey,
-        metadata: { sourceFingerprint: job.sourceFingerprint },
+        metadata: {
+          sportsState: match.fixture.status?.state,
+          isFinal: match.fixture.status?.isFinal,
+          sourceFingerprint: job.sourceFingerprint,
+        },
       });
       return {
         eventId,
         sourceFingerprint: job.sourceFingerprint,
         partial: false,
         skipped: true,
+        phase: 'IN_PLAY',
         counts,
         unresolvedReasons: [reason],
       };
     }
 
-    // Summary enriches evidence after the fixture refresh has already confirmed
-    // the finished lifecycle. Provider failures never block stored local facts.
-    let currentFixture = fixture;
-    let facts = this.factsService.extract(currentFixture);
-    let summaryRequestedThisRun = false;
-    if (this.needsSummaryData(currentFixture, facts)) {
-      summaryRequestedThisRun = await this.refreshSummaryForSettlement(currentFixture, eventId);
-      if (summaryRequestedThisRun) {
-        const refreshedFixture = await this.fixtureModel.findOne({ eventId }).lean().exec();
-        if (refreshedFixture) {
-          currentFixture = refreshedFixture as unknown as EspnFixture;
-          facts = this.factsService.extract(currentFixture);
-        }
-      }
-    }
-    const counts: SettlementTargetCounts = {
-      predictionMarketsFound: 0,
-      predictionSelectionsSettled: 0,
-      predictionSelectionsSkipped: 0,
-      predictionSelectionsUnresolved: 0,
-      betLabTicketsFound: 0,
-      betLabLegsSettled: 0,
-      betLabTicketsFinalized: 0,
-      betLabLegsUnresolved: 0,
-    };
-    const unresolvedReasons: string[] = [];
+    const recovered = await this.recoverFinalMatchEvidence(match, job);
+    match = recovered.match;
+    const facts = recovered.facts;
+    const phase: SettlementPhase = isSportsFixtureFinished(match.fixture)
+      ? 'FULL_TIME'
+      : match.fixture.status.state === 'HALFTIME'
+        ? 'HALF_TIME'
+        : 'IN_PLAY';
+
     if (facts.settlementBlockers?.length) {
       unresolvedReasons.push(...facts.settlementBlockers.slice(0, 100));
     }
     if (facts.conflictingStats?.length && unresolvedReasons.length < 100) {
-      unresolvedReasons.push(`Conflicting provider statistics require review: ${facts.conflictingStats.slice(0, 20).join(', ')}.`);
+      unresolvedReasons.push(
+        `Conflicting normalized Sports statistics require review: ${facts.conflictingStats.slice(0, 20).join(', ')}.`,
+      );
     }
+
     const runFilter = { eventId, sourceFingerprint: facts.sourceFingerprint };
     const run = (await this.runModel
       .findOneAndUpdate(
@@ -125,8 +108,10 @@ export class SettlementProcessorService {
         {
           $set: {
             leagueId: facts.leagueId,
+            // Retained for compatibility with existing persisted runs/jobs.
+            // This field now stores the newest normalized Sports source time.
             sourceSummaryCollectedAt:
-              facts.sourceSummaryCollectedAt ?? job.sourceSummaryCollectedAt,
+              facts.sourceDataCollectedAt ?? job.sourceSummaryCollectedAt,
             status: SettlementJobStatus.PROCESSING,
             counts: counts as unknown as Record<string, number>,
             unresolvedReasons: [],
@@ -142,13 +127,22 @@ export class SettlementProcessorService {
     await this.eventLog.write({
       level: SettlementEventLevel.INFO,
       action: 'SETTLEMENT_PROCESS_STARTED',
-      message: `Processing available fixture facts for ${facts.homeTeamName} vs ${facts.awayTeamName}.`,
+      message: `Evaluating ${phase.toLowerCase()} settlement evidence for ${facts.homeTeamName} vs ${facts.awayTeamName}.`,
       eventId,
       jobKey: job.jobKey,
       runId: String(run._id),
       metadata: {
+        phase,
         sourceFingerprint: facts.sourceFingerprint,
-        summaryCollectedAt: facts.sourceSummaryCollectedAt,
+        sourceDataCollectedAt: facts.sourceDataCollectedAt,
+        fixtureSourceCollectedAt: facts.fixtureSourceCollectedAt,
+        timelineCollectedAt: facts.timelineCollectedAt,
+        statisticsCollectedAt: facts.statisticsCollectedAt,
+        homeStatisticsCollectedAt: facts.homeStatisticsCollectedAt,
+        awayStatisticsCollectedAt: facts.awayStatisticsCollectedAt,
+        fixtureState: facts.fixtureState,
+        currentPeriod: facts.currentPeriod,
+        currentMinute: facts.currentMinute,
         scoreSource: facts.scoreSource,
         sourceDiagnostics: facts.sourceDiagnostics,
         settlementBlockers: facts.settlementBlockers,
@@ -157,12 +151,14 @@ export class SettlementProcessorService {
     });
 
     try {
+      await this.queue.assertProcessingLease(job);
       await this.predictionSettlementService.settleEvent(
         eventId,
         facts,
         counts,
         unresolvedReasons,
       );
+      await this.queue.assertProcessingLease(job);
       await this.betLabSettlementService.settleEvent(
         eventId,
         facts,
@@ -171,6 +167,7 @@ export class SettlementProcessorService {
         unresolvedReasons,
       );
 
+      await this.queue.assertProcessingLease(job);
       const partial =
         counts.predictionSelectionsUnresolved > 0 ||
         counts.betLabLegsUnresolved > 0 ||
@@ -182,34 +179,36 @@ export class SettlementProcessorService {
         eventId,
         sourceFingerprint: facts.sourceFingerprint,
         partial,
+        phase,
         counts,
         unresolvedReasons,
       };
-      await this.runModel
-        .updateOne(runFilter, {
-          $set: {
-            status: partial
-              ? SettlementJobStatus.PARTIAL
-              : SettlementJobStatus.COMPLETED,
-            counts: counts as unknown as Record<string, number>,
-            unresolvedReasons: unresolvedReasons.slice(0, 100),
-            completedAt,
-            durationMs,
-          },
-        })
-        .exec();
+
+      await this.runModel.updateOne(runFilter, {
+        $set: {
+          status: partial
+            ? SettlementJobStatus.PARTIAL
+            : SettlementJobStatus.COMPLETED,
+          counts: counts as unknown as Record<string, number>,
+          unresolvedReasons: unresolvedReasons.slice(0, 100),
+          completedAt,
+          durationMs,
+        },
+      }).exec();
+
       await this.eventLog.write({
         level: partial ? SettlementEventLevel.WARN : SettlementEventLevel.INFO,
         action: partial
           ? 'SETTLEMENT_PROCESS_PARTIAL'
           : 'SETTLEMENT_PROCESS_COMPLETED',
         message: partial
-          ? `Settlement completed with unresolved markets or ticket legs for event ${eventId}.`
-          : `Settlement completed for event ${eventId}.`,
+          ? `Settlement ${phase.toLowerCase()} evaluation completed with unresolved markets or ticket legs for event ${eventId}.`
+          : `Settlement ${phase.toLowerCase()} evaluation completed for event ${eventId}.`,
         eventId,
         jobKey: job.jobKey,
         runId: String(run._id),
         metadata: {
+          phase,
           ...counts,
           durationMs,
           unresolvedReasonCount: unresolvedReasons.length,
@@ -219,74 +218,79 @@ export class SettlementProcessorService {
           conflictingStats: facts.conflictingStats,
         },
       });
-      if (partial && unresolvedReasons.length > 0 && !summaryRequestedThisRun) {
-        // A partial first pass can reveal that market-specific evidence is absent
-        // even when a basic score was present. Make one targeted provider call;
-        // the persisted cooldown prevents retry loops across re-evaluations.
-        await this.refreshSummaryForSettlement(currentFixture, eventId);
-      }
 
       this.logger.log(
-        `Settlement ${partial ? 'PARTIAL' : 'COMPLETED'} for ${eventId}: prediction selections=${counts.predictionSelectionsSettled}, Bet Lab legs=${counts.betLabLegsSettled}, tickets finalized=${counts.betLabTicketsFinalized}, duration=${durationMs}ms`,
+        `Settlement ${phase}/${partial ? 'PARTIAL' : 'COMPLETED'} for ${eventId}: prediction selections=${counts.predictionSelectionsSettled}, Bet Lab legs=${counts.betLabLegsSettled}, tickets finalized=${counts.betLabTicketsFinalized}, duration=${durationMs}ms`,
       );
       return result;
     } catch (error) {
       const completedAt = new Date();
       const durationMs = Date.now() - started;
       const message = error instanceof Error ? error.message : String(error);
+      let stillOwnsLease = false;
       try {
-        await this.runModel.updateOne(runFilter, {
-          $set: {
-            status: SettlementJobStatus.FAILED,
-            counts: counts as unknown as Record<string, number>,
-            unresolvedReasons: [...unresolvedReasons, `PROCESSING_ERROR: ${message}`].slice(0, 100),
-            completedAt,
-            durationMs,
-          },
-        }).exec();
-      } catch (runUpdateError) {
-        this.logger.error(`Could not mark settlement run failed for ${eventId}: ${runUpdateError instanceof Error ? runUpdateError.message : String(runUpdateError)}`);
+        stillOwnsLease = await this.queue.ownsProcessingLease(job);
+      } catch (leaseCheckError) {
+        this.logger.warn(
+          `Could not verify Settlement lease while handling ${eventId}: ${leaseCheckError instanceof Error ? leaseCheckError.message : String(leaseCheckError)}`,
+        );
       }
-      await this.eventLog.write({
-        level: SettlementEventLevel.ERROR,
-        action: 'SETTLEMENT_PROCESS_FAILED',
-        message: `Settlement processing failed for event ${eventId}: ${message}`,
-        eventId,
-        jobKey: job.jobKey,
-        runId: String(run._id),
-        metadata: { ...counts, durationMs, error: message },
-      });
+      if (stillOwnsLease) {
+        try {
+          await this.runModel.updateOne(runFilter, {
+            $set: {
+              status: SettlementJobStatus.FAILED,
+              counts: counts as unknown as Record<string, number>,
+              unresolvedReasons: [...unresolvedReasons, `PROCESSING_ERROR: ${message}`].slice(0, 100),
+              completedAt,
+              durationMs,
+            },
+          }).exec();
+        } catch (runUpdateError) {
+          this.logger.error(
+            `Could not mark settlement run failed for ${eventId}: ${runUpdateError instanceof Error ? runUpdateError.message : String(runUpdateError)}`,
+          );
+        }
+        try {
+          await this.eventLog.write({
+            level: SettlementEventLevel.ERROR,
+            action: 'SETTLEMENT_PROCESS_FAILED',
+            message: `Settlement processing failed for event ${eventId}: ${message}`,
+            eventId,
+            jobKey: job.jobKey,
+            runId: String(run._id),
+            metadata: { ...counts, durationMs, error: message },
+          });
+        } catch (loggingError) {
+          this.logger.warn(
+            `Could not persist Settlement process failure event for ${eventId}: ${loggingError instanceof Error ? loggingError.message : String(loggingError)}`,
+          );
+        }
+      } else {
+        this.logger.warn(
+          `Settlement processor stopped updating run ${eventId} because its queue lease is no longer owned by this worker.`,
+        );
+      }
       throw error;
     }
   }
 
   /**
-   * TEMPORARY ONE-TIME REPAIR: recompute previously settled Prediction Engine
-   * selections using the corrected fact extraction and Odds catalogue.
-   * Enabled only by SETTLEMENT_HISTORICAL_RESETTLE_ON_STARTUP=true and guarded
-   * by a durable marker in settlement_runs so a restart cannot credit/rewrite
-   * the same pass repeatedly. Terminal Bet Lab tickets are deliberately excluded:
-   * changing those requires a separate audited wallet-ledger correction, not a
-   * second ordinary settlement credit.
+   * Optional, one-time historical repair of terminal Prediction selections.
+   * It is explicitly feature-flagged and only re-grades matches that Sports
+   * currently confirms FULL_TIME. Live/in-play outcomes are never cleared or
+   * rewritten by this historical pass. Bet Lab terminal tickets remain excluded
+   * because changing them requires a separately audited wallet-ledger correction.
    */
   async runHistoricalResettlementOnce(): Promise<Record<string, unknown>> {
     if (String(process.env.SETTLEMENT_HISTORICAL_RESETTLE_ON_STARTUP ?? '').toLowerCase() !== 'true') {
       return { enabled: false, skipped: true, reason: 'FEATURE_FLAG_DISABLED' };
     }
 
-    const markerEventId = '__SYSTEM_HISTORICAL_RESETTLE_V1__';
-    const markerFingerprint = 'HISTORICAL_RESETTLE_V1';
+    const markerEventId = '__SYSTEM_HISTORICAL_RESETTLE_SPORTS_V2__';
+    const markerFingerprint = 'HISTORICAL_RESETTLE_SPORTS_V2';
     const markerFilter = { eventId: markerEventId, sourceFingerprint: markerFingerprint };
-    const emptyCounts = (): SettlementTargetCounts => ({
-      predictionMarketsFound: 0,
-      predictionSelectionsSettled: 0,
-      predictionSelectionsSkipped: 0,
-      predictionSelectionsUnresolved: 0,
-      betLabTicketsFound: 0,
-      betLabLegsSettled: 0,
-      betLabTicketsFinalized: 0,
-      betLabLegsUnresolved: 0,
-    });
+    const emptyCounts = (): SettlementTargetCounts => this.emptyCounts();
 
     try {
       await this.runModel.findOneAndUpdate(
@@ -304,8 +308,6 @@ export class SettlementProcessorService {
         { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true },
       ).exec();
     } catch (error) {
-      // Concurrent app instances may race to create the unique marker. Re-read
-      // it below; only duplicate-key races are expected here.
       if (!(error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 11000)) {
         throw error;
       }
@@ -313,7 +315,6 @@ export class SettlementProcessorService {
 
     const existing = await this.runModel.findOne(markerFilter).lean().exec() as any;
     if (existing && [SettlementJobStatus.COMPLETED, SettlementJobStatus.PARTIAL].includes(existing.status)) {
-      this.logger.log(`Historical resettlement already completed; skipping. status=${existing.status}`);
       return { enabled: true, skipped: true, reason: 'ALREADY_COMPLETED', status: existing.status, counts: existing.counts };
     }
 
@@ -359,59 +360,40 @@ export class SettlementProcessorService {
         'selections.actualOutcome': { $in: terminalOutcomes },
       }).exec();
       const eventIds = [...new Set(rawEventIds.map((value) => String(value ?? '').trim()).filter(Boolean))];
-      const totalEvents = eventIds.length;
-      this.logger.warn(`One-time historical resettlement started for ${totalEvents} Prediction Engine events. This may take time.`);
       await this.eventLog.write({
         level: SettlementEventLevel.WARN,
         action: 'SETTLEMENT_HISTORICAL_RESETTLE_STARTED',
-        message: `One-time historical resettlement started for ${totalEvents} Prediction Engine events.`,
+        message: `Sports-native historical resettlement started for ${eventIds.length} previously settled Prediction events.`,
         runId: String(claimed._id),
-        metadata: { markerFingerprint, totalEvents },
+        metadata: { markerFingerprint, totalEvents: eventIds.length },
       });
 
-      const batchSize = 50;
+      const batchSize = 25;
       for (let offset = 0; offset < eventIds.length; offset += batchSize) {
         const batch = eventIds.slice(offset, offset + batchSize);
-        const fixtureValues = await this.fixtureModel.find({ eventId: { $in: batch } }).lean().exec();
-        const fixtureById = new Map<string, unknown>();
-        for (const value of fixtureValues as unknown as Array<Record<string, unknown>>) {
-          fixtureById.set(String(value.eventId ?? ''), value);
-        }
-
         for (const eventId of batch) {
-          const fixtureValue = fixtureById.get(eventId);
-          if (!fixtureValue) {
+          const match = await this.sportsRead.getMatch(eventId);
+          if (!match || !isSportsFixtureFinished(match.fixture)) {
             unresolvedEvents += 1;
-            if (unresolvedReasons.length < 100) unresolvedReasons.push(`${eventId}: canonical fixture was not found; previous outcomes were retained.`);
+            if (unresolvedReasons.length < 100) {
+              unresolvedReasons.push(`${eventId}: Sports does not currently confirm a finished fixture; historical outcomes were preserved unchanged.`);
+            }
             processedEvents += 1;
             continue;
           }
 
-          let currentFixture = fixtureValue;
-          let facts = this.factsService.extract(currentFixture);
-          // This pass may cover thousands of old fixtures. Do not trigger a
-          // provider request merely because every stat/event detail is not
-          // available; use stored Summary data consistently and refresh only
-          // where the fixture/result payload itself is absent or incomplete.
-          if (this.historicalNeedsSummaryRefresh(currentFixture, facts)) {
-            const requested = await this.refreshSummaryForSettlement(currentFixture, eventId);
-            if (requested) {
-              const refreshed = await this.fixtureModel.findOne({ eventId }).lean().exec();
-              if (refreshed) {
-                currentFixture = refreshed;
-                facts = this.factsService.extract(currentFixture);
-              }
-            }
+          let timelineCoverageComplete = false;
+          try {
+            timelineCoverageComplete = await this.sportsCollection.hasCompleteMatchPlays(match.fixture.id);
+          } catch (error) {
+            this.logger.warn(
+              `Could not verify historical Core Plays coverage for ${eventId}: ${this.errorMessage(error)}`,
+            );
           }
-
+          const facts = this.factsService.extract(match, { timelineCoverageComplete });
           const beforeSettled = counts.predictionSelectionsSettled;
           const beforeUnresolved = counts.predictionSelectionsUnresolved;
           const eventReasons: string[] = [];
-          if (!facts.isFinished) {
-            // Let the corrected settlement service move terminal outcomes to
-            // pending review rather than silently preserving an unverified result.
-            eventReasons.push('Fixture is not confirmed finished by the current ESPN status; previous terminal outcomes require review.');
-          }
           await this.predictionSettlementService.settleEvent(
             eventId,
             facts,
@@ -423,19 +405,16 @@ export class SettlementProcessorService {
             counts.predictionSelectionsSettled > beforeSettled ||
             counts.predictionSelectionsUnresolved > beforeUnresolved
           ) updatedEvents += 1;
-          if (
-            eventReasons.length > 0 ||
-            (facts.settlementBlockers?.length ?? 0) > 0 ||
-            (facts.conflictingStats?.length ?? 0) > 0
-          ) {
+
+          const integrityReasons = [
+            ...(facts.settlementBlockers ?? []),
+            ...(facts.conflictingStats?.length
+              ? [`Conflicting normalized Sports statistics require review: ${facts.conflictingStats.slice(0, 20).join(', ')}.`]
+              : []),
+            ...eventReasons,
+          ];
+          if (integrityReasons.length > 0) {
             unresolvedEvents += 1;
-            const integrityReasons = [
-              ...facts.settlementBlockers,
-              ...(facts.conflictingStats?.length
-                ? [`Conflicting provider statistics require review: ${facts.conflictingStats.slice(0, 20).join(', ')}.`]
-                : []),
-              ...eventReasons,
-            ];
             for (const reason of integrityReasons) {
               if (unresolvedReasons.length < 100 && !unresolvedReasons.includes(`${eventId}: ${reason}`)) {
                 unresolvedReasons.push(`${eventId}: ${reason}`);
@@ -449,7 +428,7 @@ export class SettlementProcessorService {
           $set: {
             counts: {
               ...(counts as unknown as Record<string, number>),
-              historicalTotalEvents: totalEvents,
+              historicalTotalEvents: eventIds.length,
               historicalProcessedEvents: processedEvents,
               historicalUpdatedEvents: updatedEvents,
               historicalUnresolvedEvents: unresolvedEvents,
@@ -457,7 +436,6 @@ export class SettlementProcessorService {
             unresolvedReasons: unresolvedReasons.slice(0, 100),
           },
         }).exec();
-        this.logger.log(`Historical resettlement progress: ${processedEvents}/${totalEvents}; updated events=${updatedEvents}; unresolved=${unresolvedEvents}.`);
       }
 
       const durationMs = Date.now() - startedAt;
@@ -482,30 +460,11 @@ export class SettlementProcessorService {
       await this.eventLog.write({
         level: partial ? SettlementEventLevel.WARN : SettlementEventLevel.INFO,
         action: 'SETTLEMENT_HISTORICAL_RESETTLE_COMPLETED',
-        message: `Historical resettlement ${partial ? 'finished partially' : 'completed'}: processed ${processedEvents}/${eventIds.length} events; updated ${updatedEvents}; unresolved ${unresolvedEvents}.`,
+        message: `Sports-native historical resettlement ${partial ? 'finished partially' : 'completed'}: processed ${processedEvents}/${eventIds.length}; updated ${updatedEvents}; unresolved ${unresolvedEvents}.`,
         runId: String(claimed._id),
-        metadata: {
-          markerFingerprint,
-          totalEvents: eventIds.length,
-          processedEvents,
-          updatedEvents,
-          unresolvedEvents,
-          counts,
-          durationMs,
-          betLabTerminalTicketsChanged: 0,
-        },
+        metadata: { markerFingerprint, totalEvents: eventIds.length, processedEvents, updatedEvents, unresolvedEvents, counts, durationMs, betLabTerminalTicketsChanged: 0 },
       });
-      return {
-        enabled: true,
-        skipped: false,
-        status: finalStatus,
-        totalEvents: eventIds.length,
-        processedEvents,
-        updatedEvents,
-        unresolvedEvents,
-        counts,
-        durationMs,
-      };
+      return { enabled: true, skipped: false, status: finalStatus, totalEvents: eventIds.length, processedEvents, updatedEvents, unresolvedEvents, counts, durationMs };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.runModel.updateOne(markerFilter, {
@@ -520,7 +479,7 @@ export class SettlementProcessorService {
       await this.eventLog.write({
         level: SettlementEventLevel.ERROR,
         action: 'SETTLEMENT_HISTORICAL_RESETTLE_FAILED',
-        message: `Historical resettlement failed: ${message}`,
+        message: `Sports-native historical resettlement failed: ${message}`,
         runId: String(claimed._id),
         metadata: { processedEvents, updatedEvents, unresolvedEvents },
       });
@@ -528,112 +487,172 @@ export class SettlementProcessorService {
     }
   }
 
-  private historicalNeedsSummaryRefresh(
-    fixture: unknown,
-    facts: ReturnType<FootballMatchFactsService['extract']>,
-  ): boolean {
-    const raw = fixture && typeof fixture === 'object'
-      ? fixture as Record<string, unknown>
-      : {};
-    const payload = raw.payload && typeof raw.payload === 'object' && !Array.isArray(raw.payload)
-      ? raw.payload as Record<string, unknown>
-      : {};
-    const summary = payload.summary && typeof payload.summary === 'object' && !Array.isArray(payload.summary)
-      ? payload.summary as Record<string, unknown>
-      : {};
-    return Object.keys(summary).length === 0 ||
-      facts.homeGoals === undefined || facts.awayGoals === undefined ||
-      !facts.homeTeamId || !facts.awayTeamId ||
-      !facts.isFinished ||
-      (facts.settlementBlockers ?? []).some((reason) =>
-        /score conflict|persisted root fixture score|partial summary header/i.test(reason),
-      );
-  }
+  /**
+   * Finished-match evidence is recovered through the existing Sports
+   * collection boundary. A Summary refresh is attempted only when the final
+   * score/statistics snapshot is missing or stale; Core Plays is requested
+   * when complete timeline coverage has not yet been confirmed.
+   *
+   * Provider failures are fail-safe: the current normalized Sports facts are
+   * still evaluated, and any market requiring missing evidence remains
+   * UNRESOLVED for the queue's normal partial retry.
+   */
+  private async recoverFinalMatchEvidence(
+    initialMatch: SportsMatchReadModel,
+    job: SettlementJobDocument,
+  ): Promise<{ match: SportsMatchReadModel; facts: ReturnType<FootballMatchFactsService['extract']> }> {
+    let match = initialMatch;
+    let fixture = match.fixture;
 
-  private needsSummaryData(fixture: unknown, facts: ReturnType<FootballMatchFactsService['extract']>): boolean {
-    const raw = fixture && typeof fixture === 'object' ? fixture as Record<string, unknown> : {};
-    const payload = raw.payload && typeof raw.payload === 'object' && !Array.isArray(raw.payload)
-      ? raw.payload as Record<string, unknown>
-      : {};
-    const summary = payload.summary && typeof payload.summary === 'object' && !Array.isArray(payload.summary)
-      ? payload.summary as Record<string, unknown>
-      : {};
-    return Object.keys(summary).length === 0 ||
-      !facts.isFinished ||
-      facts.homeGoals === undefined || facts.awayGoals === undefined ||
-      !facts.goalEventsComplete ||
-      !facts.eventDetailsAvailable ||
-      (facts.settlementBlockers?.length ?? 0) > 0 ||
-      (facts.conflictingStats?.length ?? 0) > 0 ||
-      Object.keys(facts.homeStats ?? {}).length === 0 ||
-      Object.keys(facts.awayStats ?? {}).length === 0;
-  }
-
-  private async refreshSummaryForSettlement(fixtureValue: unknown, eventId: string): Promise<boolean> {
-    const fixture = fixtureValue && typeof fixtureValue === 'object'
-      ? fixtureValue as Record<string, unknown>
-      : {};
-    const leagueId = String(fixture.leagueId ?? '').trim().toLowerCase();
-    const payload = fixture.payload && typeof fixture.payload === 'object' && !Array.isArray(fixture.payload)
-      ? fixture.payload as Record<string, unknown>
-      : {};
-    if (!leagueId || !eventId) return false;
-
-    const lastAttemptValue = payload.settlementSummaryAttemptedAt;
-    const lastAttempt = lastAttemptValue instanceof Date
-      ? lastAttemptValue
-      : lastAttemptValue ? new Date(lastAttemptValue as string | number) : undefined;
-    if (lastAttempt && Number.isFinite(lastAttempt.getTime()) &&
-      Date.now() - lastAttempt.getTime() < SETTLEMENT_CONFIG.queue.summaryRequestCooldownMs) {
-      return false;
-    }
-
-    // Claim the refresh cooldown atomically. Multiple backend replicas can
-    // process different jobs for the same fixture; a read-then-write cooldown
-    // would allow all of them to call ESPN at once.
-    const cooldownCutoff = new Date(Date.now() - SETTLEMENT_CONFIG.queue.summaryRequestCooldownMs);
-    let refreshClaimed = false;
-    try {
-      const claim = await this.fixtureModel.findOneAndUpdate(
-        {
-          eventId,
-          $or: [
-            { 'payload.settlementSummaryAttemptedAt': { $exists: false } },
-            { 'payload.settlementSummaryAttemptedAt': null },
-            { 'payload.settlementSummaryAttemptedAt': { $lte: cooldownCutoff } },
-          ],
-        },
-        { $set: { 'payload.settlementSummaryAttemptedAt': new Date() } },
-        { returnDocument: 'before' },
-      ).select({ eventId: 1 }).lean().exec();
-      refreshClaimed = Boolean(claim);
-    } catch (error) {
-      // Fail closed on the provider call when the distributed cooldown cannot
-      // be claimed. The settlement job remains recoverable and will try again.
-      this.logger.warn(`Could not claim Settlement Summary cooldown for ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
-    }
-
-    if (!refreshClaimed) {
-      this.logger.debug(`Settlement Summary refresh skipped for ${eventId}: another attempt is inside the cooldown window.`);
-      return false;
-    }
-
-    try {
-      const summary = await this.espnService.getMatchSummary(leagueId, eventId);
-      if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
-        this.logger.warn(`Settlement received no usable ESPN Summary for ${eventId}.`);
-        return true;
+    // Stage 9: first re-normalize the latest retained raw ESPN Summary locally.
+    // This avoids another ESPN call when raw Summary exists but normalized facts
+    // are missing or were produced by an older normalization version.
+    const summaryMetadata = match.matchSummary;
+    const normalizedFacts = match.matchFacts;
+    const summaryNeedsNormalization = Boolean(
+      summaryMetadata && (
+        !normalizedFacts ||
+        normalizedFacts.sourcePayloadHash !== summaryMetadata.payloadHash ||
+        normalizedFacts.sourceRevision !== summaryMetadata.revision ||
+        normalizedFacts.normalizationVersion !== '1.1.0'
+      ),
+    );
+    if (isSportsFixtureFinished(fixture) && summaryNeedsNormalization) {
+      try {
+        await this.sportsCollection.normalizeStoredMatchSummary(fixture);
+        await this.queue.assertProcessingLease(job);
+        const normalizedMatch = await this.sportsRead.getMatch(fixture.id);
+        if (normalizedMatch) {
+          match = normalizedMatch;
+          fixture = normalizedMatch.fixture;
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Retained ESPN Summary normalization failed for ${fixture.id}; settlement will use the verified facts already available: ${this.errorMessage(error)}`,
+        );
       }
-      await this.sportsCollectionService.collectEspnMatchSummary({ leagueId, eventId, summary });
-      this.logger.log(`Settlement refreshed ESPN Summary directly for ${eventId}.`);
-      return true;
+    }
+    if (!isSportsFixtureFinished(fixture)) {
+      return {
+        match,
+        facts: this.factsService.extract(match, { timelineCoverageComplete: false }),
+      };
+    }
+
+    let timelineCoverageComplete = false;
+    try {
+      timelineCoverageComplete = await this.sportsCollection.hasCompleteMatchPlays(fixture.id);
     } catch (error) {
       this.logger.warn(
-        `Settlement's direct ESPN Summary call failed for ${eventId}: ${error instanceof Error ? error.message : String(error)}`,
+        `Could not verify Core Plays coverage for ${fixture.id}: ${this.errorMessage(error)}`,
       );
-      return true;
     }
+
+    let facts = this.factsService.extract(match, { timelineCoverageComplete });
+    let sportsDataRefreshed = false;
+    const statisticsFreshnessMs = SETTLEMENT_CONFIG.evidence.fullTimeStatisticsFreshnessMs;
+    const needsSummary =
+      facts.scoreSource !== 'ESPN_SUMMARY' ||
+      !this.hasFreshTeamStatistics(facts, statisticsFreshnessMs) ||
+      Object.keys(facts.homeStats).length === 0 ||
+      Object.keys(facts.awayStats).length === 0 ||
+      facts.homeGoals === undefined ||
+      facts.awayGoals === undefined ||
+      (facts.afterExtraTime === true && facts.regulationScoreAvailable !== true);
+
+    if (needsSummary && match.competition?.slug && fixture.espnEventId) {
+      try {
+        const shouldCollect = await this.sportsCollection.shouldCollectFixtureSummary(
+          fixture.espnEventId,
+          statisticsFreshnessMs,
+        );
+        if (shouldCollect) {
+          await this.queue.assertProcessingLease(job);
+          const summaryFixture = await this.sportsCollection.collectFixtureSummary(
+            match.competition.slug,
+            fixture.espnEventId,
+            {
+              competitionId: fixture.competitionId,
+              seasonId: fixture.seasonId,
+              seasonYear: fixture.seasonYear,
+            },
+          );
+          // collectFixtureSummary persists the raw response and normalized facts
+          // independently of whether its fixture normalizer returns a fixture.
+          sportsDataRefreshed = true;
+          this.logger.log(`Requested ESPN Summary recovery for finished Sports fixture ${fixture.id}${summaryFixture ? '' : ' (raw Summary retained; fixture normalization incomplete)'}.`);
+        }
+      } catch (error) {
+        this.logger.warn(
+          `ESPN Summary recovery failed for finished Sports fixture ${fixture.id}; settlement will retain unresolved evidence: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+
+    if (!timelineCoverageComplete) {
+      try {
+        const shouldCollect = await this.sportsCollection.shouldCollectMatchPlays(fixture.id);
+        if (shouldCollect) {
+          await this.queue.assertProcessingLease(job);
+          const playsResult = await this.sportsCollection.collectMatchPlays(fixture);
+          if (playsResult) {
+            sportsDataRefreshed = true;
+            this.logger.log(`Requested Core Plays recovery for finished Sports fixture ${fixture.id}.`);
+          }
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Core Plays recovery failed for finished Sports fixture ${fixture.id}; event markets will remain unresolved where coverage is required: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+
+    if (sportsDataRefreshed) {
+      await this.queue.assertProcessingLease(job);
+      const refreshedMatch = await this.sportsRead.getMatch(fixture.id);
+      if (refreshedMatch) match = refreshedMatch;
+      try {
+        timelineCoverageComplete = await this.sportsCollection.hasCompleteMatchPlays(match.fixture.id);
+      } catch (error) {
+        timelineCoverageComplete = false;
+        this.logger.warn(
+          `Could not verify refreshed Core Plays coverage for ${fixture.id}: ${this.errorMessage(error)}`,
+        );
+      }
+    }
+
+    facts = this.factsService.extract(match, { timelineCoverageComplete });
+    return { match, facts };
   }
 
+  private hasFreshTeamStatistics(
+    facts: ReturnType<FootballMatchFactsService['extract']>,
+    maximumAgeMs: number,
+  ): boolean {
+    const now = Date.now();
+    return [facts.homeStatisticsCollectedAt, facts.awayStatisticsCollectedAt].every((value) => {
+      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) return false;
+      const age = now - value.getTime();
+      return age >= -60_000 && age <= maximumAgeMs;
+    });
+  }
+
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private emptyCounts(): SettlementTargetCounts {
+    return {
+      predictionMarketsFound: 0,
+      predictionSelectionsSettled: 0,
+      predictionSelectionsSkipped: 0,
+      predictionSelectionsUnresolved: 0,
+      betLabTicketsFound: 0,
+      betLabLegsSettled: 0,
+      betLabTicketsFinalized: 0,
+      betLabLegsUnresolved: 0,
+    };
+  }
 }
+
+

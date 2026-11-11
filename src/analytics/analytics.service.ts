@@ -6,13 +6,13 @@ import { User, UserDocument, UserStatus } from '../users/schemas/user.schema';
 import { Subscription, SubscriptionDocument } from '../subscriptions/schemas/subscription.schema';
 import { MarketPrediction, MarketPredictionDocument } from '../predictions-engine/schemas/market-prediction.schema';
 import { PredictionStatus } from '../predictions-engine/enums/prediction-status.enum';
-import { ActiveCompetition, ActiveCompetitionDocument } from '../sports/schemas/active-competition.schema';
-import { ActiveCompetitionStatus } from '../sports/interfaces/active-competition.interface';
-import { FOOTBALL_MARKET_CATALOG } from '../odds/catalog/football-market-catalog';
+import { SportsDomainReadService } from '../sports/services/sports-domain-read.service';
+import { OddsReadService } from '../odds/services/odds-read.service';
 
 import { AnalyticsOverviewService } from './analytics-overview.service';
 import { AnalyticsRevenueService } from './analytics-revenue.service';
 import { AnalyticsLeaderboardService } from './analytics-leaderboard.service';
+import { AnalyticsOperationsService } from './analytics-operations.service';
 
 type CountResult = { count: number };
 
@@ -20,7 +20,10 @@ export interface PublicAnalyticsStats {
   registeredUsers: number;
   subscribers: number;
   marketsPredicted: number;
+  /** Full canonical catalogue count; retained for homepage compatibility. */
   totalMarkets: number;
+  /** Market groups currently enabled for Odds pricing and prediction access. */
+  pricingEnabledMarkets: number;
   marketsWon: number;
   matchesPredicted: number;
   activeLeagues: number;
@@ -54,13 +57,12 @@ export class AnalyticsService {
     private readonly subscriptionModel: Model<SubscriptionDocument>,
     @InjectModel(MarketPrediction.name)
     private readonly marketPredictionModel: Model<MarketPredictionDocument>,
-    @InjectModel(ActiveCompetition.name)
-    private readonly activeCompetitionModel: Model<ActiveCompetitionDocument>,
+    private readonly sportsRead: SportsDomainReadService,
+    private readonly oddsRead: OddsReadService,
     private readonly overviewService: AnalyticsOverviewService,
-
     private readonly revenueService: AnalyticsRevenueService,
-
     private readonly leaderboardService: AnalyticsLeaderboardService,
+    private readonly operationsService: AnalyticsOperationsService,
   ) {}
 
   /**
@@ -94,6 +96,7 @@ export class AnalyticsService {
 
   private async calculatePublicStats(): Promise<PublicAnalyticsStats> {
     const now = new Date();
+    const marketCatalog = this.oddsRead.getMarketCatalog();
     const predictedMarketsMatch = {
       status: { $in: PREDICTED_MARKET_STATUSES },
       selections: { $elemMatch: { isFinalSelection: true } },
@@ -105,7 +108,7 @@ export class AnalyticsService {
       marketsPredicted,
       marketWinCounts,
       matchesPredictedCounts,
-      activeLeagues,
+      activeCompetitionCount,
       settledMatchCounts,
     ] = await Promise.all([
       this.userModel.countDocuments({
@@ -152,11 +155,7 @@ export class AnalyticsService {
         { $group: { _id: '$eventId' } },
         { $count: 'count' },
       ]).exec(),
-      this.activeCompetitionModel.countDocuments({
-        status: {
-          $in: [ActiveCompetitionStatus.ACTIVE, ActiveCompetitionStatus.UPCOMING],
-        },
-      }).exec(),
+      this.sportsRead.countCompetitions({ activeOnly: true }),
       this.marketPredictionModel.aggregate<CountResult>([
         { $match: predictedMarketsMatch },
         { $unwind: '$selections' },
@@ -199,22 +198,24 @@ export class AnalyticsService {
       registeredUsers,
       subscribers: subscriberCounts[0]?.count ?? 0,
       marketsPredicted,
-      totalMarkets: FOOTBALL_MARKET_CATALOG.length,
+      totalMarkets: marketCatalog.length,
+      pricingEnabledMarkets: marketCatalog.filter(
+        (market) => market.pricingEnabled !== false,
+      ).length,
       marketsWon: marketWinCounts[0]?.count ?? 0,
       matchesPredicted: matchesPredictedCounts[0]?.count ?? 0,
-      activeLeagues,
+      activeLeagues: activeCompetitionCount,
       settledMatches: settledMatchCounts[0]?.count ?? 0,
       updatedAt: new Date().toISOString(),
     };
   }
 
   async getDashboard() {
-    const [overview, revenue, leaderboards] = await Promise.all([
+    const [overview, revenue, leaderboards, operations] = await Promise.all([
       this.overviewService.getOverview(),
-
       this.revenueService.getRevenue(),
-
       this.leaderboardService.getLeaderboards(),
+      this.operationsService.getOverview(),
     ]);
 
     return {
@@ -233,6 +234,7 @@ export class AnalyticsService {
       referrals: overview.referrals,
 
       leaderboards,
+      operations,
     };
   }
 }

@@ -12,6 +12,8 @@ export enum BetLabCreditBucket {
   WELCOME = 'WELCOME',
   MONTHLY = 'MONTHLY',
   WINNINGS = 'WINNINGS',
+  BONUS = 'BONUS',
   MIXED = 'MIXED',
   SYSTEM = 'SYSTEM',
 }
+

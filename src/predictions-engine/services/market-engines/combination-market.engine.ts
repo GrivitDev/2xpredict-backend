@@ -3,7 +3,7 @@ import {
   MarketDefinition,
   ExpandedMarketSelection,
 } from '../../interfaces/market-catalog.interface';
-import { PredictionModelInput } from '../../interfaces/espn-prediction-context.interface';
+import { PredictionModelInput } from '../../interfaces/prediction-match-context.interface';
 import {
   MarketEngineOutput,
   SelectionModelOutput,
@@ -124,4 +124,5 @@ export class CombinationMarketEngine {
     );
   }
 }
+
 

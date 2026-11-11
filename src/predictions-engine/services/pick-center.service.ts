@@ -5,6 +5,8 @@ import { Model } from 'mongoose';
 import { PickCenter } from '../schemas/pick-center.schema';
 import { MarketPrediction } from '../schemas/market-prediction.schema';
 import { PredictionStatus } from '../enums/prediction-status.enum';
+import { PredictionMarket } from '../enums/prediction-market.enum';
+import { MARKET_DEFINITION_BY_KEY } from '../catalog/football-market-catalog';
 import { PickStatus } from '../enums/pick-status.enum';
 import { PredictionRunSummary } from '../interfaces/prediction-run.interface';
 import { PickCenterUpdateResult } from '../interfaces/pick-center.interface';
@@ -14,6 +16,7 @@ import { PredictionEngineMonitorService } from './prediction-engine-monitor.serv
 import { MarketCalibrationService } from './market-calibration.service';
 import { CuratedPredictionService } from './curated-prediction.service';
 import { PredictionMathUtil } from '../utils/prediction-math.util';
+import { PredictionDataService } from './prediction-data.service';
 
 type SelectionLike = {
   status?: PredictionStatus | string;
@@ -74,8 +77,10 @@ type MarketDocumentLike = {
   homeTeamName?: string;
   awayTeamName?: string;
   modelVersion?: string;
+  fixtureSourceRevision?: number;
   live?: boolean;
   completed?: boolean;
+  retentionExpiresAt?: Date | string | null;
 };
 
 type Candidate = {
@@ -143,6 +148,7 @@ export class PickCenterService {
     private readonly monitor: PredictionEngineMonitorService,
     private readonly marketCalibrationService: MarketCalibrationService,
     private readonly curatedPredictionService: CuratedPredictionService,
+    private readonly predictionDataService: PredictionDataService,
   ) {}
 
   /**
@@ -159,36 +165,28 @@ export class PickCenterService {
       return { scanned: 0, rebuilt: 0, failed: 0 };
     }
     const now = new Date();
-    const horizon = new Date(
-      now.getTime() +
-        PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 3_600_000,
-    );
     const marketGroups = await this.marketPredictionModel
       .aggregate<{
         _id: string;
         fixtureDate: Date;
-        live?: boolean;
         latestMarketUpdate?: Date;
       }>([
         {
           $match: {
             modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
             completed: { $ne: true },
-            $or: [
-              { fixtureDate: { $gte: now, $lte: horizon } },
-              { live: true },
-            ],
+            live: { $ne: true },
+            fixtureDate: { $gt: now },
           },
         },
         {
           $group: {
             _id: '$eventId',
             fixtureDate: { $min: '$fixtureDate' },
-            live: { $max: '$live' },
             latestMarketUpdate: { $max: '$updatedAt' },
           },
         },
-        { $sort: { live: -1, fixtureDate: 1 } },
+        { $sort: { fixtureDate: 1 } },
       ])
       .exec();
     if (!marketGroups.length) return { scanned: 0, rebuilt: 0, failed: 0 };
@@ -235,8 +233,8 @@ export class PickCenterService {
     let failed = 0;
     for (const row of toRebuild) {
       try {
-        await this.rebuildForEvent(String(row._id));
-        rebuilt += 1;
+        const result = await this.rebuildForEvent(String(row._id));
+        if (result.status !== 'FROZEN') rebuilt += 1;
       } catch (error) {
         failed += 1;
         this.logger.warn(
@@ -258,18 +256,33 @@ export class PickCenterService {
   ): Promise<PickCenterUpdateResult> {
     const modelVersion =
       run?.modelVersion ?? PREDICTION_ENGINE_CONFIG.modelVersion;
-    const marketDocuments = (await this.marketPredictionModel
-      .find({ eventId, modelVersion, completed: { $ne: true } })
+    if (!(await this.predictionDataService.isFixturePreMatch(eventId))) {
+      return this.getFrozenSnapshotResult(eventId);
+    }
+    const retentionExpiresAt =
+      await this.predictionDataService.getFixtureRetentionExpiresAt(eventId);
+
+    const loadedMarketDocuments = (await this.marketPredictionModel
+      .find({ eventId, modelVersion, completed: { $ne: true }, live: { $ne: true } })
       .lean()
       .exec()) as unknown as MarketDocumentLike[];
+    const currentFixtureSourceRevision =
+      await this.predictionDataService.getCurrentFixtureSourceRevision(eventId);
+    const marketDocuments = loadedMarketDocuments.filter(
+      (document) => Number(document.fixtureSourceRevision ?? -1) === currentFixtureSourceRevision,
+    );
 
     if (!marketDocuments.length) {
+      if (!(await this.predictionDataService.isFixturePreMatch(eventId))) {
+        return this.getFrozenSnapshotResult(eventId);
+      }
       await this.pickCenterModel
         .findOneAndUpdate(
           { eventId },
           {
             $set: {
               eventId,
+              retentionExpiresAt: retentionExpiresAt ?? null,
               status: PickStatus.INELIGIBLE,
               selectedMarkets: [],
               eligibleMarketCount: 0,
@@ -329,7 +342,13 @@ export class PickCenterService {
     // each market engine, then ranks those final outcomes across market keys.
     for (const document of marketDocuments) {
       if (document.completed === true) continue;
-      const marketKey = String(document.marketKey ?? '').toUpperCase();
+      const marketKey = String(document.marketKey ?? '').trim().toUpperCase();
+      const marketDefinition = MARKET_DEFINITION_BY_KEY.get(
+        marketKey as PredictionMarket,
+      );
+      // Published recommendations must come from the active canonical catalogue.
+      // Legacy enum values remain readable in settled history but are not active products.
+      if (!marketDefinition || marketDefinition.pricingEnabled === false) continue;
       const marketName = String(document.marketName ?? marketKey);
       const documentQualityValue = Number(document.dataQuality ?? 0);
       const documentQuality = Number.isFinite(documentQualityValue)
@@ -339,13 +358,22 @@ export class PickCenterService {
         (selection) =>
           selection.status === PredictionStatus.CALCULATED &&
           selection.isFinalSelection === true &&
+          selection.recommendationEligible === true &&
           selection.oddsPredictionReady === true &&
           (selection.priceType === 'PROVIDER' ||
             selection.priceType === 'ESTIMATED') &&
           (selection.actualOutcome === undefined ||
             selection.actualOutcome === null),
       );
-
+      // The market engine owns outcome selection. Pick Center accepts exactly
+      // one final selection per market and never repairs or re-ranks malformed
+      // market documents containing multiple final outcomes.
+      if (validSelections.length > 1) {
+        this.logger.warn(
+          `Skipping malformed ${marketKey} prediction for ${eventId}: ${validSelections.length} final selections were marked eligible; exactly one is required.`,
+        );
+        continue;
+      }
       const finalSelections = validSelections;
 
       for (const selection of finalSelections) {
@@ -570,6 +598,12 @@ export class PickCenterService {
       : 'No final Odds-ready market selections were available to rank for this unfinished fixture.';
     const first = marketDocuments[0];
 
+    // Re-read Sports at the write boundary. If kickoff occurred while this
+    // ranking was in progress, preserve the last pre-match Pick Center snapshot.
+    if (!(await this.predictionDataService.isFixturePreMatch(eventId))) {
+      return this.getFrozenSnapshotResult(eventId);
+    }
+
     const saved = await this.pickCenterModel
       .findOneAndUpdate(
         { eventId },
@@ -578,7 +612,8 @@ export class PickCenterService {
             eventId,
             leagueId: first.leagueId,
             fixtureDate: first.fixtureDate,
-            live: marketDocuments.some((item) => item.live === true),
+            retentionExpiresAt: retentionExpiresAt ?? null,
+            live: false,
             completed: false,
             homeTeamName: first.homeTeamName,
             awayTeamName: first.awayTeamName,
@@ -648,6 +683,30 @@ export class PickCenterService {
     };
   }
 
+  private async getFrozenSnapshotResult(
+    eventId: string,
+  ): Promise<PickCenterUpdateResult> {
+    const existing = await this.pickCenterModel
+      .findOne({ eventId })
+      .select({ selectedMarkets: 1, selectedMarketCount: 1, eligibleMarketCount: 1 })
+      .lean()
+      .exec();
+
+    const selectedCount = Number(
+      existing?.selectedMarketCount ?? existing?.selectedMarkets?.length ?? 0,
+    );
+    const eligibleCount = Number(
+      existing?.eligibleMarketCount ?? selectedCount,
+    );
+
+    return {
+      eventId,
+      selectedCount: Number.isFinite(selectedCount) ? selectedCount : 0,
+      eligibleCount: Number.isFinite(eligibleCount) ? eligibleCount : 0,
+      status: 'FROZEN',
+    };
+  }
+
   private marketPriority(marketKey: string): number {
     if (marketKey === 'MATCH_RESULT') return 0;
     if (marketKey.startsWith('BOTH_TEAMS_TO_SCORE')) return 1;
@@ -658,4 +717,6 @@ export class PickCenterService {
     return 5;
   }
 }
+
+
 

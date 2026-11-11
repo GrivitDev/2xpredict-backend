@@ -3,7 +3,7 @@ import {
   MarketDefinition,
   ExpandedMarketSelection,
 } from '../../interfaces/market-catalog.interface';
-import { PredictionModelInput } from '../../interfaces/espn-prediction-context.interface';
+import { PredictionModelInput } from '../../interfaces/prediction-match-context.interface';
 import {
   MarketEngineOutput,
   SelectionModelOutput,
@@ -21,6 +21,13 @@ import {
 export class GoalsMarketEngine {
   private readonly supported = new Set<string>([
     PredictionMarket.GOALS_OVER_UNDER,
+    PredictionMarket.ASIAN_TOTAL_GOALS,
+    PredictionMarket.HOME_TEAM_TO_SCORE,
+    PredictionMarket.AWAY_TEAM_TO_SCORE,
+    PredictionMarket.HOME_TEAM_CLEAN_SHEET,
+    PredictionMarket.AWAY_TEAM_CLEAN_SHEET,
+    PredictionMarket.HOME_TEAM_TO_WIN_TO_NIL,
+    PredictionMarket.AWAY_TEAM_TO_WIN_TO_NIL,
     PredictionMarket.EXACT_TOTAL_GOALS,
     PredictionMarket.TOTAL_GOALS_RANGE,
     PredictionMarket.ODD_EVEN_TOTAL_GOALS,
@@ -94,6 +101,14 @@ export class GoalsMarketEngine {
         return totalGoalsProbability(matrix, (total) =>
           key.startsWith('OVER_') ? total > line : total < line + 0.000001,
         );
+      case PredictionMarket.ASIAN_TOTAL_GOALS: {
+        const push = totalGoalsProbability(matrix, (total) => Math.abs(total - line) < 0.000001);
+        const decisive = Math.max(0.000001, 1 - push);
+        const outcome = totalGoalsProbability(matrix, (total) =>
+          key.startsWith('OVER_') ? total > line : total < line,
+        );
+        return PredictionMathUtil.clamp(outcome / decisive, 0, 1);
+      }
       case PredictionMarket.EXACT_TOTAL_GOALS:
         if (key === 'GOALS_6_PLUS')
           return totalGoalsProbability(matrix, (total) => total >= 6);
@@ -136,6 +151,30 @@ export class GoalsMarketEngine {
         return matrixProbability(matrix, (_home, away) =>
           key.startsWith('OVER_') ? away > line : away < line + 0.000001,
         );
+      case PredictionMarket.HOME_TEAM_TO_SCORE: {
+        const yes = matrixProbability(matrix, (home) => home > 0);
+        return key === 'YES' ? yes : 1 - yes;
+      }
+      case PredictionMarket.AWAY_TEAM_TO_SCORE: {
+        const yes = matrixProbability(matrix, (_home, away) => away > 0);
+        return key === 'YES' ? yes : 1 - yes;
+      }
+      case PredictionMarket.HOME_TEAM_CLEAN_SHEET: {
+        const yes = matrixProbability(matrix, (_home, away) => away === 0);
+        return key === 'YES' ? yes : 1 - yes;
+      }
+      case PredictionMarket.AWAY_TEAM_CLEAN_SHEET: {
+        const yes = matrixProbability(matrix, (home) => home === 0);
+        return key === 'YES' ? yes : 1 - yes;
+      }
+      case PredictionMarket.HOME_TEAM_TO_WIN_TO_NIL: {
+        const yes = matrixProbability(matrix, (home, away) => home > away && away === 0);
+        return key === 'YES' ? yes : 1 - yes;
+      }
+      case PredictionMarket.AWAY_TEAM_TO_WIN_TO_NIL: {
+        const yes = matrixProbability(matrix, (home, away) => away > home && home === 0);
+        return key === 'YES' ? yes : 1 - yes;
+      }
       case PredictionMarket.CORRECT_SCORE:
         if (
           selection.homeGoals === undefined ||
@@ -163,7 +202,7 @@ export class GoalsMarketEngine {
         const anyGoal = 1 - Math.exp(-totalLambda);
         if (key === 'NO_GOAL') return 1 - anyGoal;
         if (totalLambda <= 0) return null;
-        const sideRate = key.startsWith('HOME_')
+        const sideRate = key === 'HOME' || key.startsWith('HOME_')
           ? input.expectedGoals.home
           : input.expectedGoals.away;
         return (anyGoal * sideRate) / totalLambda;
@@ -202,4 +241,5 @@ export class GoalsMarketEngine {
     );
   }
 }
+
 

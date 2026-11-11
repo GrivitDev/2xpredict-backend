@@ -1,13 +1,7 @@
 import { BetLabMarketCategory } from '../enums/bet-lab-market-category.enum';
 import { BetLabMarketCode } from '../enums/bet-lab-market-code.enum';
-import {
-  CanonicalMarketDefinition,
-  CanonicalPeriod,
-  CanonicalSelectionMode,
-  FOOTBALL_MARKET_CATALOG as CANONICAL_MARKETS,
-  canonicalLineSlug,
-  expandCanonicalSelections,
-} from '../../odds/catalog/football-market-catalog';
+import { FOOTBALL_MARKET_CATALOG as CANONICAL_MARKETS, canonicalLineSlug, expandCanonicalSelections } from '../../odds/catalog/football-market-catalog';
+import type { CanonicalMarketDefinition, CanonicalPeriod, CanonicalSelectionMode } from '../../odds/catalog/football-market-catalog';
 
 export type BetLabPeriod = CanonicalPeriod;
 export type BetLabSelectionMode = CanonicalSelectionMode;
@@ -39,6 +33,7 @@ export interface BetLabMarketDefinition {
   selections: BetLabSelectionDefinition[];
   lines?: number[];
   notes?: string;
+  pricingEnabled?: boolean;
 }
 
 export interface BetLabMarketExpansionContext {
@@ -53,9 +48,10 @@ export interface BetLabMarketExpansionContext {
 }
 
 function categoryFor(market: CanonicalMarketDefinition): BetLabMarketCategory {
-  if (market.id === 'TOTAL_CORNERS_OVER_UNDER')
-    return BetLabMarketCategory.CORNERS;
-  if (market.id === 'TOTAL_CARDS_OVER_UNDER') return BetLabMarketCategory.CARDS;
+  if (market.id.includes('CORNERS')) return BetLabMarketCategory.CORNERS;
+  if (market.id.includes('CARD')) return BetLabMarketCategory.CARDS;
+  if (market.family === 'PLAYER') return BetLabMarketCategory.PLAYER;
+
   switch (market.family) {
     case 'RESULT':
       return BetLabMarketCategory.MATCH_RESULT;
@@ -65,6 +61,9 @@ function categoryFor(market: CanonicalMarketDefinition): BetLabMarketCategory {
       return BetLabMarketCategory.HALF_TIME;
     case 'HANDICAP':
       return BetLabMarketCategory.HANDICAP;
+    case 'EVENTS':
+      return BetLabMarketCategory.SPECIALS;
+    case 'STATISTICS':
     default:
       return BetLabMarketCategory.STATISTICS;
   }
@@ -85,6 +84,7 @@ export const BET_LAB_MARKET_CATALOG: BetLabMarketDefinition[] =
     })),
     lines: market.lines ? [...market.lines] : undefined,
     notes: market.notes,
+    pricingEnabled: market.pricingEnabled !== false,
   }));
 
 // BetLab exposes a derived read-only catalogue; it cannot add or mutate markets.
@@ -140,7 +140,7 @@ export const BET_LAB_MARKET_BY_CODE: ReadonlyMap<
 
 /** Active API market allow-list derived exclusively from the Odds catalogue. */
 export const BET_LAB_ACTIVE_MARKET_CODES: readonly string[] = Object.freeze(
-  BET_LAB_MARKET_CATALOG.map((market) => String(market.code)),
+  BET_LAB_MARKET_CATALOG.filter((market) => market.pricingEnabled !== false).map((market) => String(market.code)),
 );
 
 export function formatLine(line: number): string {
@@ -212,11 +212,12 @@ export function assertBetLabCatalogValid(): void {
       selectionKeys.add(selection.code);
     }
   }
-  if (BET_LAB_MARKET_CATALOG.length !== 16) {
+  if (BET_LAB_MARKET_CATALOG.length !== CANONICAL_MARKETS.length) {
     throw new Error(
-      `Expected 16 Bet Lab market groups, found ${BET_LAB_MARKET_CATALOG.length}.`,
+      `Bet Lab market catalogue is out of sync with the canonical Odds catalogue (${BET_LAB_MARKET_CATALOG.length}/${CANONICAL_MARKETS.length}).`,
     );
   }
 }
 
 assertBetLabCatalogValid();
+

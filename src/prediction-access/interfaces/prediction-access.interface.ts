@@ -1,5 +1,4 @@
 import { PredictionAccessPlan } from '../enums/prediction-access-plan.enum';
-import { CompetitionPriority } from '../../sports/enums/competition-priority.enum';
 
 export interface AccessRequestUser {
   _id?: unknown;
@@ -13,11 +12,10 @@ export interface PredictionAccessDecision {
   allowed: boolean;
   settled: boolean;
   plan: PredictionAccessPlan;
-  priority: CompetitionPriority | 'UNKNOWN';
+  leagueId?: string | null;
   state:
     | 'settled_public'
-    | 'subscription'
-    | 'selective_league_access'
+    | 'daily_league_access'
     | 'upgrade_required'
     | 'not_published';
   message: string | null;

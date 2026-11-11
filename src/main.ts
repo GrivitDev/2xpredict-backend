@@ -7,6 +7,17 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { rawBody: true });
   const logger = new Logger('Bootstrap');
 
+  // Set only when the backend is behind a known, fixed number of trusted
+  // reverse proxies. Express then resolves req.ip safely for rate limiting.
+  const trustProxyHopsValue = process.env.TRUST_PROXY_HOPS;
+  if (trustProxyHopsValue !== undefined) {
+    const trustProxyHops = Number(trustProxyHopsValue);
+    if (!Number.isInteger(trustProxyHops) || trustProxyHops < 0 || trustProxyHops > 5) {
+      throw new Error('TRUST_PROXY_HOPS must be an integer from 0 to 5.');
+    }
+    app.getHttpAdapter().getInstance().set('trust proxy', trustProxyHops);
+  }
+
   const allowedOrigins = [
     process.env.FRONTEND_URL,
     'https://www.2xpredict.com',

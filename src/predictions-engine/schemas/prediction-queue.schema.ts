@@ -34,14 +34,30 @@ export class PredictionQueue {
   @Prop({ type: Date })
   lockedAt?: Date;
 
+  /** Token proving ownership of the currently active processing lease. */
+  @Prop({ type: String, trim: true })
+  lockToken?: string;
+
   @Prop({ type: Date })
   completedAt?: Date;
+
+  /** Same expiry deadline as the retained Sports fixture. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date;
 
   @Prop({ type: Date })
   summaryCollectedAt?: Date;
 
   @Prop({ type: Date })
   lastProcessedSummaryAt?: Date;
+
+  /** Latest normalized Sports fixture revision observed by queue reconciliation. */
+  @Prop({ type: Number, min: 0, default: 0 })
+  fixtureSourceRevision?: number;
+
+  /** Sports fixture revision consumed by the last successfully completed prediction run. */
+  @Prop({ type: Number, min: 0 })
+  lastProcessedFixtureSourceRevision?: number;
 
   @Prop({ type: Date })
   oddsUpdatedAt?: Date;
@@ -69,6 +85,16 @@ export class PredictionQueue {
 
   @Prop({ type: Number, default: 0 })
   refreshCount!: number;
+
+  /** A source/Odds update arrived while this fixture was being calculated. */
+  @Prop({ type: Date, index: true })
+  refreshRequestedAt?: Date;
+
+  @Prop({ type: String, trim: true })
+  refreshRequestedReason?: string;
+
+  @Prop({ type: String, trim: true })
+  sourceChangeEventId?: string;
 }
 export type PredictionQueueDocument = HydratedDocument<PredictionQueue>;
 export const PredictionQueueSchema =
@@ -80,5 +106,10 @@ PredictionQueueSchema.index({
   fixtureDate: 1,
 });
 PredictionQueueSchema.index({ status: 1, fixtureDate: 1 });
+PredictionQueueSchema.index(
+  { retentionExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_prediction_queue_fixture_retention' },
+);
+
 
 

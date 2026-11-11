@@ -29,4 +29,3 @@ export enum PriorityInternationalCompetition {
   CONCACAF_WOMENS_GOLD_CUP = 'concacaf.w.gold',
   MENS_OLYMPIC_SOCCER = 'fifa.olympics',
 }
-

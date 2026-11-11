@@ -3,7 +3,7 @@ import {
   MarketDefinition,
   ExpandedMarketSelection,
 } from '../../interfaces/market-catalog.interface';
-import { PredictionModelInput } from '../../interfaces/espn-prediction-context.interface';
+import { PredictionModelInput } from '../../interfaces/prediction-match-context.interface';
 import {
   MarketEngineOutput,
   SelectionModelOutput,
@@ -57,12 +57,7 @@ export class ResultMarketEngine {
           decisive > 0 ? (key === 'HOME_DNB' ? home : away) / decisive : null;
       }
 
-      const oddsSource =
-        input.marketOdds?.source === 'ESPN_PICKCENTER'
-          ? PredictionSource.ESPN_PICKCENTER
-          : input.marketOdds?.source === 'ESPN_EVENT_ODDS'
-            ? PredictionSource.ESPN_EVENT_ODDS
-            : PredictionSource.ESPN_ODDS;
+      const oddsSource = PredictionSource.PROVIDER_ODDS;
       const oddsWereUsed = Boolean(
         input.marketOdds && definition.model === MarketModel.SCORE_MATRIX,
       );
@@ -70,7 +65,7 @@ export class ResultMarketEngine {
         selection,
         probability,
         oddsWereUsed
-          ? 'Poisson score matrix reconciled with normalized ESPN three-way odds'
+          ? 'Poisson score matrix reconciled with fresh Odds-module three-way prices'
           : 'Independent Poisson score matrix',
         oddsWereUsed
           ? [PredictionSource.POISSON_SCORE_MODEL, oddsSource]
@@ -111,4 +106,5 @@ export class ResultMarketEngine {
     );
   }
 }
+
 

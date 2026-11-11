@@ -3,16 +3,25 @@ import {
   MarketDefinition,
   ExpandedMarketSelection,
 } from '../../interfaces/market-catalog.interface';
-import { PredictionModelInput } from '../../interfaces/espn-prediction-context.interface';
-import {
-  MarketEngineOutput,
-  SelectionModelOutput,
-} from '../../interfaces/market-engine-output.interface';
+import { PredictionModelInput } from '../../interfaces/prediction-match-context.interface';
+import { MarketEngineOutput } from '../../interfaces/market-engine-output.interface';
 import { PredictionMarket } from '../../enums/prediction-market.enum';
 import { PredictionSource } from '../../enums/prediction-source.enum';
-import { EspnPayloadUtil } from '../../utils/espn-payload.util';
+import { ODDS_CONFIG } from '../../../odds/config/odds.config';
+import { PredictionMathUtil } from '../../utils/prediction-math.util';
 import { selectionOutput } from './market-engine.util';
 
+const EVENT_FIELDS: Readonly<Record<string, string>> = {
+  [PredictionMarket.RED_CARD]: 'redCardMatches',
+  [PredictionMarket.PENALTY_AWARDED]: 'penaltyAwardedMatches',
+  [PredictionMarket.OWN_GOAL_SCORED]: 'ownGoalMatches',
+};
+
+/**
+ * Pre-match event probabilities are derived only from Sports' completed,
+ * Plays-covered competition projection. A current fixture timeline is never
+ * treated as a pre-match sample.
+ */
 @Injectable()
 export class SpecialMarketEngine {
   calculate(
@@ -20,12 +29,8 @@ export class SpecialMarketEngine {
     selections: ExpandedMarketSelection[],
     input: PredictionModelInput,
   ): MarketEngineOutput {
-    if (
-      ![
-        PredictionMarket.PENALTY_AWARDED,
-        PredictionMarket.OWN_GOAL_SCORED,
-      ].includes(definition.key)
-    ) {
+    const eventField = EVENT_FIELDS[String(definition.key)];
+    if (!eventField) {
       return {
         handled: false,
         selections: [],
@@ -35,102 +40,103 @@ export class SpecialMarketEngine {
       };
     }
 
-    const evidence = this.eventEvidence(definition.key, input);
-    const results = selections.map((selection): SelectionModelOutput => {
-      if (evidence.sampleSize < 8) {
-        return selectionOutput(
-          selection,
-          null,
-          'Insufficient ESPN event-history coverage',
-          [PredictionSource.HISTORICAL_FIXTURES],
-          0,
-          [
-            `Only ${evidence.sampleSize} historical fixtures had usable event details; at least 8 are required.`,
-          ],
-        );
-      }
-      const probabilityYes = (evidence.events + 1) / (evidence.sampleSize + 2);
-      const probability =
-        selection.key === 'YES' ? probabilityYes : 1 - probabilityYes;
+    const metrics = input.context.competitionScoring?.eventMetrics;
+    const coverageValue = this.nonNegativeInteger(metrics?.timelineCoverageMatches);
+    const coverage = coverageValue ?? 0;
+    const completedFixtures = this.nonNegativeInteger(input.context.competitionScoring?.fixturesPlayed) ?? 0;
+    const coverageRate = completedFixtures > 0 ? coverage / completedFixtures : 0;
+    const observedMatches = this.nonNegativeInteger(metrics?.[eventField]);
+    const minimumSample = Math.max(
+      ODDS_CONFIG.minimumEventTimelineSampleSize,
+      definition.minimumSampleSize ?? 0,
+    );
+
+    const evidenceReady =
+      coverageValue !== null
+      && completedFixtures >= coverage
+      && coverage >= minimumSample
+      && coverageRate >= ODDS_CONFIG.minimumEventTimelineCoverage
+      && observedMatches !== null
+      && observedMatches <= coverage;
+
+    if (!evidenceReady) {
+      const reason =
+        `Sports timeline event history is insufficient for ${String(definition.key)}. ` +
+        `Covered matches: ${coverage}; completed competition matches: ${completedFixtures}; ` +
+        `timeline coverage: ${(coverageRate * 100).toFixed(1)}%; required: ${minimumSample} covered matches ` +
+        `and ${(ODDS_CONFIG.minimumEventTimelineCoverage * 100).toFixed(0)}% coverage.`;
+      const results = selections.map((selection) => selectionOutput(
+        selection,
+        null,
+        'Unavailable pending sufficient normalized Sports timeline coverage',
+        [],
+        0,
+        [reason],
+      ));
+      return {
+        handled: true,
+        selections: results,
+        calculationMethod: 'Unavailable: insufficient normalized Sports event sample',
+        unavailableReason: reason,
+        dataQuality: 0,
+        diagnostics: [reason],
+      };
+    }
+
+    const observedEventMatches = observedMatches ?? 0;
+
+    // Jeffreys-style smoothing prevents a finite sample with zero or all
+    // observed events from producing an artificial 0% or 100% probability.
+    const yesProbability = PredictionMathUtil.clamp(
+      (observedEventMatches + 0.5) / (coverage + 1),
+      0.005,
+      0.995,
+    );
+    const dataQuality = PredictionMathUtil.clamp(
+      0.55
+        + 0.30 * Math.min(1, coverageRate)
+        + 0.10 * Math.min(1, coverage / 20),
+      0,
+      0.95,
+    );
+    const method = `Sports normalized ${String(definition.key).toLowerCase()} frequency with Jeffreys smoothing`;
+    const diagnostics = [
+      `Observed event matches: ${observedEventMatches}/${coverage} Plays-covered matches.`,
+      `Timeline coverage: ${coverage}/${completedFixtures} completed competition matches (${(coverageRate * 100).toFixed(1)}%).`,
+    ];
+
+    const results = selections.map((selection) => {
+      const probability = selection.key === 'YES'
+        ? yesProbability
+        : selection.key === 'NO'
+          ? 1 - yesProbability
+          : null;
       return selectionOutput(
         selection,
         probability,
-        'Smoothed historical event frequency',
-        [PredictionSource.HISTORICAL_FIXTURES],
-        Math.min(0.85, evidence.sampleSize / 20),
-        [
-          `Observed in ${evidence.events} of ${evidence.sampleSize} fixtures; one-event/one-non-event beta smoothing applied.`,
-        ],
+        method,
+        [PredictionSource.HISTORICAL_COUNT_MODEL],
+        dataQuality,
+        diagnostics,
       );
     });
 
+    const hasCalculatedSelection = results.some((item) => item.status === 'CALCULATED');
     return {
       handled: true,
       selections: results,
-      calculationMethod: 'Smoothed historical ESPN event frequency',
-      dataQuality: Math.min(1, evidence.sampleSize / 20),
-      unavailableReason:
-        evidence.sampleSize < 8
-          ? 'Insufficient historical event details.'
-          : undefined,
-      diagnostics: [
-        `Event count: ${evidence.events}; usable fixture sample: ${evidence.sampleSize}.`,
-      ],
+      calculationMethod: method,
+      unavailableReason: hasCalculatedSelection
+        ? undefined
+        : 'The canonical event selection could not be resolved to YES or NO.',
+      dataQuality: hasCalculatedSelection ? dataQuality : 0,
+      diagnostics,
     };
   }
 
-  private eventEvidence(
-    marketKey: PredictionMarket,
-    input: PredictionModelInput,
-  ): { events: number; sampleSize: number } {
-    const all = [
-      ...input.context.historicalFixtures,
-      ...input.context.leagueFixtures,
-    ];
-    const unique = new Map(all.map((fixture) => [fixture.eventId, fixture]));
-    let events = 0;
-    let sampleSize = 0;
-
-    for (const fixture of unique.values()) {
-      if (
-        !fixture.completed ||
-        fixture.fixtureDate >= input.context.fixture.fixtureDate
-      )
-        continue;
-      const payload = EspnPayloadUtil.asRecord(fixture.payload);
-      const summary = EspnPayloadUtil.asRecord(payload.summary);
-      const competitions = EspnPayloadUtil.asArray(payload.competitions);
-      const details: unknown[] = [];
-      for (const competition of competitions) {
-        for (const detail of EspnPayloadUtil.asArray(
-          EspnPayloadUtil.asRecord(competition).details,
-        )) {
-          details.push(detail as unknown);
-        }
-      }
-      for (const event of EspnPayloadUtil.asArray(summary.keyEvents)) {
-        details.push(event as unknown);
-      }
-      if (!details.length) continue;
-      sampleSize += 1;
-      const foundEvent = details.some((raw) => {
-        const event = EspnPayloadUtil.asRecord(raw);
-        const type = EspnPayloadUtil.asRecord(event.type);
-        const text = String(
-          type.text ?? type.name ?? event.text ?? '',
-        ).toLowerCase();
-        if (marketKey === PredictionMarket.PENALTY_AWARDED) {
-          return (
-            event.penaltyKick === true ||
-            text.includes('penalty') ||
-            text.includes('penalty kick')
-          );
-        }
-        return event.ownGoal === true || text.includes('own goal');
-      });
-      if (foundEvent) events += 1;
-    }
-    return { events, sampleSize };
+  private nonNegativeInteger(value: unknown): number | null {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
   }
 }
-

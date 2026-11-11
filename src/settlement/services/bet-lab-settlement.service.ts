@@ -8,6 +8,8 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { BetLabTicket } from '../../bet-lab/schemas/bet-lab-ticket.schema';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import { isSportsFixtureFinished } from '../utils/fixture-lifecycle.util';
 import { BetLabLegStatus } from '../../bet-lab/enums/bet-lab-leg-status.enum';
 import { BetLabTicketStatus } from '../../bet-lab/enums/bet-lab-ticket-status.enum';
 import { BetLabSettlementOutcome } from '../../bet-lab/enums/bet-lab-settlement-outcome.enum';
@@ -16,6 +18,7 @@ import {
   SettlementEventFacts,
   SettlementTargetCounts,
   SettlementSelectionInput,
+  SettlementPhase,
 } from '../interfaces/settlement-context.interface';
 import { SettlementOutcome } from '../enums/settlement-outcome.enum';
 import { MarketSettlementService } from './market-settlement.service';
@@ -43,6 +46,10 @@ interface BetLabSettlementLeg {
   settledAt?: unknown;
   settlementMethod?: unknown;
   settlementNote?: unknown;
+  settlementPhase?: SettlementPhase;
+  settlementSourceFingerprint?: string;
+  settlementEvidence?: Record<string, unknown>;
+  settlementHistory?: Array<Record<string, unknown>>;
   decimalOdds?: unknown;
   fixturePricingGroup?: unknown;
   fixturePricingAdjustment?: unknown;
@@ -70,6 +77,7 @@ export class BetLabSettlementService {
     private readonly marketSettlementService: MarketSettlementService,
     private readonly adapter: BetLabSettlementAdapterService,
     private readonly eventLog: SettlementEventLogService,
+    private readonly sportsRead: SportsDomainReadService,
   ) {}
 
   async settleEvent(
@@ -97,10 +105,12 @@ export class BetLabSettlementService {
       if (!ticketId) continue;
 
       for (const leg of originalTicket.legs) {
-        if (
-          this.asString(leg.eventId) !== eventId ||
-          leg.status !== BetLabLegStatus.OPEN
-        ) continue;
+        const sameEvent = this.asString(leg.eventId) === eventId;
+        const isProvisionalOutcome = this.isResolvedLegStatus(leg.status) &&
+          (leg.settlementPhase === 'IN_PLAY' || leg.settlementPhase === 'HALF_TIME') &&
+          Boolean(leg.settlementSourceFingerprint) &&
+          leg.settlementSourceFingerprint !== facts.sourceFingerprint;
+        if (!sameEvent || (leg.status !== BetLabLegStatus.OPEN && !isProvisionalOutcome)) continue;
 
         const legId = this.asString(leg.legId);
         if (!legId) {
@@ -125,33 +135,112 @@ export class BetLabSettlementService {
           subjectName: typeof leg.subjectName === 'string' ? leg.subjectName : undefined,
           subjectTeamId: typeof leg.subjectTeamId === 'string' ? leg.subjectTeamId : undefined,
         };
-        const result = this.marketSettlementService.settle(
+        const evaluation = this.marketSettlementService.settle(
           this.asString(leg.marketCode),
           selection,
           facts,
         );
+        const result = {
+          ...evaluation,
+          evidence: { ...(evaluation.evidence ?? {}),
+            sourceFingerprint: facts.sourceFingerprint,
+            scoreSource: facts.scoreSource ?? null,
+            summaryFactsRevision: facts.summaryFactsRevision ?? null,
+            summaryFactsSourcePayloadHash: facts.summaryFactsSourcePayloadHash ?? null,
+            summaryFactsCollectedAt: facts.summaryFactsCollectedAt ?? null,
+            summaryFactsNormalizationVersion: facts.summaryFactsNormalizationVersion ?? null,
+            summaryFactsSectionStatus: facts.summaryFactsSectionStatus ?? null,
+            homeStatisticsSource: facts.homeStatisticsSource ?? null,
+            awayStatisticsSource: facts.awayStatisticsSource ?? null,
+            homeStatisticsCollectedAt: facts.homeStatisticsCollectedAt ?? null,
+            awayStatisticsCollectedAt: facts.awayStatisticsCollectedAt ?? null,
+            timelineCoverageComplete: facts.timelineCoverageComplete === true,
+            timelineCollectedAt: facts.timelineCollectedAt ?? null,
+          },
+        };
         if (result.outcome === SettlementOutcome.UNRESOLVED) {
           counts.betLabLegsUnresolved += 1;
           const reason = `BET_LAB/${this.asString(leg.marketCode)}/${this.asString(leg.selectionCode)}: ${result.reason ?? 'insufficient settlement evidence'}`;
           if (unresolvedReasons.length < 100 && !unresolvedReasons.includes(reason)) unresolvedReasons.push(reason);
+          if (isProvisionalOutcome && legId) {
+            const historyEntry = {
+              correctedAt: new Date(),
+              auditLabel: 'SPORTS_SOURCE_RECHECK',
+              previousOutcome: this.asString(leg.settlementOutcome ?? leg.status),
+              nextOutcome: null,
+              previousPhase: leg.settlementPhase ?? null,
+              previousSourceFingerprint: leg.settlementSourceFingerprint ?? null,
+              nextSourceFingerprint: facts.sourceFingerprint,
+              reason: result.reason ?? 'Updated Sports facts no longer prove the provisional result.',
+            };
+            await this.ticketModel.updateOne(
+              {
+                _id: originalTicket._id,
+                status: { $in: [BetLabTicketStatus.OPEN, BetLabTicketStatus.PENDING_SETTLEMENT] },
+                legs: { $elemMatch: { eventId, legId, status: leg.status, settlementSourceFingerprint: leg.settlementSourceFingerprint } },
+              },
+              {
+                $set: {
+                  'legs.$.status': BetLabLegStatus.OPEN,
+                  'legs.$.settlementNote': 'Provisional result withdrawn; awaiting new authoritative Sports evidence.',
+                },
+                $unset: {
+                  'legs.$.settlementOutcome': 1,
+                  'legs.$.settledAt': 1,
+                  'legs.$.settlementMethod': 1,
+                  'legs.$.settlementPhase': 1,
+                  'legs.$.settlementSourceFingerprint': 1,
+                  'legs.$.settlementEvidence': 1,
+                },
+                $push: { 'legs.$.settlementHistory': historyEntry },
+              },
+            ).exec();
+          }
           continue;
         }
 
+        const previousOutcome = this.asString(leg.settlementOutcome ?? leg.status);
+        const nextOutcome = String(result.outcome);
+        const provisionalOutcomeChanged = isProvisionalOutcome && previousOutcome !== nextOutcome;
+        const historyEntry = provisionalOutcomeChanged ? {
+          correctedAt: new Date(),
+          auditLabel: 'SPORTS_SOURCE_RECHECK',
+          previousOutcome,
+          nextOutcome,
+          previousPhase: leg.settlementPhase ?? null,
+          previousSourceFingerprint: leg.settlementSourceFingerprint ?? null,
+          nextSourceFingerprint: facts.sourceFingerprint,
+        } : undefined;
         const update = await this.ticketModel.updateOne(
           {
             _id: originalTicket._id,
             status: { $in: [BetLabTicketStatus.OPEN, BetLabTicketStatus.PENDING_SETTLEMENT] },
-            legs: { $elemMatch: { eventId, legId, status: BetLabLegStatus.OPEN } },
+            legs: { $elemMatch: {
+              eventId,
+              legId,
+              status: leg.status,
+              ...(isProvisionalOutcome ? { settlementSourceFingerprint: leg.settlementSourceFingerprint } : {}),
+            } },
           },
           {
             $set: {
               'legs.$.status': this.toBetLabLegStatus(result.outcome),
               'legs.$.settlementOutcome': result.outcome,
               'legs.$.settledAt': new Date(),
-              'legs.$.settlementMethod': result.method,
+              'legs.$.settlementMethod': provisionalOutcomeChanged ? `PROVISIONAL_RECHECK:${result.method}` : result.method,
               'legs.$.settlementNote': result.reason ?? undefined,
+              'legs.$.settlementPhase': result.phase ?? (facts.isFinished ? 'FULL_TIME' : facts.fixtureState === 'HALFTIME' ? 'HALF_TIME' : 'IN_PLAY'),
+              'legs.$.settlementSourceFingerprint': facts.sourceFingerprint,
+              'legs.$.settlementEvidence': {
+                ...(result.evidence ?? {}),
+                sourceFingerprint: facts.sourceFingerprint,
+                fixtureState: facts.fixtureState ?? null,
+                sourceDataCollectedAt: facts.sourceDataCollectedAt ?? null,
+                ...(isProvisionalOutcome ? { sourceRecheck: true, previousOutcome } : {}),
+              },
               status: BetLabTicketStatus.PENDING_SETTLEMENT,
             },
+            ...(historyEntry ? { $push: { 'legs.$.settlementHistory': historyEntry } } : {}),
           },
         ).exec();
 
@@ -160,7 +249,7 @@ export class BetLabSettlementService {
         }
       }
 
-      // Re-read current ticket state and update only the per-match summary fields.
+      // Re-read current ticket state and update only the per-fixture settlement fields.
       // Individual leg outcomes are atomic writes, so parallel jobs for different
       // fixtures cannot silently overwrite each other's array changes.
       const ticket = await this.refreshMatchStatuses(ticketId);
@@ -190,6 +279,23 @@ export class BetLabSettlementService {
       ];
       if (terminalStatuses.includes(ticket.status)) continue;
       if (ticket.settledAt || (typeof ticket.settlementId === 'string' && ticket.settlementId.trim())) continue;
+
+      const fixtureIds = [...new Set(legs.map((item) => this.asString(item.eventId)).filter(Boolean))];
+      const fixtureContexts = await this.sportsRead.getFixtureContexts(fixtureIds);
+      const confirmedFinishedIds = new Set(
+        fixtureContexts
+          .filter((context) => isSportsFixtureFinished(context.fixture))
+          .flatMap((context) => [context.fixture.id, context.fixture.espnEventId]),
+      );
+      if (!fixtureIds.every((fixtureId) => confirmedFinishedIds.has(fixtureId))) {
+        if (ticket.status === BetLabTicketStatus.OPEN) {
+          await this.ticketModel.updateOne(
+            { _id: ticket._id, status: BetLabTicketStatus.OPEN },
+            { $set: { status: BetLabTicketStatus.PENDING_SETTLEMENT } },
+          ).exec();
+        }
+        continue;
+      }
 
       const payout = this.calculateTicketReturn(Number(ticket.stake), legs);
       const status = this.calculateTicketStatus(Number(ticket.stake), payout.grossReturn, legs);
@@ -784,5 +890,7 @@ export class BetLabSettlementService {
     return error instanceof Error ? error.message : this.asString(error);
   }
 }
+
+
 
 

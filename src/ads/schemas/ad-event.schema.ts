@@ -12,7 +12,7 @@ export type AdEventDocument = HydratedDocument<AdEvent>;
 export class AdEvent {
   @Prop({ type: Types.ObjectId, ref: 'Ad', required: true, index: true })
   adId!: Types.ObjectId;
-  @Prop({ required: true, enum: Object.values(AdEventType), index: true })
+  @Prop({ required: true, type: String, enum: Object.values(AdEventType), index: true })
   type!: AdEventType;
   @Prop({ required: true, trim: true, maxlength: 120 }) eventKey!: string;
   /** Anonymous visitor/session identifiers are SHA-256 hashes, never raw browser identifiers. */
@@ -42,3 +42,4 @@ AdEventSchema.index(
   { createdAt: 1 },
   { expireAfterSeconds: 60 * 60 * 24 * 180 },
 );
+

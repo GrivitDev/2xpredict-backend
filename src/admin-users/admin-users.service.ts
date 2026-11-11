@@ -16,6 +16,7 @@ import { PromoEngineService } from '../promos/promo-engine.service';
 import { BonusesService } from '../bonuses/bonuses.service';
 import { WebsiteAnalyticsAggregationService } from '../website-analytics/website-analytics-aggregation.service';
 import { PredictionAccessService } from '../prediction-access/prediction-access.service';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 @Injectable()
 export class AdminUsersService {
@@ -34,6 +35,7 @@ export class AdminUsersService {
     private readonly bonusesService: BonusesService,
     private readonly websiteAnalytics: WebsiteAnalyticsAggregationService,
     private readonly predictionAccess: PredictionAccessService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   async getUsers(query: AdminUserQueryDto) {
@@ -159,12 +161,18 @@ export class AdminUsersService {
     await this.writeAudit(userId, adminId, 'suspend', data.reason ?? '', null, {
       bannedUntil: data.bannedUntil ?? null,
     });
+    await this.notificationEvents.accountSuspended({
+      userId,
+      reason: data.reason,
+      bannedUntil: data.bannedUntil ?? null,
+    });
     return result;
   }
 
   async activateUser(userId: string, adminId?: string) {
     const result = await this.usersService.activateUser(userId);
     if (adminId) await this.writeAudit(userId, adminId, 'activate');
+    await this.notificationEvents.accountRestored({ userId });
     return result;
   }
 
@@ -177,6 +185,12 @@ export class AdminUsersService {
   async logoutAll(userId: string, adminId?: string) {
     const result = await this.sessionsService.deactivateAllUserSessions(userId);
     if (adminId) await this.writeAudit(userId, adminId, 'logout_all');
+    await this.notificationEvents.accountSecurityAlert({
+      userId,
+      eventKey: `admin-logout-all:${Date.now()}`,
+      title: 'Security Notice: Sessions Signed Out',
+      message: 'An administrator signed out all active sessions on your account. Sign in again only if you recognise this action.',
+    });
     return result;
   }
 
@@ -186,7 +200,15 @@ export class AdminUsersService {
 
   async revokeSession(sessionId: string, userId: string, adminId?: string) {
     const result = await this.sessionsService.revokeSession(sessionId, userId);
-    if (adminId) await this.writeAudit(userId, adminId, 'revoke_session', '', sessionId);
+    if (adminId) {
+      await this.writeAudit(userId, adminId, 'revoke_session', '', sessionId);
+      await this.notificationEvents.accountSecurityAlert({
+        userId,
+        eventKey: `admin-session-revoked:${sessionId}`,
+        title: 'Security Notice: Session Revoked',
+        message: 'An administrator signed out one of your active sessions. Review your account security if you do not recognise this action.',
+      });
+    }
     return result;
   }
 
@@ -234,3 +256,4 @@ export class AdminUsersService {
       : fallback;
   }
 }
+

@@ -36,13 +36,6 @@ export class SportsProviderRateLimit {
    *   live-scoreboard
    *   news
    *
-   * Football-Data:
-   *   competitions
-   *   competition
-   *   matches
-   *   competition-matches
-   *   standings
-   *   teams
    *
    * Odds API:
    *   sports
@@ -58,15 +51,6 @@ export class SportsProviderRateLimit {
     trim: true,
   })
   endpoint!: string;
-
-  /**
-   * Prevents another worker from claiming the
-   * same provider + endpoint slot simultaneously.
-   */
-  @Prop({
-    type: Date,
-  })
-  lockedUntil?: Date;
 
   /**
    * Last outbound request timestamp for this
@@ -157,10 +141,6 @@ SportsProviderRateLimitSchema.index(
   },
 );
 
-/**
- * Useful for expired-lock cleanup.
- */
-SportsProviderRateLimitSchema.index({
-  lockedUntil: 1,
-});
+
+
 

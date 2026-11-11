@@ -48,6 +48,9 @@ export interface MarketDefinition {
   lines?: number[];
   notes?: string;
   entityType?: 'ATHLETE';
+  pricingEnabled?: boolean;
+  requiredData?: string[];
+  minimumSampleSize?: number;
 }
 
 export interface ExpandedMarketSelection extends MarketSelectionDefinition {
@@ -64,3 +67,4 @@ export interface ExpandedMarketSelection extends MarketSelectionDefinition {
   subjectAbbreviation?: string;
   subjectTeamId?: string;
 }
+

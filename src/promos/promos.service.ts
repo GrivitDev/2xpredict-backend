@@ -6,7 +6,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { ClientSession, Model, Types } from 'mongoose';
 import { Promo, PromoDocument } from './schemas/promo.schema';
 import { CreatePromoDto } from './dto/create-promo.dto';
 import { UpdatePromoDto } from './dto/update-promo.dto';
@@ -30,6 +30,7 @@ import { User } from '../users/schemas/user.schema';
 import { Payment } from '../payments/schemas/payment.schema';
 import { Subscription } from '../subscriptions/schemas/subscription.schema';
 import { BetLabWalletService } from '../bet-lab/services/bet-lab-wallet.service';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 type PaidPlan = 'regular' | 'vip' | 'premium';
 type PurchaseType = 'subscription' | 'vip_upgrade' | 'premium_upgrade';
@@ -63,6 +64,36 @@ interface PromoAnalyticsRow {
   pointsAwarded: number;
 }
 
+
+// Public campaign fields are deliberately allow-listed. Promo codes remain
+// public so visitors can use the welcome offer during registration, while
+// redemption counters, eligibility internals and campaign-control fields stay
+// server-side.
+const PUBLIC_PROMO_SELECT = [
+  '_id',
+  'name',
+  'description',
+  'promoCode',
+  'campaignType',
+  'promotionKind',
+  'purpose',
+  'startDate',
+  'endDate',
+  'requirement',
+  'targetCount',
+  'rewardType',
+  'rewardPlan',
+  'rewardDurationDays',
+  'pointsAmount',
+  'discountType',
+  'discountValue',
+  'minPurchaseAmount',
+  'maxDiscountAmount',
+  'amountCurrency',
+  'eligiblePlans',
+].join(' ');
+
+
 export interface PromoPricingResult {
   amount: number;
   baseAmount: number;
@@ -87,6 +118,7 @@ export class PromosService implements OnModuleInit {
     @InjectModel(Subscription.name)
     private readonly subscriptionModel: Model<Subscription>,
     private readonly walletService: BetLabWalletService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   /** Disable legacy cash campaigns at startup without deleting historical records. */
@@ -316,9 +348,51 @@ export class PromosService implements OnModuleInit {
     };
   }
 
+  private toPublicPromo(promo: Partial<Promo> & { _id: unknown }) {
+    const promoCode = typeof promo.promoCode === 'string'
+      ? promo.promoCode
+      : undefined;
+    return {
+      _id: promo._id,
+      name: promo.name,
+      description: promo.description,
+      promoCode,
+      campaignType: promo.campaignType,
+      promotionKind: promo.promotionKind,
+      purpose: promo.purpose,
+      startDate: promo.startDate,
+      endDate: promo.endDate,
+      requirement: promo.requirement,
+      targetCount: promo.targetCount,
+      rewardType: promo.rewardType,
+      rewardPlan: promo.rewardPlan,
+      rewardDurationDays: promo.rewardDurationDays,
+      pointsAmount: promo.pointsAmount,
+      discountType: promo.discountType,
+      discountValue: promo.discountValue,
+      minPurchaseAmount: promo.minPurchaseAmount,
+      maxDiscountAmount: promo.maxDiscountAmount,
+      amountCurrency: promo.amountCurrency,
+      eligiblePlans: promo.eligiblePlans,
+      registrationUrl: promoCode
+        ? this.buildRegistrationUrl(promoCode)
+        : undefined,
+    };
+  }
+
+  private async findPublicPromos(filter: Record<string, any>) {
+    const promos = await this.promoModel
+      .find(filter)
+      .select(PUBLIC_PROMO_SELECT)
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+    return promos.map((promo) => this.toPublicPromo(promo as Partial<Promo> & { _id: unknown }));
+  }
+
   async getActivePromos() {
     const now = new Date();
-    return this.promoModel.find({
+    return this.findPublicPromos({
       isActive: true,
       rewardType: { $ne: 'cash' as RewardType },
       startDate: { $lte: now },
@@ -328,24 +402,18 @@ export class PromosService implements OnModuleInit {
 
   async getActiveDirectPromos() {
     const now = new Date();
-    const promos = await this.promoModel.find({
+    return this.findPublicPromos({
       campaignType: PromoCampaignType.DIRECT,
       isActive: true,
       rewardType: { $ne: 'cash' as RewardType },
       startDate: { $lte: now },
       endDate: { $gte: now },
     });
-    return promos.map((promo) => ({
-      ...promo.toObject(),
-      registrationUrl: promo.promoCode
-        ? this.buildRegistrationUrl(promo.promoCode)
-        : undefined,
-    }));
   }
 
   async getActiveReferralPromos() {
     const now = new Date();
-    return this.promoModel.find({
+    return this.findPublicPromos({
       campaignType: PromoCampaignType.REFERRAL,
       isActive: true,
       rewardType: { $ne: 'cash' as RewardType },
@@ -354,14 +422,9 @@ export class PromosService implements OnModuleInit {
     });
   }
 
+  /** Public listing: only currently redeemable campaigns and public fields. */
   async findAll() {
-    const promos = await this.promoModel.find().sort({ createdAt: -1 });
-    return promos.map((promo) => ({
-      ...promo.toObject(),
-      registrationUrl: promo.promoCode
-        ? this.buildRegistrationUrl(promo.promoCode)
-        : undefined,
-    }));
+    return this.getActivePromos();
   }
 
   async findById(id: string) {
@@ -532,9 +595,17 @@ export class PromosService implements OnModuleInit {
       existing.promoVersion = Number(promo.eligibilityVersion ?? 1);
       existing.expiresAt = expiresAt;
       existing.status = PromoClaimStatus.ACTIVE;
-      return existing.save();
+      const reactivated = await existing.save();
+      await this.notificationEvents.promotionJoined({
+        userId,
+        promoId: String(promo._id),
+        promoName: String(promo.name),
+        promoCode: String(promo.promoCode ?? promoCode),
+        expiresAt,
+      });
+      return reactivated;
     }
-    return this.claimModel.create({
+    const created = await this.claimModel.create({
       promoId: promo._id,
       userId: new Types.ObjectId(userId),
       verificationStatusAtClaim: user.isVerified ? 'verified' : 'unverified',
@@ -542,6 +613,14 @@ export class PromosService implements OnModuleInit {
       expiresAt,
       status: PromoClaimStatus.ACTIVE,
     });
+    await this.notificationEvents.promotionJoined({
+      userId,
+      promoId: String(promo._id),
+      promoName: String(promo.name),
+      promoCode: String(promo.promoCode ?? promoCode),
+      expiresAt,
+    });
+    return created;
   }
 
   /** Server-authoritative discount calculation. The frontend never submits a payable amount. */
@@ -802,105 +881,123 @@ export class PromosService implements OnModuleInit {
     };
   }
 
-  /** Reserve a use before sending the customer to the payment gateway. */
-  async reserveRedemption(input: {
-    promoId?: string;
-    userId: string;
-    paymentReference: string;
-    baseAmount: number;
-    discountAmount: number;
-    finalAmount: number;
-    pointsReward?: number;
-    currency: 'NGN' | 'USD';
-  }) {
+  /**
+   * Reserve a promotion redemption. When a caller supplies a session, the
+   * reservation participates in that caller's transaction (payment creation
+   * uses this to commit the payment and promo reservation as one operation).
+   */
+  async reserveRedemption(
+    input: {
+      promoId?: string;
+      userId: string;
+      paymentReference: string;
+      baseAmount: number;
+      discountAmount: number;
+      finalAmount: number;
+      pointsReward?: number;
+      currency: 'NGN' | 'USD';
+    },
+    externalSession?: ClientSession,
+  ) {
     if (!input.promoId) return null;
-    const existing = await this.redemptionModel.findOne({
-      paymentReference: input.paymentReference,
-    });
-    if (existing) return existing;
-    const session = await this.promoModel.db.startSession();
-    let created: PromoRedemptionDocument | null = null;
-    try {
-      await session.withTransaction(async () => {
-        const promo = await this.promoModel
-          .findById(input.promoId)
-          .session(session)
-          .exec();
-        if (!promo)
-          throw new BadRequestException('Promotion no longer exists.');
-        const now = new Date();
-        if (!promo.isActive || promo.startDate > now || promo.endDate < now)
-          throw new ConflictException('This promotion is no longer active.');
-        const userId = new Types.ObjectId(input.userId);
-        const uses = await this.redemptionModel
-          .countDocuments({
-            promoId: promo._id,
-            userId,
-            status: {
-              $in: [
-                PromoRedemptionStatus.RESERVED,
-                PromoRedemptionStatus.REDEEMED,
+
+    const reserveInSession = async (session: ClientSession) => {
+      const existing = await this.redemptionModel
+        .findOne({ paymentReference: input.paymentReference })
+        .session(session)
+        .exec();
+      if (existing) return existing;
+
+      const promo = await this.promoModel
+        .findById(input.promoId)
+        .session(session)
+        .exec();
+      if (!promo) throw new BadRequestException('Promotion no longer exists.');
+
+      const now = new Date();
+      if (!promo.isActive || promo.startDate > now || promo.endDate < now) {
+        throw new ConflictException('This promotion is no longer active.');
+      }
+
+      const userId = new Types.ObjectId(input.userId);
+      const uses = await this.redemptionModel
+        .countDocuments({
+          promoId: promo._id,
+          userId,
+          status: {
+            $in: [PromoRedemptionStatus.RESERVED, PromoRedemptionStatus.REDEEMED],
+          },
+        })
+        .session(session)
+        .exec();
+
+      if (promo.perUserRedemptionLimit > 0 && uses >= promo.perUserRedemptionLimit) {
+        throw new ConflictException(
+          'You have reached this promotion’s redemption limit.',
+        );
+      }
+
+      const filter: Record<string, any> = { _id: promo._id };
+      if (promo.totalRedemptionLimit > 0) {
+        filter.$expr = {
+          $lt: [
+            {
+              $add: [
+                { $ifNull: ['$redemptionCount', 0] },
+                { $ifNull: ['$reservedRedemptions', 0] },
               ],
             },
-          })
-          .session(session)
-          .exec();
-        if (
-          promo.perUserRedemptionLimit > 0 &&
-          uses >= promo.perUserRedemptionLimit
-        )
-          throw new ConflictException(
-            'You have reached this promotion’s redemption limit.',
-          );
-        const filter: Record<string, any> = { _id: promo._id };
-        if (promo.totalRedemptionLimit > 0)
-          filter.$expr = {
-            $lt: [
-              {
-                $add: [
-                  { $ifNull: ['$redemptionCount', 0] },
-                  { $ifNull: ['$reservedRedemptions', 0] },
-                ],
-              },
-              promo.totalRedemptionLimit,
-            ],
-          };
-        const reservedPromo = await this.promoModel
-          .findOneAndUpdate(
-            filter,
-            { $inc: { reservedRedemptions: 1 } },
-            { returnDocument: 'after', session },
-          )
-          .exec();
-        if (!reservedPromo)
-          throw new ConflictException(
-            'This promotion has reached its redemption limit.',
-          );
-        const docs = await this.redemptionModel.create(
-          [
-            {
-              promoId: promo._id,
-              userId,
-              paymentReference: input.paymentReference,
-              status: PromoRedemptionStatus.RESERVED,
-              baseAmount: input.baseAmount,
-              discountAmount: input.discountAmount,
-              finalAmount: input.finalAmount,
-              pointsReward: Math.max(
-                0,
-                Math.floor(Number(input.pointsReward ?? 0)),
-              ),
-              currency: input.currency,
-            },
+            promo.totalRedemptionLimit,
           ],
-          { session },
+        };
+      }
+
+      const reservedPromo = await this.promoModel
+        .findOneAndUpdate(
+          filter,
+          { $inc: { reservedRedemptions: 1 } },
+          { returnDocument: 'after', session },
+        )
+        .exec();
+
+      if (!reservedPromo) {
+        throw new ConflictException(
+          'This promotion has reached its redemption limit.',
         );
-        created = docs[0];
+      }
+
+      const [created] = await this.redemptionModel.create(
+        [
+          {
+            promoId: promo._id,
+            userId,
+            paymentReference: input.paymentReference,
+            status: PromoRedemptionStatus.RESERVED,
+            baseAmount: input.baseAmount,
+            discountAmount: input.discountAmount,
+            finalAmount: input.finalAmount,
+            pointsReward: Math.max(0, Math.floor(Number(input.pointsReward ?? 0))),
+            currency: input.currency,
+          },
+        ],
+        { session },
+      );
+
+      return created;
+    };
+
+    if (externalSession) return reserveInSession(externalSession);
+
+    const session = await this.promoModel.db.startSession();
+    try {
+      let result: PromoRedemptionDocument | null = null;
+      await session.withTransaction(async () => {
+        result = await reserveInSession(session);
       });
+      return result;
     } finally {
       await session.endSession();
     }
-    return created;
   }
 
   /** Called after payment entitlement processing; wallet grant is idempotent by redemption ID. */
@@ -916,83 +1013,133 @@ export class PromosService implements OnModuleInit {
       .exec();
     if (!redemption || redemption.status === PromoRedemptionStatus.RELEASED)
       return null;
-    if (redemption.status === PromoRedemptionStatus.REDEEMED) return redemption;
     const points = Math.max(
       0,
       Math.floor(Number(redemption.pointsReward ?? payment.pointsReward ?? 0)),
     );
-    if (points > 0)
-      await this.walletService.grantAdminBonusPoints(
-        String(redemption.userId),
-        points,
-        `Promotion reward for ${payment.reference}`,
-        String(redemption._id),
-      );
-    await this.claimModel
-      .updateOne(
-        {
-          promoId: redemption.promoId,
-          userId: redemption.userId,
-          status: PromoClaimStatus.ACTIVE,
-        },
-        { $set: { status: PromoClaimStatus.USED } },
-      )
-      .exec();
-    const session = await this.promoModel.db.startSession();
-    try {
-      await session.withTransaction(async () => {
-        const updated = await this.redemptionModel
-          .findOneAndUpdate(
-            { _id: redemption._id, status: PromoRedemptionStatus.RESERVED },
-            {
-              $set: {
-                status: PromoRedemptionStatus.REDEEMED,
-                redeemedAt: new Date(),
+
+    if (redemption.status !== PromoRedemptionStatus.REDEEMED) {
+      if (points > 0)
+        await this.walletService.grantAdminBonusPoints(
+          String(redemption.userId),
+          points,
+          `Promotion reward for ${payment.reference}`,
+          String(redemption._id),
+        );
+      await this.claimModel
+        .updateOne(
+          {
+            promoId: redemption.promoId,
+            userId: redemption.userId,
+            status: PromoClaimStatus.ACTIVE,
+          },
+          { $set: { status: PromoClaimStatus.USED } },
+        )
+        .exec();
+      const session = await this.promoModel.db.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const updated = await this.redemptionModel
+            .findOneAndUpdate(
+              { _id: redemption._id, status: PromoRedemptionStatus.RESERVED },
+              {
+                $set: {
+                  status: PromoRedemptionStatus.REDEEMED,
+                  redeemedAt: new Date(),
+                },
               },
-            },
-            { returnDocument: 'after', session },
-          )
-          .exec();
-        if (updated)
-          await this.promoModel
-            .updateOne(
-              { _id: redemption.promoId },
-              { $inc: { reservedRedemptions: -1, redemptionCount: 1 } },
-              { session },
+              { returnDocument: 'after', session },
             )
             .exec();
-      });
-    } finally {
-      await session.endSession();
+          if (updated) {
+            const counters = await this.promoModel
+              .updateOne(
+                { _id: redemption.promoId, reservedRedemptions: { $gt: 0 } },
+                { $inc: { reservedRedemptions: -1, redemptionCount: 1 } },
+                { session },
+              )
+              .exec();
+
+            if (counters.matchedCount !== 1) {
+              throw new ConflictException(
+                'Promotion reservation counters are inconsistent; redemption was not committed.',
+              );
+            }
+          }
+        });
+      } finally {
+        await session.endSession();
+      }
     }
-    return this.redemptionModel.findById(redemption._id).exec();
+
+    // This is safe to call on retries: the event is deduplicated by payment reference.
+    // It also repairs the rare case where the redemption committed before the process
+    // stopped, but the in-app event had not yet been queued.
+    const completed = await this.redemptionModel.findById(redemption._id).exec();
+    if (completed?.status === PromoRedemptionStatus.REDEEMED) {
+      const promo = await this.promoModel
+        .findById(redemption.promoId)
+        .select('name')
+        .lean()
+        .exec();
+      await this.notificationEvents.promotionCompleted({
+        userId: String(redemption.userId),
+        promoId: String(redemption.promoId),
+        reference: payment.reference,
+        promoName: String(promo?.name ?? 'Your promotion'),
+        pointsReward: points,
+      });
+    }
+    return completed;
   }
 
-  async releaseRedemption(paymentReference: string) {
-    const session = await this.promoModel.db.startSession();
-    try {
-      await session.withTransaction(async () => {
-        const redemption = await this.redemptionModel
-          .findOneAndUpdate(
-            { paymentReference, status: PromoRedemptionStatus.RESERVED },
-            {
-              $set: {
-                status: PromoRedemptionStatus.RELEASED,
-                releasedAt: new Date(),
-              },
+  /** Release a reservation. A supplied session lets payment rejection and
+   * promo release commit atomically. Repeated calls are safe. */
+  async releaseRedemption(
+    paymentReference: string,
+    externalSession?: ClientSession,
+  ) {
+    const releaseInSession = async (session: ClientSession) => {
+      const redemption = await this.redemptionModel
+        .findOneAndUpdate(
+          { paymentReference, status: PromoRedemptionStatus.RESERVED },
+          {
+            $set: {
+              status: PromoRedemptionStatus.RELEASED,
+              releasedAt: new Date(),
             },
-            { returnDocument: 'after', session },
+          },
+          { returnDocument: 'after', session },
+        )
+        .exec();
+
+      if (redemption) {
+        const updatedPromo = await this.promoModel
+          .updateOne(
+            { _id: redemption.promoId, reservedRedemptions: { $gt: 0 } },
+            { $inc: { reservedRedemptions: -1 } },
+            { session },
           )
           .exec();
-        if (redemption)
-          await this.promoModel
-            .updateOne(
-              { _id: redemption.promoId, reservedRedemptions: { $gt: 0 } },
-              { $inc: { reservedRedemptions: -1 } },
-              { session },
-            )
-            .exec();
+
+        if (updatedPromo.matchedCount !== 1) {
+          throw new ConflictException(
+            'Promotion reservation counters are inconsistent; release was not committed.',
+          );
+        }
+      }
+      return redemption;
+    };
+
+    if (externalSession) return releaseInSession(externalSession);
+
+    const session = await this.promoModel.db.startSession();
+    try {
+      let result: PromoRedemptionDocument | null = null;
+      await session.withTransaction(async () => {
+        result = await releaseInSession(session);
       });
+      return result;
     } finally {
       await session.endSession();
     }
@@ -1130,3 +1277,6 @@ export class PromosService implements OnModuleInit {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
   }
 }
+
+
+

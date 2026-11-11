@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, InternalServerErrorException, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
@@ -25,23 +25,105 @@ const EDITABLE_FIELDS = [
 ] as const;
 
 @Injectable()
-export class PlanConfigService {
+export class PlanConfigService implements OnModuleInit {
+  private indexReady?: Promise<void>;
+  private static readonly SINGLETON_KEY = 'primary' as const;
   constructor(
     @InjectModel(PlanConfig.name)
     private readonly model: Model<PlanConfigDocument>,
   ) {}
 
-  async get() {
-    let config = await this.model.findOne();
+  async onModuleInit(): Promise<void> {
+    await this.ensureSingletonIndex();
+  }
 
-    if (!config) {
-      config = await this.model.create({
-        subscriptionDurationDays: PAID_SUBSCRIPTION_DURATION_DAYS,
-        planLabels: DEFAULT_PLAN_LABELS,
-      });
-      return config;
+  private ensureSingletonIndex(): Promise<void> {
+    if (!this.indexReady) {
+      this.indexReady = this.model.collection
+        .createIndex(
+          { configKey: 1 },
+          {
+            unique: true,
+            partialFilterExpression: { configKey: { $type: 'string' } },
+            name: 'plan_config_singleton_key_unique',
+          },
+        )
+        .then(() => undefined);
+    }
+    return this.indexReady;
+  }
+
+  private async getOrCreateSingleton() {
+    await this.ensureSingletonIndex();
+
+    const singletonKey = PlanConfigService.SINGLETON_KEY;
+    let config = await this.model.findOne({ configKey: singletonKey }).exec();
+    if (config) return config;
+
+    // Adopt the oldest legacy configuration instead of creating a second one.
+    // The conditional update means concurrent adopters converge on one record.
+    const legacy = await this.model
+      .findOne({
+        $or: [{ configKey: { $exists: false } }, { configKey: null }],
+      })
+      .sort({ createdAt: 1, _id: 1 })
+      .exec();
+
+    if (legacy) {
+      config = await this.model
+        .findOneAndUpdate(
+          {
+            _id: legacy._id,
+            $or: [{ configKey: { $exists: false } }, { configKey: null }],
+          },
+          { $set: { configKey: singletonKey } },
+          { returnDocument: 'after' },
+        )
+        .exec();
+      if (config) return config;
+
+      // Another process may have adopted the same legacy document first.
+      config = await this.model.findOne({ configKey: singletonKey }).exec();
+      if (config) return config;
     }
 
+    // A fixed selector plus the unique partial index makes concurrent first
+    // creation deterministic across application instances.
+    try {
+      config = await this.model
+        .findOneAndUpdate(
+          { configKey: singletonKey },
+          {
+            $setOnInsert: {
+              configKey: singletonKey,
+              subscriptionDurationDays: PAID_SUBSCRIPTION_DURATION_DAYS,
+              planLabels: DEFAULT_PLAN_LABELS,
+            },
+          },
+          { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true },
+        )
+        .exec();
+    } catch (error) {
+      // Two application instances can race on the first upsert. The unique
+      // index elects one winner; the other instance reads that committed row.
+      const code =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? Number((error as { code?: unknown }).code)
+          : 0;
+      if (code !== 11000) throw error;
+      config = await this.model.findOne({ configKey: singletonKey }).exec();
+    }
+
+    if (!config) {
+      throw new InternalServerErrorException(
+        'Plan configuration could not be initialized.',
+      );
+    }
+    return config;
+  }
+
+  async get() {
+    let config = await this.getOrCreateSingleton();
     let changed = false;
 
     // Existing configuration documents predate the Premium tier.
@@ -154,3 +236,4 @@ export class PlanConfigService {
     return config.save();
   }
 }
+

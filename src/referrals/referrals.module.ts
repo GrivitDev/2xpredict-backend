@@ -1,4 +1,4 @@
-import { forwardRef, Module } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { MongooseModule } from '@nestjs/mongoose';
 
@@ -9,7 +9,6 @@ import { ReferralsMonitorService } from './referrals-monitor.service';
 import { ReferralsController } from './referrals.controller';
 
 import { UsersModule } from '../users/users.module';
-import { PromosModule } from '../promos/promos.module';
 
 @Module({
   imports: [
@@ -22,7 +21,6 @@ import { PromosModule } from '../promos/promos.module';
 
     UsersModule,
 
-    forwardRef(() => PromosModule),
   ],
 
   controllers: [ReferralsController],

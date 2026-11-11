@@ -7,10 +7,10 @@ import {
 import {
   MarketOddsBaseline,
   PredictionMatchContext,
-} from '../interfaces/espn-prediction-context.interface';
+} from '../interfaces/prediction-match-context.interface';
 import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
 
-import type { OddsBasis, OddsProvider } from '../interfaces/espn-prediction-context.interface';
+import type { OddsBasis, OddsProvider } from '../interfaces/prediction-match-context.interface';
 
 export interface ProviderSelectionPrice {
   decimalOdds: number;
@@ -108,6 +108,7 @@ export class MarketOddsService {
     };
   }
 }
+
 
 
 

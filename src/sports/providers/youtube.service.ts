@@ -44,7 +44,8 @@ export class YoutubeService implements OnModuleInit {
 
   private http!: AxiosInstance;
 
-  private apiKey!: string;
+  private apiKey = '';
+  private enabled = false;
 
   /** Resolved handles remain cached for the lifetime of this service instance. */
   private readonly channelIdByHandle = new Map<string, string>();
@@ -61,10 +62,13 @@ export class YoutubeService implements OnModuleInit {
       ?.trim();
 
     if (!apiKey) {
-      throw new Error('YOUTUBE_DATA_API_KEY is missing');
+      this.enabled = false;
+      this.logger.warn('YouTube highlights are disabled: YOUTUBE_DATA_API_KEY is not configured. ESPN sports collection will continue normally.');
+      return;
     }
 
     this.apiKey = apiKey;
+    this.enabled = true;
 
     this.http = axios.create({
       baseURL: this.baseUrl,
@@ -77,6 +81,10 @@ export class YoutubeService implements OnModuleInit {
     });
   }
 
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   // ============================================================
   // SEARCH
   // ============================================================
@@ -84,6 +92,7 @@ export class YoutubeService implements OnModuleInit {
   async searchVideos(
     options: YouTubeSearchOptions,
   ): Promise<YouTubeSearchResponse> {
+    if (!this.enabled) throw new InternalServerErrorException('YouTube highlights are disabled because YOUTUBE_DATA_API_KEY is not configured');
     if (!options.query?.trim()) {
       throw new BadRequestException('YouTube search query is required');
     }
@@ -192,8 +201,8 @@ export class YoutubeService implements OnModuleInit {
 
     // Registry entries may be immutable channel IDs or official @handles.
     // Resolve handles through channels.list because search.list's channelId
-    // filter requires the immutable channel ID. Channel lookups are tracked
-    // separately from the reserved daily search-call budget.
+    // filter requires the immutable channel ID. The lookup also consumes the
+    // shared daily request allowance, keeping all YouTube HTTP calls below cap.
     const channelReference = channelId?.trim() || undefined;
     const resolvedChannelId = channelReference
       ? await this.resolveChannelId(channelReference)
@@ -212,7 +221,7 @@ export class YoutubeService implements OnModuleInit {
     const query = `${normalizedHome} ${normalizedAway}`;
 
     // One queue job performs exactly one API search. The final stage intentionally
-    // omits the channel filter; retries are persisted by EspnQueueWorkerService.
+    // omits the channel filter; retries are persisted by SportsQueueWorkerService.
     const searchResponse = await this.searchVideos({
       query,
       // The query is intentionally broader now that "highlights" is not
@@ -287,7 +296,7 @@ export class YoutubeService implements OnModuleInit {
         forHandle: normalized,
         maxResults: 1,
       },
-      { countTowardProviderQuota: false, minimumIntervalSeconds: 1 },
+      { countTowardProviderQuota: true, minimumIntervalSeconds: 1 },
     );
     const channel = response.items?.[0];
     const channelId = channel?.id?.trim();
@@ -666,11 +675,19 @@ export class YoutubeService implements OnModuleInit {
       ).toLowerCase();
     }
 
-    return (
+    const isDailySearchQuota =
+      serialized.includes('search queries per day') ||
+      serialized.includes('defaultsearchlistperdayperproject') ||
+      serialized.includes('youtube.googleapis.com/search_list') ||
+      serialized.includes('quota_limit_value') && serialized.includes('1/d/{project}');
+    const isExplicitDailyLimit =
       serialized.includes('quotaexceeded') ||
+      serialized.includes('quota exceeded') ||
       serialized.includes('dailylimitexceeded') ||
-      serialized.includes('daily quota exceeded')
-    );
+      serialized.includes('daily quota exceeded') ||
+      serialized.includes('daily limit exceeded');
+
+    return isDailySearchQuota || isExplicitDailyLimit;
   }
 
   // ============================================================
@@ -693,4 +710,7 @@ export class YoutubeService implements OnModuleInit {
     this.logger.error(`YouTube API request failed: ${endpoint}`, error);
   }
 }
+
+
+
 

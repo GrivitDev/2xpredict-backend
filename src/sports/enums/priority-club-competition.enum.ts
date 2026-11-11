@@ -35,4 +35,3 @@ export enum PriorityClubCompetition {
   FIFA_CLUB_WORLD_CUP = 'fifa.cwc',
   FIFA_INTERCONTINENTAL_CUP = 'fifa.intercontinental_cup',
 }
-

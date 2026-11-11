@@ -1,19 +1,17 @@
 export const PREDICTION_ENGINE_CONFIG = {
   enabled: true,
-  modelVersion: '2XP-FOOTBALL-2.3.0',
+  modelVersion: '2XP-FOOTBALL-3.1.0',
   queue: {
-    /** Full fixture queue reconciliation is periodic; event-driven triggers may enqueue earlier. */
+    /** Periodic full-inventory reconciliation; Stage 2 adds direct Sports/Odds event enqueueing. */
     syncIntervalMs: 10 * 60_000,
-    /** Drain one available prediction job on each two-minute worker tick. */
-    workerIntervalMs: 2 * 60_000,
-    /** Two workers improve throughput without flooding the database or providers. */
+    /** Poll quickly and dispatch the full configured worker concurrency per tick. */
+    workerIntervalMs: 5_000,
+    /** Bounded parallelism keeps full-season backfills moving without unbounded DB pressure. */
     workerConcurrency: 2,
-    /** Recalculate unchanged upcoming fixtures periodically so queues do not stay idle indefinitely. */
-    completedRefreshIntervalMs: 2 * 60 * 60 * 1000,
+    /** Temporary safety-net refresh; Stage 2 will make source-change events the primary trigger. */
+    completedRefreshIntervalMs: 12 * 60 * 60 * 1000,
     /** Retry exhausted jobs after a cooldown, even if source timestamps did not change. */
     failedRecoveryIntervalMs: 30 * 60 * 1000,
-    /** Market-engine fixtures are forecast within a rolling 72-hour kickoff window. */
-    forwardWindowHours: 72,
     maxAttempts: 4,
     retryBaseMs: 30_000,
     maxRetryMs: 10 * 60_000,
@@ -37,7 +35,7 @@ export const PREDICTION_ENGINE_CONFIG = {
     defaultLeagueAwayGoals: 1.15,
     minimumExpectedGoals: 0.15,
     maximumExpectedGoals: 4.25,
-    sourceSummaryStaleHours: 48,
+    sourceDataStaleHours: 48,
   },
   selectionEligibility: {
     /** Broad input-sanity bounds only; do not use these as betting-price bands. */
@@ -55,22 +53,26 @@ export const PREDICTION_ENGINE_CONFIG = {
     minimumDataQuality: 0.5,
   },
   calibration: {
+    /** Do not fit a market calibrator until it has a meaningful settled sample. */
     minimumSettledSamples: 30,
-    /** Refit from newly settled results at most every six hours per active model version. */
-    refreshIntervalMs: 6 * 60 * 60 * 1000,
+    /** Check for new calibration work every five minutes. */
+    checkIntervalMs: 5 * 60_000,
+    /** Refit every 15 minutes when settled data changes; regularization protects sparse markets. */
+    refreshIntervalMs: 15 * 60_000,
     /** Strong enough to correct demonstrated bias while retaining shrinkage for limited samples. */
     maximumCorrectionBlendWeight: 0.8,
   },
   curatedPredictions: {
     enabled: true,
-    /** Publish curated recommendations only during the final 48 hours before kickoff, plus live fixtures. */
+    /** Create the immutable curated snapshot during the final 48 hours before kickoff. */
     horizonHours: 48,
-    /** Curated product refresh is deliberately paced to ten minutes. */
+    /** Recheck on the configured ten-minute cadence; published snapshots are never supplemented. */
     refreshIntervalMs: 10 * 60_000,
     minimumSelectionsPerMatch: 1,
-    maximumSelectionsPerMatch: 3,
-    minimumProbability: 0.4,
-    minimumConfidence: 60,
+    maximumSelectionsPerMatch: 7,
+    /** Use final market probabilities after any active market-specific calibration correction. */
+    minimumProbability: 0.6,
+    minimumConfidence: 70,
     /** Data quality and safety/ranking scores inform ordering; they do not reject a priced selection. */
     minimumDataQuality: 0,
     minimumSafetyScore: 0,
@@ -79,7 +81,8 @@ export const PREDICTION_ENGINE_CONFIG = {
     enabled: true,
     /** Reconcile Pick Center independently of market worker success, on a ten-minute cadence. */
     refreshIntervalMs: 10 * 60_000,
-    refreshBatchSize: 20,
+    /** Reconcile a larger bounded batch because Pick Center now covers the full upcoming season. */
+    refreshBatchSize: 100,
     minimumMarketsPerMatch: 2,
     minimumConfidence: 0,
     minimumDataQuality: 0,
@@ -104,22 +107,24 @@ export const PREDICTION_ENGINE_CONFIG = {
     minimumLegs: 1,
     defaultLegs: 1,
     /** Maximum total selections per slip. */
-    maximumLegs: 20,
+    maximumLegs: 80,
     /** Shared across normal odds products and every Sure Odds product. */
-    maximumSelectionsPerMatch: 3,
-    minimumLegProbability: 0.3,
-    minimumLegConfidence: 60,
+    maximumSelectionsPerMatch: 7,
+    /** Slip products apply stricter per-leg standards than the base Pick Center. */
+    minimumLegProbability: 0.4,
+    minimumLegConfidence: 70,
+    minimumLegDecimalOdds: 1.1,
     /** Data quality and safety scores are metadata/ranking signals, not eligibility gates. */
     minimumLegDataQuality: 0,
     minimumSafetyScore: 0,
     autoCreate: true,
-    /** Hard ceiling per fixture kickoff date; the six product targets sum to 30 each day. */
-    maxAutoSlipsPerDate: 30,
-    dailySlipTarget: 30,
+    /** Hard ceiling per fixture kickoff date; the configured product targets sum to 210. */
+    maxAutoSlipsPerDate: 250,
+    dailySlipTarget: 210,
     categoryTargets: {
-      ODDS_10: 7,
-      ODDS_25: 7,
-      ODDS_50: 7,
+      ODDS_10: 50,
+      ODDS_25: 50,
+      ODDS_50: 50,
     },
     oddsBands: {
       ODDS_10: { minOdds: 9, maxOdds: 10 },
@@ -127,11 +132,11 @@ export const PREDICTION_ENGINE_CONFIG = {
       ODDS_50: { minOdds: 48, maxOdds: 50 },
     },
     sureOdds: {
-      vipDailyTarget: 3,
-      premiumDailyTarget: 6,
-      /** Same per-selection threshold used by ODDS_10, ODDS_25, and ODDS_50. */
-      minimumProbability: 0.3,
-      minimumConfidence: 60,
+      vipDailyTarget: 20,
+      premiumDailyTarget: 40,
+      /** Sure Odds uses the same per-leg standards as the standard Slip Center products. */
+      minimumProbability: 0.4,
+      minimumConfidence: 70,
       minimumDataQuality: 0,
       minimumLegs: 1,
       maximumLegs: 12,
@@ -140,19 +145,19 @@ export const PREDICTION_ENGINE_CONFIG = {
         SURE_2: {
           minOdds: 1.8,
           maxOdds: 2.0,
-          dailyTarget: 3,
+          dailyTarget: 20,
           requiredPlan: 'vip',
         },
         SURE_5: {
           minOdds: 4.5,
           maxOdds: 5.0,
-          dailyTarget: 3,
+          dailyTarget: 20,
           requiredPlan: 'premium',
         },
         SURE_7: {
           minOdds: 6.2,
           maxOdds: 7.0,
-          dailyTarget: 3,
+          dailyTarget: 20,
           requiredPlan: 'premium',
         },
       },

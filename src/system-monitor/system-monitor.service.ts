@@ -2,6 +2,18 @@ import { Injectable } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { OnModuleInit } from '@nestjs/common';
 import { AdminGateway } from '../realtime/admin.gateway';
+import {
+  getSystemMonitorDefaultCritical,
+  getSystemMonitorDefaultMonitoringLevel,
+  getSystemMonitorModuleDefinition,
+  normalizeSystemMonitorModuleKey,
+  SYSTEM_MONITOR_MODULE_REGISTRY,
+} from './system-monitor-module-registry';
+import type {
+  SystemMonitorModuleCategory,
+  SystemMonitorProbeMode,
+  SystemMonitorExternalProbeMode,
+} from './system-monitor-module-registry';
 
 export type SystemMonitorCronStatus =
   | 'REGISTERED'
@@ -39,6 +51,15 @@ export interface SystemMonitorActivity {
   durationMs?: number;
   referenceKey?: string;
 }
+
+/** Common input contract used by every module-local operational monitor. */
+export interface SystemMonitorModuleSnapshot {
+  status: string;
+  checkedAt?: Date | string;
+  warnings?: readonly unknown[];
+  checks?: readonly unknown[];
+  details?: Record<string, unknown>;
+}
 export interface SystemMonitorCronView {
   key: string;
   module: string;
@@ -60,11 +81,35 @@ export interface SystemMonitorCronView {
     nextRunAt?: Date;
   };
 }
+export interface ModuleDependencyHealthView {
+  module: string;
+  status: ModuleHealthStatus;
+  critical: boolean;
+  kind: 'module-import' | 'data' | 'runtime';
+}
 export interface ModuleHealthView {
   module: string;
   status: ModuleHealthStatus;
   monitoringLevel: ModuleMonitoringLevel;
   critical: boolean;
+  category: SystemMonitorModuleCategory | 'unclassified';
+  description: string;
+  probeMode: SystemMonitorProbeMode | 'UNCLASSIFIED';
+  moduleImports?: string[];
+  dataDependencies?: string[];
+  runtimeDependencies?: string[];
+  actualModuleImports?: string[];
+  missingModuleImports?: string[];
+  unexpectedModuleImports?: string[];
+  observedStatus?: ModuleHealthStatus;
+  healthIsStale?: boolean;
+  healthAgeMs?: number;
+  healthFreshnessMs?: number;
+  externalProbeMode?: SystemMonitorExternalProbeMode;
+  dependencies: ModuleDependencyHealthView[];
+  externalDependencies: string[];
+  dependencyStatus: ModuleHealthStatus;
+  dependencyIssues: ModuleDependencyHealthView[];
   message: string;
   source: string;
   checkedAt: Date;
@@ -82,32 +127,16 @@ export interface ModuleHealthView {
 }
 interface CronRuntimeState extends Omit<SystemMonitorCronView, 'scheduler'> {}
 
-const DEEP_MODULES = new Set([
-  'database',
-  'payments',
-  'payment-gateways',
-  'subscriptions',
-  'settlement',
-  'predictions-engine',
-  'sports',
-  'bet-lab',
-  'telegram',
-  'customer-care',
-]);
+const DEEP_MODULES = new Set(
+  SYSTEM_MONITOR_MODULE_REGISTRY
+    .filter((definition) => definition.monitoringLevel === 'deep')
+    .map((definition) => definition.module),
+);
 const TELEMETRY_MODULES = new Set([
   'payments',
   'payment-gateways',
   'subscriptions',
   'plan-config',
-]);
-const CRITICAL_MODULES = new Set([
-  'database',
-  'payments',
-  'payment-gateways',
-  'subscriptions',
-  'settlement',
-  'predictions-engine',
-  'sports',
 ]);
 
 @Injectable()
@@ -117,6 +146,11 @@ export class SystemMonitorService implements OnModuleInit {
   private readonly recentErrors: SystemMonitorError[] = [];
   private readonly recentActivity: SystemMonitorActivity[] = [];
   private readonly moduleHealth = new Map<string, ModuleHealthView>();
+  private discoveredModules = new Set<string>();
+  private discoveredModuleImports = new Map<string, Set<string>>();
+  private readonly monitorErrorDedupUntil = new Map<string, number>();
+  private readonly MAX_MONITOR_ERROR_KEYS = 300;
+  private readonly MONITOR_ERROR_DEDUP_MS = 5 * 60_000;
   private readonly MAX_ERRORS = 100;
   private readonly MAX_ACTIVITY = 200;
   private readonly MAX_MODULES = 100;
@@ -140,6 +174,10 @@ export class SystemMonitorService implements OnModuleInit {
         'Database telemetry is connected; operational health will follow driver health checks.',
       operationalStatus: 'UNKNOWN',
     });
+    this.reportModuleHealth('system-monitor', 'HEALTHY', {
+      source: 'system-monitor-lifecycle',
+      message: 'Central System Monitor initialized and realtime health reporting is available.',
+    });
   }
 
   registerModule(
@@ -149,14 +187,35 @@ export class SystemMonitorService implements OnModuleInit {
   ): void {
     const key = this.normalizeModule(moduleName);
     if (!key) return;
+    const definition = getSystemMonitorModuleDefinition(key);
     const current = this.moduleHealth.get(key);
-    if (current) return;
+    if (current) {
+      // Classification is canonical and may be applied after an early worker or
+      // monitor has already registered the module.
+      this.moduleHealth.set(key, {
+        ...current,
+        monitoringLevel: definition?.monitoringLevel ?? level ?? current.monitoringLevel,
+        critical: definition?.critical ?? critical ?? current.critical,
+        category: definition?.category ?? current.category,
+        description: definition?.description ?? current.description,
+        probeMode: definition?.probeMode ?? current.probeMode,
+        externalDependencies: definition ? [...definition.externalDependencies] : current.externalDependencies,
+      });
+      return;
+    }
     const now = new Date();
     this.moduleHealth.set(key, {
       module: key,
       status: 'UNKNOWN',
-      monitoringLevel: level ?? (DEEP_MODULES.has(key) ? 'deep' : 'health'),
-      critical: critical ?? CRITICAL_MODULES.has(key),
+      monitoringLevel: getSystemMonitorModuleDefinition(key)?.monitoringLevel ?? level ?? getSystemMonitorDefaultMonitoringLevel(key),
+      critical: getSystemMonitorModuleDefinition(key)?.critical ?? critical ?? getSystemMonitorDefaultCritical(key),
+      category: definition?.category ?? 'unclassified',
+      description: definition?.description ?? 'Module discovered at runtime; no classification entry exists.',
+      probeMode: definition?.probeMode ?? 'UNCLASSIFIED',
+      dependencies: [],
+      externalDependencies: definition ? [...definition.externalDependencies] : [],
+      dependencyStatus: 'UNKNOWN',
+      dependencyIssues: [],
       message: 'Awaiting first health check.',
       source: 'registry',
       checkedAt: now,
@@ -167,6 +226,40 @@ export class SystemMonitorService implements OnModuleInit {
       averageDurationMs: 0,
     });
     this.trimModules();
+  }
+
+  /** Records discovered Nest modules without overwriting earlier health results. */
+  setDiscoveredModules(moduleNames: readonly string[]): void {
+    this.discoveredModules = new Set(
+      moduleNames.map((name) => this.normalizeModule(name)).filter(Boolean),
+    );
+    for (const name of this.discoveredModules) this.registerModule(name);
+  }
+
+  /**
+   * Records actual Nest module imports. Duplicate monitoring aliases (for
+   * example SportsModule and SportsDataModule) are merged into one domain node.
+   */
+  setDiscoveredModuleGraph(
+    entries: readonly { module: string; imports: readonly string[] }[],
+  ): void {
+    const discovered = new Set<string>(['database', 'application']);
+    const graph = new Map<string, Set<string>>();
+
+    for (const entry of entries) {
+      const module = this.normalizeModule(entry.module);
+      if (!module) continue;
+      discovered.add(module);
+      const imports = graph.get(module) ?? new Set<string>();
+      for (const importedName of entry.imports ?? []) {
+        const imported = this.normalizeModule(importedName);
+        if (imported && imported !== module) imports.add(imported);
+      }
+      graph.set(module, imports);
+    }
+
+    this.discoveredModuleImports = graph;
+    this.setDiscoveredModules([...discovered]);
   }
 
   reportModuleHealth(
@@ -183,6 +276,8 @@ export class SystemMonitorService implements OnModuleInit {
     this.registerModule(key);
     const previous = this.moduleHealth.get(key)!;
     const checkedAt = options.checkedAt ?? new Date();
+    // An older asynchronous probe must never overwrite a newer health result.
+    if (checkedAt.getTime() < previous.checkedAt.getTime()) return;
     const failed = status === 'FAILED' || status === 'DEGRADED';
     const nextMessage = this.safeTelemetryText(
       options.message ?? previous.message,
@@ -235,6 +330,154 @@ export class SystemMonitorService implements OnModuleInit {
           details: options.details,
         },
       );
+  }
+
+  /**
+   * Normalizes a module-local monitor snapshot into the central health model.
+   * Detailed monitor payloads remain with their owning module; only compact,
+   * payload-free health summaries and failed check metadata are forwarded here.
+   */
+  reportMonitorSnapshot(
+    moduleName: string,
+    snapshot: SystemMonitorModuleSnapshot,
+  ): void {
+    const module = this.normalizeModule(moduleName);
+    this.registerModule(module);
+
+    const checkedAt = this.toMonitorDate(snapshot.checkedAt) ?? new Date();
+    const currentSnapshot = this.moduleHealth.get(module);
+    // Ignore a delayed monitor result before it can add stale errors or activity.
+    if (currentSnapshot && checkedAt.getTime() < currentSnapshot.checkedAt.getTime()) return;
+    const rawStatus = String(snapshot.status ?? 'UNKNOWN').trim().toUpperCase();
+    const status: ModuleHealthStatus =
+      ['HEALTHY', 'OK', 'SUCCESS', 'READY'].includes(rawStatus)
+        ? 'HEALTHY'
+        : ['DEGRADED', 'WARN', 'WARNING'].includes(rawStatus)
+          ? 'DEGRADED'
+          : ['FAILED', 'FAIL', 'ERROR', 'CRITICAL', 'STOPPED'].includes(rawStatus)
+            ? 'FAILED'
+            : 'UNKNOWN';
+
+    const checkRows = (snapshot.checks ?? []).map((item, index) => {
+      const row = this.asRecord(item);
+      const checkStatus = String(row.status ?? row.severity ?? '').toUpperCase();
+      const name = this.safeTelemetryText(
+        String(row.name ?? row.code ?? row.operation ?? `check-${index + 1}`),
+        100,
+      );
+      const message = this.safeTelemetryText(
+        String(row.error ?? row.message ?? ''),
+        500,
+      );
+      return { name, status: checkStatus, message };
+    });
+
+    const failedChecks = checkRows.filter((item) =>
+      ['FAILED', 'FAIL', 'ERROR', 'CRITICAL'].includes(item.status),
+    );
+    const warningChecks = checkRows.filter((item) =>
+      ['DEGRADED', 'WARN', 'WARNING'].includes(item.status),
+    );
+    const warnings = (snapshot.warnings ?? [])
+      .map((item) => {
+        if (typeof item === 'string') return this.safeTelemetryText(item, 300);
+        const row = this.asRecord(item);
+        return this.safeTelemetryText(
+          String(row.message ?? row.error ?? row.code ?? ''),
+          300,
+        );
+      })
+      .filter(Boolean);
+
+    const message =
+      status === 'HEALTHY'
+        ? `${module} operational monitor checks are healthy.`
+        : status === 'DEGRADED'
+          ? `${module} operational monitor detected warnings or degraded checks.`
+          : status === 'FAILED'
+            ? `${module} operational monitor detected critical failures or could not complete its probe.`
+            : `${module} operational status has not yet been verified.`;
+
+    const details: Record<string, unknown> = {
+      ...(snapshot.details ?? {}),
+      monitorCheckCount: checkRows.length,
+      monitorFailedCheckCount: failedChecks.length,
+      monitorWarningCheckCount: warningChecks.length,
+      monitorWarningCount: warnings.length,
+      monitorFailedCheckNames: failedChecks
+        .map((item) => item.name)
+        .slice(0, 10)
+        .join(', '),
+      monitorWarningSummary: warnings.slice(0, 3).join(' | '),
+    };
+
+    // A single failing check is enough to create an error record, but repeat
+    // snapshots of the same failure are rate-limited in memory.
+    const errorRows = failedChecks.length
+      ? failedChecks
+      : status === 'FAILED'
+        ? [{
+            name: 'operational-health',
+            status: 'FAILED',
+            message: message,
+          }]
+        : [];
+
+    for (const item of errorRows.slice(0, 10)) {
+      const errorMessage = item.message || `${item.name} failed.`;
+      const dedupKey = `${module}|${item.name}|${errorMessage}`;
+      const until = this.monitorErrorDedupUntil.get(dedupKey) ?? 0;
+      if (until > checkedAt.getTime()) continue;
+      this.monitorErrorDedupUntil.set(
+        dedupKey,
+        checkedAt.getTime() + this.MONITOR_ERROR_DEDUP_MS,
+      );
+      this.reportError({
+        module,
+        source: 'local-monitor',
+        operation: item.name,
+        message: errorMessage,
+        occurredAt: checkedAt,
+        referenceKey: `${module}:${item.name}`,
+      });
+    }
+
+    // reportError() also updates the Admin Gateway; report the normalized
+    // snapshot afterwards so FAILED remains FAILED rather than DEGRADED.
+    const previousStatus = this.moduleHealth.get(module)?.status ?? 'UNKNOWN';
+    this.reportModuleHealth(module, status, {
+      source: 'local-monitor',
+      message,
+      checkedAt,
+      details,
+    });
+
+    if (previousStatus !== status) {
+      this.reportActivity({
+        module,
+        source: 'local-monitor',
+        operation: 'health-check',
+        status:
+          status === 'HEALTHY'
+            ? 'SUCCESS'
+            : status === 'FAILED'
+              ? 'FAILED'
+              : 'INFO',
+        message,
+        occurredAt: checkedAt,
+        referenceKey: `${module}:health`,
+      });
+    }
+
+    // Bound the in-memory deduplication map and discard expired keys.
+    if (this.monitorErrorDedupUntil.size > this.MAX_MONITOR_ERROR_KEYS) {
+      for (const [key, expiresAt] of this.monitorErrorDedupUntil) {
+        if (expiresAt <= checkedAt.getTime() || this.monitorErrorDedupUntil.size > this.MAX_MONITOR_ERROR_KEYS) {
+          this.monitorErrorDedupUntil.delete(key);
+        }
+        if (this.monitorErrorDedupUntil.size <= this.MAX_MONITOR_ERROR_KEYS) break;
+      }
+    }
   }
 
   /** Wraps an important background operation without changing its result/error semantics. */
@@ -546,12 +789,19 @@ export class SystemMonitorService implements OnModuleInit {
       occurredAt: safeError.occurredAt.toISOString(),
       referenceKey: safeError.referenceKey,
     });
-    this.adminGateway.setModuleOperationalStatus(
-      safeError.module,
-      'DEGRADED',
-      safeError.message,
-      { source: safeError.source, operation: safeError.operation },
-    );
+    const currentModuleStatus = this.moduleHealth.get(
+      this.normalizeModule(safeError.module),
+    )?.status;
+    // An error event must not downgrade an already-confirmed FAILED state to
+    // DEGRADED. The next explicit health probe is responsible for recovery.
+    if (currentModuleStatus !== 'FAILED') {
+      this.adminGateway.setModuleOperationalStatus(
+        safeError.module,
+        'DEGRADED',
+        safeError.message,
+        { source: safeError.source, operation: safeError.operation },
+      );
+    }
   }
   reportActivity(activity: SystemMonitorActivity): void {
     this.addActivity(activity);
@@ -578,26 +828,53 @@ export class SystemMonitorService implements OnModuleInit {
   getDashboard(): unknown {
     const crons = this.getCrons();
     const modules = this.getModules();
+    const coverage = this.getCoverage();
     const failedCrons = crons.filter((cron) => cron.status === 'FAILED').length;
-    const failedModules = modules.filter(
-      (module) => module.status === 'FAILED',
+    const failedModules = modules.filter((module) => module.status === 'FAILED').length;
+    const degradedModules = modules.filter((module) => module.status === 'DEGRADED').length;
+    const unknownModules = modules.filter((module) => module.status === 'UNKNOWN').length;
+    const criticalModules = modules.filter((module) => module.critical);
+    const criticalFailed = criticalModules.filter((module) => module.status === 'FAILED').length;
+    const criticalDegraded = criticalModules.filter((module) => module.status === 'DEGRADED').length;
+    const criticalUnknown = criticalModules.filter((module) => module.status === 'UNKNOWN').length;
+    const criticalDependencyFailures = coverage.criticalDependencyIssues.filter(
+      (issue: { status: ModuleHealthStatus }) => issue.status === 'FAILED',
     ).length;
-    const degradedModules = modules.filter(
-      (module) => module.status === 'DEGRADED',
+    const criticalDependencyIssues = coverage.criticalDependencyIssues.length;
+    const criticalGraphIssues = coverage.moduleGraphIssues.filter(
+      (issue: { critical: boolean }) => issue.critical,
     ).length;
-    const unknownModules = modules.filter(
-      (module) => module.status === 'UNKNOWN',
+    const criticalMissingModules = modules.filter(
+      (module) => module.critical && !this.discoveredModules.has(module.module),
     ).length;
-    const criticalModulesUnverified = modules.filter(
-      (module) => module.critical && module.status === 'UNKNOWN',
-    ).length;
+    const readinessStatus = criticalFailed > 0 || criticalDependencyFailures > 0
+      ? 'FAILED'
+      : criticalDegraded > 0 || criticalUnknown > 0 || criticalDependencyIssues > 0
+        || criticalGraphIssues > 0 || criticalMissingModules > 0
+        ? 'DEGRADED'
+        : 'ONLINE';
+    const readinessMessage = readinessStatus === 'FAILED'
+      ? 'One or more critical modules or their required dependencies have failed.'
+      : readinessStatus === 'DEGRADED'
+        ? 'One or more critical modules, dependencies or module-import contracts are degraded or unverified.'
+        : 'All critical modules and their required dependencies are healthy.';
     const memory = process.memoryUsage();
     return {
       system: {
-        // UNKNOWN means health has not been verified; only confirmed failures
-        // should downgrade the overall system status.
-        status:
-          failedModules > 0 || degradedModules > 0 ? 'DEGRADED' : 'ONLINE',
+        // Readiness includes critical module and dependency state. Unknown is
+        // unverified, not healthy; it degrades readiness but does not imply failure.
+        status: readinessStatus,
+        readiness: {
+          status: readinessStatus,
+          message: readinessMessage,
+          criticalModules: criticalModules.length,
+          criticalFailed,
+          criticalDegraded,
+          criticalUnknown,
+          criticalDependencyIssues,
+          criticalModuleGraphIssues: criticalGraphIssues,
+          criticalModulesMissingFromNest: criticalMissingModules,
+        },
         startedAt: this.startedAt,
         uptimeSeconds: Math.floor(process.uptime()),
         currentTime: new Date(),
@@ -621,13 +898,15 @@ export class SystemMonitorService implements OnModuleInit {
         failedModules,
         degradedModules,
         unknownModules,
-        criticalModulesUnhealthy: modules.filter(
-          (module) =>
-            module.critical &&
-            (module.status === 'FAILED' || module.status === 'DEGRADED'),
-        ).length,
-        criticalModulesUnverified,
+        staleModules: modules.filter((module) => module.healthIsStale).length,
+        criticalModulesUnhealthy: criticalDegraded + criticalFailed,
+        criticalModulesUnverified: criticalUnknown,
+        criticalDependencyIssues,
+        criticalModuleGraphIssues: criticalGraphIssues,
+        modulesMissingFromNest: coverage.summary.modulesMissingFromNest,
+        unclassifiedDiscoveredModules: coverage.summary.unclassifiedDiscoveredModules,
       },
+      coverage,
       modules,
       crons,
       recentActivity: [...this.recentActivity],
@@ -640,22 +919,143 @@ export class SystemMonitorService implements OnModuleInit {
     level?: ModuleMonitoringLevel;
     critical?: boolean;
   }): ModuleHealthView[] {
-    let modules = [...this.moduleHealth.values()].sort(
-      (a, b) =>
-        Number(b.critical) - Number(a.critical) ||
-        a.module.localeCompare(b.module),
-    );
+    let modules = [...this.moduleHealth.values()]
+      .sort(
+        (a, b) =>
+          Number(b.critical) - Number(a.critical) ||
+          a.module.localeCompare(b.module),
+      )
+      .map((module) => this.enrichModuleHealth(module));
     if (options?.status)
-      modules = modules.filter((m) => m.status === options.status);
+      modules = modules.filter((module) => module.status === options.status);
     if (options?.level)
-      modules = modules.filter((m) => m.monitoringLevel === options.level);
+      modules = modules.filter((module) => module.monitoringLevel === options.level);
     if (typeof options?.critical === 'boolean')
-      modules = modules.filter((m) => m.critical === options.critical);
+      modules = modules.filter((module) => module.critical === options.critical);
     return modules;
   }
 
   getModuleHealth(moduleName: string): ModuleHealthView | null {
-    return this.moduleHealth.get(this.normalizeModule(moduleName)) ?? null;
+    const module = this.moduleHealth.get(this.normalizeModule(moduleName));
+    return module ? this.enrichModuleHealth(module) : null;
+  }
+
+  /** Coverage, import-contract drift and dependency readiness from the discovered Nest graph. */
+  getCoverage() {
+    const definitions = SYSTEM_MONITOR_MODULE_REGISTRY;
+    const knownModules = new Set(definitions.map((definition) => definition.module));
+    const moduleRows = definitions.map((definition) => {
+      const current = this.moduleHealth.get(definition.module);
+      const enriched = current ? this.enrichModuleHealth(current) : undefined;
+      const status: ModuleHealthStatus = enriched?.status ?? 'UNKNOWN';
+      const actualModuleImports = [...(this.discoveredModuleImports.get(definition.module) ?? new Set<string>())].sort();
+      const declaredModuleImports = [...definition.moduleImports].sort();
+      const missingModuleImports = declaredModuleImports.filter((item) => !actualModuleImports.includes(item));
+      const unexpectedModuleImports = actualModuleImports.filter((item) => !declaredModuleImports.includes(item));
+      return {
+        module: definition.module,
+        category: definition.category,
+        description: definition.description,
+        critical: definition.critical,
+        monitoringLevel: definition.monitoringLevel,
+        probeMode: definition.probeMode,
+        healthFreshnessMs: definition.healthFreshnessMs,
+        externalProbeMode: definition.externalProbeMode,
+        externalDependencies: [...definition.externalDependencies],
+        moduleImports: [...definition.moduleImports],
+        dataDependencies: [...definition.dataDependencies],
+        runtimeDependencies: [...definition.runtimeDependencies],
+        dependsOn: [...definition.dependsOn],
+        actualModuleImports,
+        missingModuleImports,
+        unexpectedModuleImports,
+        moduleImportDrift: missingModuleImports.length > 0 || unexpectedModuleImports.length > 0,
+        status,
+        observedStatus: enriched?.observedStatus ?? 'UNKNOWN',
+        healthIsStale: enriched?.healthIsStale ?? false,
+        healthAgeMs: enriched?.healthAgeMs,
+        discovered: this.discoveredModules.has(definition.module) || definition.module === 'database',
+        dependencies: definition.dependsOn.map((dependency) => {
+          const dependencyHealth = this.moduleHealth.get(dependency);
+          const dependencyView = dependencyHealth
+            ? this.enrichModuleHealth(dependencyHealth)
+            : undefined;
+          return {
+            module: dependency,
+            status: dependencyView?.status ?? 'UNKNOWN' as ModuleHealthStatus,
+            critical: getSystemMonitorModuleDefinition(dependency)?.critical ?? false,
+            kind: definition.moduleImports.includes(dependency)
+              ? 'module-import' as const
+              : definition.dataDependencies.includes(dependency)
+                ? 'data' as const
+                : 'runtime' as const,
+          };
+        }),
+      };
+    });
+
+    const critical = moduleRows.filter((item) => item.critical);
+    const dependencyIssues = critical.flatMap((item) =>
+      item.dependencies
+        .filter((dependency) => dependency.status !== 'HEALTHY')
+        .map((dependency) => ({ parentModule: item.module, ...dependency })),
+    );
+    const statusCount = (status: ModuleHealthStatus) => critical.filter((item) => item.status === status).length;
+    const probeModes = {
+      periodic: moduleRows.filter((item) => item.probeMode === 'PERIODIC').length,
+      workerLifecycle: moduleRows.filter((item) => item.probeMode === 'WORKER_LIFECYCLE').length,
+      lifecycle: moduleRows.filter((item) => item.probeMode === 'LIFECYCLE').length,
+      onDemand: moduleRows.filter((item) => item.probeMode === 'ON_DEMAND').length,
+      requestObserved: moduleRows.filter((item) => item.probeMode === 'REQUEST_OBSERVED').length,
+    };
+    const missingModules = moduleRows.filter((item) => !item.discovered).map((item) => item.module);
+    const criticalWithoutLocalProbe = critical
+      .filter((item) => item.probeMode === 'REQUEST_OBSERVED')
+      .map((item) => item.module);
+    const criticalOnDemandOnly = critical
+      .filter((item) => item.probeMode === 'ON_DEMAND')
+      .map((item) => item.module);
+    const moduleGraphIssues = moduleRows
+      .filter((item) => item.discovered && item.module !== 'application' && item.module !== 'database' && item.moduleImportDrift)
+      .map((item) => ({
+        module: item.module,
+        critical: item.critical,
+        expectedImports: item.moduleImports,
+        actualImports: item.actualModuleImports,
+        missingImports: item.missingModuleImports,
+        unexpectedImports: item.unexpectedModuleImports,
+      }));
+    const unclassifiedDiscoveredModules = [...this.discoveredModules]
+      .filter((module) => !knownModules.has(module))
+      .sort();
+    const staleModules = moduleRows.filter((item) => item.healthIsStale).map((item) => item.module);
+
+    return {
+      checkedAt: new Date(),
+      expectedModules: moduleRows.length,
+      discoveredModules: moduleRows.filter((item) => item.discovered).length,
+      missingModules,
+      unclassifiedDiscoveredModules,
+      moduleGraphIssues,
+      staleModules,
+      summary: {
+        criticalModules: critical.length,
+        criticalHealthy: statusCount('HEALTHY'),
+        criticalDegraded: statusCount('DEGRADED'),
+        criticalFailed: statusCount('FAILED'),
+        criticalUnknown: statusCount('UNKNOWN'),
+        criticalDependencyIssues: dependencyIssues.length,
+        modulesMissingFromNest: missingModules.length,
+        unclassifiedDiscoveredModules: unclassifiedDiscoveredModules.length,
+        modulesWithImportDrift: moduleGraphIssues.length,
+        staleModules: staleModules.length,
+        criticalWithoutLocalProbe,
+        criticalOnDemandOnly,
+        probeModes,
+      },
+      criticalDependencyIssues: dependencyIssues,
+      modules: moduleRows,
+    };
   }
 
   getCrons(options?: {
@@ -747,6 +1147,19 @@ export class SystemMonitorService implements OnModuleInit {
     if (this.recentActivity.length > this.MAX_ACTIVITY)
       this.recentActivity.length = this.MAX_ACTIVITY;
   }
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value !== null && typeof value === 'object'
+      ? (value as Record<string, unknown>)
+      : {};
+  }
+  private toMonitorDate(value?: Date | string): Date | undefined {
+    if (value instanceof Date && Number.isFinite(value.getTime())) return value;
+    if (typeof value === 'string') {
+      const parsed = new Date(value);
+      return Number.isFinite(parsed.getTime()) ? parsed : undefined;
+    }
+    return undefined;
+  }
   private safeTelemetryText(value: string, maxLength: number): string {
     return String(value ?? '')
       .replace(
@@ -757,15 +1170,101 @@ export class SystemMonitorService implements OnModuleInit {
       .slice(0, maxLength);
   }
   private normalizeModule(value: string): string {
-    return (
-      String(value ?? 'unknown')
-        .trim()
-        .replace(/Module$/, '')
-        .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
-        .replace(/_/g, '-')
-        .toLowerCase() || 'unknown'
-    );
+    return normalizeSystemMonitorModuleKey(value);
   }
+
+  private enrichModuleHealth(module: ModuleHealthView): ModuleHealthView {
+    const definition = getSystemMonitorModuleDefinition(module.module);
+    if (!definition) {
+      return {
+        ...module,
+        observedStatus: module.status,
+        healthIsStale: false,
+        healthAgeMs: Math.max(0, Date.now() - module.checkedAt.getTime()),
+        moduleImports: [],
+        dataDependencies: [],
+        runtimeDependencies: [],
+        actualModuleImports: [],
+        missingModuleImports: [],
+        unexpectedModuleImports: [],
+      };
+    }
+
+    const now = Date.now();
+    const healthAgeMs = Math.max(0, now - module.checkedAt.getTime());
+    const healthIsStale = Number.isFinite(definition.healthFreshnessMs)
+      && healthAgeMs > Number(definition.healthFreshnessMs);
+    // A stale HEALTHY probe cannot continue to certify readiness. A prior
+    // FAILED/DEGRADED result remains visible until a newer explicit success.
+    const status = healthIsStale && module.status === 'HEALTHY'
+      ? 'UNKNOWN'
+      : module.status;
+    const dependencies = definition.dependsOn.map((dependency) => {
+      const health = this.moduleHealth.get(dependency);
+      const effectiveStatus = health
+        ? this.getEffectiveModuleStatus(dependency, health)
+        : 'UNKNOWN';
+      return {
+        module: dependency,
+        status: effectiveStatus,
+        critical: getSystemMonitorModuleDefinition(dependency)?.critical ?? false,
+        kind: definition.moduleImports.includes(dependency)
+          ? 'module-import' as const
+          : definition.dataDependencies.includes(dependency)
+            ? 'data' as const
+            : 'runtime' as const,
+      };
+    });
+    const dependencyIssues = dependencies.filter((dependency) => dependency.status !== 'HEALTHY');
+    const dependencyStatuses = dependencies.map((dependency) => dependency.status);
+    const dependencyStatus: ModuleHealthStatus =
+      dependencyStatuses.includes('FAILED') ? 'FAILED'
+        : dependencyStatuses.includes('DEGRADED') ? 'DEGRADED'
+          : dependencyStatuses.includes('UNKNOWN') ? 'UNKNOWN'
+            : 'HEALTHY';
+    const actualModuleImports = [...(this.discoveredModuleImports.get(module.module) ?? new Set<string>())].sort();
+    const declaredModuleImports = [...definition.moduleImports].sort();
+    const missingModuleImports = declaredModuleImports.filter((item) => !actualModuleImports.includes(item));
+    const unexpectedModuleImports = actualModuleImports.filter((item) => !declaredModuleImports.includes(item));
+
+    return {
+      ...module,
+      status,
+      observedStatus: module.status,
+      healthIsStale,
+      healthAgeMs,
+      healthFreshnessMs: definition.healthFreshnessMs,
+      externalProbeMode: definition.externalProbeMode,
+      message: healthIsStale && module.status === 'HEALTHY'
+        ? 'The last successful periodic health probe is stale; current operational health is unverified.'
+        : module.message,
+      category: definition.category,
+      description: definition.description,
+      probeMode: definition.probeMode,
+      moduleImports: [...definition.moduleImports],
+      dataDependencies: [...definition.dataDependencies],
+      runtimeDependencies: [...definition.runtimeDependencies],
+      actualModuleImports,
+      missingModuleImports,
+      unexpectedModuleImports,
+      dependencies,
+      externalDependencies: [...definition.externalDependencies],
+      dependencyStatus,
+      dependencyIssues,
+    };
+  }
+
+  private getEffectiveModuleStatus(
+    moduleName: string,
+    health: ModuleHealthView,
+  ): ModuleHealthStatus {
+    const definition = getSystemMonitorModuleDefinition(moduleName);
+    if (!definition?.healthFreshnessMs || health.status !== 'HEALTHY') return health.status;
+    return Date.now() - health.checkedAt.getTime() > definition.healthFreshnessMs
+      ? 'UNKNOWN'
+      : health.status;
+  }
+
   private trimModules() {
     if (this.moduleHealth.size <= this.MAX_MODULES) return;
     for (const [key] of this.moduleHealth) {
@@ -822,3 +1321,4 @@ export class SystemMonitorService implements OnModuleInit {
       : 50;
   }
 }
+

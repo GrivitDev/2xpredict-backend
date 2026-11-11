@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import {
   Injectable,
   Logger,
@@ -19,24 +21,27 @@ import { MarketCalibrationService } from './market-calibration.service';
 import { CuratedPredictionService } from './curated-prediction.service';
 import { SlipCenterService } from './slip-center.service';
 import { PickCenterService } from './pick-center.service';
+import { SportsQueueJobType } from '../../sports/interfaces/sports-queue.interface';
+import { SportsQueueService } from '../../sports/services/sports-queue.service';
+import { PredictionSourceRevisionChangedError } from './prediction-data.service';
 
 @Injectable()
 export class PredictionQueueWorkerService
   implements OnModuleInit, OnModuleDestroy
 {
   private readonly logger = new Logger(PredictionQueueWorkerService.name);
+  private readonly sourceTriggerWorkerId = `prediction-source-trigger:${process.env.HOSTNAME ?? 'node'}`;
   private workerTimer?: ReturnType<typeof setInterval>;
   private syncTimer?: ReturnType<typeof setInterval>;
   private productTimer?: ReturnType<typeof setInterval>;
-  private slipTimer?: ReturnType<typeof setInterval>;
   private calibrationTimer?: ReturnType<typeof setInterval>;
-  private pickCenterTimer?: ReturnType<typeof setInterval>;
   private activeWorkers = 0;
   private pickCenterBusy = false;
   private syncBusy = false;
   private curatedBusy = false;
   private slipBusy = false;
   private calibrationBusy = false;
+  private productPipelineBusy = false;
   private started = false;
 
   constructor(
@@ -49,6 +54,7 @@ export class PredictionQueueWorkerService
     private readonly curatedPredictionService: CuratedPredictionService,
     private readonly slipCenterService: SlipCenterService,
     private readonly pickCenterService: PickCenterService,
+    private readonly sportsQueue: SportsQueueService,
   ) {}
 
   onModuleInit(): void {
@@ -103,33 +109,30 @@ export class PredictionQueueWorkerService
     });
 
     void this.syncQueueSafely();
-    void this.runOneSafely();
+    void this.runWorkerBatchSafely();
     // Publication products have their own recurring cycle. They do not depend
     // on a new market-engine run and therefore continue refreshing while Pick
     // Center already contains eligible upcoming/live fixtures.
     void this.refreshCalibrationSafely();
-    void this.refreshCuratedSafely();
-    void this.refreshSlipSafely();
-    void this.refreshPickCenterSafely();
+    // Product stages are deliberately serialized. A cycle always reconciles
+    // Pick Center first, then Curated Predictions, then Slip Center.
+    void this.refreshProductPipelineSafely();
 
-    const pickCenterTimer = setInterval(
-      () => void this.refreshPickCenterSafely(),
+    const productIntervalMs = Math.min(
       PREDICTION_ENGINE_CONFIG.pickCenter.refreshIntervalMs,
+      PREDICTION_ENGINE_CONFIG.curatedPredictions.refreshIntervalMs,
+      PREDICTION_ENGINE_CONFIG.slipCenter.refreshIntervalMs,
     );
     const productTimer = setInterval(
-      () => void this.refreshCuratedSafely(),
-      PREDICTION_ENGINE_CONFIG.curatedPredictions.refreshIntervalMs,
-    );
-    const slipTimer = setInterval(
-      () => void this.refreshSlipSafely(),
-      PREDICTION_ENGINE_CONFIG.slipCenter.refreshIntervalMs,
+      () => void this.refreshProductPipelineSafely(),
+      productIntervalMs,
     );
     const calibrationTimer = setInterval(
       () => void this.refreshCalibrationSafely(),
-      PREDICTION_ENGINE_CONFIG.calibration.refreshIntervalMs,
+      PREDICTION_ENGINE_CONFIG.calibration.checkIntervalMs,
     );
     const workerTimer = setInterval(
-      () => void this.runOneSafely(),
+      () => void this.runWorkerBatchSafely(),
       PREDICTION_ENGINE_CONFIG.queue.workerIntervalMs,
     );
     const syncTimer = setInterval(
@@ -139,24 +142,18 @@ export class PredictionQueueWorkerService
     this.workerTimer = workerTimer;
     this.syncTimer = syncTimer;
     this.productTimer = productTimer;
-    this.slipTimer = slipTimer;
     this.calibrationTimer = calibrationTimer;
-    this.pickCenterTimer = pickCenterTimer;
   }
 
   stop(): void {
     if (this.workerTimer) clearInterval(this.workerTimer);
     if (this.syncTimer) clearInterval(this.syncTimer);
     if (this.productTimer) clearInterval(this.productTimer);
-    if (this.slipTimer) clearInterval(this.slipTimer);
     if (this.calibrationTimer) clearInterval(this.calibrationTimer);
-    if (this.pickCenterTimer) clearInterval(this.pickCenterTimer);
     this.workerTimer = undefined;
     this.syncTimer = undefined;
     this.productTimer = undefined;
-    this.slipTimer = undefined;
     this.calibrationTimer = undefined;
-    this.pickCenterTimer = undefined;
     if (!this.started) return;
     this.started = false;
     void this.monitor
@@ -176,6 +173,20 @@ export class PredictionQueueWorkerService
     failed?: boolean;
   }> {
     return this.processOne();
+  }
+
+  /** Fill all available worker slots on every poll instead of dispatching one job per tick. */
+  private async runWorkerBatchSafely(): Promise<void> {
+    if (!this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
+    const availableSlots = Math.max(
+      0,
+      PREDICTION_ENGINE_CONFIG.queue.workerConcurrency - this.activeWorkers,
+    );
+    if (availableSlots === 0) return;
+
+    await Promise.all(
+      Array.from({ length: availableSlots }, () => this.runOneSafely()),
+    );
   }
 
   private async runOneSafely(): Promise<void> {
@@ -198,7 +209,7 @@ export class PredictionQueueWorkerService
         failed = true;
         this.monitor.recordOperationFailure(
           'prediction-worker',
-          'Prediction queue item failed during generation or persistence.',
+          'Prediction queue item failed during generation or Sports/Odds source-change handoff.',
           { eventId: outcome.eventId },
         );
       }
@@ -238,6 +249,18 @@ export class PredictionQueueWorkerService
           source: 'queue-worker',
           message: 'Prediction worker processed a fixture successfully.',
         });
+    }
+  }
+
+  private async refreshProductPipelineSafely(): Promise<void> {
+    if (this.productPipelineBusy || !this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
+    this.productPipelineBusy = true;
+    try {
+      await this.refreshPickCenterSafely();
+      await this.refreshCuratedSafely();
+      await this.refreshSlipSafely();
+    } finally {
+      this.productPipelineBusy = false;
     }
   }
 
@@ -450,53 +473,144 @@ export class PredictionQueueWorkerService
     eventId?: string;
     failed?: boolean;
   }> {
-    const job: unknown = await this.queue.claimNext();
-    if (!job) return { processed: false };
+    // Sports/Odds source changes are consumed before normal prediction work.
+    // The source trigger only mutates the durable prediction queue; the normal
+    // worker path below then claims and calculates the refreshed fixture.
+    const sourceTrigger = await this.processOneSourceChangeTrigger();
+    if (sourceTrigger.failed) return sourceTrigger;
 
-    const eventId = String((job as { eventId: unknown }).eventId);
+    const job = await this.queue.claimNext();
+    if (!job) return sourceTrigger;
+
+    const eventId = String(job.eventId);
+    const lockToken = job.lockToken;
     const startedAt = Date.now();
+    const leaseIntervalMs = Math.max(
+      5_000,
+      Math.floor(PREDICTION_ENGINE_CONFIG.queue.staleProcessingMs / 3),
+    );
+    let renewalInFlight = false;
+    let leaseLost = false;
+    let queueTransitionCommitted = false;
+    const leaseTimer = setInterval(() => {
+      if (renewalInFlight || leaseLost) return;
+      renewalInFlight = true;
+      void this.queue
+        .renewProcessingLease(eventId, lockToken)
+        .then((renewed) => {
+          if (!renewed && !queueTransitionCommitted) {
+            leaseLost = true;
+            this.logger.warn(
+              `Prediction worker lost the processing lease for ${eventId}; the current result will not be committed to the queue.`,
+            );
+          }
+        })
+        .catch((error) => {
+          this.logger.warn(
+            `Could not renew prediction processing lease for ${eventId}: ${this.errorMessage(error)}`,
+          );
+        })
+        .finally(() => {
+          renewalInFlight = false;
+        });
+    }, leaseIntervalMs);
+
     try {
       const readinessByEvent =
         await this.oddsService.getPredictionReadinessForEvents([eventId]);
       const readiness = readinessByEvent.get(eventId);
       if (!readiness?.ready) {
-        await this.queue.deferForOddsNotReady(
-          job as Parameters<typeof this.queue.deferForOddsNotReady>[0],
+        const deferred = await this.queue.deferForOddsNotReady(
+          job,
           readiness?.reason ??
             'Odds module has not marked this fixture prediction-ready.',
         );
+        if (deferred) queueTransitionCommitted = true;
+        if (!deferred) {
+          this.logger.warn(
+            `Prediction job ${eventId} was not deferred because this worker no longer owns its processing lease.`,
+          );
+        }
         return { processed: false, eventId };
       }
-      await this.engine.generateForFixture(eventId);
-      await this.queue.complete(
-        job as Parameters<PredictionQueueService['complete']>[0],
-        Date.now() - startedAt,
+
+      if (leaseLost) return { processed: false, eventId };
+      const predictionResult = await this.engine.generateForFixture(eventId);
+      const processedRevisionValue = Number(
+        (predictionResult as { fixtureSourceRevision?: unknown } | null)?.fixtureSourceRevision,
       );
+      const processedFixtureSourceRevision = Number.isSafeInteger(processedRevisionValue)
+        && processedRevisionValue >= 0
+        ? processedRevisionValue
+        : Number(job.fixtureSourceRevision ?? 0);
+      const completed = await this.queue.complete(
+        job,
+        Date.now() - startedAt,
+        processedFixtureSourceRevision,
+      );
+      if (!completed) {
+        this.logger.warn(
+          `Prediction generation finished for ${eventId}, but queue completion was rejected because the processing lease is no longer owned by this worker.`,
+        );
+        return { processed: false, eventId };
+      }
+      queueTransitionCommitted = true;
       return { processed: true, eventId };
     } catch (error) {
       const message = this.errorMessage(error);
       const durationMs = Date.now() - startedAt;
+      if (error instanceof PredictionSourceRevisionChangedError) {
+        // complete() compares the claimed revision with the live Sports
+        // revision and atomically returns the row to PENDING when they differ.
+        const requeued = await this.queue.complete(
+          job,
+          durationMs,
+          Number(job.fixtureSourceRevision ?? 0),
+        );
+        if (requeued) {
+          queueTransitionCommitted = true;
+          this.systemMonitor.reportActivity({
+            module: 'predictions-engine',
+            source: 'queue-worker',
+            operation: 'requeue-source-revision-change',
+            status: 'INFO',
+            message: `Prediction for ${eventId} was requeued because its Sports source revision changed during calculation.`,
+            occurredAt: new Date(),
+            durationMs,
+            referenceKey: eventId,
+          });
+        } else {
+          this.logger.warn(
+            `Prediction for ${eventId} detected a source revision change, but its queue transition was not committed because the processing lease is no longer owned by this worker.`,
+          );
+        }
+        return { processed: requeued, eventId, failed: !requeued };
+      }
+
       const expectedSkip =
         error instanceof NotFoundException ||
         error instanceof UnprocessableEntityException;
 
       if (expectedSkip) {
-        await this.queue.skip(
-          job as Parameters<typeof this.queue.skip>[0],
-          message,
-          durationMs,
-        );
-        this.systemMonitor.reportActivity({
-          module: 'predictions-engine',
-          source: 'queue-worker',
-          operation: 'skip-fixture',
-          status: 'INFO',
-          message: `Prediction skipped for fixture ${eventId}: ${message}`,
-          occurredAt: new Date(),
-          durationMs,
-          referenceKey: eventId,
-        });
-        return { processed: true, eventId };
+        const skipped = await this.queue.skip(job, message, durationMs);
+        if (skipped) {
+          queueTransitionCommitted = true;
+          this.systemMonitor.reportActivity({
+            module: 'predictions-engine',
+            source: 'queue-worker',
+            operation: 'skip-fixture',
+            status: 'INFO',
+            message: `Prediction skipped for fixture ${eventId}: ${message}`,
+            occurredAt: new Date(),
+            durationMs,
+            referenceKey: eventId,
+          });
+        } else {
+          this.logger.warn(
+            `Prediction skip for ${eventId} was not committed because the processing lease is no longer owned by this worker.`,
+          );
+        }
+        return { processed: skipped, eventId };
       }
 
       this.systemMonitor.reportModuleHealth('predictions-engine', 'DEGRADED', {
@@ -522,12 +636,63 @@ export class PredictionQueueWorkerService
         durationMs,
         referenceKey: eventId,
       });
-      await this.queue.fail(
-        job as Parameters<typeof this.queue.fail>[0],
-        message,
-        durationMs,
+      const failed = await this.queue.fail(job, message, durationMs);
+      if (!failed) {
+        this.logger.warn(
+          `Prediction failure for ${eventId} was not committed because the processing lease is no longer owned by this worker.`,
+        );
+      }
+      if (failed) queueTransitionCommitted = true;
+      return { processed: failed, eventId, failed };
+    } finally {
+      clearInterval(leaseTimer);
+    }
+  }
+
+  private async processOneSourceChangeTrigger(): Promise<{
+    processed: boolean;
+    eventId?: string;
+    failed?: boolean;
+  }> {
+    const workerId = `${this.sourceTriggerWorkerId}:${randomUUID()}`;
+    const trigger = await this.sportsQueue.claimNext(
+      workerId,
+      120_000,
+      SportsQueueJobType.PREDICTION_ENGINE_RECALCULATION,
+    );
+    if (!trigger) return { processed: false };
+
+    const fixtureId = String(trigger.scope.fixtureId ?? '').trim();
+    const heartbeat = setInterval(() => {
+      void this.sportsQueue.markHeartbeat(trigger.jobKey, workerId, 120_000)
+        .then((renewed) => {
+          if (!renewed) {
+            this.logger.warn(`Prediction source-change lease ${trigger.jobKey} is no longer owned by this worker.`);
+          }
+        })
+        .catch((error: unknown) => {
+          this.logger.warn(`Prediction source-change heartbeat failed: ${this.errorMessage(error)}`);
+        });
+    }, 30_000);
+    (heartbeat as unknown as { unref?: () => void }).unref?.();
+
+    try {
+      if (!fixtureId) throw new Error('Prediction recalculation trigger is missing fixtureId.');
+      await this.queue.requestFixtureRefresh(fixtureId, trigger.triggerEventId);
+      const completed = await this.sportsQueue.markCompleted(trigger.jobKey, workerId);
+      if (!completed) {
+        this.logger.warn(`Prediction source-change job ${trigger.jobKey} lost its processing lease before completion.`);
+        return { processed: false, eventId: fixtureId, failed: true };
+      }
+      return { processed: true, eventId: fixtureId };
+    } catch (error) {
+      const outcome = await this.sportsQueue.markFailed(trigger, workerId, error);
+      this.logger.warn(
+        `Prediction source-change job ${trigger.jobKey} failed and was ${outcome.toLowerCase()}: ${this.errorMessage(error)}`,
       );
-      return { processed: true, eventId, failed: true };
+      return { processed: false, eventId: fixtureId || undefined, failed: true };
+    } finally {
+      clearInterval(heartbeat);
     }
   }
 
@@ -573,4 +738,3 @@ export class PredictionQueueWorkerService
     return error instanceof Error ? error.message : String(error);
   }
 }
-

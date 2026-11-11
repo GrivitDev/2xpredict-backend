@@ -1,4 +1,9 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 
 import { Resend } from 'resend';
 
@@ -16,13 +21,26 @@ import {
 } from './templates/email-components';
 @Injectable()
 export class EmailService {
-  private resend: Resend;
+  private resendClient?: { apiKey: string; client: Resend };
 
-  constructor() {
-    this.resend = new Resend(process.env.RESEND_API_KEY);
+  constructor(private readonly config: ConfigService) {}
+
+  /** Resolve Resend lazily so missing optional provider credentials never
+   * prevent the Nest application from booting. */
+  private get resend(): Resend {
+    const apiKey = this.config.get<string>('RESEND_API_KEY')?.trim();
+    if (!apiKey) {
+      throw new ServiceUnavailableException(
+        'Email delivery is unavailable because RESEND_API_KEY is not configured.',
+      );
+    }
+    if (!this.resendClient || this.resendClient.apiKey !== apiKey) {
+      this.resendClient = { apiKey, client: new Resend(apiKey) };
+    }
+    return this.resendClient.client;
   }
 
-  async sendOtpEmail(email: string, otp: string) {
+  async sendOtpEmail(email: string, otp: string, idempotencyKey?: string) {
     try {
       const response = await this.resend.emails.send({
         from: '2XPredict <register@2xpredict.com>',
@@ -171,7 +189,7 @@ ${otp}
 >
 
 This verification code will expire in
-<strong>5 minutes</strong>.
+<strong>20 minutes</strong>.
 
 </p>
 
@@ -271,18 +289,19 @@ www.2xpredict.com
 
 </html>
 `,
-      });
+      }, idempotencyKey ? ({ idempotencyKey } as any) : undefined);
 
       return response;
     } catch (error) {
-      console.error('Email sending error:', error);
-
+      if (error instanceof ServiceUnavailableException) throw error;
+      // Avoid logging OTPs, email addresses or provider payloads.
       throw new InternalServerErrorException('Failed to send OTP email');
     }
   }
 
-  async sendPasswordResetEmail(email: string, resetLink: string) {
-    await this.resend.emails.send({
+  async sendPasswordResetEmail(email: string, resetLink: string, idempotencyKey?: string) {
+    const safeResetLink = escapeHtml(resetLink);
+    return this.resend.emails.send({
       from: '2XPredict <passwordreset@2xpredict.com>',
       to: email,
       subject: 'Reset Your Password',
@@ -388,7 +407,7 @@ If this was you, simply click the button below.
 >
 
 <a
-  href="${resetLink}"
+  href="${safeResetLink}"
   style="
     background:#2563eb;
     color:#ffffff;
@@ -437,13 +456,13 @@ If the button doesn't work, copy and paste this link into your browser:
 >
 
 <a
-  href="${resetLink}"
+  href="${safeResetLink}"
   style="
     color:#2563eb;
   "
 >
 
-${resetLink}
+${safeResetLink}
 
 </a>
 
@@ -535,7 +554,7 @@ www.2xpredict.com
 
 </html>
 `,
-    });
+    }, idempotencyKey ? ({ idempotencyKey } as any) : undefined);
   }
   async sendPaymentReceivedEmail(data: {
     email: string;
@@ -555,30 +574,30 @@ www.2xpredict.com
 
       to: data.email,
 
-      subject: 'Payment Received Successfully',
+      subject: 'Payment Request Submitted — Awaiting Verification',
 
       html: emailLayout({
-        title: 'Payment Received',
+        title: 'Payment Submission Received',
 
         preheader:
-          'Your payment has been received and is awaiting verification.',
+          'Your payment submission has been recorded and is awaiting verification.',
 
         body: `
-${sectionTitle('Payment Received')}
+${sectionTitle('Payment Request Submitted')}
 
 ${paragraph(`
 Hello,
 
 Thank you for submitting your payment to 2XPredict.
 
-Our finance team has successfully received your payment request and it is now awaiting verification.
+Your payment request has been recorded and is now awaiting verification by our finance team.
 
 Verification normally takes less than <strong>30 minutes</strong>.
 As soon as your payment has been approved you will receive another confirmation email.
 `)}
 
 ${warningBox(`
-Your payment has been received successfully and is currently under review.
+Your payment request is pending verification. This message does not confirm payment settlement or subscription activation.
 No further action is required from you at this time.
 `)}
 
@@ -816,7 +835,8 @@ We appreciate your continued support of 2XPredict.
     });
   }
 
-  async sendWelcomeEmail(data: { email: string; fullName: string }) {
+  async sendWelcomeEmail(data: { email: string; fullName: string }, idempotencyKey?: string) {
+    const safeFullName = escapeHtml(data.fullName);
     const predictionsUrl = 'https://www.2xpredict.com/predictions';
 
     const betlabUrl = 'https://www.2xpredict.com/bet-lab';
@@ -837,7 +857,7 @@ We appreciate your continued support of 2XPredict.
 ${sectionTitle('Welcome to 2XPredict! ⚽')}
 
 ${paragraph(`
-Hello <strong>${data.fullName}</strong>,
+Hello <strong>${safeFullName}</strong>,
 
 Congratulations! Your account has been verified successfully, and you're now officially part of the 2XPredict community.
 
@@ -890,7 +910,7 @@ We wish you success and hope you enjoy everything our platform has to offer.
 `)}
 `,
       }),
-    });
+    }, idempotencyKey ? ({ idempotencyKey } as any) : undefined);
   }
 
   async sendSubscriptionExpiringEmail(data: {
@@ -1048,4 +1068,70 @@ Thank you for being part of 2XPredict.
       }),
     });
   }
+
+  /**
+   * Sends the generic email representation of an in-app notification.
+   * Resend's provider idempotency key is stable across outbox retries.
+   */
+  async sendNotificationEmail(
+    data: {
+      email: string;
+      title: string;
+      message: string;
+      actionUrl?: string | null;
+      details?: Array<{ label: string; value: string }>;
+    },
+    idempotencyKey: string,
+  ) {
+    const title = escapeHtml(data.title);
+    const message = escapeHtml(data.message);
+    const actionPath = safeLocalActionPath(data.actionUrl);
+    const actionUrl = actionPath
+      ? `https://www.2xpredict.com${actionPath}`
+      : null;
+    const details = (data.details ?? []).slice(0, 8).map((item) => ({
+      label: escapeHtml(item.label),
+      value: escapeHtml(item.value),
+    }));
+    const safeSubject = String(data.title).replace(/[\r\n]+/g, ' ').slice(0, 100);
+
+    return this.resend.emails.send(
+      {
+        from: '2XPredict <register@2xpredict.com>',
+        to: data.email,
+        subject: `2xPredict | ${safeSubject}`,
+        html: emailLayout({
+          title,
+          preheader: message.slice(0, 150),
+          body: `
+${sectionTitle(title)}
+${paragraph(message)}
+${details.length ? infoCard('Details', details) : ''}
+${actionUrl ? primaryButton('View in 2xPredict', actionUrl) : ''}
+${paragraph('This message relates to activity on your 2xPredict account. Sign in to your account for more information.')}
+`,
+        }),
+      },
+      { idempotencyKey } as any,
+    );
+  }
+
 }
+
+
+function escapeHtml(value: string): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeLocalActionPath(value?: string | null): string | null {
+  const path = String(value ?? '').trim();
+  if (!path || !path.startsWith('/') || path.startsWith('//')) return null;
+  if (/[\\\r\n]/.test(path)) return null;
+  return path.slice(0, 300);
+}
+

@@ -17,7 +17,11 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test:e2e": "jest --config ./test/jest-e2e.json --runInBand",
+    "test:ci": "jest --runInBand --ci",
+    "db:check-transactions": "ts-node -r tsconfig-paths/register scripts/verify-mongodb-transactions.ts",
+    "load:staging": "node scripts/staging-load-check.mjs",
+    "db:check-indexes": "ts-node -r tsconfig-paths/register scripts/verify-critical-indexes.ts"
   },
   "dependencies": {
     "@google/genai": "^2.19.0",
@@ -98,10 +102,23 @@
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "auth/password-policy.util.ts",
+      "settlement/utils/fixture-lifecycle.util.ts",
+      "settlement/utils/sports-settlement-fingerprint.util.ts",
+      "predictions-engine/utils/prediction-math.util.ts",
+      "odds/catalog/football-market-catalog.ts",
+      "predictions-engine/catalog/football-market-catalog.ts",
+      "bet-lab/utils/odds.util.ts",
+      "bet-lab/utils/bet-lab-pricing.util.ts",
+      "bet-lab/utils/bet-lab-selection-compatibility.util.ts",
+      "!**/*.spec.ts"
     ],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "coverageReporters": [
+      "text",
+      "lcov"
+    ]
   },
   "allowScripts": {
     "@nestjs/core@11.1.21": true,

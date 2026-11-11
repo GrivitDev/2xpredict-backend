@@ -12,6 +12,7 @@ import { PickCenter } from '../schemas/pick-center.schema';
 import { CuratedPrediction } from '../schemas/curated-prediction.schema';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
 import { PredictionMathUtil } from '../utils/prediction-math.util';
+import { isOddsQuoteFresh } from '../../odds/config/odds.config';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 
 interface PickCenterSource {
@@ -19,6 +20,7 @@ interface PickCenterSource {
   leagueId?: string | number | null;
   leagueName?: string | null;
   fixtureDate: Date | string | number;
+  retentionExpiresAt?: Date | string | null;
   homeTeamName?: string | null;
   awayTeamName?: string | null;
   modelVersion?: string | null;
@@ -33,6 +35,7 @@ interface CuratedSelectionCandidate {
   leagueId: string;
   leagueName: string;
   fixtureDate: Date;
+  retentionExpiresAt?: Date;
   homeTeamName: string;
   awayTeamName: string;
   marketPredictionId: string;
@@ -79,16 +82,6 @@ interface CuratedSelectionCandidate {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function toPlainRecord(value: unknown): Record<string, unknown> {
-  if (!isRecord(value)) return {};
-  const toObject = value.toObject;
-  if (typeof toObject === 'function') {
-    const plain = (value.toObject as () => unknown)();
-    return isRecord(plain) ? plain : {};
-  }
-  return { ...value };
 }
 
 function toSelectionText(value: unknown): string | undefined {
@@ -346,6 +339,9 @@ export class CuratedPredictionService {
       throw new NotFoundException('Curated prediction was not found.');
 
     const nextStatus = publish ? 'PUBLISHED' : 'CANCELLED';
+    if (publish && String(prediction.status).toUpperCase() === 'PUBLISHED') {
+      return prediction.toObject() as unknown as Record<string, unknown>;
+    }
     if (publish) {
       if (
         String(prediction.settlementStatus ?? 'PENDING').toUpperCase() !==
@@ -375,13 +371,14 @@ export class CuratedPredictionService {
       const nowMs = now.getTime();
       const horizon = nowMs + config.horizonHours * 3_600_000;
       const kickoff = asDate(prediction.fixtureDateFrom);
-      const isLive = prediction.live === true;
       if (
+        prediction.live === true ||
         !Number.isFinite(kickoff.getTime()) ||
-        (!isLive && (kickoff.getTime() < nowMs || kickoff.getTime() > horizon))
+        kickoff.getTime() <= nowMs ||
+        kickoff.getTime() > horizon
       ) {
         throw new BadRequestException(
-          `Only unfinished fixtures kicking off within the next ${config.horizonHours} hours, plus active live fixtures, can be published.`,
+          `Only pre-match fixtures kicking off within the next ${config.horizonHours} hours can be published.`,
         );
       }
 
@@ -394,6 +391,11 @@ export class CuratedPredictionService {
         ).trim();
         const selectionKey = String(selection.selectionKey ?? '').trim();
         const marketKey = String(selection.marketKey ?? '').toUpperCase();
+        const offeredOdds = Number(selection.decimalOdds);
+        const oddsUpdatedAt = asDate(selection.oddsUpdatedAt);
+        const validPriceType = selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED';
+        const oddsBasis = String(selection.oddsBasis ?? '');
+        const validOddsBasis = ['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY'].includes(oddsBasis);
         if (!marketKey || seenMarkets.has(marketKey)) {
           throw new BadRequestException(
             'Curated selections must use distinct market keys.',
@@ -409,10 +411,18 @@ export class CuratedPredictionService {
           probability >= 1 ||
           !Number.isFinite(confidence) ||
           confidence < config.minimumConfidence ||
-          confidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence
+          confidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence ||
+          selection.predictionReady !== true ||
+          !validPriceType ||
+          !Number.isFinite(offeredOdds) ||
+          offeredOdds < PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds ||
+          offeredOdds > PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds ||
+          !isOddsQuoteFresh(oddsUpdatedAt) ||
+          !validOddsBasis ||
+          !toSelectionText(selection.oddsCalculationMethod)
         ) {
           throw new BadRequestException(
-            'A curated selection must have valid market identifiers and meet the configured probability and confidence thresholds.',
+            'A curated selection must meet the final market-probability and confidence thresholds and retain a fresh, valid Odds-module quote.',
           );
         }
       }
@@ -421,15 +431,13 @@ export class CuratedPredictionService {
         .findOne({
           eventId: String(prediction.eventId),
           completed: { $ne: true },
+          live: { $ne: true },
           'selectedMarkets.0': { $exists: true },
-          $or: [
-            { fixtureDate: { $gte: now, $lte: new Date(horizon) } },
-            { live: true },
-          ],
+          fixtureDate: { $gt: now, $lte: new Date(horizon) },
         })
         .lean()
         .exec()) as unknown as PickCenterSource | null;
-      if (!currentPick || currentPick.completed === true) {
+      if (!currentPick || currentPick.completed === true || currentPick.live === true || isFinishedPick(currentPick)) {
         throw new BadRequestException(
           'The fixture no longer has a current unfinished Pick Center ranking within the curated horizon. Regenerate it before publication.',
         );
@@ -456,17 +464,49 @@ export class CuratedPredictionService {
         const currentConfidence = Number(
           isRecord(current) ? current.confidence : undefined,
         );
+        const currentOdds = Number(isRecord(current) ? current.decimalOdds : undefined);
+        const currentOddsUpdatedAt = asDate(isRecord(current) ? current.oddsUpdatedAt : undefined);
+        const snapshotProbability = Number(selection.probability);
+        const snapshotOdds = Number(selection.decimalOdds);
+        const snapshotOddsUpdatedAt = asDate(selection.oddsUpdatedAt);
+        const snapshotConfidence = Number(selection.confidence);
+        const snapshotPriceType = selection.priceType;
+        const snapshotOddsBasis = String(selection.oddsBasis ?? '');
+        const snapshotOddsMethod = toSelectionText(selection.oddsCalculationMethod);
+        const currentPriceType = isRecord(current) ? current.priceType : undefined;
+        const currentOddsBasis = String(isRecord(current) ? current.oddsBasis ?? '' : '');
+        const currentOddsMethod = toSelectionText(isRecord(current) ? current.oddsCalculationMethod : undefined);
         if (
           !current ||
+          (
+            isRecord(current) &&
+            (current.isFinalSelection !== true ||
+              current.recommendationEligible !== true ||
+              current.oddsPredictionReady !== true)
+          ) ||
           !Number.isFinite(currentProbability) ||
+          Math.abs(currentProbability - snapshotProbability) > 0.000001 ||
+          Math.abs(currentOdds - snapshotOdds) > 0.000001 ||
+          currentOddsUpdatedAt.getTime() !== snapshotOddsUpdatedAt.getTime() ||
           currentProbability < config.minimumProbability ||
           currentProbability >= 1 ||
           !Number.isFinite(currentConfidence) ||
+          Math.abs(currentConfidence - snapshotConfidence) > 0.000001 ||
           currentConfidence < config.minimumConfidence ||
-          currentConfidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence
+          currentConfidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence ||
+          (currentPriceType !== 'PROVIDER' && currentPriceType !== 'ESTIMATED') ||
+          currentPriceType !== snapshotPriceType ||
+          currentOddsBasis !== snapshotOddsBasis ||
+          currentOddsMethod !== snapshotOddsMethod ||
+          !Number.isFinite(currentOdds) ||
+          currentOdds < PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds ||
+          currentOdds > PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds ||
+          !isOddsQuoteFresh(currentOddsUpdatedAt) ||
+          !['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY'].includes(currentOddsBasis) ||
+          !currentOddsMethod
         ) {
           throw new BadRequestException(
-            'A curated selection must retain its current market identifiers and meet the configured probability and confidence thresholds in Pick Center.',
+            'A curated selection must remain the same current final Pick Center selection and retain its fresh Odds-module quote.',
           );
         }
       }
@@ -516,16 +556,18 @@ export class CuratedPredictionService {
   }
 
   /**
-   * Continuously builds one curated record per eligible fixture. A record can
-   * contain one to three distinct market keys. Published records remain immutable
-   * audit recommendations; READY records may be refreshed from current Pick Center data.
+   * Builds one curated snapshot per eligible fixture in the final 48 hours.
+   * A snapshot contains one to seven distinct, compatible market selections.
+   * Once published, it is immutable; only settlement fields are changed by settlement workflows.
    */
   async refreshFromPickCenter(force = false): Promise<Record<string, unknown>> {
     const nowMs = Date.now();
     if (this.refreshInProgress) {
       return { skipped: true, reason: 'REFRESH_ALREADY_RUNNING' };
     }
-    if (!force && nowMs - this.lastRefreshAt < 5 * 60_000) {
+    const refreshIntervalMs =
+      PREDICTION_ENGINE_CONFIG.curatedPredictions.refreshIntervalMs;
+    if (!force && nowMs - this.lastRefreshAt < refreshIntervalMs) {
       return { skipped: true, reason: 'REFRESH_THROTTLED' };
     }
     this.refreshInProgress = true;
@@ -549,7 +591,8 @@ export class CuratedPredictionService {
       .find({
         completed: { $ne: true },
         'selectedMarkets.0': { $exists: true },
-        $or: [{ fixtureDate: { $gte: now, $lte: horizon } }, { live: true }],
+        live: { $ne: true },
+        fixtureDate: { $gt: now, $lte: horizon },
       })
       .sort({ fixtureDate: 1 })
       .lean()
@@ -561,15 +604,16 @@ export class CuratedPredictionService {
       if (isFinishedPick(pick)) return false;
       const kickoff = asDate(pick.fixtureDate);
       return (
+        pick.live !== true &&
         Number.isFinite(kickoff.getTime()) &&
-        (pick.live === true ||
-          (kickoff.getTime() >= nowMs &&
-            kickoff.getTime() <= horizon.getTime()))
+        kickoff.getTime() > nowMs &&
+        kickoff.getTime() <= horizon.getTime()
       );
     });
 
-    // Pick Center is the sole ranking source. Curated Predictions does not run
-    // another calibration or selection-scoring pass.
+    // Pick Center is the sole probability/calibration source. Curated Predictions
+    // applies eligibility gates and reuses Pick Center's safety ranking; it does not
+    // recalculate or independently calibrate probabilities.
     const candidatesByEvent = new Map<string, CuratedSelectionCandidate[]>();
     let validOddsReadySelections = 0;
     for (const pick of picks) {
@@ -581,13 +625,11 @@ export class CuratedPredictionService {
         !Number.isFinite(fixtureDate.getTime())
       )
         continue;
-      const isLive = pick.live === true;
       if (
-        !isLive &&
-        (fixtureDate.getTime() < nowMs ||
-          fixtureDate.getTime() > horizon.getTime())
-      )
-        continue;
+        pick.live === true ||
+        fixtureDate.getTime() <= nowMs ||
+        fixtureDate.getTime() > horizon.getTime()
+      ) continue;
       const selections = Array.isArray(pick.selectedMarkets)
         ? pick.selectedMarkets
         : [];
@@ -607,8 +649,10 @@ export class CuratedPredictionService {
         );
         const marketKey = toSelectionText(selection.marketKey);
         const selectionKey = toSelectionText(selection.selectionKey);
-        const priceType: 'PROVIDER' | 'ESTIMATED' =
-          selection.priceType === 'PROVIDER' ? 'PROVIDER' : 'ESTIMATED';
+        const priceType =
+          selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED'
+            ? selection.priceType
+            : null;
         const rawOddsBasis =
           typeof selection.oddsBasis === 'string' ? selection.oddsBasis : '';
         const oddsBasis = [
@@ -635,9 +679,18 @@ export class CuratedPredictionService {
             : probability > 0
               ? 1 / probability
               : undefined;
-        const safetyScore = Number(
+        const safetyScoreInput = Number(
           selection.safetyScore ?? selection.rankingScore ?? 0,
         );
+        const safetyScore = Number.isFinite(safetyScoreInput)
+        ? Math.max(0, Math.min(1, safetyScoreInput))
+        : 0;
+        const oddsCalculationMethod = toSelectionText(selection.oddsCalculationMethod);
+        const hasFreshOdds = isOddsQuoteFresh(oddsUpdatedAt, nowMs);
+        const isFinalMarketSelection =
+          selection.isFinalSelection === true &&
+          selection.recommendationEligible === true &&
+          selection.oddsPredictionReady === true;
         if (
           !Number.isFinite(probability) ||
           probability < config.minimumProbability ||
@@ -647,11 +700,17 @@ export class CuratedPredictionService {
           confidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence ||
           !marketPredictionId ||
           !marketKey ||
-          !selectionKey
+          !selectionKey ||
+          !isFinalMarketSelection ||
+          !priceType ||
+          !hasValidOfferedOdds ||
+          !hasFreshOdds ||
+          !oddsBasis ||
+          !oddsCalculationMethod
         )
           continue;
 
-        if (hasValidOfferedOdds) validOddsReadySelections += 1;
+        validOddsReadySelections += 1;
         const settlementProfile = isRecord(selection.settlementProfile)
           ? (selection.settlementProfile as CuratedSelectionCandidate['settlementProfile'])
           : undefined;
@@ -674,6 +733,9 @@ export class CuratedPredictionService {
             pick.leagueName ?? pick.leagueId ?? 'Unknown league',
           ),
           fixtureDate,
+          ...(asDate(pick.retentionExpiresAt).getTime() > 0
+            ? { retentionExpiresAt: asDate(pick.retentionExpiresAt) }
+            : {}),
           homeTeamName: String(pick.homeTeamName ?? ''),
           awayTeamName: String(pick.awayTeamName ?? ''),
           marketPredictionId,
@@ -690,10 +752,7 @@ export class CuratedPredictionService {
           fairOdds > 1
             ? { fairOdds }
             : {}),
-          ...(selection.priceType === 'PROVIDER' ||
-          selection.priceType === 'ESTIMATED'
-            ? { priceType }
-            : {}),
+          priceType,
           predictionReady: true,
           ...(expectedValue !== null
             ? { expectedValue, expectedValuePercent: expectedValue * 100 }
@@ -703,13 +762,7 @@ export class CuratedPredictionService {
             ? { oddsUpdatedAt }
             : {}),
           ...(oddsBasis ? { oddsBasis } : {}),
-          ...(toSelectionText(selection.oddsCalculationMethod)
-            ? {
-                oddsCalculationMethod: toSelectionText(
-                  selection.oddsCalculationMethod,
-                ),
-              }
-            : {}),
+          oddsCalculationMethod,
           ...(selection.oddsProvider === 'ESPN' ||
           selection.oddsProvider === 'THE_ODDS_API'
             ? { oddsProvider: selection.oddsProvider }
@@ -744,7 +797,7 @@ export class CuratedPredictionService {
               }
             : {}),
           safetyScore,
-          live: isLive,
+          live: false,
           settlementOutcome: 'PENDING',
           matchSettlementStatus: 'PENDING',
         });
@@ -756,173 +809,32 @@ export class CuratedPredictionService {
     const publishableEventIds = new Set<string>();
     let created = 0;
     let updated = 0;
-    let publishedRecordsSupplemented = 0;
     let skipped = 0;
     let riskRejected = 0;
-    let oneSelectionMatches = 0;
-    let twoSelectionMatches = 0;
-    let threeSelectionMatches = 0;
+
+    const selectionCountDistribution: Record<string, number> = {};
+    for (let count = 1; count <= config.maximumSelectionsPerMatch; count += 1) {
+      selectionCountDistribution[String(count)] = 0;
+    }
+    const recordSelectionCount = (count: number): void => {
+      if (count >= 1 && count <= config.maximumSelectionsPerMatch) {
+        const key = String(count);
+        selectionCountDistribution[key] = (selectionCountDistribution[key] ?? 0) + 1;
+      }
+    };
 
     for (const [eventId, candidates] of candidatesByEvent) {
-      const uniqueByMarket = new Map<string, CuratedSelectionCandidate>();
-      candidates.sort(
-        (a, b) =>
-          b.probability - a.probability ||
-          b.confidence - a.confidence ||
-          b.rankingScore - a.rankingScore ||
-          (a.rank ?? Number.MAX_SAFE_INTEGER) -
-            (b.rank ?? Number.MAX_SAFE_INTEGER),
-      );
-      for (const candidate of candidates) {
-        const marketIdentity = candidate.marketKey.toUpperCase();
-        if (!uniqueByMarket.has(marketIdentity))
-          uniqueByMarket.set(marketIdentity, candidate);
-      }
-      const ranked = [...uniqueByMarket.values()];
-      // Probability and confidence determine eligibility. Quality/safety and odds provenance
-      // remain available as ranking metadata, but must not suppress a valid priced market.
-      const eligible = ranked;
-      const selected: CuratedSelectionCandidate[] = [];
-      for (const candidate of eligible) {
-        if (
-          selected.some(
-            (current) => !selectionsAreCompatible(current, candidate),
-          )
-        )
-          continue;
-        selected.push(candidate);
-        if (selected.length >= config.maximumSelectionsPerMatch) break;
-      }
-      if (!selected.length) {
-        // Keep an already-published recommendation visible on the correct kickoff
-        // date when no replacement selection currently has a valid probability, confidence, and price. Do
-        // not change its original market, odds, probability, or settlement data.
-        const existingWithoutSafeReplacement = await this.curatedPredictionModel
-          .findOne({ eventId })
-          .exec();
-        const currentPickWithoutSafeReplacement = picks.find(
-          (pick) => String(pick.eventId) === eventId,
-        );
-        if (
-          existingWithoutSafeReplacement &&
-          String(existingWithoutSafeReplacement.status).toUpperCase() ===
-            'PUBLISHED' &&
-          String(
-            existingWithoutSafeReplacement.settlementStatus ?? 'PENDING',
-          ).toUpperCase() === 'PENDING' &&
-          currentPickWithoutSafeReplacement
-        ) {
-          const currentFixtureDate = asDate(
-            currentPickWithoutSafeReplacement.fixtureDate,
-          );
-          if (Number.isFinite(currentFixtureDate.getTime())) {
-            const currentTitle = `${String(currentPickWithoutSafeReplacement.homeTeamName ?? existingWithoutSafeReplacement.title)} vs ${String(currentPickWithoutSafeReplacement.awayTeamName ?? '')}`;
-            const metadataChanged =
-              String(existingWithoutSafeReplacement.title ?? '') !==
-                currentTitle ||
-              asDate(
-                existingWithoutSafeReplacement.fixtureDateFrom,
-              ).getTime() !== currentFixtureDate.getTime() ||
-              existingWithoutSafeReplacement.live !==
-                (currentPickWithoutSafeReplacement.live === true) ||
-              existingWithoutSafeReplacement.completed === true;
-            if (metadataChanged) {
-              const priorSelections = Array.isArray(
-                existingWithoutSafeReplacement.selections,
-              )
-                ? (existingWithoutSafeReplacement.selections as unknown[]).map(
-                    (item) => {
-                      const saved = toPlainRecord(item);
-                      saved.fixtureDate = currentFixtureDate;
-                      saved.homeTeamName =
-                        toSelectionText(
-                          currentPickWithoutSafeReplacement.homeTeamName,
-                        ) ??
-                        toSelectionText(saved.homeTeamName) ??
-                        '';
-                      saved.awayTeamName =
-                        toSelectionText(
-                          currentPickWithoutSafeReplacement.awayTeamName,
-                        ) ??
-                        toSelectionText(saved.awayTeamName) ??
-                        '';
-                      saved.leagueId =
-                        toSelectionText(
-                          currentPickWithoutSafeReplacement.leagueId,
-                        ) ??
-                        toSelectionText(saved.leagueId) ??
-                        '';
-                      saved.leagueName =
-                        toSelectionText(
-                          currentPickWithoutSafeReplacement.leagueName,
-                        ) ??
-                        toSelectionText(saved.leagueName) ??
-                        toSelectionText(
-                          currentPickWithoutSafeReplacement.leagueId,
-                        ) ??
-                        'Unknown league';
-                      saved.live =
-                        currentPickWithoutSafeReplacement.live === true;
-                      return saved;
-                    },
-                  )
-                : [];
-              await this.curatedPredictionModel
-                .updateOne(
-                  {
-                    _id: existingWithoutSafeReplacement._id,
-                    status: 'PUBLISHED',
-                    settlementStatus: 'PENDING',
-                  },
-                  {
-                    $set: {
-                      title: currentTitle,
-                      fixtureDateFrom: currentFixtureDate,
-                      fixtureDateTo: currentFixtureDate,
-                      live: currentPickWithoutSafeReplacement.live === true,
-                      completed: false,
-                      selections: priorSelections,
-                      selectionCount: priorSelections.length,
-                    },
-                  },
-                )
-                .exec();
-              updated += 1;
-              publishableEventIds.add(eventId);
-              results.push({
-                eventId,
-                created: false,
-                updated: true,
-                reason: 'PUBLISHED_FIXTURE_METADATA_RECONCILED',
-                replacementSkipped: true,
-                predictionId: String(existingWithoutSafeReplacement._id),
-                selectionCount: priorSelections.length,
-              });
-            }
-          }
-        }
-        skipped += 1;
-        riskRejected += 1;
-        results.push({
-          eventId,
-          created: false,
-          reason: ranked.length
-            ? 'NO_COMPATIBLE_ELIGIBLE_SELECTION'
-            : 'NO_SELECTION_PASSED_PROBABILITY_CONFIDENCE_AND_IDENTIFIERS',
-          availableMarkets: ranked.length,
-          eligibleSelections: candidates.length,
-        });
-        continue;
-      }
-
       const existing = await this.curatedPredictionModel
         .findOne({ eventId })
         .exec();
+      const existingStatus = String(existing?.status ?? '').toUpperCase();
+      const existingSettlementStatus = String(
+        existing?.settlementStatus ?? 'PENDING',
+      ).toUpperCase();
+
       if (
         existing &&
-        (String(existing.settlementStatus ?? 'PENDING').toUpperCase() !==
-          'PENDING' ||
-          String(existing.status).toUpperCase() === 'SETTLED')
+        (existingSettlementStatus !== 'PENDING' || existingStatus === 'SETTLED')
       ) {
         skipped += 1;
         results.push({
@@ -933,243 +845,28 @@ export class CuratedPredictionService {
         });
         continue;
       }
-      if (existing && String(existing.status).toUpperCase() === 'PUBLISHED') {
-        // Preserve every already-published recommendation as an immutable
-        // selection. If fewer than three markets are stored, add only new,
-        // current eligible markets; never replace the original pick.
+
+      // The first publication is the permanent recommendation snapshot.
+      // Later Pick Center, Odds, model, or fixture refreshes must not add,
+      // replace, rescore, or rewrite its markets, prices, probabilities, or metadata.
+      if (existing && existingStatus === 'PUBLISHED') {
         publishableEventIds.add(eventId);
-        const currentPick = picks.find(
-          (pick) => String(pick.eventId) === eventId,
-        );
-        const currentFixtureDate = currentPick
-          ? asDate(currentPick.fixtureDate)
-          : asDate(existing.fixtureDateFrom);
-        const priorSelections = Array.isArray(existing.selections)
-          ? (existing.selections as unknown[]).map((item) => {
-              const saved = toPlainRecord(item);
-              // A rescheduled fixture can otherwise remain hidden under yesterday's
-              // fixtureDateFrom in public/admin queries. Preserve selection, odds,
-              // and settlement outcomes while reconciling fixture metadata only.
-              if (
-                currentPick &&
-                Number.isFinite(currentFixtureDate.getTime())
-              ) {
-                saved.fixtureDate = currentFixtureDate;
-                saved.homeTeamName =
-                  toSelectionText(currentPick.homeTeamName) ??
-                  toSelectionText(saved.homeTeamName) ??
-                  '';
-                saved.awayTeamName =
-                  toSelectionText(currentPick.awayTeamName) ??
-                  toSelectionText(saved.awayTeamName) ??
-                  '';
-                saved.leagueId =
-                  toSelectionText(currentPick.leagueId) ??
-                  toSelectionText(saved.leagueId) ??
-                  '';
-                saved.leagueName =
-                  toSelectionText(currentPick.leagueName) ??
-                  toSelectionText(saved.leagueName) ??
-                  toSelectionText(currentPick.leagueId) ??
-                  'Unknown league';
-                saved.live = currentPick.live === true;
-              }
-              return saved;
-            })
-          : [];
-        const mergedSelections: Record<string, unknown>[] = [
-          ...priorSelections,
-        ];
-        const occupiedMarkets = new Set(
-          priorSelections.map((item) =>
-            (toSelectionText(item.marketKey) ?? '').toUpperCase(),
-          ),
-        );
-        const occupiedKeys = new Set(
-          priorSelections.map(
-            (item) =>
-              `${(toSelectionText(item.marketKey) ?? '').toUpperCase()}::${(toSelectionText(item.selectionKey) ?? '').toUpperCase()}`,
-          ),
-        );
-        for (const candidate of eligible) {
-          if (mergedSelections.length >= config.maximumSelectionsPerMatch)
-            break;
-          const marketKey = candidate.marketKey.toUpperCase();
-          const selectionIdentity = `${marketKey}::${candidate.selectionKey.toUpperCase()}`;
-          if (
-            occupiedMarkets.has(marketKey) ||
-            occupiedKeys.has(selectionIdentity)
-          )
-            continue;
-          if (
-            mergedSelections.some(
-              (current) =>
-                !selectionsAreCompatible(
-                  {
-                    eventId,
-                    marketKey: toSelectionText(current.marketKey) ?? '',
-                    selectionKey: toSelectionText(current.selectionKey) ?? '',
-                  },
-                  {
-                    eventId,
-                    marketKey: candidate.marketKey,
-                    selectionKey: candidate.selectionKey,
-                  },
-                ),
-            )
-          )
-            continue;
-          mergedSelections.push({
-            ...candidate,
-            settlementOutcome: 'PENDING',
-            matchSettlementStatus: 'PENDING',
-          });
-          occupiedMarkets.add(marketKey);
-          occupiedKeys.add(selectionIdentity);
-        }
-        if (mergedSelections.length > priorSelections.length) {
-          const primary = priorSelections[0] ?? mergedSelections[0];
-          const diagnostics = Array.isArray(existing.diagnostics)
-            ? [...existing.diagnostics]
-            : [];
-          diagnostics.push(
-            `AUTO_SUPPLEMENTED_PUBLISHED_CURATED: added ${mergedSelections.length - priorSelections.length} eligible market selection(s) from the current Pick Center refresh; original published selections were preserved.`,
-          );
-          const updatedPublished = await this.curatedPredictionModel
-            .findByIdAndUpdate(
-              existing._id,
-              {
-                $set: {
-                  selections: mergedSelections,
-                  selectionCount: mergedSelections.length,
-                  title: currentPick
-                    ? `${String(currentPick.homeTeamName ?? existing.title)} vs ${String(currentPick.awayTeamName ?? '')}`
-                    : existing.title,
-                  live: currentPick?.live === true,
-                  completed: false,
-                  fixtureDateFrom: Number.isFinite(currentFixtureDate.getTime())
-                    ? currentFixtureDate
-                    : existing.fixtureDateFrom,
-                  fixtureDateTo: Number.isFinite(currentFixtureDate.getTime())
-                    ? currentFixtureDate
-                    : existing.fixtureDateTo,
-                  combinedProbability: Number(
-                    Number(
-                      primary.probability ?? existing.combinedProbability,
-                    ).toFixed(8),
-                  ),
-                  ...(Number.isFinite(
-                    Number(primary.decimalOdds ?? existing.combinedOdds),
-                  ) &&
-                  Number(primary.decimalOdds ?? existing.combinedOdds) >=
-                    PREDICTION_ENGINE_CONFIG.selectionEligibility
-                      .minimumDecimalOdds
-                    ? {
-                        combinedOdds: Number(
-                          Number(
-                            primary.decimalOdds ?? existing.combinedOdds,
-                          ).toFixed(6),
-                        ),
-                      }
-                    : {}),
-                  confidence: Number(primary.confidence ?? existing.confidence),
-                  combinedProbabilityMethod:
-                    mergedSelections.length > 1
-                      ? 'PRIMARY_SELECTION_WITH_ADDITIONAL_MARKET_RECOMMENDATIONS'
-                      : 'SINGLE_SELECTION',
-                  diagnostics,
-                },
-                ...(Number.isFinite(
-                  Number(primary.decimalOdds ?? existing.combinedOdds),
-                ) &&
-                Number(primary.decimalOdds ?? existing.combinedOdds) >=
-                  PREDICTION_ENGINE_CONFIG.selectionEligibility
-                    .minimumDecimalOdds
-                  ? {}
-                  : { $unset: { combinedOdds: 1 } }),
-              },
-              { returnDocument: 'after', runValidators: true },
-            )
-            .lean()
-            .exec();
-          updated += 1;
-          publishedRecordsSupplemented += 1;
-          if (mergedSelections.length === 1) oneSelectionMatches += 1;
-          else if (mergedSelections.length === 2) twoSelectionMatches += 1;
-          else threeSelectionMatches += 1;
-          results.push({
-            eventId,
-            created: false,
-            updated: true,
-            reason: 'PUBLISHED_RECORD_SUPPLEMENTED',
-            predictionId: String(existing._id),
-            selectionCount: mergedSelections.length,
-            prediction: updatedPublished,
-          });
-        } else {
-          const metadataChanged = Boolean(
-            currentPick &&
-            (String(existing.title ?? '') !==
-              `${String(currentPick.homeTeamName ?? existing.title)} vs ${String(currentPick.awayTeamName ?? '')}` ||
-              asDate(existing.fixtureDateFrom).getTime() !==
-                currentFixtureDate.getTime() ||
-              existing.live !== (currentPick.live === true) ||
-              existing.completed === true),
-          );
-          if (
-            metadataChanged &&
-            Number.isFinite(currentFixtureDate.getTime())
-          ) {
-            await this.curatedPredictionModel
-              .updateOne(
-                {
-                  _id: existing._id,
-                  status: 'PUBLISHED',
-                  settlementStatus: 'PENDING',
-                },
-                {
-                  $set: {
-                    title: `${String(currentPick?.homeTeamName ?? existing.title)} vs ${String(currentPick?.awayTeamName ?? '')}`,
-                    fixtureDateFrom: currentFixtureDate,
-                    fixtureDateTo: currentFixtureDate,
-                    live: currentPick?.live === true,
-                    completed: false,
-                    selections: priorSelections,
-                    selectionCount: priorSelections.length,
-                  },
-                },
-              )
-              .exec();
-            updated += 1;
-            results.push({
-              eventId,
-              created: false,
-              updated: true,
-              reason: 'PUBLISHED_FIXTURE_METADATA_RECONCILED',
-              predictionId: String(existing._id),
-              selectionCount: priorSelections.length,
-            });
-          } else {
-            skipped += 1;
-            results.push({
-              eventId,
-              created: false,
-              reason:
-                priorSelections.length >= config.maximumSelectionsPerMatch
-                  ? 'PUBLISHED_SELECTION_LIMIT_REACHED'
-                  : 'PUBLISHED_SELECTION_PRESERVED_NO_NEW_COMPATIBLE_MARKET',
-              predictionId: String(existing._id),
-              selectionCount: priorSelections.length,
-            });
-          }
-          if (priorSelections.length === 1) oneSelectionMatches += 1;
-          else if (priorSelections.length === 2) twoSelectionMatches += 1;
-          else if (priorSelections.length >= 3) threeSelectionMatches += 1;
-        }
+        const storedSelectionCount = Array.isArray(existing.selections)
+          ? existing.selections.length
+          : 0;
+        recordSelectionCount(storedSelectionCount);
+        skipped += 1;
+        results.push({
+          eventId,
+          created: false,
+          updated: false,
+          reason: 'PUBLISHED_SNAPSHOT_FROZEN',
+          predictionId: String(existing._id),
+          selectionCount: storedSelectionCount,
+        });
         continue;
       }
 
-      const existingStatus = String(existing?.status ?? '').toUpperCase();
       const wasAutoWithdrawn =
         Array.isArray(existing?.diagnostics) &&
         existing.diagnostics.some(
@@ -1187,87 +884,111 @@ export class CuratedPredictionService {
         });
         continue;
       }
+
+      const uniqueByMarket = new Map<string, CuratedSelectionCandidate>();
+      for (const candidate of candidates) {
+        const marketIdentity = candidate.marketKey.toUpperCase();
+        const current = uniqueByMarket.get(marketIdentity);
+        if (!current || candidate.safetyScore > current.safetyScore) {
+          uniqueByMarket.set(marketIdentity, candidate);
+        }
+      }
+      const ranked = [...uniqueByMarket.values()].sort(
+        (a, b) =>
+          b.safetyScore - a.safetyScore ||
+          b.rankingScore - a.rankingScore ||
+          b.probability - a.probability ||
+          b.confidence - a.confidence ||
+          (a.rank ?? Number.MAX_SAFE_INTEGER) -
+            (b.rank ?? Number.MAX_SAFE_INTEGER),
+      );
+
+      // Final probability (after any active market-specific calibration) and confidence
+      // are hard gates. Pick Center's safety ranking then selects up to seven markets.
+      const selected: CuratedSelectionCandidate[] = [];
+      for (const candidate of ranked) {
+        if (
+          selected.some(
+            (current) => !selectionsAreCompatible(current, candidate),
+          )
+        ) {
+          continue;
+        }
+        selected.push(candidate);
+        if (selected.length >= config.maximumSelectionsPerMatch) break;
+      }
+
+      if (selected.length < config.minimumSelectionsPerMatch) {
+        skipped += 1;
+        riskRejected += 1;
+        results.push({
+          eventId,
+          created: false,
+          reason: ranked.length
+            ? 'NO_COMPATIBLE_ELIGIBLE_SELECTION'
+            : 'NO_SELECTION_PASSED_PROBABILITY_CONFIDENCE_ODDS_READINESS_AND_FRESHNESS',
+          availableMarkets: ranked.length,
+          eligibleSelections: candidates.length,
+        });
+        continue;
+      }
+
       const kickoffDateKey = lagosDateKey(selected[0].fixtureDate);
       const predictionCode =
         existing?.predictionCode ??
         `2XP-P-${kickoffDateKey.replace(/-/g, '')}-${randomUUID().slice(0, 6).toUpperCase()}`;
       const generatedDateKey =
         existing?.generatedDateKey ?? `${kickoffDateKey}:${eventId}`;
-      const shouldRepublish =
-        existingStatus === 'CANCELLED' && wasAutoWithdrawn;
-      // READY drafts and system-auto-withdrawn records must become visible again
-      // once current safe selections exist. Manual cancellations stay cancelled.
-      const status = existing
-        ? existingStatus === 'PUBLISHED' ||
-          existingStatus === 'READY' ||
-          shouldRepublish
-          ? 'PUBLISHED'
-          : existingStatus || 'PUBLISHED'
-        : 'PUBLISHED';
-      publishableEventIds.add(eventId);
-
       const selectionRecords = selected.map((selection) => ({
         ...selection,
         settlementOutcome: 'PENDING',
         matchSettlementStatus: 'PENDING',
       }));
-      // Curated selections are standalone recommendations attached to one match,
-      // not a same-game accumulator. Legacy aggregate fields therefore represent
-      // the primary (highest-ranked) selection only; never fabricate combined odds.
+      // Curated selections remain standalone recommendations, not a same-game accumulator.
       const primarySelection = selected[0];
       const combinedOdds = primarySelection.decimalOdds;
       const combinedProbability = primarySelection.probability;
       const combinedConfidence = primarySelection.confidence;
       const hasMultipleMarkets = selected.length > 1;
+      const publishedAt = new Date();
       const update = {
         $set: {
           eventId,
-          title: `${selected[0].homeTeamName} vs ${selected[0].awayTeamName}`,
-          ...(shouldRepublish ? { publishedAt: new Date() } : {}),
-          status,
-          live: selected.some((selection) => selection.live),
+          title: `${primarySelection.homeTeamName} vs ${primarySelection.awayTeamName}`,
+          status: 'PUBLISHED',
+          publishedAt,
+          live: false,
           completed: false,
           selections: selectionRecords,
           selectionCount: selected.length,
           combinedProbability: Number(combinedProbability.toFixed(8)),
-          ...(Number.isFinite(Number(combinedOdds)) &&
-          Number(combinedOdds) >=
-            PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds
-            ? { combinedOdds: Number(Number(combinedOdds).toFixed(6)) }
-            : {}),
+          combinedOdds: Number(Number(combinedOdds).toFixed(6)),
           confidence: combinedConfidence,
           combinedProbabilityMethod: hasMultipleMarkets
             ? 'PRIMARY_SELECTION_WITH_ADDITIONAL_MARKET_RECOMMENDATIONS'
             : 'SINGLE_SELECTION',
           settlementStatus: existing?.settlementStatus ?? 'PENDING',
-          fixtureDateFrom: selected[0].fixtureDate,
-          fixtureDateTo: selected[0].fixtureDate,
+          fixtureDateFrom: primarySelection.fixtureDate,
+          fixtureDateTo: primarySelection.fixtureDate,
+          retentionExpiresAt: primarySelection.retentionExpiresAt ?? null,
           diagnostics: [
-            `Selected ${selected.length} distinct, compatible market(s) from Pick Center, prioritizing probability and confidence while retaining quality and source scores as ranking metadata.`,
+            `Frozen ${selected.length} distinct, compatible market selection(s) at the first qualifying curated refresh.`,
+            `Eligibility: final market probability (with calibration applied when active) >= ${(config.minimumProbability * 100).toFixed(0)}%; evidence confidence >= ${config.minimumConfidence}/98; explicit final market selection; fresh Odds-module quote >= ${PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds.toFixed(2)}.`,
             hasMultipleMarkets
-              ? 'This record contains multiple standalone market recommendations for the same fixture, not a combined bet. Legacy probability/odds fields represent the highest-ranked primary selection only; use each selection’s own probability and odds.'
+              ? 'These are independent recommendations for the same fixture, not a combined bet. Legacy probability/odds fields represent only the highest-safety primary selection.'
               : 'The record contains one market recommendation; probability and odds fields correspond to that selection.',
             selected.some((selection) => selection.priceType === 'ESTIMATED')
               ? 'At least one displayed price is an Odds-module estimate, not a bookmaker offer.'
-              : selected.some(
-                    (selection) => selection.decimalOdds === undefined,
-                  )
-                ? 'One or more eligible selections have no valid stored decimal odds; no bookmaker price was fabricated.'
-                : 'Individual displayed prices are provider-backed and may differ from later or other bookmaker quotes.',
-            `Model version ${selected[0].modelVersion}; selected markets: ${selected.map((item) => `${item.marketKey}/${item.selectionKey}`).join(', ')}.`,
-            `Pick Center ranking scores: ${selected.map((item) => `${item.marketKey}=${(item.rankingScore * 100).toFixed(1)}`).join(', ')}.`,
+              : 'Displayed prices were provider-backed when the snapshot was created.',
+            `Model version ${primarySelection.modelVersion}; selected markets: ${selected.map((item) => `${item.marketKey}/${item.selectionKey}`).join(', ')}.`,
+            `Pick Center safety scores: ${selected.map((item) => `${item.marketKey}=${(item.safetyScore * 100).toFixed(1)}`).join(', ')}.`,
+            'IMMUTABLE_CURATED_SNAPSHOT: future Pick Center, Odds, or model refreshes cannot supplement or replace these selections.',
           ],
         },
         $setOnInsert: {
           predictionCode,
           generatedDateKey,
-          publishedAt: new Date(),
         },
-        ...(Number.isFinite(Number(combinedOdds)) &&
-        Number(combinedOdds) >=
-          PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds
-          ? {}
-          : { $unset: { combinedOdds: 1 } }),
       };
 
       const result = await this.curatedPredictionModel
@@ -1281,12 +1002,12 @@ export class CuratedPredictionService {
         .exec();
       if (existing) updated += 1;
       else created += 1;
-      if (selected.length === 1) oneSelectionMatches += 1;
-      else if (selected.length === 2) twoSelectionMatches += 1;
-      else threeSelectionMatches += 1;
+      publishableEventIds.add(eventId);
+      recordSelectionCount(selected.length);
       results.push({
         eventId,
         created: !existing,
+        updated: Boolean(existing),
         selectionCount: selected.length,
         prediction: result,
       });
@@ -1350,33 +1071,30 @@ export class CuratedPredictionService {
       validOddsReadySelections,
       created,
       updated,
-      publishedRecordsSupplemented,
-      publishedRecordsReconciled: results.filter(
-        (result) => result.reason === 'PUBLISHED_FIXTURE_METADATA_RECONCILED',
+      publishedSnapshotsFrozen: results.filter(
+        (result) => result.reason === 'PUBLISHED_SNAPSHOT_FROZEN',
       ).length,
+      selectionCountDistribution,
       skippedMatches: skipped,
       riskRejected,
       withdrawn: withdrawnEventIds.length,
-      oneSelectionMatches,
-      twoSelectionMatches,
-      threeSelectionMatches,
-      selectedMarkets:
-        oneSelectionMatches +
-        twoSelectionMatches * 2 +
-        threeSelectionMatches * 3,
+      selectedMarkets: Object.entries(selectionCountDistribution).reduce(
+        (total, [count, matches]) => total + Number(count) * matches,
+        0,
+      ),
       minimumSafetyScore: config.minimumSafetyScore,
       skipReasonCounts,
       results,
     };
     this.logger.log(
-      `Curated refresh: ${created} created, ${updated} updated (${publishedRecordsSupplemented} published records supplemented), ${skipped} skipped, ${riskRejected} risk-rejected, ${withdrawnEventIds.length} stale drafts withdrawn; scanned ${queriedPicks.length} Pick Center records and accepted ${picks.length} unfinished fixtures within the rolling ${config.horizonHours}-hour horizon plus live matches.`,
+      `Curated refresh: ${created} created, ${updated} legacy drafts refreshed, ${skipped} skipped, ${riskRejected} risk-rejected, ${withdrawnEventIds.length} stale drafts withdrawn; ${results.filter((result) => result.reason === 'PUBLISHED_SNAPSHOT_FROZEN').length} published snapshots frozen; scanned ${queriedPicks.length} Pick Center records within the rolling ${config.horizonHours}-hour pre-match horizon.`,
     );
     await this.monitor.recordCuratedRefresh(summary);
     return {
       ...summary,
       rules: {
-        selectionsPerFixture: `${config.minimumSelectionsPerMatch}–${config.maximumSelectionsPerMatch} distinct market selections; one valid selection is sufficient`,
-        fixtureHorizon: `rolling ${config.horizonHours} hours before kickoff plus live fixtures`,
+        selectionsPerFixture: `${config.minimumSelectionsPerMatch}–${config.maximumSelectionsPerMatch} distinct market selections`,
+        fixtureHorizon: `rolling ${config.horizonHours} hours before kickoff; pre-match fixtures only`,
         minimumProbability: config.minimumProbability,
         minimumConfidence: config.minimumConfidence,
         minimumDataQuality: config.minimumDataQuality,
@@ -1385,16 +1103,19 @@ export class CuratedPredictionService {
           PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds,
         maximumDecimalOdds:
           PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds,
-        requireExplicitOddsReadiness: false,
-        requireValidStoredOdds: false,
+        requireExplicitOddsReadiness: true,
+        requireFreshStoredOdds: true,
+        requireValidStoredOdds: true,
         dataQualityAndSafetyAreHardGates: false,
         pickCenterRankingUsed: true,
         calibrationUsedWhenAvailable: false,
         probabilityCombination:
           'Pick Center probabilities are reused; no new predictions are calculated',
         originalPublishedSelectionsPreserved: true,
-        publishedRecordsMayBeSupplementedUpToMaximum: true,
+        publishedRecordsMayBeSupplementedUpToMaximum: false,
+        publishedSnapshotsAreImmutable: true,
       },
     };
   }
 }
+

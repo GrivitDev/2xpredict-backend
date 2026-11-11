@@ -3,6 +3,10 @@ export type BetLabPricingQuoteSelection = {
   selectionCode?: string;
   decimalOdds?: number | null;
   odds?: number | null;
+  /** Fair probability already calculated and quality-gated by the Odds module. */
+  fairProbability?: number | null;
+  /** Raw implied probability already calculated and stored by the Odds module. */
+  impliedProbability?: number | null;
   line?: number | null;
   handicap?: number | null;
   available?: boolean;
@@ -24,7 +28,7 @@ export type BetLabFixturePricingModel = {
 };
 
 export type BetLabSelectionPricing = {
-  fairProbability: number;
+  fairProbability: number | null;
   marketMargin: number;
   model: BetLabFixturePricingModel;
 };
@@ -117,19 +121,37 @@ function overUnderSide(code: string): 'OVER' | 'UNDER' | null {
   return null;
 }
 
-function normalizeProbabilities(
+function fairProbabilityOf(selection: BetLabPricingQuoteSelection): number | null {
+  const value = Number(selection.fairProbability);
+  return Number.isFinite(value) && value > 0 && value < 1 ? value : null;
+}
+
+/**
+ * Margin is metadata supplied by Odds in the form of raw implied probability
+ * versus fair probability. Bet Lab does not de-vig bookmaker prices itself.
+ */
+function marketMarginOf(selection: BetLabPricingQuoteSelection): number {
+  const implied = Number(selection.impliedProbability);
+  const fair = fairProbabilityOf(selection);
+  if (!fair || !Number.isFinite(implied) || implied <= 0) return 1;
+  return clamp(implied / fair, 1, 1.35);
+}
+
+function readMarketFairProbabilities(
   selections: BetLabPricingQuoteSelection[],
 ): { probabilities: Map<string, number>; margin: number } | null {
-  const eligible = selections.filter(usable);
+  const eligible = selections.filter((selection) => usable(selection) && fairProbabilityOf(selection) !== null);
   if (eligible.length < 2) return null;
-  const inverse = eligible.map((selection) => 1 / oddsOf(selection));
-  const total = inverse.reduce((sum, value) => sum + value, 0);
-  if (!Number.isFinite(total) || total <= 0) return null;
   const probabilities = new Map<string, number>();
-  eligible.forEach((selection, index) => {
-    probabilities.set(selectionCodeOf(selection), inverse[index] / total);
-  });
-  return { probabilities, margin: clamp(total, 1, 1.35) };
+  for (const selection of eligible) {
+    const probability = fairProbabilityOf(selection);
+    if (probability !== null) probabilities.set(selectionCodeOf(selection), probability);
+  }
+  const margins = eligible.map(marketMarginOf).filter((value) => value > 1);
+  const margin = margins.length
+    ? margins.reduce((sum, value) => sum + value, 0) / margins.length
+    : 1;
+  return { probabilities, margin: clamp(margin, 1, 1.35) };
 }
 
 function staticMarketProbability(
@@ -137,62 +159,19 @@ function staticMarketProbability(
   selectionCode: string,
 ): { probability: number; margin: number } | null {
   if (!market?.selections) return null;
-  const normalized = normalizeProbabilities(market.selections);
-  if (!normalized) return null;
-  const probability = normalized.probabilities.get(selectionCode.toUpperCase());
-  return probability === undefined
-    ? null
-    : { probability, margin: normalized.margin };
+  const selected = market.selections.find((item) => selectionCodeOf(item) === selectionCode.toUpperCase());
+  if (!selected || !usable(selected)) return null;
+  const probability = fairProbabilityOf(selected);
+  if (probability === null) return null;
+  return { probability, margin: marketMarginOf(selected) };
 }
 
 function pairedMarketProbability(
   market: BetLabPricingMarket | undefined,
   selectionCode: string,
 ): { probability: number; margin: number } | null {
-  if (!market?.selections) return null;
-  const selected = market.selections.find((item) => selectionCodeOf(item) === selectionCode.toUpperCase());
-  if (!selected || !usable(selected)) return null;
-
-  const side = overUnderSide(selectionCode);
-  if (side) {
-    const line = lineOf(selected, selectionCode);
-    if (line === null) return null;
-    const counterpart = market.selections.find((item) =>
-      overUnderSide(selectionCodeOf(item)) === (side === 'OVER' ? 'UNDER' : 'OVER')
-      && Math.abs((lineOf(item) ?? Number.NaN) - line) < EPSILON
-      && usable(item),
-    );
-    if (!counterpart) return null;
-    const selectedInverse = 1 / oddsOf(selected);
-    const otherInverse = 1 / oddsOf(counterpart);
-    const margin = selectedInverse + otherInverse;
-    return {
-      probability: selectedInverse / margin,
-      margin: clamp(margin, 1, 1.35),
-    };
-  }
-
-  if (selectionCode.startsWith('HOME_') || selectionCode.startsWith('AWAY_')) {
-    const line = lineOf(selected, selectionCode);
-    if (line === null) return null;
-    const counterpartSide = selectionCode.startsWith('HOME_') ? 'AWAY_' : 'HOME_';
-    // The opposing Asian Handicap price uses the opposite signed line:
-    // Home -1.5 is paired with Away +1.5, not Away -1.5.
-    const counterpart = market.selections.find((item) =>
-      selectionCodeOf(item).startsWith(counterpartSide)
-      && Math.abs((lineOf(item) ?? Number.NaN) + line) < EPSILON
-      && usable(item),
-    );
-    if (!counterpart) return null;
-    const selectedInverse = 1 / oddsOf(selected);
-    const otherInverse = 1 / oddsOf(counterpart);
-    const margin = selectedInverse + otherInverse;
-    return {
-      probability: selectedInverse / margin,
-      margin: clamp(margin, 1, 1.35),
-    };
-  }
-
+  // Odds has already normalized this exact selection and line. Do not rebuild
+  // probabilities from paired decimal prices or infer a missing outcome.
   return staticMarketProbability(market, selectionCode);
 }
 
@@ -200,33 +179,8 @@ function doubleChanceProbability(
   markets: BetLabPricingMarket[],
   selectionCode: string,
 ): { probability: number; margin: number } | null {
-  const matchResult = markets.find((market) => marketCodeOf(market) === 'MATCH_RESULT');
-  const result = staticMarketProbability(matchResult, 'HOME_WIN');
-  const draw = staticMarketProbability(matchResult, 'DRAW');
-  const away = staticMarketProbability(matchResult, 'AWAY_WIN');
-  if (!result || !draw || !away) return null;
-
-  const probabilityByCode = new Map<string, number>([
-    ['HOME_WIN', result.probability],
-    ['DRAW', draw.probability],
-    ['AWAY_WIN', away.probability],
-  ]);
-  const pHome = probabilityByCode.get('HOME_WIN') ?? 0;
-  const pDraw = probabilityByCode.get('DRAW') ?? 0;
-  const pAway = probabilityByCode.get('AWAY_WIN') ?? 0;
-  const dcProbability = selectionCode === 'HOME_OR_DRAW'
-    ? pHome + pDraw
-    : selectionCode === 'DRAW_OR_AWAY'
-      ? pDraw + pAway
-      : selectionCode === 'HOME_OR_AWAY'
-        ? pHome + pAway
-        : 0;
-  const dcMarket = markets.find((market) => marketCodeOf(market) === 'DOUBLE_CHANCE');
-  const dcPrices = dcMarket?.selections?.filter(usable) ?? [];
-  const inverseTotal = dcPrices.reduce((sum, selection) => sum + 1 / oddsOf(selection), 0);
-  return dcProbability > 0
-    ? { probability: clamp(dcProbability, 0.001, 0.999), margin: clamp(inverseTotal / 2, 1, 1.35) }
-    : null;
+  const market = markets.find((item) => marketCodeOf(item) === 'DOUBLE_CHANCE');
+  return staticMarketProbability(market, selectionCode);
 }
 
 function marketProbabilityForSelection(
@@ -234,10 +188,10 @@ function marketProbabilityForSelection(
   marketCode: string,
   selectionCode: string,
 ): { probability: number; margin: number } | null {
-  const market = markets.find((item) => marketCodeOf(item) === marketCode.toUpperCase());
   if (marketCode.toUpperCase() === 'DOUBLE_CHANCE') {
     return doubleChanceProbability(markets, selectionCode.toUpperCase());
   }
+  const market = markets.find((item) => marketCodeOf(item) === marketCode.toUpperCase());
   return pairedMarketProbability(market, selectionCode);
 }
 
@@ -251,7 +205,7 @@ function getOverUnderPairs(
   const lines = new Set<number>();
 
   for (const selection of market.selections) {
-    if (!usable(selection)) continue;
+    if (!usable(selection) || fairProbabilityOf(selection) === null) continue;
     const side = overUnderSide(selectionCodeOf(selection));
     const line = lineOf(selection);
     if (side && line !== null) lines.add(line);
@@ -261,18 +215,11 @@ function getOverUnderPairs(
     const over = market.selections.find((item) =>
       overUnderSide(selectionCodeOf(item)) === 'OVER'
       && Math.abs((lineOf(item) ?? Number.NaN) - line) < EPSILON
-      && usable(item),
+      && usable(item)
+      && fairProbabilityOf(item) !== null,
     );
-    const under = market.selections.find((item) =>
-      overUnderSide(selectionCodeOf(item)) === 'UNDER'
-      && Math.abs((lineOf(item) ?? Number.NaN) - line) < EPSILON
-      && usable(item),
-    );
-    if (!over || !under) continue;
-    const overInverse = 1 / oddsOf(over);
-    const underInverse = 1 / oddsOf(under);
-    const total = overInverse + underInverse;
-    if (total > 0) pairs.push({ line, overProbability: overInverse / total });
+    const probability = over ? fairProbabilityOf(over) : null;
+    if (probability !== null) pairs.push({ line, overProbability: probability });
   }
   return pairs;
 }
@@ -307,7 +254,7 @@ function estimateHomeShare(
   markets: BetLabPricingMarket[],
 ): number {
   const market = markets.find((item) => marketCodeOf(item) === 'MATCH_RESULT');
-  const result = normalizeProbabilities(market?.selections ?? []);
+  const result = readMarketFairProbabilities(market?.selections ?? []);
   if (!result) return 0.56;
   const pHome = result.probabilities.get('HOME_WIN');
   const pDraw = result.probabilities.get('DRAW');
@@ -396,12 +343,12 @@ export function buildBetLabSelectionPricing(
   marketRows: BetLabPricingMarket[],
   marketCode: string,
   selectionCode: string,
-  decimalOdds: number,
+  _decimalOdds: number,
   model: BetLabFixturePricingModel = buildBetLabFixturePricingModel(marketRows),
 ): BetLabSelectionPricing {
   const quote = marketProbabilityForSelection(marketRows, marketCode, selectionCode);
   return {
-    fairProbability: clamp(quote?.probability ?? 1 / decimalOdds, 0.001, 0.999),
+    fairProbability: quote?.probability ?? null,
     marketMargin: clamp(quote?.margin ?? 1, 1, 1.35),
     model,
   };
@@ -489,10 +436,20 @@ function addAdjustment(
 ): void {
   if (!Number.isFinite(jointOdds) || !Number.isFinite(baseOdds) || baseOdds <= 0) return;
   const factor = jointOdds / baseOdds;
-  if (Number.isFinite(factor) && factor > 0) adjustments.push({ eventId, group, factor });
+  if (Number.isFinite(factor) && factor > 0 && Math.abs(factor - 1) >= 0.000001) {
+    adjustments.push({ eventId, group, factor });
+  }
 }
 
 function priceRelatedMatchCombination(picks: readonly BetLabPricingPick[]): number {
+  if (picks.some((pick) => {
+    const probability = Number(pick.pricing?.fairProbability);
+    return !Number.isFinite(probability) || probability <= 0 || probability >= 1;
+  })) {
+    // No locally inferred probability fallback. Keep Odds-module prices and
+    // skip a correlation adjustment until every selected leg has fair data.
+    return productOfOdds(picks);
+  }
   const model = picks.find((pick) => pick.pricing?.model)?.pricing?.model
     ?? buildBetLabFixturePricingModel([]);
   const scorePicks = picks.filter((pick) => SCORE_MARKETS.has(pick.marketCode.toUpperCase()));
@@ -530,10 +487,10 @@ function priceScoreAndShotsCombination(
   const { scoreWeights, shotWeights } = calibrateScoreAndShotWeights(
     scoreStates,
     scoreOutcomes,
-    scorePicks.map((pick) => pick.pricing?.fairProbability ?? 1 / pick.odds),
+    scorePicks.map((pick) => pick.pricing!.fairProbability!),
     shotStates,
     shotOutcomes,
-    shotPicks.map((pick) => pick.pricing?.fairProbability ?? 1 / pick.odds),
+    shotPicks.map((pick) => pick.pricing!.fairProbability!),
   );
 
   const maxGoals = SCORE_CEILING * 2;
@@ -714,7 +671,7 @@ function priceScoreCombination(picks: readonly BetLabPricingPick[]): number {
   const weights = calibrateScenarioWeights(
     states.map((state) => state.weight),
     outcomes,
-    picks.map((pick) => pick.pricing?.fairProbability ?? 1 / pick.odds),
+    picks.map((pick) => pick.pricing!.fairProbability!),
   );
 
   let successfulProbability = 0;
@@ -740,7 +697,7 @@ function priceShotsCombination(picks: readonly BetLabPricingPick[]): number {
   const weights = calibrateScenarioWeights(
     states.map((state) => state.weight),
     outcomes,
-    picks.map((pick) => pick.pricing?.fairProbability ?? 1 / pick.odds),
+    picks.map((pick) => pick.pricing!.fairProbability!),
   );
 
   let successfulProbability = 0;
@@ -1042,3 +999,4 @@ function roundOdds(value: number): number {
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
+

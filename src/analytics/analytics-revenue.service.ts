@@ -28,6 +28,7 @@ export class AnalyticsRevenueService {
       totalPayments,
       approvedPayments,
       pendingPayments,
+      processingPayments,
       rejectedPayments,
     ] = await Promise.all([
       this.sumRevenue(approved),
@@ -53,7 +54,11 @@ export class AnalyticsRevenueService {
         type: { $in: VALID_PAYMENT_TYPES },
       }),
       this.paymentModel.countDocuments({
-        status: 'pending',
+        status: { $in: ['pending', 'processing'] },
+        type: { $in: VALID_PAYMENT_TYPES },
+      }),
+      this.paymentModel.countDocuments({
+        status: 'processing',
         type: { $in: VALID_PAYMENT_TYPES },
       }),
       this.paymentModel.countDocuments({
@@ -70,6 +75,7 @@ export class AnalyticsRevenueService {
       totalPayments,
       approvedPayments,
       pendingPayments,
+      processingPayments,
       rejectedPayments,
     };
   }
@@ -90,3 +96,4 @@ export class AnalyticsRevenueService {
     return revenue;
   }
 }
+

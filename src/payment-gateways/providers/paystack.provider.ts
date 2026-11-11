@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
@@ -28,6 +32,7 @@ interface PaystackInitializationData {
 
 interface PaystackTransaction {
   id?: string | number;
+  reference?: string;
   status?: string;
   amount?: number;
   currency?: string;
@@ -36,6 +41,13 @@ interface PaystackTransaction {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
+
+
+// Bound outbound gateway requests. PaymentGatewaysService deliberately treats
+// transport timeouts as uncertain outcomes and keeps the payment reference
+// available for later verification/reconciliation.
+const PAYSTACK_INITIALIZE_TIMEOUT_MS = 15_000;
+const PAYSTACK_VERIFY_TIMEOUT_MS = 12_000;
 
 @Injectable()
 export class PaystackProvider implements PaymentGateway {
@@ -74,13 +86,16 @@ export class PaystackProvider implements PaymentGateway {
           headers: {
             Authorization: `Bearer ${this.secretKey}`,
           },
+          timeout: PAYSTACK_INITIALIZE_TIMEOUT_MS,
         },
       ),
     );
 
     if (!data.status || !data.data) {
-      throw new BadRequestException(
-        data.message ?? 'Unable to initialize payment.',
+      // A negative provider envelope is not enough to conclude that the
+      // transaction was not created. Keep the payment reference recoverable.
+      throw new ServiceUnavailableException(
+        data.message ?? 'The gateway could not confirm payment initialization.',
       );
     }
 
@@ -97,16 +112,49 @@ export class PaystackProvider implements PaymentGateway {
   // VERIFY PAYMENT
   // =====================================================
   async verifyPayment(reference: string): Promise<VerifyPaymentResult> {
-    const { data } = await firstValueFrom(
-      this.http.get<PaystackResponse<PaystackTransaction>>(
-        `${this.baseUrl}/transaction/verify/${encodeURIComponent(reference)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${this.secretKey}`,
+    let data: PaystackResponse<PaystackTransaction>;
+    try {
+      const response = await firstValueFrom(
+        this.http.get<PaystackResponse<PaystackTransaction>>(
+          `${this.baseUrl}/transaction/verify/${encodeURIComponent(reference)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${this.secretKey}`,
+            },
+            timeout: PAYSTACK_VERIFY_TIMEOUT_MS,
           },
-        },
-      ),
-    );
+        ),
+      );
+      data = response.data;
+    } catch (error) {
+      const responseStatus = Number((error as any)?.response?.status ?? 0);
+      const responseBody = (error as any)?.response?.data;
+      const message =
+        typeof responseBody?.message === 'string'
+          ? responseBody.message
+          : error instanceof Error
+            ? error.message
+            : 'The gateway could not confirm the transaction state.';
+
+      if ([401, 403].includes(responseStatus)) {
+        throw new ServiceUnavailableException(
+          'Paystack rejected the verification credentials. Check the configured secret key.',
+        );
+      }
+
+      // Axios rejects HTTP 4xx/5xx responses before an API envelope can be
+      // inspected. Normalize them to UNKNOWN rather than treating transport or
+      // lookup errors as a failed charge. The payment service applies the
+      // reference-not-found grace period before releasing a pending payment.
+      return {
+        success: false,
+        status: 'unknown',
+        message,
+        raw: isRecord(responseBody)
+          ? (responseBody as Record<string, any>)
+          : { message, httpStatus: responseStatus || null },
+      };
+    }
     const payment = data.data;
 
     // ===================================================
@@ -117,11 +165,14 @@ export class PaystackProvider implements PaymentGateway {
       return {
         success: false,
 
-        status: 'failed',
+        // A negative verification API response is not proof that a transaction
+        // failed. It can also represent a temporary or not-yet-indexed result.
+        status: 'unknown',
 
-        message: data.message ?? 'Unable to verify payment.',
+        message: data.message ?? 'The gateway could not confirm the transaction state.',
 
         transactionId: payment?.id ? String(payment.id) : undefined,
+        reference: payment?.reference,
         amountMinor: typeof payment?.amount === 'number' ? payment.amount : undefined,
         currency: payment?.currency,
         raw: data,
@@ -147,6 +198,7 @@ export class PaystackProvider implements PaymentGateway {
         message: data.message ?? 'Payment verified successfully.',
 
         transactionId: payment.id ? String(payment.id) : undefined,
+        reference: payment.reference,
         amountMinor: typeof payment.amount === 'number' ? payment.amount : undefined,
         currency: payment.currency,
         raw: payment,
@@ -157,7 +209,7 @@ export class PaystackProvider implements PaymentGateway {
     // PENDING / PROCESSING
     // ===================================================
 
-    if (paymentStatus === 'pending' || paymentStatus === 'ongoing') {
+    if (['pending', 'ongoing', 'queued', 'processing'].includes(paymentStatus)) {
       return {
         success: false,
 
@@ -166,6 +218,7 @@ export class PaystackProvider implements PaymentGateway {
         message: data.message ?? 'Your payment is still being processed.',
 
         transactionId: payment.id ? String(payment.id) : undefined,
+        reference: payment.reference,
         amountMinor: typeof payment.amount === 'number' ? payment.amount : undefined,
         currency: payment.currency,
         raw: payment,
@@ -173,13 +226,16 @@ export class PaystackProvider implements PaymentGateway {
     }
 
     // ===================================================
-    // FAILED / ABANDONED / OTHER
+    // CONFIRMED FAILURE / UNKNOWN PROVIDER STATE
     // ===================================================
+
+    const confirmedFailureStatuses = new Set(['failed', 'abandoned']);
+    const confirmedFailure = confirmedFailureStatuses.has(paymentStatus);
 
     return {
       success: false,
 
-      status: 'failed',
+      status: confirmedFailure ? 'failed' : 'unknown',
 
       message:
         data.message ?? `Payment status: ${payment.status ?? 'unknown'}.`,
@@ -238,4 +294,6 @@ export class PaystackProvider implements PaymentGateway {
     });
   }
 }
+
+
 

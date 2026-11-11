@@ -1,5 +1,7 @@
 import { SettlementOutcome } from '../enums/settlement-outcome.enum';
 
+export type SettlementPhase = 'IN_PLAY' | 'HALF_TIME' | 'FULL_TIME';
+
 export interface SettlementSelectionInput {
   key?: string;
   code?: string;
@@ -21,6 +23,8 @@ export interface SettlementEvaluation {
   method: string;
   reason?: string;
   evidence?: Record<string, unknown>;
+  /** Identifies when the outcome became demonstrably final for this market. */
+  phase?: SettlementPhase;
 }
 
 export interface SettlementEventFacts {
@@ -32,9 +36,15 @@ export interface SettlementEventFacts {
   homeTeamName: string;
   awayTeamName: string;
   isFinished: boolean;
-  /** True when ESPN indicates the fixture continued beyond regulation or went to a shootout. */
+  fixtureState?: string;
+  fixtureStatus?: string;
+  firstHalfComplete: boolean;
+  secondHalfComplete: boolean;
+  currentPeriod?: number;
+  currentMinute?: number;
+  /** True when Sports reports that the fixture proceeded beyond regulation. */
   afterExtraTime?: boolean;
-  /** False when a regulation-time score cannot be separated safely from extra time. */
+  /** False when regulation time cannot be separated safely from extra time. */
   regulationScoreAvailable?: boolean;
   homeGoals?: number;
   awayGoals?: number;
@@ -43,8 +53,11 @@ export interface SettlementEventFacts {
   secondHalfHomeGoals?: number;
   secondHalfAwayGoals?: number;
   periodScoresAvailable: boolean;
+  /** True only when the regulation goal timeline reconciles and Sports confirms complete Core Plays coverage. */
   goalEventsComplete: boolean;
   eventDetailsAvailable: boolean;
+  /** True only after Sports confirms a successful complete Core Plays collection. */
+  timelineCoverageComplete?: boolean;
   homeStats: Record<string, number>;
   awayStats: Record<string, number>;
   playerStats: Record<string, Record<string, number>>;
@@ -70,14 +83,25 @@ export interface SettlementEventFacts {
   ownGoals?: number;
   redCards?: number;
   yellowCards?: number;
+  /** Kept for persisted settlement_runs/jobs written by earlier versions. */
   sourceSummaryCollectedAt?: Date;
-  /** Critical integrity conflicts prevent every market from being settled. */
+  sourceDataCollectedAt?: Date;
+  fixtureSourceCollectedAt?: Date;
+  timelineCollectedAt?: Date;
+  statisticsCollectedAt?: Date;
+  homeStatisticsCollectedAt?: Date;
+  awayStatisticsCollectedAt?: Date;
   settlementBlockers: string[];
-  /** Non-blocking notes showing when mirrored fixture fields were stale. */
   sourceDiagnostics: string[];
-  /** Conflicting values are keyed by canonical side/statistic, e.g. home:corners. */
   conflictingStats: string[];
   scoreSource?: string;
+  summaryFactsRevision?: number;
+  summaryFactsSourcePayloadHash?: string;
+  summaryFactsCollectedAt?: Date;
+  summaryFactsNormalizationVersion?: string;
+  summaryFactsSectionStatus?: Record<string, string>;
+  homeStatisticsSource?: 'ESPN_SUMMARY' | 'SPORTS_NORMALIZED_FIXTURE' | 'UNAVAILABLE';
+  awayStatisticsSource?: 'ESPN_SUMMARY' | 'SPORTS_NORMALIZED_FIXTURE' | 'UNAVAILABLE';
   sourceFingerprint: string;
 }
 
@@ -96,10 +120,9 @@ export interface SettlementProcessResult {
   eventId: string;
   sourceFingerprint: string;
   partial: boolean;
-  /** True when the worker safely declines a stale/non-final lifecycle job. */
   skipped?: boolean;
+  phase?: SettlementPhase;
   counts: SettlementTargetCounts;
   unresolvedReasons: string[];
 }
-
 

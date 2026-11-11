@@ -49,6 +49,7 @@ export class AnalyticsEvent {
   sessionId!: string;
 
   @Prop({
+    type: String,
     enum: AnalyticsVisitorType,
     required: true,
     index: true,
@@ -60,6 +61,7 @@ export class AnalyticsEvent {
   // ==========================================
 
   @Prop({
+    type: String,
     enum: AnalyticsEventType,
     required: true,
     index: true,
@@ -255,3 +257,4 @@ AnalyticsEventSchema.index({
   visitorType: 1,
   occurredAt: -1,
 });
+

@@ -27,7 +27,7 @@ import { PlaceBetLabTicketDto } from '../dto/place-bet-lab-ticket.dto';
 import { PlaceBetLabSlipDto } from '../dto/place-bet-lab-slip.dto';
 import { BetLabEventService } from './bet-lab-event.service';
 import { BetLabMarketService } from './bet-lab-market.service';
-import { BetLabWalletService } from './bet-lab-wallet.service';
+import { BetLabWalletService, type BetLabWalletSnapshot } from './bet-lab-wallet.service';
 import { roundDecimal } from '../utils/odds.util';
 import { findBetLabSelectionCompatibilityError } from '../utils/bet-lab-selection-compatibility.util';
 import {
@@ -40,6 +40,14 @@ import {
 } from '../utils/bet-lab-pricing.util';
 import { AdminGateway } from '../../realtime/admin.gateway';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
+import { NotificationEventsService } from '../../notifications/in-app/notification-events.service';
+import { assertBetLabPreMatchFixture } from '../utils/fixture.util';
+import {
+  areBetLabOddsSnapshotsIdentical,
+  BET_LAB_PRICING_SNAPSHOT_VERSION,
+  createBetLabOddsSnapshotFingerprint,
+  createBetLabTicketPricingSnapshotFingerprint,
+} from '../utils/bet-lab-pricing-snapshot.util';
 
 @Injectable()
 export class BetLabTicketService {
@@ -56,6 +64,7 @@ export class BetLabTicketService {
     private readonly adminGateway: AdminGateway,
     @Inject(forwardRef(() => SettlementTriggerService))
     private readonly settlementTrigger: SettlementTriggerService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   async placeSingle(userId: string, dto: PlaceBetLabTicketDto) {
@@ -79,20 +88,19 @@ export class BetLabTicketService {
       fingerprint,
     );
     if (existing) {
-      await this.settlementTrigger.onTargetsCreated(
-        [eventId],
-        'BET_LAB_TICKET_CREATED',
-      );
-      return {
+      const replay = {
         ticket: existing,
         alreadyPlaced: true,
-        wallet: await this.walletService.getWallet(userId),
+        wallet: await this.getWalletSnapshotSafely(userId),
       };
+      await this.afterTicketCommitted(userId, replay, [eventId]);
+      return replay;
     }
 
+    let placed: Awaited<ReturnType<BetLabTicketService['placeTicketAtomic']>>;
     try {
       const quotes = await this.resolveSelectionQuotes(requests);
-      const ticket = await this.placeTicketAtomic(
+      placed = await this.placeTicketAtomic(
         userId,
         BetLabTicketType.SINGLE,
         dto.stake,
@@ -100,13 +108,15 @@ export class BetLabTicketService {
         fingerprint,
         quotes,
       );
-      await this.settlementTrigger.onTargetsCreated([eventId], 'BET_LAB_TICKET_CREATED');
-      this.adminGateway.publishModuleEvent('bet-lab', 'bet-lab:ticket-placed', { ticketId: String((ticket as any)?.ticket?._id ?? ''), status: (ticket as any)?.ticket?.status, occurredAt: new Date().toISOString() });
-      return ticket;
     } catch (error) {
       await this.logPlacementFailure(userId, eventId, error);
       throw error;
     }
+
+    // The ticket and stake debit have committed. Post-commit integrations are
+    // best-effort and must never turn a successful placement into an API error.
+    await this.afterTicketCommitted(userId, placed, [eventId]);
+    return placed;
   }
 
   async placeSlip(userId: string, dto: PlaceBetLabSlipDto) {
@@ -141,25 +151,25 @@ export class BetLabTicketService {
       dto.idempotencyKey,
       fingerprint,
     );
+    const targetEventIds = [...new Set(requests.map((item) => item.eventId))];
     if (existing) {
-      await this.settlementTrigger.onTargetsCreated(
-        [...new Set(requests.map((item) => item.eventId))],
-        'BET_LAB_TICKET_CREATED',
-      );
-      return {
+      const replay = {
         ticket: existing,
         alreadyPlaced: true,
-        wallet: await this.walletService.getWallet(userId),
+        wallet: await this.getWalletSnapshotSafely(userId),
       };
+      await this.afterTicketCommitted(userId, replay, targetEventIds);
+      return replay;
     }
 
+    let placed: Awaited<ReturnType<BetLabTicketService['placeTicketAtomic']>>;
     try {
       const quotes = await this.resolveSelectionQuotes(requests);
       const compatibilityError = findBetLabSelectionCompatibilityError(quotes);
       if (compatibilityError) throw new BadRequestException(compatibilityError);
       const pricing = await this.calculateSlipPricing(quotes);
 
-      const ticket = await this.placeTicketAtomic(
+      placed = await this.placeTicketAtomic(
         userId,
         BetLabTicketType.ACCUMULATOR,
         dto.stake,
@@ -168,12 +178,6 @@ export class BetLabTicketService {
         quotes,
         pricing,
       );
-      await this.settlementTrigger.onTargetsCreated(
-        [...new Set(requests.map((item) => item.eventId))],
-        'BET_LAB_TICKET_CREATED',
-      );
-      this.adminGateway.publishModuleEvent('bet-lab', 'bet-lab:ticket-placed', { ticketId: String((ticket as any)?.ticket?._id ?? ''), status: (ticket as any)?.ticket?.status, occurredAt: new Date().toISOString() });
-      return ticket;
     } catch (error) {
       await this.logPlacementFailure(
         userId,
@@ -182,6 +186,9 @@ export class BetLabTicketService {
       );
       throw error;
     }
+
+    await this.afterTicketCommitted(userId, placed, targetEventIds);
+    return placed;
   }
 
   async listTickets(
@@ -251,9 +258,46 @@ export class BetLabTicketService {
     quotes: Awaited<ReturnType<BetLabTicketService['resolveSelectionQuotes']>>,
     pricing?: BetLabSlipPricing,
   ) {
+    this.validateStake(stake);
+    if (!String(idempotencyKey ?? '').trim() || idempotencyKey.length > 120) {
+      throw new ConflictException('A valid ticket idempotency key is required.');
+    }
+    if (!Array.isArray(quotes) || quotes.length === 0) {
+      throw new ConflictException('A ticket requires at least one verified price.');
+    }
+
+    // Re-read the exact canonical prices immediately before the write transaction.
+    // A stale boolean captured during the initial quote/pricing work is not enough
+    // to authorise a later ticket write.
+    const replayedBeforeRevalidation = await this.findExistingByIdempotency(
+      userId,
+      idempotencyKey,
+      fingerprint,
+    );
+    if (replayedBeforeRevalidation) {
+      return {
+        ticket: replayedBeforeRevalidation,
+        alreadyPlaced: true,
+        wallet: await this.getWalletSnapshotSafely(userId),
+      };
+    }
+    await this.revalidateSelectionQuotes(quotes);
+    let verifiedPricing = pricing;
+    if (pricing) {
+      const currentPricing = await this.calculateSlipPricing(quotes);
+      if (!this.areSlipPricingsEquivalent(currentPricing, pricing)) {
+        throw new ConflictException(
+          'Accumulator pricing changed while the ticket was being prepared. Refresh the slip and confirm the updated combined odds.',
+        );
+      }
+      verifiedPricing = currentPricing;
+    }
+
     const entitlement = await this.walletService.getCurrentEntitlement(userId);
+    const allowanceNotificationWindowStart = new Date();
     const session = await this.ticketModel.db.startSession();
     let placedTicket: HydratedDocument<BetLabTicket> | null = null;
+    let walletSnapshot: BetLabWalletSnapshot | null = null;
     let alreadyPlaced = false;
     let placementEvent: {
       ticketId: string;
@@ -265,6 +309,14 @@ export class BetLabTicketService {
     } | null = null;
     try {
       await session.withTransaction(async () => {
+        // Mongoose may retry this callback after a transient transaction error.
+        // Reset callback-scoped results so an aborted attempt cannot leak into
+        // the response from a later attempt.
+        placedTicket = null;
+        walletSnapshot = null;
+        alreadyPlaced = false;
+        placementEvent = null;
+
         const existing = await this.ticketModel
           .findOne({ userId, idempotencyKey })
           .session(session)
@@ -277,6 +329,10 @@ export class BetLabTicketService {
           }
           placedTicket = existing;
           alreadyPlaced = true;
+          walletSnapshot = await this.walletService.getExistingWalletSnapshotInSession(
+            userId,
+            session,
+          );
           return;
         }
 
@@ -298,8 +354,8 @@ export class BetLabTicketService {
           entitlement,
           session,
         );
-        const combinedOdds = pricing
-          ? roundDecimal(pricing.combinedOdds, BET_LAB_CONFIG.odds.decimalPlaces)
+        const combinedOdds = verifiedPricing
+          ? roundDecimal(verifiedPricing.combinedOdds, BET_LAB_CONFIG.odds.decimalPlaces)
           : this.calculateCombinedOdds(quotes.map((quote) => quote.decimalOdds));
         if (
           !Number.isFinite(combinedOdds) ||
@@ -316,10 +372,26 @@ export class BetLabTicketService {
             'Potential return exceeds the configured virtual-point limit. Reduce the stake or choose a lower-odds selection.',
           );
         }
+        // Re-read the complete Odds-approved quote set inside the transaction,
+        // immediately before persisting the immutable ticket snapshots.
+        await this.revalidateSelectionQuotes(quotes);
+        if (verifiedPricing) {
+          // Recheck correlated full-market inputs as well as the selected legs.
+          // A non-selected quote can change the relationship adjustment while
+          // all selected single prices remain unchanged.
+          const finalPricing = await this.calculateSlipPricing(quotes);
+          if (!this.areSlipPricingsEquivalent(finalPricing, verifiedPricing)) {
+            throw new ConflictException(
+              'Accumulator relationship pricing changed before the ticket could be committed. Refresh the slip and confirm the updated combined odds.',
+            );
+          }
+          verifiedPricing = finalPricing;
+        }
         const now = new Date();
+        this.assertQuoteSnapshotsFresh(quotes, now);
         const ticketNumber = this.createTicketNumber();
         const adjustments = new Map(
-          (pricing?.adjustments ?? []).map((adjustment) => [
+          (verifiedPricing?.adjustments ?? []).map((adjustment) => [
             `${adjustment.eventId}:${adjustment.group}`,
             adjustment.factor,
           ]),
@@ -370,8 +442,24 @@ export class BetLabTicketService {
             providerUpdatedAt: quote.providerUpdatedAt ?? undefined,
             oddsTimestampBasis: quote.oddsTimestampBasis,
             oddsCapturedAt: quote.oddsCapturedAt,
+            oddsRecordUpdatedAt: quote.oddsRecordUpdatedAt ?? undefined,
             oddsBasis: quote.oddsBasis ?? undefined,
             oddsCalculationMethod: quote.oddsCalculationMethod ?? undefined,
+            fairOdds: quote.fairOdds ?? undefined,
+            fairOddsBasis: quote.fairOddsBasis ?? undefined,
+            marketFairOdds: quote.marketFairOdds ?? undefined,
+            impliedProbability: quote.impliedProbability ?? undefined,
+            fairProbability: quote.fairProbability ?? undefined,
+            valuePercent: quote.valuePercent ?? undefined,
+            dataQuality: quote.dataQuality ?? undefined,
+            sampleSize: quote.sampleSize ?? undefined,
+            calculationVersion: quote.calculationVersion ?? undefined,
+            sourceRevision: quote.sourceRevision ?? undefined,
+            fixtureSourceRevision: quote.fixtureSourceRevision ?? undefined,
+            sourceDataUpdatedAt: quote.sourceDataUpdatedAt ?? undefined,
+            provider: quote.provider ?? undefined,
+            oddsFreshUntil: quote.oddsFreshUntil ?? undefined,
+            oddsSnapshotFingerprint: createBetLabOddsSnapshotFingerprint(quote),
             ...(adjustment !== undefined && pricingGroup
               ? {
                   fixturePricingGroup: pricingGroup,
@@ -384,6 +472,15 @@ export class BetLabTicketService {
           };
         });
 
+        const pricingSnapshotFingerprint = createBetLabTicketPricingSnapshotFingerprint({
+          ticketType,
+          combinedOdds,
+          legs: legSnapshots.map((leg) => ({
+            oddsSnapshotFingerprint: leg.oddsSnapshotFingerprint,
+            fixturePricingGroup: leg.fixturePricingGroup,
+            fixturePricingAdjustment: leg.fixturePricingAdjustment,
+          })),
+        });
         const created = await this.ticketModel.create(
           [
             {
@@ -398,6 +495,9 @@ export class BetLabTicketService {
               legs: legSnapshots,
               idempotencyKey,
               requestFingerprint: fingerprint,
+              pricingSnapshotVersion: BET_LAB_PRICING_SNAPSHOT_VERSION,
+              pricingSnapshotFingerprint,
+              pricingSnapshotCapturedAt: now,
               placedAt: now,
               settledGrossReturn: 0,
             },
@@ -414,6 +514,9 @@ export class BetLabTicketService {
           this.stakeLedgerKey(idempotencyKey),
           session,
         );
+        // Capture the post-debit wallet from the same transaction. A separate
+        // read after commit must not turn a committed ticket into an API failure.
+        walletSnapshot = this.walletService.toSnapshot(wallet);
         placementEvent = {
           ticketId: String(createdTicket._id),
           ticketNumber,
@@ -434,7 +537,7 @@ export class BetLabTicketService {
           return {
             ticket: existing,
             alreadyPlaced: true,
-            wallet: await this.walletService.getWallet(userId),
+            wallet: await this.getWalletSnapshotSafely(userId),
           };
         throw new ConflictException(
           'This request was already processed. Generate a new idempotency key for another ticket.',
@@ -444,6 +547,10 @@ export class BetLabTicketService {
     } finally {
       await session.endSession();
     }
+    await this.walletService.dispatchRecentAllowanceNotifications(
+      userId,
+      allowanceNotificationWindowStart,
+    );
     if (!placedTicket)
       throw new ConflictException('Ticket could not be placed');
     if (placementEvent && !alreadyPlaced) {
@@ -456,12 +563,212 @@ export class BetLabTicketService {
         metadata: placementEvent,
       });
     }
-    const wallet = await this.walletService.getWallet(userId);
     return {
       ticket: placedTicket,
       alreadyPlaced,
-      wallet,
+      wallet: walletSnapshot,
     };
+  }
+
+  private async getWalletSnapshotSafely(
+    userId: string,
+  ): Promise<BetLabWalletSnapshot | null> {
+    try {
+      return await this.walletService.getWallet(userId);
+    } catch (error) {
+      this.logger.warn(
+        `Could not refresh Bet Lab wallet snapshot after ticket idempotency recovery for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      try {
+        return await this.walletService.getExistingWalletSnapshot(userId);
+      } catch (fallbackError) {
+        this.logger.error(
+          `Could not read existing Bet Lab wallet snapshot for user ${userId}: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+        );
+        return null;
+      }
+    }
+  }
+
+  private async afterTicketCommitted(
+    userId: string,
+    result: {
+      ticket?: any;
+      alreadyPlaced?: boolean;
+      wallet?: { balance?: number } | null;
+    },
+    eventIds: string[],
+  ): Promise<void> {
+    try {
+      await this.notifyTicketPlacement(userId, result);
+    } catch (error) {
+      this.logger.error(
+        `Bet Lab placement notification failed for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    try {
+      await this.settlementTrigger.onTargetsCreated(
+        [...new Set(eventIds.filter(Boolean))],
+        'BET_LAB_TICKET_CREATED',
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(
+        `Settlement trigger could not be queued for committed Bet Lab ticket(s) belonging to user ${userId}: ${message}`,
+      );
+      try {
+        await this.events.record({
+          level: BetLabEventLevel.ERROR,
+          category: BetLabEventCategory.SETTLEMENT_INTEGRATION,
+          action: 'BET_LAB_TICKET_SETTLEMENT_TRIGGER_FAILED',
+          message: message.slice(0, 2000),
+          userId,
+          metadata: { eventIds: [...new Set(eventIds.filter(Boolean))] },
+        });
+      } catch (eventError) {
+        // Ticket placement and the wallet debit are already committed. A
+        // secondary audit-event failure must not turn that success into an API
+        // error; the recurring Settlement reconciliation will still recover it.
+        this.logger.error(
+          `Could not persist the Bet Lab settlement-handoff audit event for user ${userId}: ${eventError instanceof Error ? eventError.message : String(eventError)}`,
+        );
+      }
+    }
+
+    if (!result.alreadyPlaced && result.ticket) {
+      try {
+        this.adminGateway.publishModuleEvent(
+          'bet-lab',
+          'bet-lab:ticket-placed',
+          {
+            ticketId: String(result.ticket._id ?? ''),
+            status: result.ticket.status,
+            occurredAt: new Date().toISOString(),
+          },
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Admin realtime ticket event could not be published: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  private areSlipPricingsEquivalent(
+    left: BetLabSlipPricing,
+    right: BetLabSlipPricing,
+  ): boolean {
+    const canonicalAdjustments = (items: BetLabSlipPricing['adjustments']) =>
+      [...items]
+        .map((item) => ({
+          eventId: String(item.eventId),
+          group: String(item.group),
+          factor: Number(item.factor),
+        }))
+        .sort((a, b) => `${a.eventId}:${a.group}`.localeCompare(`${b.eventId}:${b.group}`));
+
+    return left.combinedOdds === right.combinedOdds
+      && JSON.stringify(canonicalAdjustments(left.adjustments))
+        === JSON.stringify(canonicalAdjustments(right.adjustments));
+  }
+
+  private async revalidateSelectionQuotes(
+    originalQuotes: Awaited<ReturnType<BetLabTicketService['resolveSelectionQuotes']>>,
+  ): Promise<void> {
+    const requests: BetLabSelectionRequest[] = originalQuotes.map((quote) => ({
+      eventId: String(quote.fixture.eventId),
+      marketCode: quote.market.code,
+      selectionCode: String(quote.selection.code),
+    }));
+    const currentQuotes = await this.resolveSelectionQuotes(requests);
+    if (currentQuotes.length !== originalQuotes.length) {
+      throw new ConflictException(
+        'The selected markets changed while the ticket was being prepared. Refresh the markets and try again.',
+      );
+    }
+
+    for (let index = 0; index < originalQuotes.length; index += 1) {
+      const original = originalQuotes[index];
+      const current = currentQuotes[index];
+      const unchanged = areBetLabOddsSnapshotsIdentical(original, current);
+
+      if (!unchanged || current.isFresh !== true) {
+        throw new ConflictException(
+          'One or more Odds-approved prices, source revisions, market lines or fixture states changed while the ticket was being prepared. Refresh the markets and confirm the updated selections.',
+        );
+      }
+    }
+  }
+
+  private assertQuoteSnapshotsFresh(
+    quotes: Awaited<ReturnType<BetLabTicketService['resolveSelectionQuotes']>>,
+    now: Date,
+  ): void {
+    for (const quote of quotes) {
+      if (quote.isFresh !== true) {
+        throw new ConflictException(
+          'One or more selection prices became stale before the ticket could be committed. Refresh the markets and try again.',
+        );
+      }
+
+      const odds = Number(quote.decimalOdds);
+      if (
+        !Number.isFinite(odds) ||
+        odds < BET_LAB_CONFIG.odds.minimumDecimalOdds ||
+        odds > BET_LAB_CONFIG.odds.maximumDecimalOdds
+      ) {
+        throw new ConflictException(
+          'One or more selection prices are no longer valid.',
+        );
+      }
+
+      if (quote.oddsFreshUntil) {
+        const freshUntil = new Date(quote.oddsFreshUntil);
+        if (
+          Number.isNaN(freshUntil.getTime()) ||
+          freshUntil.getTime() <= now.getTime()
+        ) {
+          throw new ConflictException(
+            'One or more selection prices expired before the ticket could be committed. Refresh the markets and try again.',
+          );
+        }
+      }
+
+      assertBetLabPreMatchFixture(quote.fixture, now);
+    }
+  }
+
+  private async notifyTicketPlacement(
+    userId: string,
+    result: {
+      ticket?: any;
+      alreadyPlaced?: boolean;
+      wallet?: { balance?: number } | null;
+    },
+  ): Promise<void> {
+    if (result.alreadyPlaced || !result.ticket) return;
+    const ticket = result.ticket;
+    const ticketId = String(ticket._id ?? '');
+    if (!ticketId) return;
+    await this.notificationEvents.betLabTicketPlaced({
+      userId,
+      ticketId,
+      ticketNumber: String(ticket.ticketNumber ?? ticketId),
+      ticketType: String(ticket.ticketType ?? 'SINGLE'),
+      stake: Number(ticket.stake ?? 0),
+      combinedOdds: Number(ticket.combinedOdds ?? 0),
+      potentialReturn: Number(ticket.potentialReturn ?? 0),
+      selectionCount: Array.isArray(ticket.legs) ? ticket.legs.length : 1,
+    });
+    await this.notificationEvents.walletDebited({
+      userId,
+      transactionId: ticketId,
+      amount: Number(ticket.stake ?? 0),
+      balanceAfter: Number(result.wallet?.balance ?? 0),
+      description: `Stake for Bet Lab ticket #${String(ticket.ticketNumber ?? ticketId)}.`,
+      source: 'BET_LAB_STAKE',
+    });
   }
 
   private resolveSelectionQuotes(requests: BetLabSelectionRequest[]) {
@@ -510,6 +817,8 @@ export class BetLabTicketService {
               ? {
                   ...selection,
                   decimalOdds: selectedQuote.decimalOdds,
+                  fairProbability: selectedQuote.fairProbability,
+                  impliedProbability: selectedQuote.impliedProbability,
                   available: true,
                   isStale: false,
                 }
@@ -688,6 +997,11 @@ export class BetLabTicketService {
     );
   }
 }
+
+
+
+
+
 
 
 

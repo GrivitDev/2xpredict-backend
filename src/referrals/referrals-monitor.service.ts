@@ -1,14 +1,20 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Referral } from './schemas/referral.schema';
+import { SystemMonitorService } from '../system-monitor/system-monitor.service';
 
 type MonitorCheck = { name: string; status: 'OK' | 'FAILED'; value?: unknown; error?: string };
 
 @Injectable()
-export class ReferralsMonitorService {
+export class ReferralsMonitorService implements OnModuleInit {
+  onModuleInit(): void {
+    this.systemMonitor.registerModule('referrals');
+  }
+
   constructor(
     @InjectModel(Referral.name) private readonly referralModel: Model<Referral>,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   private async safeQuery<T>(checks: MonitorCheck[], name: string, query: () => Promise<T>, fallback: T): Promise<T> {
@@ -23,6 +29,19 @@ export class ReferralsMonitorService {
   }
 
   async getOverview() {
+    try {
+      return await this.buildOverview();
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('referrals', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{ name: 'getOverview', status: 'FAILED', error: error instanceof Error ? error.message : String(error) }],
+      });
+      throw error;
+    }
+  }
+
+  private async buildOverview() {
     const checkedAt = new Date();
     const dayAgo = new Date(checkedAt.getTime() - 24 * 60 * 60 * 1000);
     const checks: MonitorCheck[] = [];
@@ -51,7 +70,7 @@ export class ReferralsMonitorService {
     if (inconsistentSubscriptionFlags > 0) warnings.push(`${inconsistentSubscriptionFlags} referral record(s) show a subscription without registered=true.`);
     if (checks.some((check) => check.status === 'FAILED')) warnings.push('One or more monitoring queries failed.');
 
-    return {
+    const overview = {
       module: 'referrals',
       checkedAt,
       status: !databaseReady || warnings.length ? 'DEGRADED' : 'OK',
@@ -65,5 +84,18 @@ export class ReferralsMonitorService {
       checks,
       warnings,
     };
+    this.systemMonitor.reportMonitorSnapshot('referrals', {
+      status: overview.status,
+      checkedAt,
+      checks,
+      warnings,
+      details: {
+        databaseConnected: databaseReady,
+        totalReferrals: total,
+        registeredReferrals: registered,
+        subscriptionsWithoutRegistration: inconsistentSubscriptionFlags,
+      },
+    });
+    return overview;
   }
 }

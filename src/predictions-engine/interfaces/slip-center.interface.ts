@@ -5,6 +5,8 @@ export interface SlipLegInput {
   homeTeamName: string;
   awayTeamName: string;
   fixtureDate: Date;
+  /** Sports season-relative expiry for this fixture leg. */
+  retentionExpiresAt?: Date | null;
   marketPredictionId: string;
   marketKey: string;
   marketName: string;
@@ -56,4 +58,5 @@ export interface SlipBuildRequest {
   sureOddsTier?: 'VIP' | 'PREMIUM';
   sureOddsProduct?: 'SURE_2' | 'SURE_5' | 'SURE_7';
 }
+
 

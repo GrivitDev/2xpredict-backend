@@ -1,12 +1,19 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
+
+const GEOLOCATION_REQUEST_TIMEOUT_MS = 1_500;
 
 @Injectable()
 export class GeoLocationService {
+  private readonly logger = new Logger(GeoLocationService.name);
+
   async lookup(ip: string) {
     try {
-      // Ignore local development IPs
-      if (ip === '127.0.0.1' || ip === '::1') {
+      const normalizedIp = String(ip ?? '').trim();
+      if (!normalizedIp) return null;
+
+      // Ignore local development IPs.
+      if (normalizedIp === '127.0.0.1' || normalizedIp === '::1') {
         return {
           country: 'Nigeria',
           countryCode: 'NG',
@@ -15,7 +22,8 @@ export class GeoLocationService {
       }
 
       const response = await axios.get(
-        `http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,timezone,isp,org,lat,lon`,
+        `http://ip-api.com/json/${encodeURIComponent(normalizedIp)}?fields=status,country,countryCode,regionName,city,timezone,isp,org,lat,lon`,
+        { timeout: GEOLOCATION_REQUEST_TIMEOUT_MS },
       );
 
       const data = response.data;
@@ -44,9 +52,11 @@ export class GeoLocationService {
         longitude: data.lon,
       };
     } catch (error) {
-      console.error('IP location lookup failed', error.message);
-
+      this.logger.warn(
+        `IP location lookup failed or timed out: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return null;
     }
   }
 }
+

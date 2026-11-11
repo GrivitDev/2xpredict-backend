@@ -20,6 +20,7 @@ import { BetLabWalletLedger } from '../schemas/bet-lab-wallet-ledger.schema';
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 import { BetLabEventService } from './bet-lab-event.service';
 import { BetLabSettingsService } from './bet-lab-settings.service';
+import { NotificationEventsService } from '../../notifications/in-app/notification-events.service';
 
 interface CurrentEntitlement {
   plan: BetLabPlan;
@@ -68,6 +69,7 @@ export class BetLabWalletService {
     private readonly subscriptionsService: SubscriptionsService,
     private readonly events: BetLabEventService,
     private readonly settingsService: BetLabSettingsService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   // Read-only admin inspection. Unlike getWallet(), this never creates a wallet
@@ -79,7 +81,20 @@ export class BetLabWalletService {
     return wallet ? this.toSnapshot(wallet) : null;
   }
 
+  /** Read-only wallet snapshot for an already committed ticket replay. */
+  async getExistingWalletSnapshotInSession(
+    userId: string,
+    session: ClientSession,
+  ): Promise<BetLabWalletSnapshot | null> {
+    const wallet = await this.walletModel
+      .findOne({ userId })
+      .session(session)
+      .exec();
+    return wallet ? this.toSnapshot(wallet) : null;
+  }
+
   async getWallet(userId: string): Promise<BetLabWalletSnapshot> {
+    const allowanceWindowStart = new Date(Date.now() - 1000);
     const entitlement = await this.getCurrentEntitlement(userId);
     const session = await this.walletModel.db.startSession();
     let snapshot: BetLabWalletSnapshot | null = null;
@@ -95,9 +110,11 @@ export class BetLabWalletService {
     } catch (error) {
       if (this.isDuplicateKey(error)) {
         const racedWallet = await this.walletModel.findOne({ userId }).exec();
-        if (racedWallet) return this.toSnapshot(racedWallet);
+        if (racedWallet) snapshot = this.toSnapshot(racedWallet);
+        else throw error;
+      } else {
+        throw error;
       }
-      throw error;
     } finally {
       await session.endSession();
     }
@@ -105,7 +122,78 @@ export class BetLabWalletService {
       throw new InternalServerErrorException(
         'Bet Lab wallet could not be loaded',
       );
+    await this.notifyAllowanceCredits(userId, allowanceWindowStart);
     return snapshot;
+  }
+
+  /**
+   * Queue idempotent notices for allowance ledger entries committed by the caller.
+   * The ledger entry ID is the notification deduplication reference.
+   */
+  async dispatchRecentAllowanceNotifications(
+    userId: string,
+    since: Date,
+  ): Promise<void> {
+    await this.notifyAllowanceCredits(userId, since);
+  }
+
+  private async notifyAllowanceCredits(
+    userId: string,
+    since: Date,
+  ): Promise<void> {
+    try {
+      const entries = await this.ledgerModel
+        .find({
+          userId,
+          createdAt: { $gte: since },
+          transactionType: {
+            $in: [
+              BetLabLedgerType.REGISTRATION_BONUS,
+              BetLabLedgerType.MONTHLY_ALLOWANCE,
+              BetLabLedgerType.MONTHLY_ALLOWANCE_EXPIRY,
+            ],
+          },
+          delta: { $ne: 0 },
+        })
+        .sort({ createdAt: 1 })
+        .limit(10)
+        .lean()
+        .exec();
+
+      for (const entry of entries) {
+        const createdAt = (entry as { createdAt?: Date | string | number })
+          .createdAt;
+        if (
+          entry.transactionType === BetLabLedgerType.MONTHLY_ALLOWANCE_EXPIRY &&
+          Number(entry.delta) < 0
+        ) {
+          await this.notificationEvents.walletAllowanceExpired({
+            userId,
+            transactionId: String(entry._id),
+            amount: Math.abs(Number(entry.delta)),
+            expiredAt: createdAt ? new Date(createdAt) : undefined,
+          });
+          continue;
+        }
+        if (Number(entry.delta) > 0) {
+          await this.notificationEvents.walletCredited({
+            userId,
+            transactionId: String(entry._id),
+            amount: Number(entry.delta),
+            balanceAfter: Number(entry.balanceAfter),
+            description: String(
+              entry.description ?? 'Bet Lab virtual points allowance',
+            ),
+            source: String(entry.transactionType),
+          });
+        }
+      }
+    } catch (error) {
+      // Notification lookup/delivery must never break a committed wallet action.
+      this.logger.warn(
+        `Could not queue Bet Lab allowance notifications for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**
@@ -129,14 +217,11 @@ export class BetLabWalletService {
       const welcome = virtualPointsSettings.registrationBonus;
       const monthly =
         virtualPointsSettings.monthlyAllowanceByPlan[entitlement.plan];
-      const periodStart =
-        entitlement.periodStart && entitlement.periodStart <= now
-          ? entitlement.periodStart
-          : now;
-      const periodEnd =
-        entitlement.periodEnd && entitlement.periodEnd > now
-          ? entitlement.periodEnd
-          : this.addDays(now, BET_LAB_CONFIG.virtualPoints.allowancePeriodDays);
+      const allowanceWindow = this.getAllowanceWindow(
+        now,
+        entitlement.periodStart,
+      );
+      const { periodStart, periodEnd } = allowanceWindow;
       const initialBalance = welcome + monthly;
       const createdWallets = await this.walletModel.create(
         [
@@ -210,11 +295,33 @@ export class BetLabWalletService {
       return wallet;
     }
 
-    // Old wallet documents predate the bonus bucket; Mongoose's schema default
-    // plus this normalization keeps their existing ledger balance valid.
+    // Older wallets may not contain the bonus bucket or may have allowance
+    // windows that were tied to a full subscription expiry. Normalize the
+    // accounting buckets and restore the configured 30-day allowance cadence.
     if (wallet.bonusBalance == null) wallet.bonusBalance = 0;
+
+    const periodMs =
+      BET_LAB_CONFIG.virtualPoints.allowancePeriodDays * 24 * 60 * 60 * 1000;
+    const storedPeriodStart = this.toValidDate(wallet.monthlyPeriodStart);
+    const periodStart =
+      storedPeriodStart && storedPeriodStart.getTime() <= now.getTime()
+        ? storedPeriodStart
+        : new Date(now.getTime() - periodMs);
+    const periodEnd = this.addDays(
+      periodStart,
+      BET_LAB_CONFIG.virtualPoints.allowancePeriodDays,
+    );
+    const periodMetadataChanged =
+      !storedPeriodStart ||
+      storedPeriodStart.getTime() !== periodStart.getTime() ||
+      !this.toValidDate(wallet.monthlyPeriodEnd) ||
+      this.toValidDate(wallet.monthlyPeriodEnd)!.getTime() !==
+        periodEnd.getTime();
+    wallet.monthlyPeriodStart = periodStart;
+    wallet.monthlyPeriodEnd = periodEnd;
+
     this.assertWalletInvariant(wallet, userId);
-    if (wallet.monthlyPeriodEnd.getTime() <= now.getTime()) {
+    if (periodEnd.getTime() <= now.getTime()) {
       const oldBalance = wallet.balance;
       const expiredMonthly = wallet.monthlyBalance;
       wallet.monthlyBalance = 0;
@@ -232,9 +339,9 @@ export class BetLabWalletService {
               amount: expiredMonthly,
               balanceBefore: oldBalance,
               balanceAfter: wallet.balance,
-              idempotencyKey: `ALLOWANCE_EXPIRY:${userId}:${this.periodKey(wallet.monthlyPeriodStart, wallet.monthlyPeriodEnd)}`,
+              idempotencyKey: `ALLOWANCE_EXPIRY:${userId}:${this.periodKey(periodStart, periodEnd)}`,
               description: 'Unused monthly virtual credits expired',
-              metadata: { expiredMonthly },
+              metadata: { expiredMonthly, periodStart, periodEnd },
             },
           ],
           { session, ordered: true },
@@ -243,21 +350,18 @@ export class BetLabWalletService {
 
       const monthly =
         virtualPointsSettings.monthlyAllowanceByPlan[entitlement.plan];
-      const periodStart =
-        entitlement.periodStart && entitlement.periodStart <= now
-          ? entitlement.periodStart
-          : now;
-      const periodEnd =
-        entitlement.periodEnd && entitlement.periodEnd > now
-          ? entitlement.periodEnd
-          : this.addDays(now, BET_LAB_CONFIG.virtualPoints.allowancePeriodDays);
+      const nextWindow = this.getAllowanceWindow(
+        now,
+        entitlement.periodStart,
+      );
       const beforeGrant = wallet.balance;
       wallet.monthlyBalance = monthly;
       wallet.balance = this.calculateBalance(wallet);
       wallet.monthlyAllowanceAmount = monthly;
       wallet.monthlyAllowancePlan = entitlement.plan;
-      wallet.monthlyPeriodStart = periodStart;
-      wallet.monthlyPeriodEnd = periodEnd;
+      wallet.monthlyPeriodStart = nextWindow.periodStart;
+      wallet.monthlyPeriodEnd = nextWindow.periodEnd;
+      this.assertWalletInvariant(wallet, userId);
       await wallet.save({ session });
       await this.ledgerModel.create(
         [
@@ -270,9 +374,13 @@ export class BetLabWalletService {
             amount: monthly,
             balanceBefore: beforeGrant,
             balanceAfter: wallet.balance,
-            idempotencyKey: `ALLOWANCE:${userId}:${this.periodKey(periodStart, periodEnd)}`,
+            idempotencyKey: `ALLOWANCE:${userId}:${this.periodKey(nextWindow.periodStart, nextWindow.periodEnd)}`,
             description: `${entitlement.plan} Bet Lab allowance`,
-            metadata: { plan: entitlement.plan, periodStart, periodEnd },
+            metadata: {
+              plan: entitlement.plan,
+              periodStart: nextWindow.periodStart,
+              periodEnd: nextWindow.periodEnd,
+            },
           },
         ],
         { session, ordered: true },
@@ -287,6 +395,10 @@ export class BetLabWalletService {
         metadata: { plan: entitlement.plan, expiredMonthly, monthly },
       });
       return wallet;
+    }
+
+    if (periodMetadataChanged) {
+      await wallet.save({ session });
     }
     // If an entitlement becomes effective or upgrades during the current monthly
     // period (for example, after email verification activates a Premium bonus),
@@ -305,6 +417,7 @@ export class BetLabWalletService {
       wallet.monthlyAllowanceAmount = targetMonthlyAllowance;
       wallet.monthlyAllowancePlan = entitlement.plan;
       wallet.balance = this.calculateBalance(wallet);
+      this.assertWalletInvariant(wallet, userId);
       await wallet.save({ session });
       await this.ledgerModel.create(
         [
@@ -334,33 +447,32 @@ export class BetLabWalletService {
   }
 
   async getCurrentEntitlement(userId: string): Promise<CurrentEntitlement> {
-    const now = new Date();
-    const [subscription, bonus] = await Promise.all([
-      this.subscriptionsService.getActiveSubscription(userId),
-      this.subscriptionsService.getActiveSubscriptionBonus(userId),
-    ]);
-    const paidPlan = this.normalizePlan(subscription?.plan);
-    const bonusPlan = this.normalizePlan(bonus?.plan);
-    const rank: Record<BetLabPlan, number> = {
-      free: 0,
-      regular: 1,
-      vip: 2,
-      premium: 3,
-    };
-    const useBonus = rank[bonusPlan] > rank[paidPlan];
-    const plan = useBonus ? bonusPlan : paidPlan;
+    const entitlement =
+      await this.subscriptionsService.getEffectiveEntitlement(userId);
+    const plan = this.normalizePlan(entitlement.plan);
+    const subscription = entitlement.subscription;
+    const bonus = entitlement.bonus;
+
+    // Preserve the wallet's existing allowance-window rule: when a paid term
+    // and a bonus provide the same effective tier, use their combined window.
+    // When the bonus is a higher tier, the lower paid tier is not part of it.
     const matchingEnds = [
-      subscription && paidPlan === plan
+      subscription && this.normalizePlan(subscription.plan) === plan
         ? new Date(subscription.expiryDate)
         : undefined,
-      bonus && bonusPlan === plan ? new Date(bonus.expiresAt) : undefined,
+      bonus && this.normalizePlan(bonus.plan) === plan
+        ? new Date(bonus.expiresAt)
+        : undefined,
     ].filter((date): date is Date => Boolean(date));
     const matchingStarts = [
-      subscription && paidPlan === plan
+      subscription && this.normalizePlan(subscription.plan) === plan
         ? new Date(subscription.startDate)
         : undefined,
-      bonus && bonusPlan === plan ? new Date(bonus.startsAt) : undefined,
+      bonus && this.normalizePlan(bonus.plan) === plan
+        ? new Date(bonus.startsAt)
+        : undefined,
     ].filter((date): date is Date => Boolean(date));
+
     return {
       plan,
       periodStart: matchingStarts.length
@@ -379,19 +491,25 @@ export class BetLabWalletService {
     reason: string,
     bonusGrantId: string,
   ): Promise<BetLabWalletSnapshot> {
+    const allowanceWindowStart = new Date(Date.now() - 1000);
     if (!Number.isSafeInteger(points) || points < 1) {
       throw new ConflictException(
         'Bonus points must be a positive whole number.',
       );
     }
+    const normalizedGrantId = String(bonusGrantId ?? '').trim();
+    if (!normalizedGrantId || normalizedGrantId.length > 160) {
+      throw new ConflictException('A valid bonus grant reference is required.');
+    }
+    const safeReason = String(reason ?? '').trim().slice(0, 300) || 'Admin Bet Lab bonus credit';
     const entitlement = await this.getCurrentEntitlement(userId);
     const session = await this.walletModel.db.startSession();
     let result: BetLabWalletSnapshot | null = null;
     try {
       await session.withTransaction(async () => {
-        const key = `BONUS_GRANT:${bonusGrantId}`;
+        const key = `BONUS_GRANT:${normalizedGrantId}`;
         const prior = await this.ledgerModel
-          .findOne({ idempotencyKey: key })
+          .findOne({ userId, idempotencyKey: key })
           .session(session)
           .lean()
           .exec();
@@ -401,11 +519,27 @@ export class BetLabWalletService {
           session,
         );
         wallet.bonusBalance = wallet.bonusBalance ?? 0;
-        if (!prior) {
-          this.assertWalletInvariant(wallet, userId);
+        this.assertWalletInvariant(wallet, userId);
+        if (prior) {
+          const priorBucket = String(prior.bucket ?? '').toUpperCase();
+          if (
+            prior.userId !== userId ||
+            prior.transactionType !== BetLabLedgerType.ADMIN_ADJUSTMENT ||
+            !['BONUS', 'SYSTEM'].includes(priorBucket) ||
+            Number(prior.delta) !== points ||
+            Number(prior.amount) !== points ||
+            prior.metadata?.kind !== 'BET_LAB_POINTS_BONUS' ||
+            String(prior.metadata?.bonusGrantId ?? '') !== normalizedGrantId
+          ) {
+            throw new ConflictException(
+              'This bonus grant reference has already been used for a different credit.',
+            );
+          }
+        } else {
           const before = wallet.balance;
           wallet.bonusBalance += points;
           wallet.balance = this.calculateBalance(wallet);
+          this.assertWalletInvariant(wallet, userId);
           await wallet.save({ session });
           await this.ledgerModel.create(
             [
@@ -413,14 +547,17 @@ export class BetLabWalletService {
                 userId,
                 walletId: String(wallet._id),
                 transactionType: BetLabLedgerType.ADMIN_ADJUSTMENT,
-                bucket: BetLabCreditBucket.SYSTEM,
+                bucket: BetLabCreditBucket.BONUS,
                 delta: points,
                 amount: points,
                 balanceBefore: before,
                 balanceAfter: wallet.balance,
                 idempotencyKey: key,
-                description: reason.slice(0, 300),
-                metadata: { bonusGrantId, kind: 'BET_LAB_POINTS_BONUS' },
+                description: safeReason,
+                metadata: {
+                  bonusGrantId: normalizedGrantId,
+                  kind: 'BET_LAB_POINTS_BONUS',
+                },
               },
             ],
             { session, ordered: true },
@@ -428,12 +565,6 @@ export class BetLabWalletService {
         }
         result = this.toSnapshot(wallet);
       });
-    } catch (error) {
-      // A duplicate key can be a concurrent wallet-creation race. Do not report
-      // success from the existing wallet: the transaction may have rolled back
-      // before crediting this grant. Leave the grant pending so an idempotent
-      // retry can observe the ledger key and safely complete the operation.
-      throw error;
     } finally {
       await session.endSession();
     }
@@ -441,24 +572,44 @@ export class BetLabWalletService {
       throw new InternalServerErrorException(
         'Bonus credit could not be completed.',
       );
+    await this.notifyAllowanceCredits(userId, allowanceWindowStart);
     return result;
   }
 
-  /** Reverses a points grant only when the complete grant remains in the bonus bucket. */
+  /** Reverses a grant only when the aggregate bonus bucket can cover its full amount. */
   async revokeAdminBonusPoints(
     userId: string,
     points: number,
     reason: string,
     bonusGrantId: string,
   ): Promise<BetLabWalletSnapshot> {
+    const allowanceWindowStart = new Date(Date.now() - 1000);
+    if (!Number.isSafeInteger(points) || points < 1) {
+      throw new ConflictException(
+        'Bonus reversal points must be a positive whole number.',
+      );
+    }
+    const normalizedGrantId = String(bonusGrantId ?? '').trim();
+    if (!normalizedGrantId || normalizedGrantId.length > 160) {
+      throw new ConflictException('A valid bonus grant reference is required.');
+    }
+    const safeReason = String(reason ?? '').trim().slice(0, 300) || 'Admin Bet Lab bonus reversal';
     const entitlement = await this.getCurrentEntitlement(userId);
     const session = await this.walletModel.db.startSession();
     let result: BetLabWalletSnapshot | null = null;
     try {
       await session.withTransaction(async () => {
-        const key = `BONUS_REVOCATION:${bonusGrantId}`;
+        const key = `BONUS_REVOCATION:${normalizedGrantId}`;
         const prior = await this.ledgerModel
-          .findOne({ idempotencyKey: key })
+          .findOne({ userId, idempotencyKey: key })
+          .session(session)
+          .lean()
+          .exec();
+        const originalGrant = await this.ledgerModel
+          .findOne({
+            userId,
+            idempotencyKey: `BONUS_GRANT:${normalizedGrantId}`,
+          })
           .session(session)
           .lean()
           .exec();
@@ -468,16 +619,46 @@ export class BetLabWalletService {
           session,
         );
         wallet.bonusBalance = wallet.bonusBalance ?? 0;
+        this.assertWalletInvariant(wallet, userId);
+        const originalBucket = String(originalGrant?.bucket ?? '').toUpperCase();
+        if (
+          !originalGrant ||
+          originalGrant.transactionType !== BetLabLedgerType.ADMIN_ADJUSTMENT ||
+          !['BONUS', 'SYSTEM'].includes(originalBucket) ||
+          Number(originalGrant.delta) !== points ||
+          Number(originalGrant.amount) !== points ||
+          originalGrant.metadata?.kind !== 'BET_LAB_POINTS_BONUS' ||
+          String(originalGrant.metadata?.bonusGrantId ?? '') !== normalizedGrantId
+        ) {
+          throw new ConflictException(
+            'The original bonus grant could not be verified for this user and amount.',
+          );
+        }
+        const priorBucket = String(prior?.bucket ?? '').toUpperCase();
+        if (
+          prior &&
+          (prior.userId !== userId ||
+            prior.transactionType !== BetLabLedgerType.ADMIN_ADJUSTMENT ||
+            !['BONUS', 'SYSTEM'].includes(priorBucket) ||
+            Number(prior.delta) !== -points ||
+            Number(prior.amount) !== points ||
+            prior.metadata?.kind !== 'BET_LAB_POINTS_BONUS_REVERSAL' ||
+            String(prior.metadata?.bonusGrantId ?? '') !== normalizedGrantId)
+        ) {
+          throw new ConflictException(
+            'This bonus reversal reference has already been used for a different reversal.',
+          );
+        }
         if (!prior) {
-          this.assertWalletInvariant(wallet, userId);
           if (wallet.bonusBalance < points) {
             throw new ConflictException(
-              'This bonus has already been spent in part or in full and cannot be automatically reversed.',
+              'The bonus bucket no longer contains enough unspent credits to reverse this grant.',
             );
           }
           const before = wallet.balance;
           wallet.bonusBalance -= points;
           wallet.balance = this.calculateBalance(wallet);
+          this.assertWalletInvariant(wallet, userId);
           await wallet.save({ session });
           await this.ledgerModel.create(
             [
@@ -485,15 +666,15 @@ export class BetLabWalletService {
                 userId,
                 walletId: String(wallet._id),
                 transactionType: BetLabLedgerType.ADMIN_ADJUSTMENT,
-                bucket: BetLabCreditBucket.SYSTEM,
+                bucket: BetLabCreditBucket.BONUS,
                 delta: -points,
                 amount: points,
                 balanceBefore: before,
                 balanceAfter: wallet.balance,
                 idempotencyKey: key,
-                description: `Bonus reversal: ${reason}`.slice(0, 300),
+                description: `Bonus reversal: ${safeReason}`.slice(0, 300),
                 metadata: {
-                  bonusGrantId,
+                  bonusGrantId: normalizedGrantId,
                   kind: 'BET_LAB_POINTS_BONUS_REVERSAL',
                 },
               },
@@ -510,6 +691,7 @@ export class BetLabWalletService {
       throw new InternalServerErrorException(
         'Bonus reversal could not be completed.',
       );
+    await this.notifyAllowanceCredits(userId, allowanceWindowStart);
     return result;
   }
 
@@ -528,6 +710,9 @@ export class BetLabWalletService {
       throw new ConflictException(
         'Stake must be a positive whole number of virtual points.',
       );
+    }
+    if (!String(idempotencyKey ?? '').trim()) {
+      throw new ConflictException('A wallet stake idempotency key is required.');
     }
     this.assertWalletInvariant(wallet, userId);
     if (wallet.balance < stake)
@@ -568,6 +753,7 @@ export class BetLabWalletService {
     wallet.netProfitLoss = wallet.totalReturns - wallet.totalStaked;
     wallet.ticketsPlaced += 1;
     wallet.lastTicketAt = new Date();
+    this.assertWalletInvariant(wallet, userId);
     await wallet.save({ session });
     await this.ledgerModel.create(
       [
@@ -608,6 +794,17 @@ export class BetLabWalletService {
         'Settlement supplied an invalid gross return.',
       );
     }
+    if (!String(ticketId ?? '').trim() || !String(settlementId ?? '').trim()) {
+      throw new ConflictException(
+        'A ticket ID and settlement ID are required for wallet settlement.',
+      );
+    }
+    if (
+      ledgerType !== BetLabLedgerType.SETTLEMENT_RETURN &&
+      ledgerType !== BetLabLedgerType.VOID_OR_PUSH_RETURN
+    ) {
+      throw new ConflictException('Invalid Bet Lab settlement ledger type.');
+    }
     this.assertWalletInvariant(wallet, userId);
     const balanceBefore = wallet.balance;
     if (grossReturn > 0) {
@@ -615,6 +812,7 @@ export class BetLabWalletService {
       wallet.balance = this.calculateBalance(wallet);
       wallet.totalReturns += grossReturn;
       wallet.netProfitLoss = wallet.totalReturns - wallet.totalStaked;
+      this.assertWalletInvariant(wallet, userId);
       await wallet.save({ session });
     }
     await this.ledgerModel.create(
@@ -765,8 +963,20 @@ export class BetLabWalletService {
     },
     userId: string,
   ): void {
+    const buckets = [
+      wallet.welcomeBalance,
+      wallet.monthlyBalance,
+      wallet.bonusBalance ?? 0,
+      wallet.winningsBalance,
+    ];
+    const bucketsValid = buckets.every(
+      (value) => Number.isSafeInteger(value) && value >= 0,
+    );
     const calculated = this.calculateBalance(wallet);
     if (
+      !bucketsValid ||
+      !Number.isSafeInteger(wallet.balance) ||
+      wallet.balance < 0 ||
       !Number.isSafeInteger(calculated) ||
       calculated < 0 ||
       wallet.balance !== calculated
@@ -791,6 +1001,44 @@ export class BetLabWalletService {
     return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
   }
 
+  private toValidDate(value: unknown): Date | null {
+    if (value instanceof Date) {
+      return Number.isNaN(value.getTime()) ? null : value;
+    }
+    if (typeof value === 'string' || typeof value === 'number') {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+    return null;
+  }
+
+  /**
+   * Produces a rolling 30-day allowance window anchored to the effective
+   * entitlement start where available. Subscription expiry must never extend a
+   * single monthly allowance across multiple months.
+   */
+  private getAllowanceWindow(
+    now: Date,
+    entitlementStart?: Date,
+  ): { periodStart: Date; periodEnd: Date } {
+    const periodDays = BET_LAB_CONFIG.virtualPoints.allowancePeriodDays;
+    const periodMs = periodDays * 24 * 60 * 60 * 1000;
+    const validAnchor = this.toValidDate(entitlementStart);
+    const anchor =
+      validAnchor && validAnchor.getTime() <= now.getTime()
+        ? validAnchor
+        : now;
+    const elapsed = Math.max(0, now.getTime() - anchor.getTime());
+    const completedPeriods = Math.floor(elapsed / periodMs);
+    const periodStart = new Date(
+      anchor.getTime() + completedPeriods * periodMs,
+    );
+    return {
+      periodStart,
+      periodEnd: this.addDays(periodStart, periodDays),
+    };
+  }
+
   private periodKey(start: Date, end: Date): string {
     return `${start.getTime()}-${end.getTime()}`;
   }
@@ -804,3 +1052,4 @@ export class BetLabWalletService {
     );
   }
 }
+

@@ -7,22 +7,6 @@ import { OddsModule } from '../odds/odds.module';
 import { SportsModule } from '../sports/sports.module';
 import { MongooseModule } from '@nestjs/mongoose';
 
-import {
-  ActiveCompetition,
-  ActiveCompetitionSchema,
-} from '../sports/schemas/active-competition.schema';
-import {
-  EspnFixture,
-  EspnFixtureSchema,
-} from '../sports/schemas/espn/espn-fixture.schema';
-import {
-  EspnTeam,
-  EspnTeamSchema,
-} from '../sports/schemas/espn/espn-team.schema';
-import {
-  EspnStanding,
-  EspnStandingSchema,
-} from '../sports/schemas/espn/espn-standing.schema';
 
 import { PredictionEngineController } from './controllers/prediction-engine.controller';
 import { PredictionsReadController } from './controllers/predictions-read.controller';
@@ -75,6 +59,7 @@ import { PickCenterService } from './services/pick-center.service';
 import { SlipCenterService } from './services/slip-center.service';
 import { CuratedPredictionService } from './services/curated-prediction.service';
 import { MarketCalibrationService } from './services/market-calibration.service';
+import { PredictionRetentionService } from './services/prediction-retention.service';
 
 import { ResultMarketEngine } from './services/market-engines/result-market.engine';
 import { GoalsMarketEngine } from './services/market-engines/goals-market.engine';
@@ -94,10 +79,6 @@ import { SettlementModule } from '../settlement/settlement.module';
     SportsModule,
     SettlementModule,
     MongooseModule.forFeature([
-      { name: EspnFixture.name, schema: EspnFixtureSchema },
-      { name: EspnTeam.name, schema: EspnTeamSchema },
-      { name: EspnStanding.name, schema: EspnStandingSchema },
-      { name: ActiveCompetition.name, schema: ActiveCompetitionSchema },
       { name: MarketPrediction.name, schema: MarketPredictionSchema },
       { name: PredictionRun.name, schema: PredictionRunSchema },
       { name: PredictionQueue.name, schema: PredictionQueueSchema },
@@ -129,6 +110,7 @@ import { SettlementModule } from '../settlement/settlement.module';
     SlipCenterService,
     CuratedPredictionService,
     MarketCalibrationService,
+    PredictionRetentionService,
     ResultMarketEngine,
     GoalsMarketEngine,
     PeriodMarketEngine,
@@ -155,6 +137,8 @@ import { SettlementModule } from '../settlement/settlement.module';
   ],
 })
 export class PredictionsEngineModule {}
+
+
 
 
 

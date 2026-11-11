@@ -1,322 +1,850 @@
-import { Injectable } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnApplicationBootstrap,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
-import { FixtureOdds } from '../schemas/fixture-odds.schema';
-import { OddsProviderCache } from '../schemas/odds-provider-cache.schema';
-import { OddsProviderState } from '../schemas/odds-provider-state.schema';
-import { TheOddsApiService } from '../providers/the-odds-api.service';
+
 import {
-  FOOTBALL_MARKET_CATALOG,
-  expandCanonicalSelections,
-} from '../catalog/football-market-catalog';
+  ModuleHealthStatus,
+  SystemMonitorService,
+} from '../../system-monitor/system-monitor.service';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import { FOOTBALL_MARKET_CATALOG } from '../catalog/football-market-catalog';
+import { ODDS_CONFIG } from '../config/odds.config';
+import { FixtureOdds } from '../schemas/fixture-odds.schema';
+import { OddsService } from './odds.service';
 import { OddsWorkerService } from './odds-worker.service';
 
-type CheckStatus = 'OK' | 'WARN' | 'FAIL' | 'UNKNOWN';
-type Check = {
-  name: string;
-  status: CheckStatus;
+const MINUTE = 60_000;
+const STARTUP_GRACE_MS = 2 * MINUTE;
+const PRICING_QUEUE_WARNING_AGE_MS = 5 * MINUTE;
+const PRICING_QUEUE_CRITICAL_AGE_MS = 15 * MINUTE;
+const MAX_FIXTURE_SAMPLE = 80;
+const ACTIVE_EXPIRY_FILTER = (now: Date) => ({
+  $or: [{ expiresAt: { $exists: false } }, { expiresAt: { $gt: now } }],
+});
+
+interface OddsMonitorAlert {
+  code: string;
+  severity: 'WARNING' | 'CRITICAL';
   message: string;
-  value?: unknown;
-};
+  count?: number;
+  details?: Record<string, unknown>;
+}
 
-type FixtureSample = { eventId?: unknown };
-type InventoryRow = { [key: string]: unknown };
-type CacheStatsRow = {
-  total?: number;
-  expired?: number;
-  latestFetchedAt?: Date | string;
-  [key: string]: unknown;
-};
-type ProviderState = {
-  status?: string;
-  requestsToday?: number;
-  blockedUntil?: Date | string | null;
-  providerRequestsRemaining?: unknown;
-  providerRequestsUsed?: unknown;
-  providerLastRequestCost?: unknown;
-  lastRequestAt?: unknown;
-  nextAllowedAt?: unknown;
-  message?: unknown;
-};
-type UpcomingPriceRow = {
-  _id: string;
-  prices?: number;
-  providerPrices?: number;
-  readyPrices?: number;
-};
-type WorkerMonitorStatus = {
-  running: boolean;
-  stopping: boolean;
-  lastCycleCompletedAt?: Date | string | null;
-  lastCycleError?: unknown;
-  [key: string]: unknown;
-};
-type IndexGroup = {
-  declared: string[];
-  actual: string[];
-  missing: string[];
-  verification: string;
-};
-type IndexStatus = {
-  fixtureOdds: IndexGroup;
-  providerState: IndexGroup;
-  providerCache: IndexGroup;
-};
+interface CountSummary {
+  totalSelections: number;
+  freshProviderSelections: number;
+  staleProviderSelections: number;
+  freshEstimatedSelections: number;
+  staleEstimatedSelections: number;
+  currentModelVersionSelections: number;
+  outdatedModelVersionSelections: number;
+  missingSourceHashSelections: number;
+  missingFixtureSourceRevisionSelections: number;
+  invalidDecimalOddsSelections: number;
+  averageDataQuality: number | null;
+}
 
+/**
+ * Read-only operational monitor for Sports-backed Odds calculation and pricing.
+ * It does not collect provider data, alter quotes, or enqueue pricing work.
+ */
 @Injectable()
-export class OddsMonitorService {
-  private readonly staleProviderPriceMs = 6 * 60 * 60_000;
-  private readonly upcomingWindowMs = 72 * 60 * 60_000;
-  private readonly upcomingFixtureSampleLimit = 2000;
-  private readonly overviewCacheMs = 15_000;
-  private overviewCache?: { cachedAt: number; value: Record<string, unknown> };
+export class OddsMonitorService
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
+  private readonly logger = new Logger(OddsMonitorService.name);
+  private readonly monitorIntervalMs = this.readPositiveInteger(
+    process.env.ODDS_MONITOR_INTERVAL_MS,
+    60_000,
+  );
+  private readonly cacheTtlMs = 15_000;
+  private stopped = false;
+  private timer?: ReturnType<typeof setTimeout>;
+  private startedAt?: Date;
+  private lastCheckAt?: Date;
+  private lastSuccessfulCheckAt?: Date;
+  private lastCheckError?: string;
+  private cachedOverview?: {
+    at: number;
+    value: Record<string, unknown>;
+  };
+  private probePromise?: Promise<Record<string, unknown>>;
 
   constructor(
-    @InjectModel(EspnFixture.name)
-    private readonly fixtureModel: Model<EspnFixture>,
     @InjectModel(FixtureOdds.name)
     private readonly oddsModel: Model<FixtureOdds>,
-    @InjectModel(OddsProviderState.name)
-    private readonly providerStateModel: Model<OddsProviderState>,
-    @InjectModel(OddsProviderCache.name)
-    private readonly providerCacheModel: Model<OddsProviderCache>,
-    private readonly oddsApi: TheOddsApiService,
+    private readonly oddsService: OddsService,
     private readonly worker: OddsWorkerService,
+    private readonly sportsRead: SportsDomainReadService,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
-  async getOverview() {
-    const cached = this.overviewCache;
-    if (cached && Date.now() - cached.cachedAt < this.overviewCacheMs) {
-      return { ...cached.value, cached: true };
-    }
-    const generatedAt = new Date();
-    const checks: Check[] = [];
-    const failures: string[] = [];
-    const warnings: string[] = [];
-    const dbReady = Number(this.fixtureModel.db.readyState) === 1;
+  onApplicationBootstrap(): void {
+    this.stopped = false;
+    this.startedAt = new Date();
+    this.systemMonitor.registerModule('odds', 'deep', false);
+    this.systemMonitor.reportMonitorSnapshot('odds', {
+      status: 'UNKNOWN',
+      checkedAt: this.startedAt,
+    });
+    this.schedule(10_000);
+  }
 
-    checks.push({
-      name: 'mongodb_connection',
-      status: dbReady ? 'OK' : 'FAIL',
-      message: dbReady
-        ? 'Odds module MongoDB connection is ready.'
-        : `MongoDB connection is not ready (readyState=${this.fixtureModel.db.readyState}).`,
-      value: { readyState: this.fixtureModel.db.readyState },
+  onModuleDestroy(): void {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+
+  /** Returns a cached operational snapshot unless refresh=true is requested. */
+  async getOverview(forceRefresh = false): Promise<Record<string, unknown>> {
+    if (
+      !forceRefresh &&
+      this.cachedOverview &&
+      Date.now() - this.cachedOverview.at < this.cacheTtlMs
+    ) {
+      return { ...this.cachedOverview.value, cached: true };
+    }
+
+    if (this.probePromise) {
+      if (this.cachedOverview) {
+        return {
+          ...this.cachedOverview.value,
+          cached: true,
+          refreshInProgress: true,
+        };
+      }
+      const current = await this.probePromise;
+      return { ...current, cached: true };
+    }
+
+    return this.refreshOverview();
+  }
+
+  private schedule(delayMs: number): void {
+    if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.runScheduledCheck();
+    }, Math.max(1_000, delayMs));
+    (this.timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  private async runScheduledCheck(): Promise<void> {
+    try {
+      await this.refreshOverview();
+    } catch (error) {
+      this.logger.error(
+        `Odds health probe failed: ${this.errorMessage(error)}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    } finally {
+      this.schedule(this.monitorIntervalMs);
+    }
+  }
+
+  private async refreshOverview(): Promise<Record<string, unknown>> {
+    if (this.probePromise) return this.probePromise;
+
+    const pending = this.collectAndReportOverview();
+    this.probePromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.probePromise === pending) this.probePromise = undefined;
+    }
+  }
+
+  private async collectAndReportOverview(): Promise<Record<string, unknown>> {
+    const checkedAt = new Date();
+    this.lastCheckAt = checkedAt;
+
+    try {
+      const overview = await this.collectOverview(checkedAt);
+      this.cachedOverview = { at: Date.now(), value: overview };
+      this.lastSuccessfulCheckAt = checkedAt;
+      this.lastCheckError = undefined;
+      this.publishHealth(overview, checkedAt);
+      return { ...overview, cached: false };
+    } catch (error) {
+      const message = this.errorMessage(error).slice(0, 500);
+      this.lastCheckError = message;
+
+      const workerStatus = this.worker.getMonitorStatus();
+      this.systemMonitor.reportMonitorSnapshot('odds', {
+        status: 'FAILED',
+        checkedAt,
+        checks: [{
+          name: 'health-probe',
+          status: 'FAILED',
+          error: message,
+        }],
+        details: {
+          lastSuccessfulCheckAt:
+            this.lastSuccessfulCheckAt?.toISOString() ?? 'NEVER',
+          workerInitialized: Boolean(workerStatus.initialized),
+          workerRunning: Boolean(workerStatus.running),
+        },
+      });
+
+      const failedOverview = {
+        generatedAt: checkedAt.toISOString(),
+        status: 'FAILED',
+        message: `Odds operational health probe failed: ${message}`,
+        monitor: this.monitorMetadata(),
+        worker: this.worker.getMonitorStatus(),
+        alerts: [
+          {
+            code: 'ODDS_HEALTH_PROBE_FAILED',
+            severity: 'CRITICAL',
+            message,
+          },
+        ],
+        cached: false,
+      };
+      this.cachedOverview = { at: Date.now(), value: failedOverview };
+      return failedOverview;
+    }
+  }
+
+  private async collectOverview(
+    checkedAt: Date,
+  ): Promise<Record<string, unknown>> {
+    const now = checkedAt;
+    const worker = this.worker.getMonitorStatus();
+    const [inventoryAndQuality, indexResult, sportsCoverage, pricingQueue] =
+      await Promise.all([
+        this.getInventoryAndQuality(now),
+        this.readIndexes(),
+        this.getSportsCoverage(now),
+        this.worker.getQueueMonitorStatus(),
+      ]);
+    const inventory = inventoryAndQuality.inventory;
+    const quality = inventoryAndQuality.quality;
+
+    const indexNames = new Set(indexResult.indexes.map((item) => item.name));
+    const expectedIndexes = [
+      {
+        name: 'uniq_fixture_market_selection_line',
+        critical: true,
+        description: 'Prevents duplicate canonical selection prices.',
+      },
+      {
+        name: 'ttl_fixture_odds_expiry',
+        critical: false,
+        description: 'Expires Grivit prices at the Sports fixture season-relative retention deadline.',
+      },
+      {
+        name: 'fixture_odds_readiness_lookup',
+        critical: false,
+        description: 'Supports event-level prediction-readiness lookups.',
+      },
+      {
+        name: 'fixture_odds_market_lookup',
+        critical: false,
+        description: 'Supports fixture and market price retrieval.',
+      },
+    ];
+    const indexChecks = expectedIndexes.map((expected) => {
+      const present = indexNames.has(expected.name);
+      return {
+        name: expected.name,
+        present,
+        critical: expected.critical,
+        description: expected.description,
+        status: present ? 'OK' : expected.critical ? 'FAIL' : 'WARN',
+      };
     });
 
-    const safe = async <T>(
-      name: string,
-      fallback: T,
-      work: () => Promise<T>,
-    ): Promise<T> => {
-      try {
-        const result = await work();
-        checks.push({
-          name,
-          status: 'OK',
-          message: `${name} query completed.`,
+    const dbReady = this.oddsModel.db.readyState === 1;
+    const alerts: OddsMonitorAlert[] = [];
+    const startupAgeMs = this.startedAt
+      ? Math.max(0, now.getTime() - this.startedAt.getTime())
+      : 0;
+    const lastCycleCompletedAt = this.toDate(worker.lastCycleCompletedAt);
+    const lastCycleStartedAt = this.toDate(worker.lastCycleStartedAt);
+    const lastSuccessfulCycleAt = this.toDate(worker.lastSuccessfulCycleAt);
+    const lastRetentionCompletedAt = this.toDate(
+      worker.lastRetentionCompletedAt,
+    );
+    const lastCycleAgeMs = lastCycleCompletedAt
+      ? Math.max(0, now.getTime() - lastCycleCompletedAt.getTime())
+      : undefined;
+    const lastSuccessfulCycleAgeMs = lastSuccessfulCycleAt
+      ? Math.max(0, now.getTime() - lastSuccessfulCycleAt.getTime())
+      : undefined;
+    const activeBatchAgeMs = worker.busy && lastCycleStartedAt
+      ? Math.max(0, now.getTime() - lastCycleStartedAt.getTime())
+      : 0;
+    const expectedCycleGraceMs = Math.max(
+      3 * ODDS_CONFIG.workerIntervalMs,
+      15 * MINUTE,
+    );
+    const expectedRetentionGraceMs = Math.max(
+      2 * ODDS_CONFIG.cleanupIntervalMs,
+      90 * MINUTE,
+    );
+
+    if (!dbReady) {
+      alerts.push({
+        code: 'ODDS_DATABASE_DISCONNECTED',
+        severity: 'CRITICAL',
+        message: 'Odds cannot read or persist prices because MongoDB is not connected.',
+        details: { readyState: this.oddsModel.db.readyState },
+      });
+    }
+
+    if (indexResult.error) {
+      alerts.push({
+        code: 'ODDS_INDEX_INSPECTION_FAILED',
+        severity: 'WARNING',
+        message: 'The monitor could not verify Odds collection indexes.',
+        details: { error: indexResult.error },
+      });
+    } else {
+      for (const check of indexChecks) {
+        if (check.present) continue;
+        alerts.push({
+          code: `ODDS_INDEX_MISSING_${check.name.toUpperCase()}`,
+          severity: check.critical ? 'CRITICAL' : 'WARNING',
+          message: `Expected Odds index ${check.name} is missing.`,
+          details: { index: check.name, critical: check.critical },
         });
-        return result;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        checks.push({
-          name,
-          status: 'FAIL',
-          message: `${name} query failed: ${message.slice(0, 250)}`,
-        });
-        failures.push(name);
-        return fallback;
       }
+    }
+
+    if (ODDS_CONFIG.enabled && startupAgeMs > STARTUP_GRACE_MS) {
+      if (!worker.initialized) {
+        alerts.push({
+          code: 'ODDS_WORKER_NOT_INITIALIZED',
+          severity: 'CRITICAL',
+          message: 'Grivit pricing worker has not initialized.',
+        });
+      } else if (!worker.running && !worker.stopping) {
+        alerts.push({
+          code: 'ODDS_WORKER_NOT_RUNNING',
+          severity: 'CRITICAL',
+          message: 'Grivit pricing worker is not running although pricing is enabled.',
+        });
+      }
+    }
+
+    if (
+      ODDS_CONFIG.enabled &&
+      startupAgeMs > expectedCycleGraceMs &&
+      !lastCycleCompletedAt
+    ) {
+      alerts.push({
+        code: 'ODDS_WORKER_NO_COMPLETED_BATCH',
+        severity: 'CRITICAL',
+        message: 'Grivit has not completed its first pricing batch within the startup window.',
+        details: { startupAgeMs, expectedCycleGraceMs },
+      });
+    } else if (
+      ODDS_CONFIG.enabled &&
+      !worker.busy &&
+      lastCycleAgeMs !== undefined &&
+      lastCycleAgeMs > expectedCycleGraceMs
+    ) {
+      alerts.push({
+        code: 'ODDS_WORKER_CYCLE_STALE',
+        severity: 'WARNING',
+        message: 'The Odds worker has not completed a pricing batch within the expected interval.',
+        details: {
+          lastCycleCompletedAt: lastCycleCompletedAt?.toISOString(),
+          ageMs: lastCycleAgeMs,
+          expectedCycleGraceMs,
+        },
+      });
+    }
+
+    if (
+      ODDS_CONFIG.enabled &&
+      worker.busy &&
+      activeBatchAgeMs > expectedCycleGraceMs
+    ) {
+      alerts.push({
+        code: 'ODDS_WORKER_BATCH_LONG_RUNNING',
+        severity: 'WARNING',
+        message: 'The current Odds pricing batch has remained active longer than the expected batch interval.',
+        details: { activeBatchAgeMs, expectedCycleGraceMs },
+      });
+    }
+
+    if (
+      ODDS_CONFIG.enabled &&
+      startupAgeMs > expectedCycleGraceMs &&
+      (!lastSuccessfulCycleAt ||
+        (lastSuccessfulCycleAgeMs !== undefined &&
+          lastSuccessfulCycleAgeMs > expectedCycleGraceMs))
+    ) {
+      alerts.push({
+        code: 'ODDS_NO_RECENT_SUCCESSFUL_CYCLE',
+        severity: 'WARNING',
+        message: 'Grivit has not completed a fully successful pricing batch within the expected interval.',
+        details: {
+          lastSuccessfulCycleAt: lastSuccessfulCycleAt?.toISOString(),
+          ageMs: lastSuccessfulCycleAgeMs ?? null,
+          expectedCycleGraceMs,
+        },
+      });
+    }
+
+    if (Number(worker.consecutiveCycleFailures ?? 0) >= 2) {
+      alerts.push({
+        code: 'ODDS_WORKER_CONSECUTIVE_FAILURES',
+        severity: 'CRITICAL',
+        message: 'Odds pricing cycles have failed consecutively.',
+        count: Number(worker.consecutiveCycleFailures),
+        details: { lastCycleError: worker.lastCycleError },
+      });
+    } else if (Number(worker.consecutiveCycleFailures ?? 0) === 1) {
+      alerts.push({
+        code: 'ODDS_WORKER_CYCLE_FAILURE',
+        severity: 'WARNING',
+        message: 'The latest Odds pricing cycle failed.',
+        details: { lastCycleError: worker.lastCycleError },
+      });
+    }
+
+    if (
+      Number(worker.consecutivePartialFailureCycles ?? 0) >= 2 ||
+      Number(worker.lastFailedCount ?? 0) > 0
+    ) {
+      alerts.push({
+        code: 'ODDS_FIXTURE_PRICING_FAILURES',
+        severity: Number(worker.consecutivePartialFailureCycles ?? 0) >= 2
+          ? 'CRITICAL'
+          : 'WARNING',
+        message: 'One or more Grivit fixture calculations failed and will be revisited by the inventory sweep or source-change queue.',
+        count: Number(worker.lastFailedCount ?? 0),
+        details: {
+          consecutivePartialFailureCycles: Number(
+            worker.consecutivePartialFailureCycles ?? 0,
+          ),
+          lastCycleError: worker.lastCycleError,
+        },
+      });
+    }
+
+    if (
+      Number(worker.retentionConsecutiveFailures ?? 0) >= 2 ||
+      (worker.lastRetentionError &&
+        Number(worker.retentionConsecutiveFailures ?? 0) > 0)
+    ) {
+      alerts.push({
+        code: 'ODDS_RETENTION_FAILURE',
+        severity: Number(worker.retentionConsecutiveFailures ?? 0) >= 2
+          ? 'CRITICAL'
+          : 'WARNING',
+        message: 'Expired Grivit fixture-price cleanup has failed.',
+        details: {
+          consecutiveFailures: Number(worker.retentionConsecutiveFailures ?? 0),
+          lastError: worker.lastRetentionError,
+        },
+      });
+    } else if (
+      ODDS_CONFIG.enabled &&
+      startupAgeMs > expectedRetentionGraceMs &&
+      !lastRetentionCompletedAt
+    ) {
+      alerts.push({
+        code: 'ODDS_RETENTION_NOT_RUN',
+        severity: 'WARNING',
+        message: 'The season-relative expired-price cleanup worker has not completed its first pass.',
+      });
+    } else if (
+      ODDS_CONFIG.enabled &&
+      lastRetentionCompletedAt &&
+      now.getTime() - lastRetentionCompletedAt.getTime() > expectedRetentionGraceMs
+    ) {
+      alerts.push({
+        code: 'ODDS_RETENTION_STALE',
+        severity: 'WARNING',
+        message: 'The expired-price cleanup pass is overdue.',
+        details: {
+          lastCompletedAt: lastRetentionCompletedAt.toISOString(),
+          ageMs: now.getTime() - lastRetentionCompletedAt.getTime(),
+          expectedRetentionGraceMs,
+        },
+      });
+    }
+
+    if (sportsCoverage.error) {
+      alerts.push({
+        code: 'ODDS_SPORTS_READ_UNAVAILABLE',
+        severity: 'CRITICAL',
+        message: 'Odds could not read the normalized Sports fixture feed.',
+        details: { error: sportsCoverage.error },
+      });
+    } else if (
+      startupAgeMs > expectedCycleGraceMs &&
+      Boolean(lastSuccessfulCycleAt) &&
+      sportsCoverage.sampleFixtureCount >= 10 &&
+      sportsCoverage.predictionReadyCoveragePercent !== null &&
+      sportsCoverage.predictionReadyCoveragePercent < 20
+    ) {
+      alerts.push({
+        code: 'ODDS_UPCOMING_READINESS_CRITICALLY_LOW',
+        severity: 'CRITICAL',
+        message: 'Fewer than one in five sampled upcoming fixtures has any prediction-ready Odds selection.',
+        details: sportsCoverage,
+      });
+    } else if (
+      startupAgeMs > expectedCycleGraceMs &&
+      Boolean(lastSuccessfulCycleAt) &&
+      sportsCoverage.sampleFixtureCount >= 10 &&
+      sportsCoverage.predictionReadyCoveragePercent !== null &&
+      sportsCoverage.predictionReadyCoveragePercent < 50
+    ) {
+      alerts.push({
+        code: 'ODDS_UPCOMING_READINESS_LOW',
+        severity: 'WARNING',
+        message: 'Prediction-ready Odds coverage is below half of the sampled upcoming fixtures.',
+        details: sportsCoverage,
+      });
+    }
+
+    if (quality.invalidDecimalOddsSelections > 0) {
+      alerts.push({
+        code: 'ODDS_INVALID_DECIMAL_PRICES',
+        severity: 'CRITICAL',
+        message: 'The active Odds inventory contains decimal prices outside the configured valid range.',
+        count: quality.invalidDecimalOddsSelections,
+      });
+    }
+    if (quality.missingSourceHashSelections > 0) {
+      alerts.push({
+        code: 'ODDS_SOURCE_FINGERPRINTS_MISSING',
+        severity: 'WARNING',
+        message: 'Some active Grivit selections do not contain a source-data fingerprint.',
+        count: quality.missingSourceHashSelections,
+      });
+    }
+
+    if (quality.missingFixtureSourceRevisionSelections > 0) {
+      alerts.push({
+        code: 'ODDS_FIXTURE_SOURCE_REVISIONS_MISSING',
+        severity: 'WARNING',
+        message: 'Some active Grivit prices predate the Sports fixture revision contract and are stale until repriced.',
+        count: quality.missingFixtureSourceRevisionSelections,
+      });
+    }
+
+    if (Number(sportsCoverage.staleSourceRevisionSelections ?? 0) > 0) {
+      alerts.push({
+        code: 'ODDS_STALE_SPORTS_REVISION_PRICES',
+        severity: 'WARNING',
+        message: 'Upcoming fixture prices were found with a Sports source revision older than the current fixture revision.',
+        count: Number(sportsCoverage.staleSourceRevisionSelections),
+      });
+    }
+
+    const queueAvailable = pricingQueue.available === true;
+    if (!queueAvailable) {
+      alerts.push({
+        code: 'ODDS_PRICING_QUEUE_MONITOR_UNAVAILABLE',
+        severity: 'WARNING',
+        message: 'The monitor could not inspect the durable Odds source-change pricing queue.',
+        details: { error: pricingQueue.error ?? null },
+      });
+    } else {
+      const duePendingCount = Number(pricingQueue.duePendingCount ?? 0);
+      const oldestDuePendingAt = this.toDate(pricingQueue.oldestDuePendingAt);
+      const oldestDuePendingAgeMs = oldestDuePendingAt
+        ? Math.max(0, now.getTime() - oldestDuePendingAt.getTime())
+        : 0;
+      const staleProcessingCount = Number(pricingQueue.staleProcessingCount ?? 0);
+      const quarantinedCount = Number(pricingQueue.quarantinedCount ?? 0);
+
+      if (staleProcessingCount > 0) {
+        alerts.push({
+          code: 'ODDS_PRICING_QUEUE_EXPIRED_LEASES',
+          severity: 'WARNING',
+          message: 'One or more Odds pricing jobs remain PROCESSING after their queue lease expired.',
+          count: staleProcessingCount,
+        });
+      }
+      const failedQueueCount = Number(pricingQueue.failedCount ?? 0);
+      if (quarantinedCount > 0) {
+        alerts.push({
+          code: 'ODDS_PRICING_QUEUE_QUARANTINED_JOBS',
+          severity: 'WARNING',
+          message: 'One or more Odds source-change pricing jobs have been quarantined and require inspection.',
+          count: quarantinedCount,
+        });
+      }
+      if (failedQueueCount > 0) {
+        alerts.push({
+          code: 'ODDS_PRICING_QUEUE_FAILED_JOBS',
+          severity: 'WARNING',
+          message: 'One or more Odds source-change pricing jobs remain in FAILED state.',
+          count: failedQueueCount,
+        });
+      }
+      if (duePendingCount > 0 && oldestDuePendingAgeMs >= PRICING_QUEUE_CRITICAL_AGE_MS) {
+        alerts.push({
+          code: 'ODDS_PRICING_QUEUE_BACKLOG_CRITICAL',
+          severity: 'CRITICAL',
+          message: 'Due Odds source-change pricing jobs have remained pending for at least 15 minutes.',
+          count: duePendingCount,
+          details: { oldestDuePendingAgeMs },
+        });
+      } else if (duePendingCount > 0 && oldestDuePendingAgeMs >= PRICING_QUEUE_WARNING_AGE_MS) {
+        alerts.push({
+          code: 'ODDS_PRICING_QUEUE_BACKLOG',
+          severity: 'WARNING',
+          message: 'Due Odds source-change pricing jobs are accumulating.',
+          count: duePendingCount,
+          details: { oldestDuePendingAgeMs },
+        });
+      }
+    }
+
+    const inventorySweep = (worker.inventorySweep ?? {}) as Record<string, any>;
+    if (Number(inventorySweep.lastFailedFixtures ?? 0) > 0) {
+      alerts.push({
+        code: 'ODDS_INVENTORY_SWEEP_WITH_FAILURES',
+        severity: Number(inventorySweep.consecutivePartialFailureSweeps ?? 0) >= 2
+          ? 'CRITICAL'
+          : 'WARNING',
+        message: 'The most recently completed full Odds inventory sweep contained fixture pricing failures.',
+        count: Number(inventorySweep.lastFailedFixtures ?? 0),
+        details: {
+          lastSweepCompletedAt: inventorySweep.lastCompletedAt ?? null,
+          lastSweepFixtures: Number(inventorySweep.lastFixtures ?? 0),
+          lastSweepPages: Number(inventorySweep.lastPages ?? 0),
+        },
+      });
+    }
+
+    const providerTotal =
+      quality.staleProviderSelections + quality.freshProviderSelections;
+    const staleProviderPercent = providerTotal
+      ? (quality.staleProviderSelections / providerTotal) * 100
+      : null;
+
+    const enabledMarketIds = new Set(
+      FOOTBALL_MARKET_CATALOG.filter((market) => market.pricingEnabled !== false)
+        .map((market) => market.id),
+    );
+    const inventoryMarketIds = new Set(
+      ((inventory.marketInventory as Array<Record<string, unknown>>) ?? [])
+        .map((item) => String(item._id ?? ''))
+        .filter((id) => enabledMarketIds.has(id)),
+    );
+    const marketCoveragePercent = enabledMarketIds.size
+      ? Number(((inventoryMarketIds.size / enabledMarketIds.size) * 100).toFixed(1))
+      : 100;
+
+    const criticalAlerts = alerts.filter(
+      (alert) => alert.severity === 'CRITICAL',
+    ).length;
+    const warningAlerts = alerts.filter(
+      (alert) => alert.severity === 'WARNING',
+    ).length;
+    const inventoryTotal = Number(inventory.totalSelections ?? 0);
+    const healthStatus: ModuleHealthStatus = !ODDS_CONFIG.enabled
+      ? 'UNKNOWN'
+      : criticalAlerts > 0
+        ? 'FAILED'
+        : warningAlerts > 0
+          ? 'DEGRADED'
+          : inventoryTotal === 0 && sportsCoverage.sampleFixtureCount === 0
+            ? 'UNKNOWN'
+            : 'HEALTHY';
+    const message = !ODDS_CONFIG.enabled
+      ? 'Odds pricing is disabled by configuration.'
+      : healthStatus === 'HEALTHY'
+        ? 'Grivit pricing worker, Sports dependency, active prices and readiness checks are healthy.'
+        : healthStatus === 'DEGRADED'
+          ? `Grivit pricing is operational with ${warningAlerts} warning(s) requiring attention.`
+          : healthStatus === 'FAILED'
+            ? `Grivit pricing has ${criticalAlerts} critical operational issue(s).`
+            : 'Odds monitoring is active; fixture data and pricing inventory are not yet available.';
+
+    const checks = [
+      {
+        name: 'mongodb_connection',
+        status: dbReady ? 'OK' : 'FAIL',
+        value: this.oddsModel.db.readyState,
+      },
+      {
+        name: 'sports_domain_read_source',
+        status: sportsCoverage.error ? 'FAIL' : 'OK',
+        message: 'Grivit calculates its own prices from normalized Sports records.',
+        sampleFixtureCount: sportsCoverage.sampleFixtureCount,
+      },
+      {
+        name: 'external_api_calls',
+        status: 'OK',
+        value: 0,
+        message: 'External bookmaker references are optional and never gate Grivit pricing.',
+      },
+      ...indexChecks,
+      {
+        name: 'pricing_worker',
+        status: !ODDS_CONFIG.enabled
+          ? 'UNKNOWN'
+          : worker.running && !worker.stopping
+            ? 'OK'
+            : startupAgeMs <= STARTUP_GRACE_MS
+              ? 'UNKNOWN'
+              : 'FAIL',
+        value: {
+          initialized: worker.initialized,
+          running: worker.running,
+          busy: worker.busy,
+        },
+      },
+      {
+        name: 'pricing_source_change_queue',
+        status: !pricingQueue.available
+          ? 'WARN'
+          : Number(pricingQueue.staleProcessingCount ?? 0) > 0 ||
+              Number(pricingQueue.failedCount ?? 0) > 0 ||
+              Number(pricingQueue.quarantinedCount ?? 0) > 0 ||
+              Number(pricingQueue.duePendingCount ?? 0) > 0
+            ? 'WARN'
+            : 'OK',
+        value: pricingQueue,
+      },
+      {
+        name: 'inventory_sweep_progress',
+        status: inventorySweep.inProgress ? 'OK' : 'UNKNOWN',
+        value: inventorySweep,
+      },
+      {
+        name: 'prediction_ready_coverage',
+        status: sportsCoverage.predictionReadyCoveragePercent === null
+          ? 'UNKNOWN'
+          : sportsCoverage.predictionReadyCoveragePercent >= 50
+            ? 'OK'
+            : 'WARN',
+        value: sportsCoverage.predictionReadyCoveragePercent,
+        sampleFixtureCount: sportsCoverage.sampleFixtureCount,
+      },
+    ];
+
+    const overview: Record<string, unknown> = {
+      generatedAt: now.toISOString(),
+      status: healthStatus,
+      message,
+      monitor: this.monitorMetadata(),
+      checks,
+      alerts,
+      worker,
+      inventorySweep,
+      pricingQueue,
+      inventory: {
+        ...inventory,
+        freshnessAndIntegrity: {
+          ...quality,
+          estimatedRevisionMetricScope: 'INVENTORY_WIDE_REVISION_STAMP_PRESENCE; EXACT_CURRENT_REVISION_IS_CHECKED_FOR_UPCOMING_FIXTURE_SAMPLE',
+        },
+        providerQuoteFreshnessPercent: providerTotal
+          ? Number((100 - (staleProviderPercent ?? 0)).toFixed(1))
+          : null,
+      },
+      sportsDependency: sportsCoverage,
+      configuration: {
+        enabled: ODDS_CONFIG.enabled,
+        pricingScope: 'ALL_RETAINED_FIXTURES',
+        predictionCoverageWindowHours: 72,
+        workerIntervalMs: ODDS_CONFIG.workerIntervalMs,
+        workerBatchSize: ODDS_CONFIG.workerBatchSize,
+        workerConcurrency: ODDS_CONFIG.workerConcurrency,
+        maximumQuoteAgeHours: ODDS_CONFIG.maximumQuoteAgeHours,
+        seasonRetentionGraceMonths: ODDS_CONFIG.seasonRetentionGraceMonths,
+        cleanupIntervalMs: ODDS_CONFIG.cleanupIntervalMs,
+        minimumHistoricalSampleSize: ODDS_CONFIG.minimumHistoricalSampleSize,
+        minimumPredictionDataQuality: ODDS_CONFIG.minimumPredictionDataQuality,
+        grivitOverroundPercent: ODDS_CONFIG.grivitOverroundPercent,
+        minimumEventTimelineSampleSize:
+          ODDS_CONFIG.minimumEventTimelineSampleSize,
+        minimumEventTimelineCoverage: ODDS_CONFIG.minimumEventTimelineCoverage,
+        modelVersion: ODDS_CONFIG.modelVersion,
+      },
+      catalogue: {
+        totalMarkets: FOOTBALL_MARKET_CATALOG.length,
+        pricingEnabled: enabledMarketIds.size,
+        awaitingSportsData: FOOTBALL_MARKET_CATALOG.filter(
+          (item) => item.pricingEnabled === false,
+        ).map((item) => ({
+          id: item.id,
+          requiredData: item.requiredData,
+          notes: item.notes,
+        })),
+        activePricedMarkets: inventoryMarketIds.size,
+        activePricedMarketCoveragePercent: marketCoveragePercent,
+      },
+      indexes: {
+        names: [...indexNames],
+        checks: indexChecks,
+        inspectionError: indexResult.error ?? null,
+      },
+      externalApiCalls: 0,
+      dataSource: 'SPORTS_MODULE',
     };
 
-    const now = new Date();
-    const windowEnd = new Date(now.getTime() + this.upcomingWindowMs);
-    const fixtureFilter: Record<string, unknown> = {
-      fixtureDate: { $gte: now, $lte: windowEnd },
-      live: { $ne: true },
-      completed: { $ne: true },
-    };
+    return overview;
+  }
 
-    const [
-      fixtureCount,
-      fixtureSample,
-      inventoryRows,
-      providerState,
-      cacheStatsRows,
-      cacheExpiredCount,
-      indexStatus,
-      workerStatus,
-    ] = await Promise.all([
-      safe('upcoming_fixture_count', 0, () =>
-        this.fixtureModel.countDocuments(fixtureFilter).exec(),
-      ),
-      safe<FixtureSample[]>(
-        'upcoming_fixture_sample',
-        [],
-        () =>
-          this.fixtureModel
-            .find(fixtureFilter)
-            .select({
-              eventId: 1,
-              fixtureDate: 1,
-              leagueId: 1,
-              live: 1,
-              completed: 1,
-            })
-            .sort({ fixtureDate: 1 })
-            .limit(this.upcomingFixtureSampleLimit)
-            .lean()
-            .exec() as Promise<FixtureSample[]>,
-      ),
-      safe<InventoryRow[]>(
-        'odds_inventory',
-        [],
-        () =>
-          this.oddsModel
-            .aggregate([
-              {
-                $match: {
-                  $or: [
-                    { expiresAt: { $exists: false } },
-                    { expiresAt: { $gt: now } },
-                  ],
-                },
-              },
+  /**
+   * One bounded-response aggregation supplies inventory and quality metrics.
+   * The collection is scanned once per monitor interval instead of issuing
+   * separate count/group queries for each metric.
+   */
+  private async getInventoryAndQuality(
+    now: Date,
+  ): Promise<{
+    inventory: Record<string, unknown>;
+    quality: CountSummary;
+  }> {
+    const cutoff = new Date(
+      now.getTime() - ODDS_CONFIG.maximumQuoteAgeHours * 3_600_000,
+    );
+    const futureLimit = new Date(
+      now.getTime() + ODDS_CONFIG.futureTimestampToleranceMs,
+    );
+
+    const [result] = await this.oddsModel
+      .aggregate([
+        { $match: ACTIVE_EXPIRY_FILTER(now) },
+        {
+          $facet: {
+            summary: [
               {
                 $group: {
                   _id: null,
-                  total: { $sum: 1 },
-                  provider: {
+                  totalSelections: { $sum: 1 },
+                  predictionReadySelections: {
+                    $sum: { $cond: ['$predictionReady', 1, 0] },
+                  },
+                  providerSelections: {
                     $sum: {
                       $cond: [{ $eq: ['$priceType', 'PROVIDER'] }, 1, 0],
                     },
                   },
-                  oddsApiProvider: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $and: [
-                            { $eq: ['$priceType', 'PROVIDER'] },
-                            { $eq: ['$provider', 'THE_ODDS_API'] },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  espnProvider: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $and: [
-                            { $eq: ['$priceType', 'PROVIDER'] },
-                            { $eq: ['$provider', 'ESPN'] },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  estimated: {
+                  estimatedSelections: {
                     $sum: {
                       $cond: [{ $eq: ['$priceType', 'ESTIMATED'] }, 1, 0],
                     },
                   },
-                  bookmakerOnly: {
-                    $sum: {
-                      $cond: [{ $eq: ['$oddsBasis', 'BOOKMAKER_ONLY'] }, 1, 0],
-                    },
-                  },
-                  bookmakerPlusHistory: {
-                    $sum: {
-                      $cond: [
-                        { $eq: ['$oddsBasis', 'BOOKMAKER_PLUS_HISTORY'] },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  historicalOnly: {
-                    $sum: {
-                      $cond: [{ $eq: ['$oddsBasis', 'HISTORICAL_ONLY'] }, 1, 0],
-                    },
-                  },
-                  priorOnly: {
-                    $sum: {
-                      $cond: [{ $eq: ['$oddsBasis', 'PRIOR_ONLY'] }, 1, 0],
-                    },
-                  },
-                  predictionReady: {
-                    $sum: {
-                      $cond: [{ $eq: ['$predictionReady', true] }, 1, 0],
-                    },
-                  },
-                  invalidOdds: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $or: [
-                            { $not: [{ $isNumber: '$decimalOdds' }] },
-                            { $lte: ['$decimalOdds', 1] },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  missingFairOdds: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $or: [
-                            { $eq: ['$fairOdds', null] },
-                            { $not: [{ $isNumber: '$fairOdds' }] },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  missingOddsBasis: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $or: [
-                            { $eq: ['$oddsBasis', null] },
-                            { $not: ['$oddsBasis'] },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  missingCalculationMethod: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $or: [
-                            { $eq: ['$oddsCalculationMethod', null] },
-                            { $not: ['$oddsCalculationMethod'] },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  missingProviderTimestamp: {
+                  freshProviderSelections: {
                     $sum: {
                       $cond: [
                         {
                           $and: [
                             { $eq: ['$priceType', 'PROVIDER'] },
-                            { $eq: ['$providerUpdatedAt', null] },
+                            { $gte: ['$providerUpdatedAt', cutoff] },
+                            { $lte: ['$providerUpdatedAt', futureLimit] },
                           ],
                         },
                         1,
@@ -324,21 +852,18 @@ export class OddsMonitorService {
                       ],
                     },
                   },
-                  staleProviderPrices: {
+                  freshEstimatedSelections: {
                     $sum: {
                       $cond: [
                         {
                           $and: [
-                            { $eq: ['$priceType', 'PROVIDER'] },
-                            { $ne: ['$providerUpdatedAt', null] },
-                            {
-                              $lt: [
-                                '$providerUpdatedAt',
-                                new Date(
-                                  now.getTime() - this.staleProviderPriceMs,
-                                ),
-                              ],
-                            },
+                            { $eq: ['$priceType', 'ESTIMATED'] },
+                            { $eq: ['$bookmaker', 'Grivit'] },
+                            { $eq: ['$pricingSource', 'GRIVIT_MODEL'] },
+                            { $eq: ['$calculationVersion', ODDS_CONFIG.modelVersion] },
+                            { $ne: ['$sourceDataHash', null] },
+                            { $ne: ['$sourceDataHash', ''] },
+                            { $ne: ['$fixtureSourceRevision', null] },
                           ],
                         },
                         1,
@@ -346,36 +871,15 @@ export class OddsMonitorService {
                       ],
                     },
                   },
-                  unknownMarkets: {
-                    $sum: {
-                      $cond: [
-                        {
-                          $not: [
-                            {
-                              $in: [
-                                '$marketId',
-                                FOOTBALL_MARKET_CATALOG.map((m) => m.id),
-                              ],
-                            },
-                          ],
-                        },
-                        1,
-                        0,
-                      ],
-                    },
-                  },
-                  markedReadyButInvalid: {
+                  missingFixtureSourceRevisionSelections: {
                     $sum: {
                       $cond: [
                         {
                           $and: [
-                            { $eq: ['$predictionReady', true] },
-                            {
-                              $or: [
-                                { $not: [{ $isNumber: '$decimalOdds' }] },
-                                { $lte: ['$decimalOdds', 1] },
-                              ],
-                            },
+                            { $eq: ['$priceType', 'ESTIMATED'] },
+                            { $eq: ['$bookmaker', 'Grivit'] },
+                            { $eq: ['$pricingSource', 'GRIVIT_MODEL'] },
+                            { $eq: ['$fixtureSourceRevision', null] },
                           ],
                         },
                         1,
@@ -383,488 +887,323 @@ export class OddsMonitorService {
                       ],
                     },
                   },
+                  currentModelVersionSelections: {
+                    $sum: {
+                      $cond: [
+                        {
+                          $eq: [
+                            '$calculationVersion',
+                            ODDS_CONFIG.modelVersion,
+                          ],
+                        },
+                        1,
+                        0,
+                      ],
+                    },
+                  },
+                  missingSourceHashSelections: {
+                    $sum: {
+                      $cond: [
+                        {
+                          $or: [
+                            { $eq: ['$sourceDataHash', null] },
+                            { $eq: ['$sourceDataHash', ''] },
+                          ],
+                        },
+                        1,
+                        0,
+                      ],
+                    },
+                  },
+                  invalidDecimalOddsSelections: {
+                    $sum: {
+                      $cond: [
+                        {
+                          $or: [
+                            { $lt: ['$decimalOdds', 1.01] },
+                            {
+                              $gt: [
+                                '$decimalOdds',
+                                ODDS_CONFIG.maximumDecimalOdds,
+                              ],
+                            },
+                            { $eq: ['$decimalOdds', null] },
+                          ],
+                        },
+                        1,
+                        0,
+                      ],
+                    },
+                  },
+                  averageDataQuality: { $avg: '$dataQuality' },
+                  latestUpdatedAt: { $max: '$updatedAt' },
                 },
               },
-            ])
-            .exec() as Promise<InventoryRow[]>,
-      ),
-      safe<ProviderState | null>(
-        'provider_state',
-        null,
-        () =>
-          this.providerStateModel
-            .findOne({ key: 'THE_ODDS_API' })
-            .lean()
-            .exec() as Promise<ProviderState | null>,
-      ),
-      safe<CacheStatsRow[]>(
-        'provider_cache_stats',
-        [],
-        () =>
-          this.providerCacheModel
-            .aggregate([
+            ],
+            marketInventory: [
               {
                 $group: {
-                  _id: null,
-                  total: { $sum: 1 },
-                  unexpired: {
-                    $sum: { $cond: [{ $gt: ['$expiresAt', now] }, 1, 0] },
+                  _id: '$marketId',
+                  selections: { $sum: 1 },
+                  predictionReady: {
+                    $sum: { $cond: ['$predictionReady', 1, 0] },
                   },
-                  expired: {
-                    $sum: { $cond: [{ $lte: ['$expiresAt', now] }, 1, 0] },
-                  },
-                  latestFetchedAt: { $max: '$fetchedAt' },
-                  oldestFetchedAt: { $min: '$fetchedAt' },
                 },
               },
-            ])
-            .exec() as Promise<CacheStatsRow[]>,
-      ),
-      safe('expired_cache_documents', 0, () =>
-        this.providerCacheModel
-          .countDocuments({ expiresAt: { $lte: now } })
-          .exec(),
-      ),
-      safe(
-        'declared_index_coverage',
-        {
-          fixtureOdds: {
-            declared: [],
-            actual: [],
-            missing: [],
-            verification: 'UNKNOWN',
+              { $sort: { selections: -1 } },
+            ],
           },
-          providerState: {
-            declared: [],
-            actual: [],
-            missing: [],
-            verification: 'UNKNOWN',
-          },
-          providerCache: {
-            declared: [],
-            actual: [],
-            missing: [],
-            verification: 'UNKNOWN',
-          },
-        } satisfies IndexStatus,
-        async () => this.inspectIndexes(),
-      ),
-      (
-        this.worker as unknown as {
-          getMonitorStatus(): Promise<WorkerMonitorStatus>;
-        }
-      ).getMonitorStatus(),
-    ]);
+        },
+      ])
+      .exec();
 
-    const inventory = inventoryRows[0] ?? {};
-    const cacheStats = cacheStatsRows[0] ?? {};
-    const eventIds: string[] = [
-      ...new Set(
-        fixtureSample
-          .map((fixture) =>
-            typeof fixture.eventId === 'string'
-              ? fixture.eventId.trim()
-              : typeof fixture.eventId === 'number'
-                ? String(fixture.eventId)
-                : '',
-          )
-          .filter(Boolean),
-      ),
-    ];
-    const upcomingPrices = await safe<UpcomingPriceRow[]>(
-      'upcoming_odds_coverage',
-      [],
-      () =>
-        eventIds.length
-          ? (this.oddsModel
-              .aggregate([
-                {
-                  $match: {
-                    eventId: { $in: eventIds },
-                    $or: [
-                      { expiresAt: { $exists: false } },
-                      { expiresAt: { $gt: now } },
-                    ],
-                  },
-                },
-                {
-                  $group: {
-                    _id: '$eventId',
-                    prices: { $sum: 1 },
-                    providerPrices: {
-                      $sum: {
-                        $cond: [{ $eq: ['$priceType', 'PROVIDER'] }, 1, 0],
-                      },
-                    },
-                    readyPrices: {
-                      $sum: {
-                        $cond: [{ $eq: ['$predictionReady', true] }, 1, 0],
-                      },
-                    },
-                    latestUpdatedAt: { $max: '$updatedAt' },
-                  },
-                },
-              ])
-              .exec() as Promise<UpcomingPriceRow[]>)
-          : Promise.resolve([]),
+    const row = result?.summary?.[0] ?? {};
+    const totalSelections = Number(row.totalSelections ?? 0);
+    const providerSelections = Number(row.providerSelections ?? 0);
+    const estimatedSelections = Number(row.estimatedSelections ?? 0);
+    const freshProviderSelections = Number(
+      row.freshProviderSelections ?? 0,
+    );
+    const freshEstimatedSelections = Number(
+      row.freshEstimatedSelections ?? 0,
+    );
+    const currentModelVersionSelections = Number(
+      row.currentModelVersionSelections ?? 0,
     );
 
-    const priceByEvent = new Map<string, UpcomingPriceRow>(
-      upcomingPrices.map((row) => [String(row._id), row]),
-    );
-    const readyFixtureCount = eventIds.filter(
-      (id) => Number(priceByEvent.get(id)?.readyPrices ?? 0) > 0,
-    ).length;
-    const pricedFixtureCount = eventIds.filter(
-      (id) => Number(priceByEvent.get(id)?.prices ?? 0) > 0,
-    ).length;
-    const providerPricedFixtureCount = eventIds.filter(
-      (id) => Number(priceByEvent.get(id)?.providerPrices ?? 0) > 0,
-    ).length;
-    const sampledFixturesWithoutOdds = eventIds.filter(
-      (id) => !priceByEvent.has(id),
-    ).length;
-    const sampleCoverage = {
-      sampleSize: eventIds.length,
-      sampleLimit: this.upcomingFixtureSampleLimit,
-      truncated: fixtureCount > eventIds.length,
-      fixturesWithAnyOdds: pricedFixtureCount,
-      fixturesWithProviderOdds: providerPricedFixtureCount,
-      predictionReadyFixtures: readyFixtureCount,
-      fixturesWithoutOdds: sampledFixturesWithoutOdds,
-      anyOddsCoveragePercent: this.percent(pricedFixtureCount, eventIds.length),
-      providerOddsCoveragePercent: this.percent(
-        providerPricedFixtureCount,
-        eventIds.length,
+    const quality: CountSummary = {
+      totalSelections,
+      freshProviderSelections,
+      staleProviderSelections: Math.max(
+        0,
+        providerSelections - freshProviderSelections,
       ),
-      predictionReadinessPercent: this.percent(
-        readyFixtureCount,
-        eventIds.length,
+      freshEstimatedSelections,
+      staleEstimatedSelections: Math.max(
+        0,
+        estimatedSelections - freshEstimatedSelections,
       ),
+      currentModelVersionSelections,
+      outdatedModelVersionSelections: Math.max(
+        0,
+        totalSelections - currentModelVersionSelections,
+      ),
+      missingSourceHashSelections: Number(
+        row.missingSourceHashSelections ?? 0,
+      ),
+      missingFixtureSourceRevisionSelections: Number(
+        row.missingFixtureSourceRevisionSelections ?? 0,
+      ),
+      invalidDecimalOddsSelections: Number(
+        row.invalidDecimalOddsSelections ?? 0,
+      ),
+      averageDataQuality:
+        typeof row.averageDataQuality === 'number'
+          ? Number(row.averageDataQuality.toFixed(4))
+          : null,
     };
 
-    const providerConfigured = this.oddsApi.isConfigured();
-    const providerStatus = String(
-      providerState?.status ?? (providerConfigured ? 'UNKNOWN' : 'DISABLED'),
-    );
-    const requestsToday = Number(providerState?.requestsToday ?? 0);
-    const configuredDailyLimit = Number(
-      process.env.THE_ODDS_API_DAILY_REQUEST_LIMIT ?? 4,
-    );
-    const dailyLimit =
-      Number.isFinite(configuredDailyLimit) && configuredDailyLimit >= 1
-        ? Math.floor(configuredDailyLimit)
-        : 4;
-    const providerQuotaRemainingInternal = Math.max(
-      0,
-      dailyLimit - requestsToday,
-    );
-    const blockedUntil = providerState?.blockedUntil
-      ? new Date(providerState.blockedUntil)
-      : null;
-    const activeProviderBlock = Boolean(
-      blockedUntil && blockedUntil.getTime() > now.getTime(),
-    );
-    const cacheAgeMs = cacheStats.latestFetchedAt
-      ? Math.max(
-          0,
-          now.getTime() - new Date(cacheStats.latestFetchedAt).getTime(),
-        )
-      : null;
-    const workerAgeMs = workerStatus.lastCycleCompletedAt
-      ? Math.max(
-          0,
-          now.getTime() - new Date(workerStatus.lastCycleCompletedAt).getTime(),
-        )
-      : null;
+    const inventory: Record<string, unknown> = {
+      generatedAt: now,
+      totalSelections,
+      predictionReadySelections: Number(
+        row.predictionReadySelections ?? 0,
+      ),
+      providerSelections,
+      estimatedSelections,
+      marketInventory: result?.marketInventory ?? [],
+      latestUpdatedAt: row.latestUpdatedAt ?? null,
+    };
 
-    if (!providerConfigured)
-      warnings.push(
-        'THE_ODDS_API_KEY is not configured; provider odds depend on ESPN prices and labelled estimates.',
-      );
-    if (providerConfigured && !providerState)
-      warnings.push(
-        'The Odds API is configured but no provider-state record exists yet; no completed provider request has been recorded.',
-      );
-    if (
-      !workerStatus.running &&
-      !workerStatus.stopping &&
-      !workerStatus.lastCycleCompletedAt
-    )
-      warnings.push(
-        'Odds worker has not completed startup and its first cycle yet.',
-      );
-    if (providerStatus === 'AUTH_ERROR')
-      failures.push('provider_authentication');
-    else if (
-      ['QUOTA_EXHAUSTED', 'THROTTLED', 'DEGRADED'].includes(providerStatus)
-    )
-      warnings.push(`The Odds API provider state is ${providerStatus}.`);
-    if (activeProviderBlock)
-      warnings.push(
-        `The Odds API is blocked until ${blockedUntil!.toISOString()}.`,
-      );
-    if (Number(inventory.invalidOdds ?? 0) > 0)
-      failures.push('invalid_decimal_odds');
-    if (Number(inventory.markedReadyButInvalid ?? 0) > 0)
-      failures.push('prediction_ready_invalid_price');
-    if (Number(inventory.staleProviderPrices ?? 0) > 0)
-      warnings.push(
-        `${String(inventory.staleProviderPrices)} provider prices are older than six hours.`,
-      );
-    if (Number(inventory.missingProviderTimestamp ?? 0) > 0)
-      warnings.push(
-        `${String(inventory.missingProviderTimestamp)} provider prices have no providerUpdatedAt timestamp.`,
-      );
-    if (Number(inventory.unknownMarkets ?? 0) > 0)
-      warnings.push(
-        `${String(inventory.unknownMarkets)} odds rows reference markets outside the canonical catalogue.`,
-      );
-    if (Number(inventory.missingOddsBasis ?? 0) > 0)
-      warnings.push(
-        `${String(inventory.missingOddsBasis)} active odds rows have no oddsBasis provenance.`,
-      );
-    if (Number(inventory.missingCalculationMethod ?? 0) > 0)
-      warnings.push(
-        `${String(inventory.missingCalculationMethod)} active odds rows have no oddsCalculationMethod.`,
-      );
-    if (fixtureCount > 0 && sampleCoverage.predictionReadinessPercent < 50)
-      warnings.push(
-        'Less than half of the sampled upcoming fixtures are prediction-ready.',
-      );
-    if (sampledFixturesWithoutOdds > 0)
-      warnings.push(
-        `${sampledFixturesWithoutOdds} sampled upcoming fixtures have no active odds rows.`,
-      );
-    if (
-      workerStatus.lastCycleCompletedAt &&
-      workerAgeMs !== null &&
-      workerAgeMs > 5 * 60_000
-    )
-      warnings.push(
-        'Odds worker has not completed a cycle in the last five minutes.',
-      );
-    if (workerStatus.lastCycleError)
-      warnings.push(
-        `Last worker error: ${(workerStatus.lastCycleError instanceof Error
-          ? workerStatus.lastCycleError.message
-          : typeof workerStatus.lastCycleError === 'string'
-            ? workerStatus.lastCycleError
-            : (JSON.stringify(workerStatus.lastCycleError) ?? 'Unknown error')
-        ).slice(0, 250)}.`,
-      );
-    if (Number(cacheStats.expired ?? 0) > 0)
-      warnings.push(
-        `${cacheStats.expired} expired cache rows remain in MongoDB; TTL deletion may be delayed.`,
-      );
-    if (
-      cacheAgeMs !== null &&
-      Number(cacheStats.total ?? 0) > 0 &&
-      cacheAgeMs > 2 * 60 * 60_000
-    )
-      warnings.push('The newest provider cache entry is older than two hours.');
-    for (const group of Object.values(indexStatus)) {
-      if (Array.isArray(group.missing) && group.missing.length)
-        warnings.push(
-          `Missing declared MongoDB indexes: ${group.missing.join(', ')}.`,
+    return { inventory, quality };
+  }
+
+  private async getSportsCoverage(now: Date): Promise<Record<string, any>> {
+    const to = new Date(
+      now.getTime() + ODDS_CONFIG.predictionCoverageWindowHours * 3_600_000,
+    );
+
+    try {
+      const page = await this.sportsRead.getFixtures({
+        from: now,
+        to,
+        limit: MAX_FIXTURE_SAMPLE,
+      });
+      const fixtures = (page.items ?? []).filter((fixture: any) => {
+        const state = String(fixture.status?.state ?? '').toUpperCase();
+        return (
+          !fixture.status?.isFinal &&
+          !['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'].includes(state)
         );
-    }
+      });
+      const ids = fixtures.map((fixture) => fixture.id).filter(Boolean);
+      const readiness = await this.oddsService.getPredictionReadinessForEvents(
+        ids,
+      );
 
-    const failedChecks = checks
-      .filter((item) => item.status === 'FAIL')
-      .map((item) => item.name);
-    failures.push(...failedChecks);
-    const uniqueFailures = [...new Set(failures)];
-    const uniqueWarnings = [...new Set(warnings)];
-    const status = uniqueFailures.length
-      ? 'DEGRADED'
-      : uniqueWarnings.length
-        ? 'DEGRADED'
-        : 'OK';
+      let fixturesWithPrices = 0;
+      let predictionReadyFixtures = 0;
+      let pricedButNotReadyFixtures = 0;
+      let fixturesWithoutPrices = 0;
+      let predictionReadySelections = 0;
+      let providerSelections = 0;
+      let estimatedSelections = 0;
+      let staleSourceRevisionSelections = 0;
 
-    const marketDefinitions = FOOTBALL_MARKET_CATALOG.map((market) => ({
-      id: market.id,
-      name: market.fullName,
-      selectionMode: market.selectionMode,
-      selectionCount: expandCanonicalSelections(market).length,
-    }));
-    const expectedCanonicalSelections = marketDefinitions.reduce(
-      (sum, market) => sum + market.selectionCount,
-      0,
-    );
-
-    const overview: Record<string, unknown> = {
-      generatedAt,
-      status,
-      summary: {
-        databaseReady: dbReady,
-        canonicalMarkets: FOOTBALL_MARKET_CATALOG.length,
-        expectedCanonicalSelections,
-        upcomingFixtures72h: fixtureCount,
-        sampledUpcomingFixtures: eventIds.length,
-        activeOddsRows: Number(inventory.total ?? 0),
-        providerOddsRows: Number(inventory.provider ?? 0),
-        oddsApiProviderRows: Number(inventory.oddsApiProvider ?? 0),
-        espnProviderRows: Number(inventory.espnProvider ?? 0),
-        estimatedOddsRows: Number(inventory.estimated ?? 0),
-        predictionReadyOddsRows: Number(inventory.predictionReady ?? 0),
-        providerStatus,
-        workerRunning: Boolean(workerStatus.running),
-        checksPassed: checks.filter((item) => item.status === 'OK').length,
-        checksFailed: checks.filter((item) => item.status === 'FAIL').length,
-        warningCount: uniqueWarnings.length,
-      },
-      health: {
-        status,
-        database: {
-          ready: dbReady,
-          readyState: this.fixtureModel.db.readyState,
-        },
-        provider: {
-          name: 'THE_ODDS_API',
-          configured: providerConfigured,
-          status: providerStatus,
-          requestsToday,
-          internalDailyLimit: dailyLimit,
-          internalRequestsRemaining: providerQuotaRemainingInternal,
-          providerRequestsRemaining:
-            providerState?.providerRequestsRemaining ?? null,
-          providerRequestsUsed: providerState?.providerRequestsUsed ?? null,
-          providerLastRequestCost:
-            providerState?.providerLastRequestCost ?? null,
-          lastRequestAt: providerState?.lastRequestAt ?? null,
-          nextAllowedAt: providerState?.nextAllowedAt ?? null,
-          blockedUntil,
-          activeBlock: activeProviderBlock,
-          message: providerState?.message ?? null,
-        },
-        worker: {
-          ...workerStatus,
-          ageSinceLastCompletedCycleMs: workerAgeMs,
-        },
-      },
-      coverage: {
-        upcomingWindow: { from: now, to: windowEnd, hours: 72 },
-        ...sampleCoverage,
-      },
-      oddsQuality: {
-        activeRows: Number(inventory.total ?? 0),
-        providerRows: Number(inventory.provider ?? 0),
-        oddsApiProviderRows: Number(inventory.oddsApiProvider ?? 0),
-        espnProviderRows: Number(inventory.espnProvider ?? 0),
-        estimatedRows: Number(inventory.estimated ?? 0),
-        oddsBasisBreakdown: {
-          bookmakerOnly: Number(inventory.bookmakerOnly ?? 0),
-          bookmakerPlusHistory: Number(inventory.bookmakerPlusHistory ?? 0),
-          historicalOnly: Number(inventory.historicalOnly ?? 0),
-          priorOnly: Number(inventory.priorOnly ?? 0),
-        },
-        predictionReadyRows: Number(inventory.predictionReady ?? 0),
-        invalidDecimalOdds: Number(inventory.invalidOdds ?? 0),
-        markedReadyButInvalid: Number(inventory.markedReadyButInvalid ?? 0),
-        missingFairOdds: Number(inventory.missingFairOdds ?? 0),
-        missingOddsBasis: Number(inventory.missingOddsBasis ?? 0),
-        missingCalculationMethod: Number(
-          inventory.missingCalculationMethod ?? 0,
-        ),
-        providerPricesMissingTimestamp: Number(
-          inventory.missingProviderTimestamp ?? 0,
-        ),
-        staleProviderPricesOverSixHours: Number(
-          inventory.staleProviderPrices ?? 0,
-        ),
-        unknownCanonicalMarkets: Number(inventory.unknownMarkets ?? 0),
-      },
-      providerCache: {
-        ...cacheStats,
-        expiredRowsRemaining: cacheExpiredCount,
-        latestCacheAgeMs: cacheAgeMs,
-      },
-      storage: {
-        models: {
-          fixtureOdds: {
-            collection: this.oddsModel.collection.name,
-            declaredIndexes: this.oddsModel.schema.indexes().length,
-          },
-          providerState: {
-            collection: this.providerStateModel.collection.name,
-            declaredIndexes: this.providerStateModel.schema.indexes().length,
-          },
-          providerCache: {
-            collection: this.providerCacheModel.collection.name,
-            declaredIndexes: this.providerCacheModel.schema.indexes().length,
-          },
-        },
-        indexStatus,
-      },
-      marketCatalog: marketDefinitions,
-      checks,
-      failures: uniqueFailures,
-      warnings: uniqueWarnings,
-      readOnly: true,
-      cached: false,
-    };
-    this.overviewCache = { cachedAt: Date.now(), value: overview };
-    return overview;
-  }
-
-  private percent(numerator: number, denominator: number): number {
-    return denominator > 0
-      ? Math.round((numerator / denominator) * 10000) / 100
-      : 100;
-  }
-
-  private async inspectIndexes(): Promise<IndexStatus> {
-    const inspect = async (model: Model<any>) => {
-      const declared = model.schema
-        .indexes()
-        .map(([keys, options]) =>
-          String(
-            (options as { name?: string } | undefined)?.name ??
-              Object.entries(keys)
-                .map(([key, direction]) => `${key}_${String(direction)}`)
-                .join('_'),
-          ),
-        )
-        .filter(Boolean);
-      let actual: string[] = [];
-      try {
-        const collection = (
-          model.collection as unknown as {
-            collection?: {
-              indexes?: () => {
-                toArray(): Promise<Array<{ name?: string }>>;
-              };
-            };
-          }
-        ).collection;
-        if (collection?.indexes) {
-          const indexes = await collection.indexes().toArray();
-          actual = indexes
-            .map((item: { name?: string }) => item.name ?? '')
-            .filter(Boolean);
+      for (const id of ids) {
+        const row = readiness.get(id);
+        const expectedSelections = Number(row?.expectedSelections ?? 0);
+        const readySelections = Number(row?.readySelections ?? 0);
+        if (expectedSelections > 0) fixturesWithPrices += 1;
+        else fixturesWithoutPrices += 1;
+        if (row?.ready === true && readySelections > 0) {
+          predictionReadyFixtures += 1;
+          predictionReadySelections += readySelections;
+        } else if (expectedSelections > 0) {
+          pricedButNotReadyFixtures += 1;
         }
-      } catch {
-        // Some MongoDB roles do not grant listIndexes; unknown is not treated as absent.
-        return {
-          declared,
-          actual: [],
-          missing: [],
-          verification: 'UNAVAILABLE',
-        };
+        providerSelections += Number(row?.bookmakerSelections ?? 0);
+        estimatedSelections += Number(row?.historicalEstimates ?? 0);
+        staleSourceRevisionSelections += Number(row?.staleSelections ?? 0);
       }
+
       return {
-        declared,
-        actual,
-        missing: declared.filter((name) => !actual.includes(name)),
-        verification: 'VERIFIED',
+        available: true,
+        source: 'SPORTS_DOMAIN_READ_SERVICE',
+        windowHours: ODDS_CONFIG.predictionCoverageWindowHours,
+        sampleLimit: MAX_FIXTURE_SAMPLE,
+        sampleFixtureCount: ids.length,
+        nextPageAvailable: Boolean(page.nextCursor),
+        fixturesWithPrices,
+        predictionReadyFixtures,
+        pricedButNotReadyFixtures,
+        fixturesWithoutPrices,
+        predictionReadySelections,
+        providerSelections,
+        estimatedSelections,
+        staleSourceRevisionSelections,
+        predictionReadyCoveragePercent: ids.length
+          ? Number(((predictionReadyFixtures / ids.length) * 100).toFixed(1))
+          : null,
+        priceCoveragePercent: ids.length
+          ? Number(((fixturesWithPrices / ids.length) * 100).toFixed(1))
+          : null,
+        checkedAt: now.toISOString(),
+        error: null,
       };
+    } catch (error) {
+      return {
+        available: false,
+        source: 'SPORTS_DOMAIN_READ_SERVICE',
+        windowHours: ODDS_CONFIG.predictionCoverageWindowHours,
+        sampleLimit: MAX_FIXTURE_SAMPLE,
+        sampleFixtureCount: 0,
+        nextPageAvailable: false,
+        fixturesWithPrices: 0,
+        predictionReadyFixtures: 0,
+        pricedButNotReadyFixtures: 0,
+        fixturesWithoutPrices: 0,
+        predictionReadySelections: 0,
+        providerSelections: 0,
+        estimatedSelections: 0,
+        staleSourceRevisionSelections: 0,
+        predictionReadyCoveragePercent: null,
+        priceCoveragePercent: null,
+        checkedAt: now.toISOString(),
+        error: this.errorMessage(error).slice(0, 300),
+      };
+    }
+  }
+
+  private async readIndexes(): Promise<{
+    indexes: Array<{ name: string }>;
+    error?: string;
+  }> {
+    try {
+      const indexes = await this.oddsModel.collection.indexes();
+      return {
+        indexes: indexes.map((item: any) => ({ name: String(item.name ?? '') })),
+      };
+    } catch (error) {
+      return { indexes: [], error: this.errorMessage(error).slice(0, 300) };
+    }
+  }
+
+  private publishHealth(
+    overview: Record<string, any>,
+    checkedAt: Date,
+  ): void {
+    const status = overview.status as ModuleHealthStatus;
+    const alerts = Array.isArray(overview.alerts)
+      ? (overview.alerts as OddsMonitorAlert[])
+      : [];
+
+    this.systemMonitor.reportMonitorSnapshot('odds', {
+      status,
+      checkedAt,
+      checks: alerts,
+      warnings: alerts
+        .filter((alert) => alert.severity === 'WARNING')
+        .map((alert) => alert.message),
+      details: {
+        alertCount: alerts.length,
+        criticalAlerts: alerts.filter(
+          (alert) => alert.severity === 'CRITICAL',
+        ).length,
+        warningAlerts: alerts.filter(
+          (alert) => alert.severity === 'WARNING',
+        ).length,
+        activeSelections: Number(overview.inventory?.totalSelections ?? 0),
+        predictionReadySelections: Number(
+          overview.inventory?.predictionReadySelections ?? 0,
+        ),
+        sampleFixtureCount: Number(
+          overview.sportsDependency?.sampleFixtureCount ?? 0,
+        ),
+        predictionReadyCoveragePercent:
+          overview.sportsDependency?.predictionReadyCoveragePercent ?? null,
+        workerRunning: Boolean(overview.worker?.running),
+        workerBusy: Boolean(overview.worker?.busy),
+        inventorySweepInProgress: Boolean(overview.inventorySweep?.inProgress),
+        inventorySweepPages: Number(overview.inventorySweep?.completedPages ?? 0),
+        inventorySweepFixtures: Number(overview.inventorySweep?.visitedFixtures ?? 0),
+        pricingQueueDuePending: Number(overview.pricingQueue?.duePendingCount ?? 0),
+        pricingQueueQuarantined: Number(overview.pricingQueue?.quarantinedCount ?? 0),
+        externalApiCalls: 0,
+        alertCodes: alerts.map((alert) => alert.code).slice(0, 20).join(','),
+      },
+    });
+
+    if (status !== 'HEALTHY') {
+      this.logger.warn(`Odds monitor: ${alerts.length} operational alert(s).`);
+    }
+  }
+
+  private monitorMetadata(): Record<string, unknown> {
+    return {
+      intervalMs: this.monitorIntervalMs,
+      cacheTtlMs: this.cacheTtlMs,
+      startedAt: this.startedAt?.toISOString() ?? null,
+      lastCheckAt: this.lastCheckAt?.toISOString() ?? null,
+      lastSuccessfulCheckAt:
+        this.lastSuccessfulCheckAt?.toISOString() ?? null,
+      lastCheckError: this.lastCheckError ?? null,
     };
-    const [fixtureOdds, providerState, providerCache] = await Promise.all([
-      inspect(this.oddsModel),
-      inspect(this.providerStateModel),
-      inspect(this.providerCacheModel),
-    ]);
-    return { fixtureOdds, providerState, providerCache };
+  }
+
+  private toDate(value: unknown): Date | undefined {
+    if (value instanceof Date && Number.isFinite(value.getTime())) return value;
+    if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date : undefined;
+  }
+
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private readPositiveInteger(value: string | undefined, fallback: number): number {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
   }
 }

@@ -1,29 +1,40 @@
 export const YOUTUBE_CONFIG = {
   apiBaseUrl: 'https://www.googleapis.com/youtube/v3',
-
-  /** YouTube Data API searches only return video results. */
   searchType: 'video',
 
-  /**
-   * The maximum accepted publication window after the scheduled kickoff.
-   * The search job itself is queued after the fixture is confirmed completed.
-   */
-  defaultSearchWindowMinutes: 20,
+  /** Accept highlights published from kickoff through the next 24 hours. */
   highlightWindowHours: 24,
 
+  /** Only these 15 high-following domestic leagues receive highlight searches. */
+  supportedCompetitionSlugs: [
+    'eng.1', // Premier League
+    'esp.1', // La Liga
+    'ita.1', // Serie A
+    'ger.1', // Bundesliga
+    'fra.1', // Ligue 1
+    'ned.1', // Eredivisie
+    'por.1', // Primeira Liga
+    'usa.1', // MLS
+    'ksa.1', // Saudi Pro League
+    'bra.1', // Brazil Serie A
+    'arg.1', // Argentina Primera
+    'mex.1', // Liga MX
+    'sco.1', // Scottish Premiership
+    'tur.1', // Turkish Super Lig
+    'nga.1', // Nigeria Professional Football League
+  ] as const,
+
   /**
-   * Durable, one-search-per-stage workflow measured from full-time detection.
-   * The search plan can include the competition channel, both clubs' channels,
-   * four general fallbacks, and a final unrestricted search. The queue builder
-   * still stops attempts when the fixture's kickoff + 24h window expires.
+   * Four total requests per fixture: an initial search, then retries beginning
+   * at one hour. The fourth search is unrestricted by channel; the first three
+   * follow the competition/club/fallback channel priority order.
    */
   searchWorkflow: {
-    maximumRequestsPerFixture: 9,
-    attemptOffsetsMinutes: [10, 30, 60, 120, 240, 360, 540, 720, 960] as const,
+    maximumRequestsPerFixture: 4,
+    attemptOffsetsMinutes: [10, 70, 130, 190] as const,
     maximumFallbackChannels: 4,
   },
 
-  /** Search only for videos that YouTube marks as embeddable/syndicated. */
   requireEmbeddable: true,
 } as const;
 

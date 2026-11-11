@@ -1,391 +1,569 @@
+import { randomUUID } from 'node:crypto';
 import {
   Injectable,
   Logger,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
-import { OddsService } from './odds.service';
-import { OddsCollectionService } from './odds-collection.service';
 import { AdminGateway } from '../../realtime/admin.gateway';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import { SportsQueueJobType } from '../../sports/interfaces/sports-queue.interface';
+import type { SportsFixtureRecord } from '../../sports/interfaces/sports-domain.interface';
+import { SportsQueueService } from '../../sports/services/sports-queue.service';
+import type { ClaimedSportsQueueJob } from '../../sports/services/sports-queue.service';
 import { ODDS_CONFIG } from '../config/odds.config';
-import { EspnQueueService } from '../../sports/services/espn-queue.service';
+import { OddsService } from './odds.service';
 
-const WORKER_INTERVAL_MS = 5 * 60_000;
-const FIXTURES_PER_CYCLE = 20; // Bounded page; refreshes run with concurrency 2.
-const CANDIDATE_COUNT_REFRESH_MS = 30 * 60_000;
-const EXPIRY_CLEANUP_INTERVAL_MS = 15 * 60_000;
+const QUEUE_POLL_MS = 1_000;
+const QUEUE_LEASE_MS = 10 * 60_000;
+const QUEUE_HEARTBEAT_MS = 60_000;
 
 @Injectable()
 export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OddsWorkerService.name);
   private timer?: ReturnType<typeof setInterval>;
-  private expiryTimer?: ReturnType<typeof setInterval>;
-  private busy = false;
-  private expiryBusy = false;
-  private candidateCountCache = 0;
-  private candidateCountRefreshedAt = 0;
-  private fixtureExplainLogged = false;
+  private cleanupTimer?: ReturnType<typeof setInterval>;
+  private queueTimer?: ReturnType<typeof setInterval>;
   private stopping = false;
-  private cursor: { fixtureDate: Date; eventId: string } | null = null;
+  private initialized = false;
+  private busy = false;
+  private cleanupBusy = false;
+  private queueBusy = false;
+  private queuePasses = 0;
+  private queueJobsClaimed = 0;
+  private queueJobsCompleted = 0;
+  private queueJobsFailed = 0;
+  private lastQueuePassAt?: Date;
+  private lastQueueError?: string;
+  private cursor?: string;
+  private startedAt?: Date;
+
+  private inventorySweepStartedAt?: Date;
+  private inventorySweepPages = 0;
+  private inventorySweepFixtures = 0;
+  private inventorySweepSucceeded = 0;
+  private inventorySweepFailed = 0;
+  private inventorySweepsCompleted = 0;
+  private lastInventorySweepStartedAt?: Date;
+  private lastInventorySweepCompletedAt?: Date;
+  private lastInventorySweepDurationMs?: number;
+  private lastInventorySweepPages = 0;
+  private lastInventorySweepFixtures = 0;
+  private lastInventorySweepSucceeded = 0;
+  private lastInventorySweepFailed = 0;
+  private lastSuccessfulInventorySweepAt?: Date;
+  private consecutivePartialInventorySweeps = 0;
+
   private cyclesCompleted = 0;
   private cyclesFailed = 0;
+  private consecutiveCycleFailures = 0;
+  private consecutivePartialFailureCycles = 0;
   private lastCycleStartedAt?: Date;
   private lastCycleCompletedAt?: Date;
-  private lastCycleSucceeded?: boolean;
+  private lastSuccessfulCycleAt?: Date;
+  private lastCycleDurationMs?: number;
   private lastCycleError?: string;
-  private lastCandidateCount = 0;
   private lastBatchSize = 0;
   private lastRefreshedCount = 0;
-  private lastPredictionReadyCount = 0;
+  private lastFailedCount = 0;
 
-  /** Read-only runtime diagnostics for the Odds monitor. */
-  getMonitorStatus() {
-    return {
-      running: Boolean(this.timer) && !this.stopping,
-      stopping: this.stopping,
-      busy: this.busy,
-      expiryCleanupBusy: this.expiryBusy,
-      startupReleased: Boolean(this.timer),
-      cyclesCompleted: this.cyclesCompleted,
-      cyclesFailed: this.cyclesFailed,
-      lastCycleStartedAt: this.lastCycleStartedAt ?? null,
-      lastCycleCompletedAt: this.lastCycleCompletedAt ?? null,
-      lastCycleSucceeded: this.lastCycleSucceeded ?? null,
-      lastCycleError: this.lastCycleError ?? null,
-      lastCandidateCount: this.lastCandidateCount,
-      lastBatchSize: this.lastBatchSize,
-      lastRefreshedCount: this.lastRefreshedCount,
-      lastPredictionReadyCount: this.lastPredictionReadyCount,
-      candidateCountCache: this.candidateCountCache,
-      candidateCountRefreshedAt: this.candidateCountRefreshedAt
-        ? new Date(this.candidateCountRefreshedAt)
-        : null,
-      configuredCycleIntervalMs: WORKER_INTERVAL_MS,
-      configuredBatchSize: FIXTURES_PER_CYCLE,
-      configuredExpiryCleanupIntervalMs: EXPIRY_CLEANUP_INTERVAL_MS,
-    };
-  }
+  private retentionCyclesCompleted = 0;
+  private retentionCyclesFailed = 0;
+  private retentionConsecutiveFailures = 0;
+  private lastRetentionStartedAt?: Date;
+  private lastRetentionCompletedAt?: Date;
+  private lastRetentionDurationMs?: number;
+  private lastRetentionError?: string;
+  private lastRetentionFixtureCount = 0;
+  private lastRetentionPages = 0;
+  private lastCompletedRetentionCount = 0;
+
+  private readonly workerId = `odds-queue:${process.env.HOSTNAME ?? 'node'}:${randomUUID()}`;
 
   constructor(
-    @InjectModel(EspnFixture.name)
-    private readonly fixtureModel: Model<EspnFixture>,
+    private readonly sportsRead: SportsDomainReadService,
     private readonly oddsService: OddsService,
-    private readonly oddsCollectionService: OddsCollectionService,
     private readonly adminGateway: AdminGateway,
-    private readonly espnQueueService: EspnQueueService,
+    private readonly queue: SportsQueueService,
   ) {}
 
   onModuleInit(): void {
-    // The Sports startup pipeline owns the provider/API startup order. Do not
-    // query fixtures, call ESPN Summary, or request Odds API feeds until it has
-    // explicitly released normal operations.
-    this.logger.log(
-      'Odds worker initialized; waiting for ESPN startup to finish before any collection begins.',
+    this.initialized = true;
+    this.startedAt = new Date();
+
+    if (!ODDS_CONFIG.enabled) {
+      this.adminGateway.setModuleOperationalStatus(
+        'odds', 'STOPPED', 'Grivit odds pricing is disabled by configuration.',
+      );
+      return;
+    }
+
+    this.adminGateway.setModuleOperationalStatus(
+      'odds', 'STARTING',
+      'Grivit is backfilling all retained Sports fixtures and consuming source-change pricing jobs.',
     );
-    void this.startAfterSportsStartup();
+
+    void this.runSafely();
+    void this.runRetentionSafely();
+    void this.runQueueSafely();
+    this.timer = setInterval(() => void this.runSafely(), ODDS_CONFIG.workerIntervalMs);
+    this.cleanupTimer = setInterval(() => void this.runRetentionSafely(), ODDS_CONFIG.cleanupIntervalMs);
+    this.queueTimer = setInterval(() => void this.runQueueSafely(), QUEUE_POLL_MS);
   }
 
   onModuleDestroy(): void {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
-    if (this.expiryTimer) clearInterval(this.expiryTimer);
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    if (this.queueTimer) clearInterval(this.queueTimer);
     this.timer = undefined;
-    this.expiryTimer = undefined;
+    this.cleanupTimer = undefined;
+    this.queueTimer = undefined;
   }
 
-  private async startAfterSportsStartup(): Promise<void> {
-    await this.espnQueueService.waitForNormalOperationsReady();
-    if (this.stopping) return;
-
-    this.logger.log(
-      'ESPN startup finished and released normal operations; starting Odds collection.',
-    );
-    this.adminGateway.setModuleOperationalStatus(
-      'odds',
-      'STARTING',
-      'ESPN startup is complete. The first Odds refresh cycle is starting.',
-    );
-
-    void this.runSafely();
-    this.timer = setInterval(() => void this.runSafely(), WORKER_INTERVAL_MS);
-    // Expiry discovery is housekeeping, not part of the five-minute price refresh.
-    // Its bounded work must never delay the next regular Odds worker cycle.
-    void this.runExpiryCleanupSafely();
-    this.expiryTimer = setInterval(
-      () => void this.runExpiryCleanupSafely(),
-      EXPIRY_CLEANUP_INTERVAL_MS,
-    );
+  /** Read-only worker telemetry for the Odds operational monitor. */
+  getMonitorStatus() {
+    return {
+      enabled: ODDS_CONFIG.enabled,
+      initialized: this.initialized,
+      running: Boolean(this.timer) && !this.stopping,
+      stopping: this.stopping,
+      startedAt: this.startedAt ?? null,
+      busy: this.busy,
+      cleanupBusy: this.cleanupBusy,
+      queueBusy: this.queueBusy,
+      sourceChangeQueue: {
+        passes: this.queuePasses,
+        jobsClaimed: this.queueJobsClaimed,
+        jobsCompleted: this.queueJobsCompleted,
+        jobsFailed: this.queueJobsFailed,
+        lastPassAt: this.lastQueuePassAt ?? null,
+        lastError: this.lastQueueError ?? null,
+      },
+      cyclesCompleted: this.cyclesCompleted,
+      cyclesFailed: this.cyclesFailed,
+      consecutiveCycleFailures: this.consecutiveCycleFailures,
+      consecutivePartialFailureCycles: this.consecutivePartialFailureCycles,
+      lastCycleStartedAt: this.lastCycleStartedAt ?? null,
+      lastCycleCompletedAt: this.lastCycleCompletedAt ?? null,
+      lastSuccessfulCycleAt: this.lastSuccessfulCycleAt ?? null,
+      lastCycleDurationMs: this.lastCycleDurationMs ?? null,
+      lastCycleError: this.lastCycleError ?? null,
+      lastBatchSize: this.lastBatchSize,
+      lastRefreshedCount: this.lastRefreshedCount,
+      lastFailedCount: this.lastFailedCount,
+      cursorPresent: Boolean(this.cursor),
+      inventorySweep: {
+        inProgress: Boolean(this.inventorySweepStartedAt),
+        startedAt: this.inventorySweepStartedAt ?? null,
+        elapsedMs: this.inventorySweepStartedAt
+          ? Math.max(0, Date.now() - this.inventorySweepStartedAt.getTime())
+          : 0,
+        completedPages: this.inventorySweepPages,
+        visitedFixtures: this.inventorySweepFixtures,
+        successfullyPricedFixtures: this.inventorySweepSucceeded,
+        failedFixtures: this.inventorySweepFailed,
+        fixturesPerMinute: this.inventorySweepStartedAt
+          ? Number((this.inventorySweepFixtures / Math.max(1 / 60, (Date.now() - this.inventorySweepStartedAt.getTime()) / 60_000)).toFixed(1))
+          : null,
+        sweepsCompleted: this.inventorySweepsCompleted,
+        lastStartedAt: this.lastInventorySweepStartedAt ?? null,
+        lastCompletedAt: this.lastInventorySweepCompletedAt ?? null,
+        lastDurationMs: this.lastInventorySweepDurationMs ?? null,
+        lastPages: this.lastInventorySweepPages,
+        lastFixtures: this.lastInventorySweepFixtures,
+        lastSuccessfullyPricedFixtures: this.lastInventorySweepSucceeded,
+        lastFailedFixtures: this.lastInventorySweepFailed,
+        lastSuccessfulAt: this.lastSuccessfulInventorySweepAt ?? null,
+        consecutivePartialFailureSweeps: this.consecutivePartialInventorySweeps,
+      },
+      retentionCyclesCompleted: this.retentionCyclesCompleted,
+      retentionCyclesFailed: this.retentionCyclesFailed,
+      retentionConsecutiveFailures: this.retentionConsecutiveFailures,
+      lastRetentionStartedAt: this.lastRetentionStartedAt ?? null,
+      lastRetentionCompletedAt: this.lastRetentionCompletedAt ?? null,
+      lastRetentionDurationMs: this.lastRetentionDurationMs ?? null,
+      lastRetentionError: this.lastRetentionError ?? null,
+      lastRetentionFixtureCount: this.lastRetentionFixtureCount,
+      lastRetentionPages: this.lastRetentionPages,
+      lastCompletedRetentionCount: this.lastCompletedRetentionCount,
+      configuredIntervalMs: ODDS_CONFIG.workerIntervalMs,
+      configuredBatchSize: ODDS_CONFIG.workerBatchSize,
+      configuredConcurrency: ODDS_CONFIG.workerConcurrency,
+      configuredScanScope: 'ALL_RETAINED_FIXTURES',
+      configuredCleanupIntervalMs: ODDS_CONFIG.cleanupIntervalMs,
+      configuredRetentionGraceMonths: ODDS_CONFIG.seasonRetentionGraceMonths,
+      queueWorkerId: this.workerId,
+      dataSource: 'SPORTS_MODULE',
+      externalApiCalls: 0,
+    };
   }
 
-  private async runSafely(): Promise<void> {
-    if (this.busy) return;
-    this.busy = true;
-    this.lastCycleStartedAt = new Date();
+  /** Queue telemetry is intentionally read-only and scoped to Odds-owned pricing jobs. */
+  async getQueueMonitorStatus(): Promise<Record<string, unknown>> {
     try {
-      const now = new Date();
-      const nowWat = new Date(now.getTime() + 60 * 60_000);
-      const todayStartWat = new Date(Date.UTC(nowWat.getUTCFullYear(), nowWat.getUTCMonth(), nowWat.getUTCDate()) - 60 * 60_000);
-      const horizon = new Date(now.getTime() + ODDS_CONFIG.lookaheadHours * 60 * 60_000);
-      // Use indexed fixtureDate/live fields for discovery. Text/regex status
-      // checks are deliberately left to OddsService after a bounded batch has
-      // been loaded; putting many regex branches in this hot query prevents an
-      // efficient keyset scan on the 2 GB host.
-      const fixtureFilter = {
-        $and: [
-          {
-            $or: [
-              { fixtureDate: { $gte: todayStartWat, $lte: horizon } },
-              { live: true },
-            ],
-          },
-          { completed: { $ne: true } },
-        ],
+      return {
+        available: true,
+        type: SportsQueueJobType.ODDS_PRICING_RECALCULATION,
+        ...(await this.queue.getTypeOperationalSummary(
+          SportsQueueJobType.ODDS_PRICING_RECALCULATION,
+        )),
       };
-      await this.logFixtureDiscoveryExplainIfRequested(fixtureFilter);
-      const candidateCount = await this.getCandidateCount(fixtureFilter);
-      this.lastCandidateCount = candidateCount;
-      // Keep the cursor unchanged until the batch has completed. A provider
-      // failure or a failed fixture must not advance the scan past work that
-      // still needs a retry.
-      let queryCursor = this.cursor;
-      const loadBatch = async (cursor: { fixtureDate: Date; eventId: string } | null) => {
-        const cursorFilter = cursor
-          ? {
-              $or: [
-                { fixtureDate: { $gt: cursor.fixtureDate } },
-                {
-                  fixtureDate: cursor.fixtureDate,
-                  eventId: { $gt: cursor.eventId },
-                },
-              ],
-            }
-          : undefined;
-        const filter = cursorFilter
-          ? { $and: [...(fixtureFilter.$and ?? []), cursorFilter] }
-          : fixtureFilter;
-        return (await this.fixtureModel
-          .find(filter)
-            .select({
-            eventId: 1,
-            leagueId: 1,
-            homeScore: 1,
-            awayScore: 1,
-            season: 1,
-            fixtureDate: 1,
-            live: 1,
-            completed: 1,
-            status: 1,
-            statusDetail: 1,
-            statusShortDetail: 1,
-            homeTeamId: 1,
-            awayTeamId: 1,
-            'payload.summary.odds': 1,
-            'payload.summary.pickcenter': 1,
-            'payload.summary.meta.lastUpdatedAt': 1,
-            'payload.summaryCollectedAt': 1,
-            'payload.oddsSummaryAttemptedAt': 1,
-            'payload.competitions.competitors': 1,
-            'payload.competitions.odds': 1,
-          })
-          .sort({ fixtureDate: 1, eventId: 1 })
-          .limit(FIXTURES_PER_CYCLE)
-          .lean()
-          .exec()) as any[];
+    } catch (error) {
+      return {
+        available: false,
+        type: SportsQueueJobType.ODDS_PRICING_RECALCULATION,
+        error: this.errorMessage(error).slice(0, 300),
       };
-      let batch = await loadBatch(queryCursor);
-      // Keyset pagination avoids increasingly expensive skip/offset scans. If
-      // the cursor reaches the end, wrap locally; do not commit until work ends.
-      if (!batch.length && queryCursor) {
-        queryCursor = null;
-        batch = await loadBatch(queryCursor);
-      }
-      this.lastBatchSize = batch.length;
+    }
+  }
 
-      // Keep provider and database concurrency bounded for the 2 GB host while
-      // rotating through the complete eligible fixture set with indexed paging.
-      const providerCollection =
-        await this.oddsCollectionService.collectProviderQuotes(batch);
+  private beginInventorySweep(at: Date): void {
+    if (this.inventorySweepStartedAt) return;
+    this.inventorySweepStartedAt = at;
+    this.lastInventorySweepStartedAt = at;
+    this.inventorySweepPages = 0;
+    this.inventorySweepFixtures = 0;
+    this.inventorySweepSucceeded = 0;
+    this.inventorySweepFailed = 0;
+  }
+
+  private completeInventorySweep(at: Date): void {
+    if (!this.inventorySweepStartedAt) return;
+    this.inventorySweepsCompleted += 1;
+    this.lastInventorySweepCompletedAt = at;
+    this.lastInventorySweepDurationMs = Math.max(
+      0,
+      at.getTime() - this.inventorySweepStartedAt.getTime(),
+    );
+    this.lastInventorySweepPages = this.inventorySweepPages;
+    this.lastInventorySweepFixtures = this.inventorySweepFixtures;
+    this.lastInventorySweepSucceeded = this.inventorySweepSucceeded;
+    this.lastInventorySweepFailed = this.inventorySweepFailed;
+    if (this.inventorySweepFailed > 0) {
+      this.consecutivePartialInventorySweeps += 1;
+    } else {
+      this.consecutivePartialInventorySweeps = 0;
+      this.lastSuccessfulInventorySweepAt = at;
+    }
+    this.inventorySweepStartedAt = undefined;
+    this.inventorySweepPages = 0;
+    this.inventorySweepFixtures = 0;
+    this.inventorySweepSucceeded = 0;
+    this.inventorySweepFailed = 0;
+  }
+
+  /** One page per pass; repeated passes cover every retained fixture. */
+  private async runSafely(): Promise<void> {
+    if (this.stopping || !ODDS_CONFIG.enabled || this.busy) return;
+    this.busy = true;
+    const startedAt = Date.now();
+    this.lastCycleStartedAt = new Date(startedAt);
+    this.beginInventorySweep(new Date(startedAt));
+
+    try {
+      let result = await this.sportsRead.getFixtures({
+        limit: ODDS_CONFIG.workerBatchSize,
+        cursor: this.cursor,
+      });
+      if (!result.items.length && this.cursor) {
+        // An empty page after a cursor means the previous cursor-based sweep
+        // reached its end. Close its metrics before restarting at the first page.
+        this.completeInventorySweep(new Date());
+        this.cursor = undefined;
+        this.beginInventorySweep(new Date());
+        result = await this.sportsRead.getFixtures({ limit: ODDS_CONFIG.workerBatchSize });
+      }
+
+      const fixtures = result.items;
+      this.lastBatchSize = fixtures.length;
       let refreshed = 0;
-      const failedEventIds = new Set<string>();
-      if (batch.length) {
-        const seen = new Set<string>();
-        const uniqueBatch = batch.filter((fixture) => {
-          const eventId = String(fixture.eventId ?? '').trim();
-          if (!eventId || seen.has(eventId)) return false;
-          seen.add(eventId);
-          return true;
-        });
-        // Keep database/provider pressure bounded while avoiding one full
-        // sequential round-trip per fixture. Provider collection remains batched.
-        const refreshConcurrency = 2;
-        for (let offset = 0; offset < uniqueBatch.length; offset += refreshConcurrency) {
-          const refreshBatch = uniqueBatch.slice(offset, offset + refreshConcurrency);
-          const outcomes = await Promise.all(refreshBatch.map(async (fixture) => {
-            const eventId = String(fixture.eventId);
-            const quotes = providerCollection.pricesByEvent.get(eventId) ?? [];
-            try {
-              await this.oddsService.refreshFixture(
-                eventId,
-                quotes,
-                providerCollection.updatedAtByEvent.get(eventId),
-              );
-              return { eventId, ok: true as const };
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              this.logger.warn(
-                `Odds refresh failed for fixture ${eventId}; other fixtures in the batch will continue: ${message}`,
-              );
-              return { eventId, ok: false as const };
-            }
-          }));
-          refreshed += outcomes.filter((outcome) => outcome.ok).length;
-          for (const outcome of outcomes) {
-            if (!outcome.ok) failedEventIds.add(outcome.eventId);
-          }
+      let failed = 0;
+      const successfullyRefreshedFixtures: SportsFixtureRecord[] = [];
+      let interrupted = false;
+      for (let offset = 0; offset < fixtures.length; offset += ODDS_CONFIG.workerConcurrency) {
+        if (this.stopping) {
+          interrupted = true;
+          break;
         }
-
-        const firstFailedIndex = uniqueBatch.findIndex((fixture) =>
-          failedEventIds.has(String(fixture.eventId)),
-        );
-        const cursorFixture = firstFailedIndex >= 0
-          ? (firstFailedIndex > 0 ? uniqueBatch[firstFailedIndex - 1] : null)
-          : batch[batch.length - 1];
-        if (firstFailedIndex >= 0 && firstFailedIndex === 0) {
-          this.cursor = queryCursor;
-        } else if (cursorFixture) {
-          const cursorDate = cursorFixture.fixtureDate instanceof Date
-            ? cursorFixture.fixtureDate
-            : new Date(cursorFixture.fixtureDate);
-          const cursorEventId = String(cursorFixture.eventId ?? '').trim();
-          if (Number.isFinite(cursorDate.getTime()) && cursorEventId) {
-            this.cursor = { fixtureDate: cursorDate, eventId: cursorEventId };
+        const batch = fixtures.slice(offset, offset + ODDS_CONFIG.workerConcurrency);
+        const outcomes = await Promise.all(batch.map(async (fixture) => {
+          try {
+            await this.oddsService.refreshFixture(fixture.id);
+            return { fixture, success: true };
+          } catch (error) {
+            this.logger.warn(`Grivit pricing failed for fixture ${fixture.id}: ${this.errorMessage(error)}`);
+            return { fixture, success: false };
           }
-        } else {
-          this.cursor = queryCursor;
-        }
-      } else {
-        // An empty result means this cursor reached the end of the current set.
-        this.cursor = null;
+        }));
+        const succeeded = outcomes.filter((item) => item.success);
+        successfullyRefreshedFixtures.push(...succeeded.map((item) => item.fixture));
+        refreshed += succeeded.length;
+        failed += outcomes.length - succeeded.length;
       }
-      const batchEventIds = batch
-        .map((fixture) => String(fixture.eventId))
-        .filter(Boolean);
-      const readinessByEvent =
-        await this.oddsService.getPredictionReadinessForEvents(batchEventIds);
-      const readyCount = [...readinessByEvent.values()].filter(
-        (item) => item.ready,
-      ).length;
+
+      // Do not advance the keyset cursor for an interrupted page. The page is
+      // safely revisited after restart instead of being counted as completed.
+      if (interrupted || this.stopping) return;
+
+      // This also covers the initial all-fixture Odds backfill. A prediction
+      // trigger is coalesced by the latest persisted Grivit price timestamp, so
+      // an unchanged full scan cannot create duplicate work every cycle.
+      const predictionTriggers = await this.enqueuePredictionRecalculations(successfullyRefreshedFixtures);
+      if (predictionTriggers > 0) {
+        this.logger.log(`Grivit refresh released ${predictionTriggers} prediction recalculation trigger(s).`);
+      }
+
+      this.inventorySweepPages += 1;
+      this.inventorySweepFixtures += fixtures.length;
+      this.inventorySweepSucceeded += refreshed;
+      this.inventorySweepFailed += failed;
+      this.cursor = result.nextCursor;
+      if (!result.nextCursor) this.completeInventorySweep(new Date());
       this.lastRefreshedCount = refreshed;
-      this.lastPredictionReadyCount = readyCount;
-      this.lastCycleSucceeded = true;
-      this.lastCycleError = undefined;
+      this.lastFailedCount = failed;
       this.cyclesCompleted += 1;
-      const moduleMessage = `${providerCollection.statusMessage || 'Odds worker cycle completed.'} Current Odds batch processed ${batch.length} of ${candidateCount} eligible fixtures; readiness: ${readyCount}/${batchEventIds.length} fixtures in this batch are ready for the Prediction Engine.`;
-      // A missing ESPN bookmaker quote is not an Odds module outage: the Odds
-      // API and the labelled historical fallback still complete price coverage.
+      this.consecutiveCycleFailures = 0;
+      if (failed > 0) {
+        this.consecutivePartialFailureCycles += 1;
+        this.lastCycleError = `${failed} fixture calculation(s) failed; the full scan will revisit them.`;
+      } else {
+        this.consecutivePartialFailureCycles = 0;
+        this.lastCycleError = undefined;
+        this.lastSuccessfulCycleAt = new Date();
+      }
+
       this.adminGateway.setModuleOperationalStatus(
-        'odds',
-        'READY',
-        moduleMessage,
+        'odds', failed ? 'DEGRADED' : 'READY',
+        `Grivit pricing batch processed ${fixtures.length} fixtures (${refreshed} successful, ${failed} failed). Upcoming, live and completed fixtures are included.`,
       );
       this.adminGateway.publishModuleEvent('odds', 'odds:cycle-completed', {
-        candidates: candidateCount,
-        batchSize: batch.length,
+        fixtureCount: fixtures.length,
         refreshed,
-        predictionReady: readyCount,
-        predictionNotReady: batchEventIds.length - readyCount,
-        primaryAvailable: providerCollection.primaryAvailable,
-        fallbackActive: providerCollection.fallbackActive,
-        providerStatus: moduleMessage,
+        failed,
+        nextPageAvailable: Boolean(result.nextCursor),
+        scanScope: 'ALL_RETAINED_FIXTURES',
+        inventorySweep: this.getMonitorStatus().inventorySweep,
+        bookmaker: 'Grivit',
+        externalApiCalls: 0,
         occurredAt: new Date().toISOString(),
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.lastCycleSucceeded = false;
+      const message = this.errorMessage(error);
       this.lastCycleError = message.slice(0, 500);
       this.cyclesFailed += 1;
-      this.adminGateway.setModuleOperationalStatus('odds', 'DEGRADED', message);
+      this.consecutiveCycleFailures += 1;
+      this.adminGateway.setModuleOperationalStatus(
+        'odds', 'DEGRADED', `Grivit inventory pricing batch failed: ${message.slice(0, 300)}`,
+      );
       this.adminGateway.publishModuleEvent('odds', 'odds:worker-error', {
-        message: message.slice(0, 500),
-        occurredAt: new Date().toISOString(),
+        message: message.slice(0, 500), occurredAt: new Date().toISOString(),
       });
-      this.logger.error(`Odds worker cycle failed: ${message}`);
+      this.logger.error(`Grivit inventory pricing batch failed: ${message}`);
     } finally {
       this.lastCycleCompletedAt = new Date();
+      this.lastCycleDurationMs = Date.now() - startedAt;
       this.busy = false;
     }
   }
 
-  private async getCandidateCount(fixtureFilter: Record<string, any>): Promise<number> {
-    const now = Date.now();
-    // This count is diagnostic only; it never gates batch discovery. Cache
-    // even a zero count so an empty result does not trigger a full count scan
-    // on every five-minute worker pass.
-    if (now - this.candidateCountRefreshedAt >= CANDIDATE_COUNT_REFRESH_MS) {
-      this.candidateCountCache = await this.fixtureModel.countDocuments(fixtureFilter).exec();
-      this.candidateCountRefreshedAt = now;
-    }
-    return this.candidateCountCache;
-  }
-
-  /**
-   * Run only when explicitly enabled so the real MongoDB plan can be measured
-   * before considering a fixture discovery index or pagination redesign.
-   * Enable with ODDS_FIXTURE_QUERY_EXPLAIN=true and inspect documents/keys examined
-   * and whether the winning plan contains a blocking SORT stage.
-   */
-  private async logFixtureDiscoveryExplainIfRequested(fixtureFilter: Record<string, any>): Promise<void> {
-    if (this.fixtureExplainLogged || process.env.ODDS_FIXTURE_QUERY_EXPLAIN !== 'true') return;
-    this.fixtureExplainLogged = true;
+  /** Consume only Odds-owned source-change jobs from the shared durable Sports queue. */
+  private async runQueueSafely(): Promise<void> {
+    if (this.stopping || !ODDS_CONFIG.enabled || this.queueBusy) return;
+    this.queueBusy = true;
+    this.queuePasses += 1;
+    this.lastQueuePassAt = new Date();
     try {
-      const explanation: any = await this.fixtureModel
-        .find(fixtureFilter)
-        .select({ eventId: 1, live: 1, fixtureDate: 1 })
-        .sort({ fixtureDate: 1, eventId: 1 })
-        .limit(FIXTURES_PER_CYCLE)
-        .explain('executionStats');
-      const execution = explanation?.executionStats ?? {};
-      const planner = explanation?.queryPlanner ?? {};
-      this.logger.log(`Odds fixture discovery explain: ${JSON.stringify({
-        executionTimeMillis: execution.executionTimeMillis,
-        nReturned: execution.nReturned,
-        totalKeysExamined: execution.totalKeysExamined,
-        totalDocsExamined: execution.totalDocsExamined,
-        winningPlan: planner.winningPlan,
-      })}`);
+      const claims: Array<{ job: ClaimedSportsQueueJob; workerId: string }> = [];
+      for (let slot = 0; slot < ODDS_CONFIG.workerConcurrency; slot += 1) {
+        const workerId = `${this.workerId}:${slot}`;
+        const job = await this.queue.claimNext(
+          workerId,
+          QUEUE_LEASE_MS,
+          SportsQueueJobType.ODDS_PRICING_RECALCULATION,
+        );
+        if (!job) break;
+        claims.push({ job, workerId });
+      }
+      this.queueJobsClaimed += claims.length;
+      await Promise.all(claims.map(({ job, workerId }) => this.processQueuedJob(job, workerId)));
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.warn(`Could not collect Odds fixture discovery explain plan: ${message}`);
+      this.lastQueueError = this.errorMessage(error).slice(0, 500);
+      this.logger.warn(`Odds source-change queue pass failed: ${this.lastQueueError}`);
+    } finally {
+      this.queueBusy = false;
     }
   }
 
-  private async runExpiryCleanupSafely(): Promise<void> {
-    if (this.stopping || this.expiryBusy) return;
-    this.expiryBusy = true;
+  private async processQueuedJob(job: ClaimedSportsQueueJob, workerId: string): Promise<void> {
+    const heartbeat = setInterval(() => {
+      void this.queue.markHeartbeat(job.jobKey, workerId, QUEUE_LEASE_MS)
+        .then((renewed) => {
+          if (!renewed) this.logger.warn(`Odds queue lease ${job.jobKey} is no longer owned by this worker.`);
+        })
+        .catch((error: unknown) => this.logger.warn(`Odds queue heartbeat failed: ${this.errorMessage(error)}`));
+    }, QUEUE_HEARTBEAT_MS);
+    (heartbeat as unknown as { unref?: () => void }).unref?.();
+
     try {
-      const updatedOddsDocuments = await this.oddsService.expireCompletedFixtures(100);
-      this.adminGateway.publishModuleEvent('odds', 'odds:expiry-cleanup-completed', {
-        updatedOddsDocuments,
-        occurredAt: new Date().toISOString(),
-      });
-      if (updatedOddsDocuments > 0) {
-        this.logger.log(`Odds expiry cleanup assigned retention dates to ${updatedOddsDocuments} odds documents.`);
+      const fixtureId = String(job.scope.fixtureId ?? '').trim();
+      if (!fixtureId) throw new Error('Odds pricing queue job is missing fixtureId.');
+      await this.oddsService.refreshFixture(fixtureId);
+      await this.enqueuePredictionRecalculationForFixture(fixtureId);
+      const completed = await this.queue.markCompleted(job.jobKey, workerId);
+      if (completed) {
+        this.queueJobsCompleted += 1;
+        this.lastQueueError = undefined;
+      } else {
+        this.logger.warn(`Odds queue job ${job.jobKey} lost its processing lease before completion.`);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.warn(`Odds expiry cleanup failed; normal Odds refresh continues: ${message}`);
-      this.adminGateway.publishModuleEvent('odds', 'odds:expiry-cleanup-error', {
-        message: message.slice(0, 500),
-        occurredAt: new Date().toISOString(),
-      });
+      this.queueJobsFailed += 1;
+      this.lastQueueError = this.errorMessage(error).slice(0, 500);
+      const outcome = await this.queue.markFailed(job, workerId, error);
+      this.logger.warn(`Odds source-change job ${job.jobKey} failed and was ${outcome.toLowerCase()}: ${this.lastQueueError}`);
     } finally {
-      this.expiryBusy = false;
+      clearInterval(heartbeat);
     }
   }
 
-}
+  private async enqueuePredictionRecalculationForFixture(
+    fixtureId: string,
+  ): Promise<void> {
+    const fixture = await this.sportsRead.getFixture(fixtureId);
+    if (!fixture || !this.isUpcomingPredictionFixture(fixture)) return;
+    await this.enqueuePredictionRecalculations([fixture]);
+  }
 
+  private async enqueuePredictionRecalculations(
+    fixtures: SportsFixtureRecord[],
+  ): Promise<number> {
+    const candidates = fixtures.filter((fixture) => this.isUpcomingPredictionFixture(fixture));
+    if (!candidates.length) return 0;
+
+    let enqueued = 0;
+    const readinessBatchSize = 500;
+    for (let offset = 0; offset < candidates.length; offset += readinessBatchSize) {
+      const batch = candidates.slice(offset, offset + readinessBatchSize);
+      const readinessByEvent = await this.oddsService.getPredictionReadinessForEvents(
+        batch.map((fixture) => String(fixture.id)),
+      );
+
+      // Report why fixtures are still waiting for a prediction trigger. This
+      // keeps insufficient Sports history, stale source revisions and invalid
+      // prices distinguishable without weakening Grivit's quality thresholds.
+      const waitingReasons = new Map<string, { count: number; examples: string[] }>();
+      let readyFixtureCount = 0;
+      for (const fixture of batch) {
+        const fixtureId = String(fixture.id);
+        const readiness = readinessByEvent.get(fixtureId);
+        if (readiness?.ready === true) {
+          readyFixtureCount += 1;
+          continue;
+        }
+        const reason = String(readiness?.reason ?? 'No Grivit readiness record was returned.');
+        const bucket = waitingReasons.get(reason) ?? { count: 0, examples: [] };
+        bucket.count += 1;
+        if (bucket.examples.length < 3) bucket.examples.push(fixtureId);
+        waitingReasons.set(reason, bucket);
+      }
+      if (waitingReasons.size > 0) {
+        const summary = [...waitingReasons.entries()]
+          .map(([reason, value]) => `${value.count}× ${reason} [${value.examples.join(', ')}]`)
+          .join('; ');
+        this.logger.debug(
+          `Grivit readiness batch ${batch.length}: ready=${readyFixtureCount}, waiting=${batch.length - readyFixtureCount}; ${summary}`,
+        );
+      }
+
+      const enqueueConcurrency = 20;
+      for (let cursor = 0; cursor < batch.length; cursor += enqueueConcurrency) {
+        const enqueueBatch = batch.slice(cursor, cursor + enqueueConcurrency);
+        const results = await Promise.all(enqueueBatch.map(async (fixture) => {
+          const fixtureId = String(fixture.id);
+          const readiness = readinessByEvent.get(fixtureId);
+          if (!readiness?.ready) return false;
+          const latestOddsUpdatedAt = this.toDate(readiness.latestOddsUpdatedAt);
+          if (!latestOddsUpdatedAt) return false;
+
+          const predictionSourceUpdatedAt = latestOddsUpdatedAt.toISOString();
+          const result = await this.queue.enqueueIfMissing({
+            type: SportsQueueJobType.PREDICTION_ENGINE_RECALCULATION,
+            scope: {
+              fixtureId,
+              predictionSourceUpdatedAt,
+            },
+            priority: 75,
+            scheduledFor: new Date(),
+            triggerEventId: `prediction:grivit:${fixtureId}:${predictionSourceUpdatedAt}`,
+          });
+          return result.created;
+        }));
+        enqueued += results.filter(Boolean).length;
+      }
+    }
+
+    return enqueued;
+  }
+
+  private isUpcomingPredictionFixture(fixture: SportsFixtureRecord): boolean {
+    const kickoffAt = this.toDate(fixture.kickoffAt);
+    if (!kickoffAt || kickoffAt.getTime() <= Date.now()) return false;
+    const state = String(fixture.status?.state ?? 'UNKNOWN').toUpperCase();
+    return ![
+      'LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES',
+      'COMPLETED', 'POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED',
+    ].includes(state) && fixture.status?.isFinal !== true;
+  }
+
+  private toDate(value: unknown): Date | null {
+    if (value instanceof Date && Number.isFinite(value.getTime())) return value;
+    if (typeof value === 'string' || typeof value === 'number') {
+      const date = new Date(value);
+      return Number.isFinite(date.getTime()) ? date : null;
+    }
+    return null;
+  }
+
+  /** TTL is the primary expiry mechanism; this bounded sweep removes expired rows promptly. */
+  private async runRetentionSafely(): Promise<void> {
+    if (this.stopping || !ODDS_CONFIG.enabled || this.cleanupBusy) return;
+    this.cleanupBusy = true;
+    const startedAt = Date.now();
+    this.lastRetentionStartedAt = new Date(startedAt);
+    try {
+      const deleted = await this.oddsService.pruneExpiredPrices(ODDS_CONFIG.expiredPriceCleanupBatchSize);
+      this.lastRetentionFixtureCount = deleted;
+      this.lastRetentionPages = deleted > 0 ? 1 : 0;
+      this.lastCompletedRetentionCount = deleted;
+      this.retentionCyclesCompleted += 1;
+      this.retentionConsecutiveFailures = 0;
+      this.lastRetentionError = undefined;
+      if (deleted > 0) {
+        this.adminGateway.publishModuleEvent('odds', 'odds:retention-completed', {
+          expiredSelectionsDeleted: deleted,
+          retentionRule: 'SPORTS_FIXTURE_SEASON_DURATION_PLUS_3_MONTHS',
+          occurredAt: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      const message = this.errorMessage(error);
+      this.lastRetentionError = message.slice(0, 500);
+      this.retentionCyclesFailed += 1;
+      this.retentionConsecutiveFailures += 1;
+      this.logger.warn(`Grivit expired-price cleanup failed: ${message}`);
+      this.adminGateway.publishModuleEvent('odds', 'odds:retention-error', {
+        message: message.slice(0, 300), occurredAt: new Date().toISOString(),
+      });
+    } finally {
+      this.lastRetentionCompletedAt = new Date();
+      this.lastRetentionDurationMs = Date.now() - startedAt;
+      this.cleanupBusy = false;
+    }
+  }
+
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
 

@@ -20,10 +20,6 @@ import {
   CuratedPrediction,
   CuratedPredictionSchema,
 } from '../predictions-engine/schemas/curated-prediction.schema';
-import {
-  EspnFixture,
-  EspnFixtureSchema,
-} from '../sports/schemas/espn/espn-fixture.schema';
 import { SettlementAdminController } from './controllers/settlement-admin.controller';
 import {
   SettlementEvent,
@@ -49,12 +45,22 @@ import { SettlementTriggerService } from './services/settlement-trigger.service'
 import { SettlementWorkerService } from './services/settlement-worker.service';
 
 import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
+/**
+ * Cross-module settlement boundary:
+ * - SportsModule supplies the authoritative normalized fixture and timeline.
+ * - FOOTBALL_MARKET_CATALOG (imported by MarketSettlementService from Odds)
+ *   defines the shared market, selection, period and line contract.
+ * - Prediction Engine records are registered here for outcome reconciliation.
+ * - BetLabModule supplies the wallet-safe settlement adapter.
+ *
+ * Odds prices are deliberately not used as match-result evidence. Settlement
+ * grades actual Sports facts against the same canonical catalogue used by Odds.
+ */
 @Module({
   imports: [
     forwardRef(() => BetLabModule),
     forwardRef(() => SportsModule),
     MongooseModule.forFeature([
-      { name: EspnFixture.name, schema: EspnFixtureSchema },
       { name: MarketPrediction.name, schema: MarketPredictionSchema },
       { name: PredictionSlip.name, schema: PredictionSlipSchema },
       { name: CuratedPrediction.name, schema: CuratedPredictionSchema },
@@ -91,4 +97,6 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
   ],
 })
 export class SettlementModule {}
+
+
 

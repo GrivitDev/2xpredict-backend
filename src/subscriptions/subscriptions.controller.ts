@@ -1,13 +1,26 @@
-import { Controller, Get, UseGuards } from '@nestjs/common';
-import { AuthGuard } from '@nestjs/passport';
+import { Controller, Get, Req, UseGuards } from '@nestjs/common';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
+import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { SubscriptionsMonitorService } from './subscriptions-monitor.service';
 import { SubscriptionsService } from './subscriptions.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { GetUser } from '../common/decorators/get-user.decorator';
 import { PlanConfigService } from '../plan-config/plan-config.service';
 import { UsersService } from '../users/users.service';
+import {
+  getSubscriptionEntitlements,
+  SubscriptionEntitlementPlan,
+} from './config/subscription-entitlements.config';
+
+type OptionalAuthRequest = {
+  user?: {
+    _id?: unknown;
+    id?: unknown;
+    userId?: unknown;
+    sub?: unknown;
+  } | null;
+};
 
 @Controller('subscriptions')
 export class SubscriptionsController {
@@ -35,20 +48,34 @@ export class SubscriptionsController {
   @Get('status')
   async getStatus(@GetUser() user: { _id: string }) {
     const subscription = await this.service.getActiveSubscription(user._id);
-
     const plan = await this.service.getUserPlan(user._id);
 
     return {
       plan,
       subscription,
+      entitlements: getSubscriptionEntitlements(plan),
     };
+  }
+
+  /** Public read for ad rendering; anonymous and Free users retain advertising. */
+  @UseGuards(OptionalJwtAuthGuard)
+  @Get('entitlements')
+  async getEntitlements(@Req() request: OptionalAuthRequest) {
+    const user = request?.user ?? null;
+    const userId = [user?._id, user?.id, user?.userId, user?.sub]
+      .map((candidate) => String(candidate ?? '').trim())
+      .find((candidate) => candidate.length > 0 && candidate !== '[object Object]');
+    const plan: SubscriptionEntitlementPlan = userId
+      ? await this.service.getUserPlan(userId)
+      : 'anonymous';
+
+    return getSubscriptionEntitlements(plan);
   }
 
   @UseGuards(JwtAuthGuard)
   @Get('upgrade-price')
   async getUpgradePrice(@GetUser() user: { _id: string }) {
     const config = await this.planConfigService.get();
-
     const dbUser = await this.usersService.findById(user._id);
 
     if (!dbUser) {

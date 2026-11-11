@@ -17,6 +17,7 @@ import {
 import { SupportActionAudit } from '../schemas/support-action-audit.schema';
 import { SupportIncident } from '../schemas/support-incident.schema';
 import { CustomerCareReplyJob } from '../schemas/customer-care-reply-job.schema';
+import { NotificationEventsService } from '../../notifications/in-app/notification-events.service';
 
 const QUEUED_ACKNOWLEDGEMENT =
   'Your message has been received. Customer Care is checking it now. Keep this conversation open; the reply will appear in the conversation shortly.';
@@ -237,6 +238,7 @@ export class CustomerCareService {
     private readonly groq: GroqAssistantService,
     private readonly escalation: SupportEscalationService,
     private readonly rateLimit: SupportRateLimitService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   /**
@@ -428,35 +430,15 @@ export class CustomerCareService {
     await conversation.save();
 
     if (humanSupportActive) {
-      const escalation = this.escalation as unknown as {
-        enqueueSupportNotification(notification: {
-          kind: 'CUSTOMER_MESSAGE' | 'HANDOFF_REQUESTED';
-          conversationId: string;
-          eventKey: string;
-          category: string;
-          summary: string;
-          assignedAdminId?: string;
-        }): Promise<unknown>;
-      };
-      const notificationKind = conversation.assignedAdminId
-        ? 'CUSTOMER_MESSAGE'
-        : 'HANDOFF_REQUESTED';
-      await escalation
-        .enqueueSupportNotification({
-          kind: notificationKind,
-          conversationId: String(conversation._id),
-          eventKey: String(userMessage._id),
-          category: String(conversation.category ?? 'GENERAL'),
-          summary: `A customer sent a new message in support conversation ${String(conversation._id)}.`,
-          assignedAdminId: conversation.assignedAdminId
-            ? String(conversation.assignedAdminId)
-            : undefined,
-        })
-        .catch((error) =>
-          this.logger.warn(
-            `Could not queue customer support notification: ${safeError(error)}`,
-          ),
-        );
+      await this.notificationEvents.supportTicketUpdated({
+        userId,
+        conversationId: String(conversation._id),
+        eventKey: `customer-message:${String(userMessage._id)}`,
+        status: String(conversation.humanSupportStatus ?? 'WAITING_FOR_ADMIN'),
+        message: conversation.assignedAdminId
+          ? 'Your message has been added to the support conversation being handled by our team.'
+          : 'Your message has been added to the support queue. A team member will continue assisting you.',
+      });
       return {
         conversationId: String(conversation._id),
         assistantName,
@@ -545,6 +527,14 @@ export class CustomerCareService {
           },
         )
         .exec();
+      if (!isFallbackMessage(existingReply)) {
+        await this.notificationEvents.supportReply({
+          userId,
+          conversationId: String(conversationObjectId),
+          messageId: String(existingReply._id),
+          source: 'AI',
+        });
+      }
       if (recordValue(existingReply.metadata).escalated === true) {
         await this.ensureHumanHandoff(
           String(conversationObjectId),
@@ -585,26 +575,12 @@ export class CustomerCareService {
       await this.messageModel
         .updateOne({ _id: messageObjectId }, { $unset: { replyStatus: 1 } })
         .exec();
-      await (
-        this.escalation.enqueueSupportNotification as (notification: {
-          kind: 'CUSTOMER_MESSAGE' | 'HANDOFF_REQUESTED';
-          conversationId: string;
-          eventKey: string;
-          category: string;
-          summary: string;
-          assignedAdminId?: string;
-        }) => Promise<unknown>
-      )({
-        kind: conversation.assignedAdminId
-          ? 'CUSTOMER_MESSAGE'
-          : 'HANDOFF_REQUESTED',
+      await this.notificationEvents.supportTicketUpdated({
+        userId,
         conversationId,
-        eventKey: String(userMessage._id),
-        category: String(conversation.category ?? 'GENERAL'),
-        summary: 'A customer message is awaiting administrator attention.',
-        assignedAdminId: conversation.assignedAdminId
-          ? String(conversation.assignedAdminId)
-          : undefined,
+        eventKey: `customer-message:${String(userMessage._id)}`,
+        status: String(conversation.humanSupportStatus ?? 'WAITING_FOR_ADMIN'),
+        message: 'Your message is waiting for a member of our support team.',
       });
       return;
     }
@@ -712,6 +688,14 @@ export class CustomerCareService {
       String(assistantReply?.content ?? result.answer),
     );
     await conversation.save();
+    if (assistantReply && !isFallbackMessage(assistantReply)) {
+      await this.notificationEvents.supportReply({
+        userId,
+        conversationId: String(conversation._id),
+        messageId: String(assistantReply._id),
+        source: 'AI',
+      });
+    }
     if (result.escalated) {
       await this.ensureHumanHandoff(
         conversationId,
@@ -1202,6 +1186,12 @@ export class CustomerCareService {
         .lean()
         .exec();
       if (existingReply) {
+        await this.notificationEvents.supportReply({
+          userId: String(conversation.userId),
+          conversationId,
+          messageId: String(existingReply._id),
+          source: 'ADMIN',
+        });
         return {
           conversationId,
           message: existingReply,
@@ -1237,6 +1227,12 @@ export class CustomerCareService {
           .lean()
           .exec();
         if (existingReply) {
+          await this.notificationEvents.supportReply({
+            userId: String(conversation.userId),
+            conversationId,
+            messageId: String(existingReply._id),
+            source: 'ADMIN',
+          });
           return {
             conversationId,
             message: existingReply,
@@ -1275,6 +1271,12 @@ export class CustomerCareService {
       );
     }
 
+    await this.notificationEvents.supportReply({
+      userId: String(conversation.userId),
+      conversationId,
+      messageId: String(savedMessage._id),
+      source: 'ADMIN',
+    });
     await this.auditModel.create({
       conversationId: conversationIdObject,
       userId: conversation.userId,
@@ -1360,30 +1362,13 @@ export class CustomerCareService {
       details: {},
       durationMs: 0,
     });
-    const escalation = this.escalation as unknown as {
-      enqueueSupportNotification(notification: {
-        kind: 'CUSTOMER_MESSAGE' | 'HANDOFF_REQUESTED';
-        conversationId: string;
-        eventKey: string;
-        category: string;
-        summary: string;
-        assignedAdminId?: string;
-      }): Promise<unknown>;
-    };
-    await escalation
-      .enqueueSupportNotification({
-        kind: 'HANDOFF_REQUESTED',
-        conversationId,
-        eventKey: `release-${Date.now()}`,
-        category: String(released.category ?? 'GENERAL'),
-        summary:
-          'An assigned support conversation has been returned to the shared queue.',
-      })
-      .catch((error) =>
-        this.logger.warn(
-          `Could not queue released support conversation notification: ${safeError(error)}`,
-        ),
-      );
+    await this.notificationEvents.supportTicketUpdated({
+      userId: String(released.userId),
+      conversationId,
+      eventKey: 'returned-to-queue',
+      status: 'WAITING_FOR_ADMIN',
+      message: 'Your support conversation has returned to the team queue. A support team member will continue assisting you.',
+    });
     return { conversationId, humanSupportStatus: 'WAITING_FOR_ADMIN' };
   }
 
@@ -1467,6 +1452,10 @@ export class CustomerCareService {
       summary: `Administrator resolved support conversation ${conversationId}.`,
       details: {},
       durationMs: 0,
+    });
+    await this.notificationEvents.supportTicketResolved({
+      userId: String(resolved.userId),
+      conversationId,
     });
     return { conversationId, status: 'RESOLVED' };
   }
@@ -1754,23 +1743,12 @@ export class CustomerCareService {
       current.humanSupportStatus !== 'WAITING_FOR_ADMIN'
     )
       return;
-    const escalation = this.escalation as unknown as {
-      enqueueSupportNotification(notification: {
-        kind: 'HANDOFF_REQUESTED';
-        conversationId: string;
-        eventKey: string;
-        category: string;
-        summary: string;
-      }): Promise<unknown>;
-    };
-    await escalation.enqueueSupportNotification({
-      kind: 'HANDOFF_REQUESTED',
+    await this.notificationEvents.supportTicketUpdated({
+      userId,
       conversationId,
-      eventKey,
-      category: String(current.category ?? 'GENERAL'),
-      summary: redactSupportMessage(
-        String(summary ?? 'The AI assistant requested human assistance.'),
-      ).slice(0, 600),
+      eventKey: `handoff:${eventKey}`,
+      status: 'WAITING_FOR_ADMIN',
+      message: 'Your support request has been sent to the team for human review.',
     });
   }
 
@@ -2041,3 +2019,4 @@ function replaceControlCharacters(value: string): string {
     })
     .join('');
 }
+

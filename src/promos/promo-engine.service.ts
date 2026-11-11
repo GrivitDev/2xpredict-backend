@@ -1,9 +1,4 @@
-import {
-  BadRequestException,
-  Inject,
-  Injectable,
-  forwardRef,
-} from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 
 import { InjectModel } from '@nestjs/mongoose';
 
@@ -34,6 +29,7 @@ import { PromoRequirement } from './constants/promo-requirements';
 import { PromoPromotionKind } from './constants/promo-promotion-kind';
 import { PromosService } from './promos.service';
 import { BetLabWalletService } from '../bet-lab/services/bet-lab-wallet.service';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 @Injectable()
 export class PromoEngineService {
@@ -44,13 +40,10 @@ export class PromoEngineService {
     @InjectModel(PromoReward.name)
     private readonly rewardModel: Model<PromoRewardDocument>,
 
-    @Inject(forwardRef(() => ReferralsService))
     private readonly referralsService: ReferralsService,
 
-    @Inject(forwardRef(() => SubscriptionsService))
     private readonly subscriptionsService: SubscriptionsService,
 
-    @Inject(forwardRef(() => UsersService))
     private readonly usersService: UsersService,
 
     private readonly promosService: PromosService,
@@ -58,6 +51,7 @@ export class PromoEngineService {
 
     @InjectModel(PromoParticipant.name)
     private readonly participantModel: Model<PromoParticipantDocument>,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   // ==============================
@@ -66,29 +60,58 @@ export class PromoEngineService {
 
   async checkUserPromos(userId: string) {
     const now = new Date();
+    const [joined, pendingPromoIds] = await Promise.all([
+      this.participantModel
+        .find({ userId })
+        .select({ promoId: 1 })
+        .lean()
+        .exec(),
+      this.rewardModel.distinct('promoId', {
+        userId,
+        status: { $ne: PromoRewardStatus.PAID },
+      }),
+    ]);
 
-    // Referral campaigns only if user joined them
-    const joined = await this.participantModel.find({
-      userId,
-    });
+    const joinedPromoIds = new Set(joined.map((item) => String(item.promoId)));
+    const joinedIds = [...joinedPromoIds];
+    const pendingIds = [...new Set(pendingPromoIds.map((id) => String(id)))];
 
-    const promoIds = joined.map((x) => x.promoId);
+    const [activeReferralPromos, pendingRewardPromos] = await Promise.all([
+      joinedIds.length
+        ? this.promoModel
+            .find({
+              _id: { $in: joinedIds },
+              campaignType: PromoCampaignType.REFERRAL,
+              isActive: true,
+              startDate: { $lte: now },
+              endDate: { $gte: now },
+            })
+            .exec()
+        : Promise.resolve([]),
+      pendingIds.length
+        ? this.promoModel.find({ _id: { $in: pendingIds } }).exec()
+        : Promise.resolve([]),
+    ]);
 
-    const referralPromos =
-      promoIds.length === 0
-        ? []
-        : await this.promoModel.find({
-            _id: { $in: promoIds },
-            campaignType: PromoCampaignType.REFERRAL,
-            isActive: true,
-            startDate: { $lte: now },
-            endDate: { $gte: now },
-          });
+    // Pending rewards remain payable even after a campaign has ended or been
+    // disabled. New claims, however, are allowed only for currently active
+    // referral campaigns that this user actually joined.
+    const promosById = new Map<string, PromoDocument>();
+    for (const promo of activeReferralPromos) {
+      promosById.set(String(promo._id), promo);
+    }
+    for (const promo of pendingRewardPromos) {
+      promosById.set(String(promo._id), promo);
+    }
 
-    const promos = referralPromos;
-
-    for (const promo of promos) {
-      await this.processPromo(promo, userId);
+    for (const promo of promosById.values()) {
+      const canCreateNewClaims =
+        joinedPromoIds.has(String(promo._id)) &&
+        promo.campaignType === PromoCampaignType.REFERRAL &&
+        promo.isActive &&
+        promo.startDate <= now &&
+        promo.endDate >= now;
+      await this.processPromo(promo, userId, canCreateNewClaims);
     }
   }
 
@@ -109,11 +132,16 @@ export class PromoEngineService {
       userId,
     });
 
-    if (claims > 0) {
-      return promo;
-    }
-
-    await this.processPromo(promo, userId);
+    // Re-entering an existing campaign resumes any pending reward instead of
+    // treating the presence of a reward record as proof that delivery finished.
+    await this.processPromo(promo, userId, claims === 0);
+    await this.notificationEvents.promotionJoined({
+      userId,
+      promoId: String(promo._id),
+      promoName: String(promo.name),
+      promoCode: String(promo.promoCode ?? promoCode),
+      expiresAt: promo.endDate,
+    });
 
     return promo;
   }
@@ -129,26 +157,46 @@ export class PromoEngineService {
       return null;
     }
 
-    const exists = await this.participantModel.findOne({
-      promoId,
-      userId,
-    });
-
-    if (exists) {
-      return exists;
-    }
-
-    await this.participantModel.create({
-      promoId,
-      userId,
-      joinedAt: new Date(),
-    });
-
+    let participant = await this.participantModel
+      .findOne({ promoId, userId })
+      .exec();
+    let wasAlreadyJoined = Boolean(participant);
     const user = await this.usersService.findById(userId);
 
     if (!user) {
       throw new BadRequestException('User not found');
     }
+
+    if (!participant) {
+      try {
+        participant = await this.participantModel.create({
+          promoId,
+          userId,
+          joinedAt: new Date(),
+        });
+      } catch (error) {
+        if (!this.isDuplicateKeyError(error)) throw error;
+        participant = await this.participantModel
+          .findOne({ promoId, userId })
+          .exec();
+        if (!participant) throw error;
+        wasAlreadyJoined = true;
+      }
+    }
+
+    // Replaying this stable event repairs notification delivery after a crash
+    // between participant creation and outbox insertion.
+    await this.notificationEvents.promotionJoined({
+      userId,
+      promoId: String(promo._id),
+      promoName: String(promo.name),
+      promoCode: String(promo.promoCode ?? ''),
+      expiresAt: promo.endDate,
+    });
+
+    // Preserve the existing return contract: first-time joins receive the
+    // success payload, while repeated joins receive the stored participant.
+    if (wasAlreadyJoined && participant) return participant;
 
     return {
       message: 'Campaign joined successfully.',
@@ -172,7 +220,25 @@ export class PromoEngineService {
   // PROCESS PROMO
   // ==============================
 
-  private async processPromo(promo: PromoDocument, userId: string) {
+  private async processPromo(
+    promo: PromoDocument,
+    userId: string,
+    allowNewClaims = true,
+  ) {
+    const pendingRewards = await this.rewardModel
+      .find({
+        promoId: String(promo._id),
+        userId,
+        status: { $ne: PromoRewardStatus.PAID },
+      })
+      .sort({ claimNumber: 1 })
+      .exec();
+
+    for (const reward of pendingRewards) {
+      await this.grantReward(promo, userId, reward.claimNumber, reward);
+    }
+
+    if (!allowNewClaims) return;
     if (promo.promotionKind !== PromoPromotionKind.REWARD || (promo.rewardType as string) === 'cash') return;
     // ==============================
     // DIRECT REGISTER CAMPAIGN
@@ -234,19 +300,65 @@ export class PromoEngineService {
     promo: PromoDocument,
     userId: string,
     claimNumber: number,
+    existingReward?: PromoRewardDocument,
   ) {
-    const exists = await this.rewardModel.findOne({ promoId: promo._id.toString(), userId, claimNumber });
-    if (exists) {
-      if (exists.type === RewardType.BET_LAB_POINTS && exists.status !== PromoRewardStatus.PAID) {
-        await this.walletService.grantAdminBonusPoints(String(exists.userId), Number(exists.points), `Promotion reward: ${promo.name}`, String(exists._id));
-        exists.status = PromoRewardStatus.PAID;
-        exists.paidAt = new Date();
-        await exists.save();
+    const reward =
+      existingReward ??
+      (await this.rewardModel
+        .findOne({ promoId: String(promo._id), userId, claimNumber })
+        .exec());
+
+    if (reward) {
+      if (reward.status === PromoRewardStatus.PAID) {
+        await this.notifyPromotionReward(promo, reward);
+        return reward;
       }
-      return exists;
+
+      if (reward.type === RewardType.SUBSCRIPTION) {
+        return this.grantSubscriptionReward(promo, userId, claimNumber, reward);
+      }
+      return this.grantPointsReward(promo, userId, claimNumber, reward);
     }
-    if (promo.rewardType === RewardType.SUBSCRIPTION) return this.grantSubscriptionReward(promo, userId, claimNumber);
+
+    if (promo.rewardType === RewardType.SUBSCRIPTION) {
+      return this.grantSubscriptionReward(promo, userId, claimNumber);
+    }
     return this.grantPointsReward(promo, userId, claimNumber);
+  }
+
+  private isDuplicateKeyError(error: unknown): boolean {
+    return Boolean(
+      error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        (error as { code?: unknown }).code === 11000,
+    );
+  }
+
+  private async createOrFindReward(data: {
+    promoId: string;
+    userId: string;
+    claimNumber: number;
+    type: RewardType;
+    plan?: 'regular' | 'vip' | 'premium';
+    durationDays?: number;
+    points?: number;
+    status: PromoRewardStatus;
+  }): Promise<PromoRewardDocument> {
+    try {
+      return await this.rewardModel.create(data);
+    } catch (error) {
+      if (!this.isDuplicateKeyError(error)) throw error;
+      const raced = await this.rewardModel
+        .findOne({
+          promoId: data.promoId,
+          userId: data.userId,
+          claimNumber: data.claimNumber,
+        })
+        .exec();
+      if (raced) return raced;
+      throw error;
+    }
   }
 
   // ==============================
@@ -257,44 +369,59 @@ export class PromoEngineService {
     promo: PromoDocument,
     userId: string,
     claimNumber: number,
+    existingReward?: PromoRewardDocument,
   ) {
     const user = await this.usersService.findById(userId);
     if (!user) {
       throw new Error('User not found');
     }
-    const reward = await this.rewardModel.create({
-      promoId: promo._id.toString(),
 
+    const reward =
+      existingReward ??
+      (await this.createOrFindReward({
+        promoId: String(promo._id),
+        userId,
+        claimNumber,
+        type: RewardType.SUBSCRIPTION,
+        plan: promo.rewardPlan,
+        durationDays: promo.rewardDurationDays ?? 30,
+        status: PromoRewardStatus.APPROVED,
+      }));
+
+    if (reward.status === PromoRewardStatus.PAID) {
+      await this.notifyPromotionReward(promo, reward);
+      return reward;
+    }
+
+    const rewardPlan = reward.plan ?? promo.rewardPlan;
+    if (!rewardPlan) {
+      throw new Error(
+        `Subscription reward ${String(reward._id)} has no configured plan.`,
+      );
+    }
+    const durationDays = Number(
+      reward.durationDays ?? promo.rewardDurationDays ?? 30,
+    );
+
+    const subscription = await this.subscriptionsService.activatePlan({
       userId,
-
-      claimNumber,
-
-      type: RewardType.SUBSCRIPTION,
-
-      plan: promo.rewardPlan,
-
-      durationDays: promo.rewardDurationDays ?? 30,
-
-      status: PromoRewardStatus.APPROVED,
-    });
-
-    await this.subscriptionsService.activatePlan({
-      userId,
-
       email: user.email,
-
-      plan: promo.rewardPlan!,
-
+      plan: rewardPlan,
       amount: 0,
-
-      durationDays: promo.rewardDurationDays ?? 30,
+      durationDays,
+      sourceReference: `PROMO_REWARD:${String(reward._id)}`,
     });
 
+    reward.subscriptionId = subscription?._id;
+    reward.subscriptionStartDate = subscription?.startDate ?? null;
+    reward.subscriptionExpiryDate = subscription?.expiryDate ?? null;
+    reward.subscriptionIsActive = Boolean(subscription?.isActive);
     reward.status = PromoRewardStatus.PAID;
 
     reward.paidAt = new Date();
 
     await reward.save();
+    await this.notifyPromotionReward(promo, reward);
 
     return reward;
   }
@@ -303,20 +430,83 @@ export class PromoEngineService {
   // BET LAB POINTS REWARD
   // ==============================
 
-  private async grantPointsReward(promo: PromoDocument, userId: string, claimNumber: number) {
-    const points = Number(promo.pointsAmount ?? 0);
+  private async grantPointsReward(
+    promo: PromoDocument,
+    userId: string,
+    claimNumber: number,
+    existingReward?: PromoRewardDocument,
+  ) {
+    const reward =
+      existingReward ??
+      (await this.createOrFindReward({
+        promoId: String(promo._id),
+        userId,
+        claimNumber,
+        type: RewardType.BET_LAB_POINTS,
+        points: Number(promo.pointsAmount ?? 0),
+        status: PromoRewardStatus.APPROVED,
+      }));
+
+    const points = Number(reward.points ?? promo.pointsAmount ?? 0);
     if (!Number.isSafeInteger(points) || points < 1) {
-      throw new BadRequestException('Promotion points reward is not configured correctly.');
+      throw new BadRequestException(
+        'Promotion points reward is not configured correctly.',
+      );
     }
-    const reward = await this.rewardModel.create({
-      promoId: promo._id.toString(), userId, claimNumber,
-      type: RewardType.BET_LAB_POINTS, points, status: PromoRewardStatus.APPROVED,
-    });
-    await this.walletService.grantAdminBonusPoints(userId, points, `Promotion reward: ${promo.name}`, String(reward._id));
-    reward.status = PromoRewardStatus.PAID;
-    reward.paidAt = new Date();
-    await reward.save();
+
+    if (reward.status !== PromoRewardStatus.PAID) {
+      // Wallet credit and ledger creation use the reward ID as a stable
+      // idempotency key. This safely resumes a crash after credit but before
+      // the reward record was marked paid.
+      await this.walletService.grantAdminBonusPoints(
+        userId,
+        points,
+        `Promotion reward: ${promo.name}`,
+        String(reward._id),
+      );
+      reward.status = PromoRewardStatus.PAID;
+      reward.paidAt = new Date();
+      await reward.save();
+    }
+
+    await this.notifyPromotionReward(promo, reward);
     return reward;
+  }
+
+  private async notifyPromotionReward(promo: PromoDocument, reward: PromoRewardDocument): Promise<void> {
+    if (reward.status !== PromoRewardStatus.PAID) return;
+    if (reward.type === RewardType.SUBSCRIPTION) {
+      // Recover from a crash after the subscription was persisted but before
+      // the reward metadata or notification was completed.
+      const subscription = reward.subscriptionId
+        ? null
+        : await this.subscriptionsService.findBySourceReference(`PROMO_REWARD:${String(reward._id)}`);
+      const startDate = reward.subscriptionStartDate ?? subscription?.startDate ?? null;
+      const expiryDate = reward.subscriptionExpiryDate ?? subscription?.expiryDate ?? null;
+      const isActive = reward.subscriptionIsActive ?? Boolean(subscription?.isActive);
+      if (startDate && expiryDate) {
+        await this.notificationEvents.subscriptionActivated({
+          userId: String(reward.userId),
+          reference: `promo:${String(reward._id)}`,
+          plan: String(reward.plan ?? promo.rewardPlan ?? 'regular'),
+          startDate: new Date(startDate),
+          expiryDate: new Date(expiryDate),
+          isActive,
+          source: 'promotion_reward',
+        });
+      }
+    }
+    await this.notificationEvents.promotionRewardGranted({
+      userId: String(reward.userId),
+      promoId: String(promo._id),
+      rewardId: String(reward._id),
+      promoName: String(promo.name),
+      rewardType: reward.type === RewardType.SUBSCRIPTION ? 'subscription' : 'points',
+      points: Number(reward.points ?? 0),
+      plan: reward.plan ? String(reward.plan) : undefined,
+      durationDays: Number(reward.durationDays ?? 0) || undefined,
+      claimNumber: Number(reward.claimNumber ?? 1),
+    });
   }
 
   // ==============================
@@ -505,3 +695,5 @@ export class PromoEngineService {
   }
 
 }
+
+

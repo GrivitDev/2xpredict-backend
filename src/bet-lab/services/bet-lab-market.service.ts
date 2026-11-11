@@ -4,60 +4,34 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import {
-  BET_LAB_MARKET_BY_CODE,
-  BET_LAB_MARKET_CATALOG,
-  expandMarketSelections,
-} from '../catalog/bet-lab-market-catalog';
+import { BET_LAB_MARKET_BY_CODE, BET_LAB_MARKET_CATALOG, expandMarketSelections } from '../catalog/bet-lab-market-catalog';
 import { BetLabMarketCode } from '../enums/bet-lab-market-code.enum';
 import { BetLabOddsSource } from '../enums/bet-lab-odds-source.enum';
-import type {
-  BetLabOddsTimestampBasis,
-  BetLabPriceType,
-} from '../enums/bet-lab-odds-source.enum';
+import type { BetLabOddsTimestampBasis, BetLabPriceType } from '../enums/bet-lab-odds-source.enum';
 import { BET_LAB_CONFIG } from '../config/bet-lab.config';
-import {
+import type {
   BetLabFixtureIdentity,
   BetLabMarketQuote,
   BetLabSelectionRequest,
   BetLabMarketWithQuotes,
   BetLabSelectionQuote,
 } from '../interfaces/bet-lab-market.interface';
-import { EspnFixture } from '../../sports/schemas/espn/espn-fixture.schema';
-import { EspnLeague } from '../../sports/schemas/espn/espn-league.schema';
+import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
+import type {
+  SportsFixtureContextReadModel,
+  SportsFixtureQuery,
+} from '../../sports/interfaces/sports-read.interface';
 import { OddsReadService } from '../../odds/services/odds-read.service';
+import type { OddsQuoteSnapshot } from '../../odds/services/odds.service';
 import {
   FOOTBALL_MARKET_BY_ID,
   FOOTBALL_MARKET_BY_BET_LAB_CODE,
 } from '../../odds/catalog/football-market-catalog';
 import {
-  asRecord,
-  extractFixtureIdentity,
-  extractRosterPlayers,
+  assertBetLabPreMatchFixture,
+  isBetLabFixtureContextComplete,
+  toBetLabFixtureIdentity,
 } from '../utils/fixture.util';
-
-interface StoredOddsPrice {
-  eventId: unknown;
-  marketId: unknown;
-  decimalOdds: unknown;
-  updatedAt: unknown;
-  oddsCapturedAt?: unknown;
-  oddsFreshUntil?: unknown;
-  isFresh?: unknown;
-  predictionReady?: unknown;
-  selectionKey: unknown;
-  line?: unknown;
-  priceType: unknown;
-  provider?: unknown;
-  bookmaker?: unknown;
-  providerUpdatedAt?: unknown;
-  fairOdds?: unknown;
-  marketFairOdds?: unknown;
-  oddsBasis?: unknown;
-  oddsCalculationMethod?: unknown;
-}
 
 interface ResolvedStoredPrice {
   decimalOdds: number;
@@ -67,14 +41,23 @@ interface ResolvedStoredPrice {
   providerUpdatedAt: Date | null;
   oddsTimestampBasis: BetLabOddsTimestampBasis;
   oddsCapturedAt: Date;
+  oddsRecordUpdatedAt: Date | null;
   oddsFreshUntil: Date | null;
   isFresh: boolean;
-  oddsBasis:
-    | 'BOOKMAKER_ONLY'
-    | 'BOOKMAKER_PLUS_HISTORY'
-    | 'HISTORICAL_ONLY'
-    | 'PRIOR_ONLY'
-    | null;
+  fairOdds: number | null;
+  fairOddsBasis: 'MODEL' | 'PRIOR' | null;
+  marketFairOdds: number | null;
+  impliedProbability: number | null;
+  fairProbability: number | null;
+  valuePercent: number | null;
+  dataQuality: number | null;
+  sampleSize: number | null;
+  calculationVersion: string | null;
+  sourceRevision: number | null;
+  fixtureSourceRevision: number | null;
+  sourceDataUpdatedAt: Date | null;
+  provider: 'ESPN' | 'THE_ODDS_API' | null;
+  oddsBasis: 'BOOKMAKER_ONLY' | 'BOOKMAKER_PLUS_HISTORY' | 'HISTORICAL_ONLY' | 'PRIOR_ONLY' | null;
   oddsCalculationMethod: string | null;
 }
 
@@ -84,24 +67,38 @@ interface FixturePricingSnapshot {
   markets: BetLabMarketWithQuotes[];
 }
 
-function asStoredOddsPrices(value: unknown): StoredOddsPrice[] {
-  return Array.isArray(value) ? (value as StoredOddsPrice[]) : [];
+function asOddsPrices(value: unknown): OddsQuoteSnapshot[] {
+  return Array.isArray(value) ? (value as OddsQuoteSnapshot[]) : [];
+}
+
+function optionalNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function optionalDate(value: unknown): Date | null {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === 'string' || typeof value === 'number') {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+  return null;
+}
+
+function normalizeLine(value: unknown): number | undefined {
+  const parsed = optionalNumber(value);
+  return parsed === null ? undefined : Number(parsed.toFixed(3));
 }
 
 @Injectable()
 export class BetLabMarketService {
-  /** Coalesce concurrent pricing reads for the same fixture (e.g. accumulator legs). */
-  private readonly pricingInFlight = new Map<
-    string,
-    Promise<FixturePricingSnapshot>
-  >();
+  /** Coalesce repeated full-fixture reads made by concurrent accumulator operations. */
+  private readonly pricingInFlight = new Map<string, Promise<FixturePricingSnapshot>>();
 
   constructor(
-    @InjectModel(EspnFixture.name)
-    private readonly fixtureModel: Model<EspnFixture>,
-    @InjectModel(EspnLeague.name)
-    private readonly leagueModel: Model<EspnLeague>,
-    private readonly oddsService: OddsReadService,
+    private readonly sportsRead: SportsDomainReadService,
+    private readonly oddsRead: OddsReadService,
   ) {}
 
   async listFixtures(
@@ -119,150 +116,97 @@ export class BetLabMarketService {
     const from = query.from ? this.parseDate(query.from, 'from') : now;
     const to = query.to ? this.parseDate(query.to, 'to') : defaultEnd;
     if (to <= from) throw new BadRequestException('to must be later than from');
-    const maxWindowMs = 90 * 24 * 60 * 60 * 1000;
-    if (to.getTime() - from.getTime() > maxWindowMs) {
-      throw new BadRequestException(
-        'Fixture query range cannot exceed 90 days',
-      );
+    if (to.getTime() - from.getTime() > 90 * 24 * 60 * 60 * 1000) {
+      throw new BadRequestException('Fixture query range cannot exceed 90 days');
     }
 
     const page = Math.max(1, Math.floor(Number(query.page) || 1));
-    const limit = Math.min(
-      100,
-      Math.max(1, Math.floor(Number(query.limit) || 20)),
-    );
-    const filter: Record<string, unknown> = {
-      fixtureDate: { $gte: from, $lt: to },
-      completed: { $ne: true },
-      $nor: [
-        {
-          status:
-            /FINAL|FINISHED|FULL[_ -]?TIME|\bFT\b|\bAET\b|\bPEN\b|POSTPON|\bPST\b|CANCEL|\bCANC\b|ABANDON|SUSPEND|INTERRUPT|DELAY|VOID|NO[_ -]?CONTEST/i,
-        },
-        {
-          statusDetail:
-            /FINAL|FINISHED|FULL[_ -]?TIME|\bFT\b|\bAET\b|\bPEN\b|POSTPON|\bPST\b|CANCEL|\bCANC\b|ABANDON|SUSPEND|INTERRUPT|DELAY|VOID|NO[_ -]?CONTEST/i,
-        },
-        {
-          statusShortDetail:
-            /FINAL|FINISHED|FULL[_ -]?TIME|\bFT\b|\bAET\b|\bPEN\b|POSTPON|\bPST\b|CANCEL|\bCANC\b|ABANDON|SUSPEND|INTERRUPT|DELAY|VOID|NO[_ -]?CONTEST/i,
-        },
-      ],
-    };
-    if (query.leagueId?.trim())
-      filter.leagueId = query.leagueId.trim().toLowerCase();
-    if (query.teamId?.trim()) {
-      filter.$or = [
-        { homeTeamId: query.teamId.trim() },
-        { awayTeamId: query.teamId.trim() },
-      ];
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(query.limit) || 20)));
+    let teamId = query.teamId?.trim() || undefined;
+    if (teamId) {
+      // Accept either normalized Sports IDs or their retained ESPN source IDs.
+      const team = await this.sportsRead.getTeam(teamId);
+      teamId = team?.id ?? teamId;
     }
 
-    const [fixtures, total] = await Promise.all([
-      this.fixtureModel
-        .find(filter)
-        .sort({ fixtureDate: 1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .select({
-          eventId: 1,
-          leagueId: 1,
-          fixtureDate: 1,
-          status: 1,
-          statusDetail: 1,
-          statusShortDetail: 1,
-          live: 1,
-          completed: 1,
-          homeTeamId: 1,
-          awayTeamId: 1,
-          venueName: 1,
-          collectedAt: 1,
-          'payload.name': 1,
-          'payload.league': 1,
-          'payload.venue': 1,
-          'payload.competitions.id': 1,
-          'payload.competitions.name': 1,
-          'payload.competitions.shortName': 1,
-          'payload.competitions.altGameNote': 1,
-          'payload.competitions.notes': 1,
-          'payload.competitions.venue': 1,
-          'payload.competitions.competitors.id': 1,
-          'payload.competitions.competitors.homeAway': 1,
-          'payload.competitions.competitors.team': 1,
-          'payload.summary.rosters': 1,
-          'payload.summaryCollectedAt': 1,
-        })
-        .lean()
-        .exec(),
-      this.fixtureModel.countDocuments(filter).exec(),
-    ]);
+    // Keep the count filter identical to the cursor-page filter. Sports uses
+    // keyset pagination and intentionally does not calculate a total on every
+    // read, so BetLab requests the count explicitly for this paginated endpoint.
+    const fixtureFilter: Omit<SportsFixtureQuery, 'limit' | 'cursor' | 'sortOrder' | 'retainedOnly'> = {
+      from,
+      to,
+      state: 'SCHEDULED',
+      competitionId: query.leagueId?.trim() || undefined,
+      teamId,
+    };
+    const totalPromise = this.sportsRead.countFixtures(fixtureFilter);
 
-    const leagueIds = [
-      ...new Set(
-        fixtures.map((fixture) => String(fixture.leagueId).toLowerCase()),
-      ),
-    ];
-    const leagueRows = leagueIds.length
-      ? await this.leagueModel
-          .find({ leagueId: { $in: leagueIds } })
-          .select({ leagueId: 1, name: 1, abbreviation: 1 })
-          .lean()
-          .exec()
-      : [];
-    const leagueNames = new Map<string, string>(
-      leagueRows.map((league) => [
-        String(league.leagueId).toLowerCase(),
-        String(league.name),
-      ]),
+    let cursor: string | undefined;
+    let pageResult: Awaited<ReturnType<SportsDomainReadService['getFixtures']>> | null = null;
+    for (let currentPage = 1; currentPage <= page; currentPage += 1) {
+      pageResult = await this.sportsRead.getFixtures({
+        ...fixtureFilter,
+        limit,
+        cursor,
+      });
+      if (currentPage < page) {
+        if (!pageResult.nextCursor) {
+          pageResult = { ...pageResult, items: [] };
+          break;
+        }
+        cursor = pageResult.nextCursor;
+      }
+    }
+
+    const fixtures = pageResult?.items ?? [];
+    const contexts = await this.sportsRead.getFixtureContexts(fixtures.map((fixture) => fixture.id));
+    const contextById = new Map(contexts.map((context) => [context.fixture.id, context]));
+    const identities = fixtures
+      .map((fixture) => contextById.get(fixture.id))
+      .filter((context): context is SportsFixtureContextReadModel =>
+        context !== undefined && isBetLabFixtureContextComplete(context),
+      )
+      .map(toBetLabFixtureIdentity);
+
+    const prices = asOddsPrices(
+      await this.oddsRead.getPricesForFixtures(identities.map((fixture) => fixture.eventId)),
     );
-    const storedPrices = asStoredOddsPrices(
-      await this.oddsService.getPricesForFixtures(
-        fixtures.map((fixture) => extractFixtureIdentity(fixture).eventId),
-      ),
-    );
-    const storedCountByEvent = new Map<string, number>();
-    for (const price of storedPrices) {
+    const priceCountByEvent = new Map<string, number>();
+    for (const price of prices) {
       const resolved = this.resolveStoredPrice(price);
-      if (!resolved) continue;
-      if (!resolved.isFresh) continue;
-      const eventId = String(price.eventId);
-      storedCountByEvent.set(
-        eventId,
-        (storedCountByEvent.get(eventId) ?? 0) + 1,
+      if (!resolved?.isFresh) continue;
+      priceCountByEvent.set(
+        price.eventId,
+        (priceCountByEvent.get(price.eventId) ?? 0) + 1,
       );
     }
 
+    const identityById = new Map(identities.map((identity) => [identity.eventId, identity]));
+    const items = fixtures.flatMap((fixture) => {
+      const identity = identityById.get(fixture.id);
+      if (!identity) return [];
+      const pricedSelectionCount = priceCountByEvent.get(identity.eventId) ?? 0;
+      return [{
+        eventId: identity.eventId,
+        leagueId: identity.leagueId,
+        leagueName: identity.leagueName,
+        fixtureDate: identity.fixtureDate,
+        status: identity.status,
+        live: identity.live,
+        completed: identity.completed,
+        homeTeam: { id: identity.homeTeamId, name: identity.homeTeamName },
+        awayTeam: { id: identity.awayTeamId, name: identity.awayTeamName },
+        venueName: identity.venueName,
+        hasSportsData: true,
+        hasPricedSelections: pricedSelectionCount > 0,
+        pricedSelectionCount,
+        sportsUpdatedAt: identity.sportsUpdatedAt,
+      }];
+    });
+
+    const total = await totalPromise;
     return {
-      items: fixtures.map((fixture) => {
-        const identity = extractFixtureIdentity(fixture);
-        identity.leagueName =
-          leagueNames.get(identity.leagueId.toLowerCase()) ??
-          identity.leagueName;
-        const summary = asRecord(identity.payload.summary);
-        const storedCount = storedCountByEvent.get(identity.eventId) ?? 0;
-        return {
-          eventId: identity.eventId,
-          leagueId: identity.leagueId,
-          leagueName: identity.leagueName,
-          fixtureDate: identity.fixtureDate,
-          status: identity.status,
-          live: identity.live,
-          completed: identity.completed,
-          homeTeam: {
-            id: identity.homeTeamId,
-            name: identity.homeTeamName,
-          },
-          awayTeam: {
-            id: identity.awayTeamId,
-            name: identity.awayTeamName,
-          },
-          venueName: identity.venueName,
-          hasSummary: Boolean(summary && Object.keys(summary).length > 0),
-          hasPricedSelections: storedCount > 0,
-          pricedSelectionCount: storedCount,
-          summaryCollectedAt: identity.summaryCollectedAt,
-        };
-      }),
+      items,
       pagination: {
         page,
         limit,
@@ -272,66 +216,23 @@ export class BetLabMarketService {
     };
   }
 
-  async getFixtureIdentity(
-    eventId: string,
-    requireUpcoming = true,
-  ): Promise<BetLabFixtureIdentity> {
+  async getFixtureIdentity(eventId: string, requireUpcoming = true): Promise<BetLabFixtureIdentity> {
     const normalizedId = String(eventId ?? '').trim();
     if (!normalizedId) throw new BadRequestException('eventId is required');
-    const fixture = await this.fixtureModel
-      .findOne({ eventId: normalizedId })
-      .select({
-        eventId: 1,
-        leagueId: 1,
-        fixtureDate: 1,
-        status: 1,
-        statusDetail: 1,
-        statusShortDetail: 1,
-        live: 1,
-        completed: 1,
-        homeTeamId: 1,
-        awayTeamId: 1,
-        venueName: 1,
-        collectedAt: 1,
-        'payload.name': 1,
-        'payload.league': 1,
-        'payload.venue': 1,
-        'payload.competitions.id': 1,
-        'payload.competitions.name': 1,
-        'payload.competitions.shortName': 1,
-        'payload.competitions.altGameNote': 1,
-        'payload.competitions.notes': 1,
-        'payload.competitions.venue': 1,
-        'payload.competitions.competitors.id': 1,
-        'payload.competitions.competitors.homeAway': 1,
-        'payload.competitions.competitors.team': 1,
-        'payload.competitions.odds': 1,
-        'payload.summary.pickcenter': 1,
-        'payload.summary.odds': 1,
-        'payload.summary.rosters': 1,
-        'payload.summaryCollectedAt': 1,
-      })
-      .lean()
-      .exec();
-    if (!fixture)
-      throw new NotFoundException(`Fixture ${normalizedId} was not found`);
-    const identity = extractFixtureIdentity(fixture);
-    const league = await this.leagueModel
-      .findOne({ leagueId: identity.leagueId })
-      .select({ leagueId: 1, name: 1 })
-      .lean()
-      .exec();
-    if (league?.name) identity.leagueName = String(league.name);
+
+    const contexts = await this.sportsRead.getFixtureContexts([normalizedId]);
+    const context = contexts[0];
+    if (!context) throw new NotFoundException(`Fixture ${normalizedId} was not found`);
+    if (!isBetLabFixtureContextComplete(context)) {
+      throw new ConflictException('The Sports module does not yet have a complete competition and team context for this fixture.');
+    }
+
+    const identity = toBetLabFixtureIdentity(context);
     if (requireUpcoming) this.assertPlaceableFixture(identity);
     return identity;
   }
 
   getMarketCatalog() {
-    const context = {
-      homeTeamName: 'Home Team',
-      awayTeamName: 'Away Team',
-      players: [] as Array<{ id: string; name: string; abbreviation: string }>,
-    };
     return BET_LAB_MARKET_CATALOG.map((market) => ({
       code: market.code,
       jsonVariable: market.jsonVariable,
@@ -340,12 +241,13 @@ export class BetLabMarketService {
       category: market.category,
       period: market.period,
       selectionMode: market.selectionMode,
-      selections: expandMarketSelections(market, context),
+      selections: expandMarketSelections(market, {
+        homeTeamName: 'Home Team',
+        awayTeamName: 'Away Team',
+      }),
       lines: market.lines ?? [],
-      // The active Odds catalogue contains no player market groups. Keep the
-      // response field for older clients without exposing an unsupported template.
-      selectionTemplate: undefined,
       notes: market.notes,
+      pricingEnabled: market.pricingEnabled !== false,
       dynamicSelections: market.selectionMode !== 'STATIC',
     }));
   }
@@ -390,26 +292,17 @@ export class BetLabMarketService {
     marketCode: BetLabMarketCode,
     selectionCode: string,
   ): Promise<BetLabMarketQuote> {
-    const quotes = await this.getSelectionQuotes([
-      { eventId, marketCode, selectionCode },
-    ]);
+    const quotes = await this.getSelectionQuotes([{ eventId, marketCode, selectionCode }]);
     const quote = quotes[0];
-    if (!quote) {
-      throw new NotFoundException(
-        'The requested Bet Lab selection could not be resolved.',
-      );
-    }
+    if (!quote) throw new NotFoundException('The requested Bet Lab selection could not be resolved.');
     return quote;
   }
 
   /**
-   * Resolve one or many ticket quotes with bounded database round trips.
-   * Accumulator placement uses one fixture read, one league read and one Odds
-   * read for the complete slip instead of three reads per leg.
+   * Resolve exact requested prices in one Odds-module query. No local pricing,
+   * probability conversion, line substitution or derived quote is permitted.
    */
-  async getSelectionQuotes(
-    requests: BetLabSelectionRequest[],
-  ): Promise<BetLabMarketQuote[]> {
+  async getSelectionQuotes(requests: BetLabSelectionRequest[]): Promise<BetLabMarketQuote[]> {
     if (!requests.length) return [];
 
     const normalizedRequests = requests.map((request) => ({
@@ -417,140 +310,69 @@ export class BetLabMarketService {
       eventId: String(request.eventId ?? '').trim(),
       selectionCode: String(request.selectionCode ?? '').trim(),
     }));
-    if (
-      normalizedRequests.some(
-        (request) => !request.eventId || !request.selectionCode,
-      )
-    ) {
-      throw new BadRequestException(
-        'Every selection must include a fixture and selection code.',
-      );
+    if (normalizedRequests.some((request) => !request.eventId || !request.selectionCode)) {
+      throw new BadRequestException('Every selection must include a fixture and selection code.');
     }
 
-    const eventIds = [
-      ...new Set(normalizedRequests.map((request) => request.eventId)),
-    ];
-    const fixtures = await this.fixtureModel
-      .find({ eventId: { $in: eventIds } })
-      .select({
-        eventId: 1,
-        leagueId: 1,
-        fixtureDate: 1,
-        status: 1,
-        statusDetail: 1,
-        statusShortDetail: 1,
-        live: 1,
-        completed: 1,
-        homeTeamId: 1,
-        awayTeamId: 1,
-        venueName: 1,
-        collectedAt: 1,
-        'payload.name': 1,
-        'payload.league': 1,
-        'payload.venue': 1,
-        'payload.competitions.id': 1,
-        'payload.competitions.name': 1,
-        'payload.competitions.shortName': 1,
-        'payload.competitions.altGameNote': 1,
-        'payload.competitions.notes': 1,
-        'payload.competitions.venue': 1,
-        'payload.competitions.competitors.id': 1,
-        'payload.competitions.competitors.homeAway': 1,
-        'payload.competitions.competitors.team': 1,
-        'payload.summary.rosters': 1,
-        'payload.summaryCollectedAt': 1,
-      })
-      .lean()
-      .exec();
-
-    const fixtureByEventId = new Map<string, BetLabFixtureIdentity>();
-    const leagueIds = new Set<string>();
-    for (const fixture of fixtures) {
-      const identity = extractFixtureIdentity(fixture);
-      this.assertPlaceableFixture(identity);
-      fixtureByEventId.set(identity.eventId, identity);
-      if (identity.leagueId) leagueIds.add(identity.leagueId);
+    const requestedEventIds = [...new Set(normalizedRequests.map((request) => request.eventId))];
+    const contexts = await this.sportsRead.getFixtureContexts(requestedEventIds);
+    const contextByRequestedId = new Map<string, SportsFixtureContextReadModel>();
+    for (const context of contexts) {
+      contextByRequestedId.set(context.fixture.id, context);
+      contextByRequestedId.set(context.fixture.espnEventId, context);
     }
 
-    const missingEventId = eventIds.find(
-      (eventId) => !fixtureByEventId.has(eventId),
-    );
-    if (missingEventId) {
-      throw new NotFoundException(`Fixture ${missingEventId} was not found`);
-    }
-
-    // Resolve requested selections from the canonical Odds catalogue first.
-    // Placement reads only those exact quotes; it does not build all 16 markets
-    // or transfer hundreds of irrelevant lines for each fixture.
     const requested = normalizedRequests.map((request) => {
-      const fixture = fixtureByEventId.get(request.eventId)!;
-      const market = BET_LAB_MARKET_BY_CODE.get(request.marketCode);
-      const canonicalMarket = FOOTBALL_MARKET_BY_BET_LAB_CODE.get(
-        String(request.marketCode),
-      );
-      if (!market || !canonicalMarket) {
-        throw new BadRequestException(
-          `Unsupported market code: ${request.marketCode}`,
-        );
+      const context = contextByRequestedId.get(request.eventId);
+      if (!context) throw new NotFoundException(`Fixture ${request.eventId} was not found`);
+      if (!isBetLabFixtureContextComplete(context)) {
+        throw new ConflictException(`The Sports context for fixture ${request.eventId} is incomplete.`);
       }
+      const fixture = toBetLabFixtureIdentity(context);
+      this.assertPlaceableFixture(fixture);
+
+      const market = BET_LAB_MARKET_BY_CODE.get(request.marketCode);
+      const canonicalMarket = FOOTBALL_MARKET_BY_BET_LAB_CODE.get(String(request.marketCode));
+      if (!market || !canonicalMarket) {
+        throw new BadRequestException(`Unsupported market code: ${request.marketCode}`);
+      }
+      if (market.pricingEnabled === false || canonicalMarket.pricingEnabled === false) {
+        throw new ConflictException(`${market.fullName} is not currently priced by the Odds module.`);
+      }
+
       const selection = expandMarketSelections(market, {
         homeTeamName: fixture.homeTeamName,
         awayTeamName: fixture.awayTeamName,
       }).find((item) => item.code === request.selectionCode);
-      if (!selection) {
-        throw new BadRequestException(
-          'Unknown market or selection for this fixture',
-        );
-      }
-      return { ...request, fixture, market, canonicalMarket, selection };
+      if (!selection) throw new BadRequestException('Unknown market or selection for this fixture');
+
+      return {
+        ...request,
+        eventId: fixture.eventId,
+        fixture,
+        market,
+        canonicalMarket,
+        selection,
+      };
     });
 
-    const [leagueRows, storedPrices] = await Promise.all([
-      leagueIds.size
-        ? this.leagueModel
-            .find({ leagueId: { $in: [...leagueIds] } })
-            .select({ leagueId: 1, name: 1 })
-            .lean()
-            .exec()
-        : Promise.resolve([]),
-      this.oddsService.getPricesForSelections(
+    const storedPrices = asOddsPrices(
+      await this.oddsRead.getPricesForSelections(
         requested.map((item) => ({
           eventId: item.eventId,
           marketId: item.canonicalMarket.id,
           selectionKey: item.selection.code,
-          ...(item.selection.line !== undefined
-            ? { line: item.selection.line }
-            : {}),
+          ...(item.selection.line !== undefined ? { line: item.selection.line } : {}),
         })),
       ),
-    ]);
+    );
 
-    const leagueNameById = new Map<string, string>();
-    for (const league of leagueRows as unknown as Array<{
-      leagueId: unknown;
-      name?: unknown;
-    }>) {
-      leagueNameById.set(
-        String(league.leagueId).toLowerCase(),
-        typeof league.name === 'string' ? league.name : '',
+    const priceByKey = new Map<string, OddsQuoteSnapshot>();
+    for (const price of storedPrices) {
+      priceByKey.set(
+        this.exactPriceKey(price.eventId, price.marketId, price.selectionKey, price.line),
+        price,
       );
-    }
-    for (const identity of fixtureByEventId.values()) {
-      const leagueName = leagueNameById.get(identity.leagueId.toLowerCase());
-      if (leagueName) identity.leagueName = leagueName;
-    }
-
-    const priceByKey = new Map<string, StoredOddsPrice>();
-    for (const price of asStoredOddsPrices(storedPrices)) {
-      const key = this.exactPriceKey(
-        String(price.eventId),
-        String(price.marketId),
-        String(price.selectionKey),
-        price.line === undefined || price.line === null
-          ? undefined
-          : Number(price.line),
-      );
-      priceByKey.set(key, price);
     }
 
     return requested.map((item) => {
@@ -566,16 +388,11 @@ export class BetLabMarketService {
       if (!resolved || !resolved.isFresh) {
         throw new ConflictException(
           stored
-            ? 'The Odds module has marked this stored price stale or unusable; the selection cannot be placed.'
-            : 'No Odds-module-approved stored price exists for this exact selection.',
+            ? 'The Odds module has marked this exact price stale or unusable; the selection cannot be placed.'
+            : 'No Odds-module-approved price exists for this exact market, selection and line.',
         );
       }
-      return this.toSelectionQuote(
-        item.fixture,
-        item.market,
-        item.selection,
-        resolved,
-      );
+      return this.toSelectionQuote(item.fixture, item.market, item.selection, resolved);
     });
   }
 
@@ -593,21 +410,7 @@ export class BetLabMarketService {
         fullName: definition.fullName,
         abbreviation: definition.abbreviation,
       },
-      selection: {
-        code: selection.code,
-        jsonVariable: selection.jsonVariable,
-        fullName: selection.fullName,
-        abbreviation: selection.abbreviation,
-        settlementKey: selection.settlementKey,
-        line: selection.line,
-        handicap: selection.handicap,
-        homeGoals: selection.homeGoals,
-        awayGoals: selection.awayGoals,
-        subjectId: selection.subjectId,
-        subjectName: selection.subjectName,
-        subjectAbbreviation: selection.subjectAbbreviation,
-        subjectTeamId: selection.subjectTeamId,
-      },
+      selection: { ...selection },
       decimalOdds: price.decimalOdds,
       oddsSource: price.oddsSource,
       priceType: price.priceType,
@@ -615,165 +418,150 @@ export class BetLabMarketService {
       providerUpdatedAt: price.providerUpdatedAt,
       oddsTimestampBasis: price.oddsTimestampBasis,
       oddsCapturedAt: price.oddsCapturedAt,
+      oddsRecordUpdatedAt: price.oddsRecordUpdatedAt,
+      oddsFreshUntil: price.oddsFreshUntil,
+      fairOdds: price.fairOdds,
+      fairOddsBasis: price.fairOddsBasis,
+      marketFairOdds: price.marketFairOdds,
+      impliedProbability: price.impliedProbability,
+      fairProbability: price.fairProbability,
+      valuePercent: price.valuePercent,
+      dataQuality: price.dataQuality,
+      sampleSize: price.sampleSize,
+      calculationVersion: price.calculationVersion,
+      sourceRevision: price.sourceRevision,
+      fixtureSourceRevision: price.fixtureSourceRevision,
+      sourceDataUpdatedAt: price.sourceDataUpdatedAt,
+      provider: price.provider,
+      isFresh: price.isFresh,
       oddsBasis: price.oddsBasis,
       oddsCalculationMethod: price.oddsCalculationMethod,
     };
   }
 
-  private exactPriceKey(
-    eventId: string,
-    marketId: string,
-    selectionKey: string,
-    line?: number,
-  ): string {
-    return `${eventId}:${marketId}:${selectionKey}:${line === undefined ? '-' : line}`;
-  }
-
-  private buildMarketPricing(
-    fixture: BetLabFixtureIdentity,
-  ): Promise<FixturePricingSnapshot> {
-    const eventId = String(fixture.eventId);
+  private buildMarketPricing(fixture: BetLabFixtureIdentity): Promise<FixturePricingSnapshot> {
+    const eventId = fixture.eventId;
     const existing = this.pricingInFlight.get(eventId);
     if (existing) return existing;
 
     const pending = this.buildMarketPricingFromStore(fixture);
     this.pricingInFlight.set(eventId, pending);
-    void pending
-      .finally(() => {
-        if (this.pricingInFlight.get(eventId) === pending) {
-          this.pricingInFlight.delete(eventId);
-        }
-      })
-      .catch(() => undefined);
+    void pending.finally(() => {
+      if (this.pricingInFlight.get(eventId) === pending) this.pricingInFlight.delete(eventId);
+    }).catch(() => undefined);
     return pending;
   }
 
   private async buildMarketPricingFromStore(
     fixture: BetLabFixtureIdentity,
-    preloadedPrices?: StoredOddsPrice[],
   ): Promise<FixturePricingSnapshot> {
-    // Bet Lab reads the Odds Module's canonical quote book as virtual-game pricing input only. It never reads Prediction Engine selections, probabilities, confidence, or recommendations.
-    // OddsWorkerService is the sole pricing writer. BetLab must only consume
-    // the latest persisted quote snapshot and must never recalculate prices.
-    const storedPrices =
-      preloadedPrices ??
-      asStoredOddsPrices(
-        await this.oddsService.getFixturePrices(fixture.eventId),
-      );
+    // The Odds worker is the sole source of single-selection prices. Bet Lab
+    // reads its persisted snapshots and never calls a provider or reprices a market.
+    const storedPrices = asOddsPrices(await this.oddsRead.getFixturePrices(fixture.eventId));
     const quoteMap = new Map<string, ResolvedStoredPrice>();
 
     for (const price of storedPrices) {
       const definition = FOOTBALL_MARKET_BY_ID.get(String(price.marketId));
-      if (!definition) continue;
-
+      if (!definition || definition.pricingEnabled === false) continue;
       const resolved = this.resolveStoredPrice(price);
       if (!resolved) continue;
-
       const marketCode = definition.betLabMarketCode as BetLabMarketCode;
-      quoteMap.set(
-        this.quoteKey(marketCode, String(price.selectionKey)),
-        resolved,
-      );
+      quoteMap.set(this.quoteKey(marketCode, String(price.selectionKey), price.line), resolved);
     }
 
-    const context = {
-      homeTeamName: fixture.homeTeamName,
-      awayTeamName: fixture.awayTeamName,
-      players: extractRosterPlayers(asRecord(fixture.payload.summary) ?? {}),
-    };
+    const markets: BetLabMarketWithQuotes[] = BET_LAB_MARKET_CATALOG.map((market) => {
+      const pricingEnabled = market.pricingEnabled !== false;
+      const selections = expandMarketSelections(market, {
+        homeTeamName: fixture.homeTeamName,
+        awayTeamName: fixture.awayTeamName,
+      }).map((selection) => {
+        const quote = pricingEnabled
+          ? quoteMap.get(this.quoteKey(market.code, selection.code, selection.line))
+          : undefined;
+        const isStale = Boolean(quote && !quote.isFresh);
+        const available = Boolean(pricingEnabled && quote && quote.isFresh);
+        const unavailableReason = !pricingEnabled
+          ? 'This market is disabled in the canonical Odds catalogue until its required Sports data is supported.'
+          : available
+            ? undefined
+            : isStale
+              ? 'The Odds module has marked this stored price stale; it cannot be used for a new ticket.'
+              : 'No Odds-module-approved price is available for this exact selection.';
 
-    const markets: BetLabMarketWithQuotes[] = BET_LAB_MARKET_CATALOG.map(
-      (market) => {
-        const selections = expandMarketSelections(market, context).map(
-          (selection) => {
-            const quote = quoteMap.get(
-              this.quoteKey(market.code, selection.code),
-            );
-            // Odds owns the freshness decision; BetLab only consumes it.
-            const isStale = Boolean(quote && !quote.isFresh);
-            const available = Boolean(quote && !isStale);
-            return {
-              ...selection,
-              available,
-              // Old but otherwise valid snapshots remain visible for diagnosis.
-              // They are explicitly unavailable for new simulated tickets.
-              decimalOdds: quote?.decimalOdds ?? null,
-              oddsSource: quote?.oddsSource ?? null,
-              priceType: quote?.priceType ?? null,
-              bookmaker: quote?.bookmaker ?? null,
-              providerUpdatedAt: quote?.providerUpdatedAt ?? null,
-              oddsTimestampBasis: quote?.oddsTimestampBasis ?? null,
-              oddsCapturedAt: quote?.oddsCapturedAt ?? null,
-              oddsFreshUntil: quote?.oddsFreshUntil ?? null,
-              oddsBasis: quote?.oddsBasis ?? null,
-              oddsCalculationMethod: quote?.oddsCalculationMethod ?? null,
-              isStale,
-              unavailableReason: available
-                ? undefined
-                : isStale
-                  ? 'The Odds module has marked this stored price stale; it cannot be used for a new ticket.'
-                  : 'No valid stored price is available for this selection.',
-            } satisfies BetLabSelectionQuote;
-          },
-        );
-        const availableSelectionCount = selections.filter(
-          (selection) => selection.available,
-        ).length;
         return {
-          code: market.code,
-          jsonVariable: market.jsonVariable,
-          fullName: market.fullName,
-          abbreviation: market.abbreviation,
-          category: market.category,
-          period: market.period,
-          available: availableSelectionCount > 0,
-          availableSelectionCount,
-          selections,
-          notes: market.notes,
-        };
-      },
-    );
+          ...selection,
+          available,
+          decimalOdds: quote?.decimalOdds ?? null,
+          oddsSource: quote?.oddsSource ?? null,
+          priceType: quote?.priceType ?? null,
+          bookmaker: quote?.bookmaker ?? null,
+          providerUpdatedAt: quote?.providerUpdatedAt ?? null,
+          oddsTimestampBasis: quote?.oddsTimestampBasis ?? null,
+          oddsCapturedAt: quote?.oddsCapturedAt ?? null,
+          oddsRecordUpdatedAt: quote?.oddsRecordUpdatedAt ?? null,
+          oddsFreshUntil: quote?.oddsFreshUntil ?? null,
+          fairOdds: quote?.fairOdds ?? null,
+          fairOddsBasis: quote?.fairOddsBasis ?? null,
+          marketFairOdds: quote?.marketFairOdds ?? null,
+          impliedProbability: quote?.impliedProbability ?? null,
+          fairProbability: quote?.fairProbability ?? null,
+          valuePercent: quote?.valuePercent ?? null,
+          dataQuality: quote?.dataQuality ?? null,
+          sampleSize: quote?.sampleSize ?? null,
+          calculationVersion: quote?.calculationVersion ?? null,
+          sourceRevision: quote?.sourceRevision ?? null,
+          fixtureSourceRevision: quote?.fixtureSourceRevision ?? null,
+          sourceDataUpdatedAt: quote?.sourceDataUpdatedAt ?? null,
+          provider: quote?.provider ?? null,
+          isFresh: quote?.isFresh ?? false,
+          oddsBasis: quote?.oddsBasis ?? null,
+          oddsCalculationMethod: quote?.oddsCalculationMethod ?? null,
+          isStale,
+          unavailableReason,
+        } satisfies BetLabSelectionQuote;
+      });
+
+      return {
+        code: market.code,
+        jsonVariable: market.jsonVariable,
+        fullName: market.fullName,
+        abbreviation: market.abbreviation,
+        category: market.category,
+        period: market.period,
+        available: selections.some((selection) => selection.available),
+        availableSelectionCount: selections.filter((selection) => selection.available).length,
+        pricingEnabled,
+        selections,
+        notes: market.notes,
+      };
+    });
 
     let latestQuoteTimestamp: Date | null = null;
     let earliestQuoteExpiry: number | null = null;
     for (const quote of quoteMap.values()) {
-      if (
-        !latestQuoteTimestamp ||
-        quote.oddsCapturedAt.getTime() > latestQuoteTimestamp.getTime()
-      ) {
+      if (!latestQuoteTimestamp || quote.oddsCapturedAt.getTime() > latestQuoteTimestamp.getTime()) {
         latestQuoteTimestamp = quote.oddsCapturedAt;
       }
       if (!quote.isFresh) continue;
-      const expiry =
-        quote.oddsFreshUntil?.getTime() ?? Number.POSITIVE_INFINITY;
-      earliestQuoteExpiry =
-        earliestQuoteExpiry === null
-          ? expiry
-          : Math.min(earliestQuoteExpiry, expiry);
+      const expiry = quote.oddsFreshUntil?.getTime() ?? Number.POSITIVE_INFINITY;
+      earliestQuoteExpiry = earliestQuoteExpiry === null ? expiry : Math.min(earliestQuoteExpiry, expiry);
     }
-    const freshnessBoundary =
-      earliestQuoteExpiry === null
-        ? null
-        : Math.min(fixture.fixtureDate.getTime(), earliestQuoteExpiry);
+    const freshnessBoundary = earliestQuoteExpiry === null
+      ? null
+      : Math.min(fixture.fixtureDate.getTime(), earliestQuoteExpiry);
 
     return {
       oddsCapturedAt: latestQuoteTimestamp,
-      oddsFreshUntil:
-        freshnessBoundary === null ? null : new Date(freshnessBoundary),
+      oddsFreshUntil: freshnessBoundary === null ? null : new Date(freshnessBoundary),
       markets,
     };
   }
 
   /**
-   * Resolve only an exact, Odds-module-approved canonical quote. BetLab does
-   * not synthesize prices, derive related markets or apply its own freshness
-   * policy; missing or stale quotes remain unavailable for ticket placement.
+   * Accepts only exact Odds-module-approved rows. Freshness, provider priority,
+   * price normalization and fair-price calculations are owned by Odds.
    */
-  private resolveStoredPrice(
-    price: StoredOddsPrice,
-  ): ResolvedStoredPrice | null {
-    // A stored price is not automatically an approved virtual-game quote.
-    // Odds must explicitly mark the exact selection as usable.
+  private resolveStoredPrice(price: OddsQuoteSnapshot): ResolvedStoredPrice | null {
     if (price.predictionReady !== true) return null;
 
     const decimalOdds = Number(price.decimalOdds);
@@ -781,56 +569,42 @@ export class BetLabMarketService {
       !Number.isFinite(decimalOdds) ||
       decimalOdds < BET_LAB_CONFIG.odds.minimumDecimalOdds ||
       decimalOdds > BET_LAB_CONFIG.odds.maximumDecimalOdds
-    ) {
-      return null;
-    }
+    ) return null;
 
-    const rawPriceType =
-      typeof price.priceType === 'string' ? price.priceType.toUpperCase() : '';
-    if (rawPriceType !== 'PROVIDER' && rawPriceType !== 'ESTIMATED') {
-      return null;
-    }
-    const priceType = rawPriceType;
-    const provider =
-      typeof price.provider === 'string'
-        ? price.provider.trim().toUpperCase()
-        : '';
-    const providerUpdatedAt = this.toOptionalDate(price.providerUpdatedAt);
-    const storedAt = this.toOptionalDate(price.updatedAt);
-    const oddsCapturedAt =
-      this.toOptionalDate(price.oddsCapturedAt) ??
-      (priceType === 'PROVIDER' ? (providerUpdatedAt ?? storedAt) : storedAt);
-    if (!oddsCapturedAt) return null;
-    const oddsBasis =
-      typeof price.oddsBasis === 'string' ? price.oddsBasis : '';
-    const oddsCalculationMethod =
-      typeof price.oddsCalculationMethod === 'string'
-        ? price.oddsCalculationMethod.trim()
-        : '';
-    if (
-      !oddsCalculationMethod ||
-      ![
-        'BOOKMAKER_ONLY',
-        'BOOKMAKER_PLUS_HISTORY',
-        'HISTORICAL_ONLY',
-        'PRIOR_ONLY',
-      ].includes(oddsBasis)
-    )
-      return null;
+    const rawPriceType = String(price.priceType ?? '').toUpperCase();
+    if (rawPriceType !== 'PROVIDER' && rawPriceType !== 'ESTIMATED') return null;
+    const priceType = rawPriceType as BetLabPriceType;
+    const provider = String(price.provider ?? '').trim().toUpperCase();
+    const providerUpdatedAt = optionalDate(price.providerUpdatedAt);
+    const storedAt = optionalDate(price.updatedAt);
+    const capturedAt = optionalDate(price.oddsCapturedAt)
+      ?? optionalDate(price.sourceDataUpdatedAt)
+      ?? providerUpdatedAt
+      ?? storedAt;
+    if (!capturedAt) return null;
+
+    const rawBasis = String(price.oddsBasis ?? '').toUpperCase();
+    const oddsBasis = ['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY'].includes(rawBasis)
+      ? rawBasis as ResolvedStoredPrice['oddsBasis']
+      : null;
+    const method = typeof price.oddsCalculationMethod === 'string' && price.oddsCalculationMethod.trim()
+      ? price.oddsCalculationMethod.trim()
+      : null;
 
     let oddsSource: BetLabOddsSource;
     if (priceType === 'ESTIMATED') {
       oddsSource = BetLabOddsSource.ESTIMATED;
     } else {
       switch (provider) {
-        case 'API_FOOTBALL':
-          oddsSource = BetLabOddsSource.API_FOOTBALL;
-          break;
-        case 'THE_ODDS_API':
-          oddsSource = BetLabOddsSource.THE_ODDS_API;
-          break;
         case 'ESPN':
           oddsSource = BetLabOddsSource.ESPN_ODDS;
+          break;
+        case 'THE_ODDS_API':
+        case 'ODDS_API':
+          oddsSource = BetLabOddsSource.THE_ODDS_API;
+          break;
+        case 'API_FOOTBALL':
+          oddsSource = BetLabOddsSource.API_FOOTBALL;
           break;
         default:
           oddsSource = BetLabOddsSource.UNKNOWN_PROVIDER;
@@ -842,86 +616,59 @@ export class BetLabMarketService {
       decimalOdds,
       oddsSource,
       priceType,
-      bookmaker:
-        typeof price.bookmaker === 'string' && price.bookmaker.trim()
-          ? price.bookmaker.trim()
-          : null,
+      bookmaker: typeof price.bookmaker === 'string' && price.bookmaker.trim() ? price.bookmaker.trim() : null,
       providerUpdatedAt,
-      oddsTimestampBasis:
-        priceType === 'ESTIMATED'
-          ? 'MODEL_GENERATED'
-          : providerUpdatedAt
-            ? 'PROVIDER_UPDATED_AT'
-            : 'INGESTED_AT',
-      oddsCapturedAt,
-      oddsFreshUntil: this.toOptionalDate(price.oddsFreshUntil),
+      oddsTimestampBasis: priceType === 'ESTIMATED'
+        ? 'MODEL_GENERATED'
+        : providerUpdatedAt
+          ? 'PROVIDER_UPDATED_AT'
+          : 'INGESTED_AT',
+      oddsCapturedAt: capturedAt,
+      oddsRecordUpdatedAt: storedAt,
+      oddsFreshUntil: optionalDate(price.oddsFreshUntil),
       isFresh: price.isFresh === true,
-      oddsBasis: oddsBasis as ResolvedStoredPrice['oddsBasis'],
-      oddsCalculationMethod,
+      fairOdds: optionalNumber(price.fairOdds),
+      fairOddsBasis: price.fairOddsBasis === 'MODEL' || price.fairOddsBasis === 'PRIOR'
+        ? price.fairOddsBasis
+        : null,
+      marketFairOdds: optionalNumber(price.marketFairOdds),
+      impliedProbability: optionalNumber(price.impliedProbability),
+      fairProbability: optionalNumber(price.fairProbability),
+      valuePercent: optionalNumber(price.valuePercent),
+      dataQuality: optionalNumber(price.dataQuality),
+      sampleSize: optionalNumber(price.sampleSize),
+      calculationVersion: typeof price.calculationVersion === 'string' && price.calculationVersion.trim()
+        ? price.calculationVersion.trim()
+        : null,
+      sourceRevision: optionalNumber(price.sourceRevision),
+      fixtureSourceRevision: optionalNumber(price.fixtureSourceRevision),
+      sourceDataUpdatedAt: optionalDate(price.sourceDataUpdatedAt),
+      provider: provider === 'ESPN' || provider === 'THE_ODDS_API' || provider === 'ODDS_API'
+        ? (provider === 'ODDS_API' ? 'THE_ODDS_API' : provider)
+        : null,
+      oddsBasis,
+      oddsCalculationMethod: method,
     };
   }
 
-  private toOptionalDate(value: unknown): Date | null {
-    if (value instanceof Date) {
-      return Number.isNaN(value.getTime()) ? null : value;
-    }
-    if (typeof value === 'string' || typeof value === 'number') {
-      const date = new Date(value);
-      return Number.isNaN(date.getTime()) ? null : date;
-    }
-    return null;
+  private assertPlaceableFixture(fixture: BetLabFixtureIdentity): void {
+    assertBetLabPreMatchFixture(fixture);
   }
 
-  private assertPlaceableFixture(fixture: BetLabFixtureIdentity): void {
-    const status = [
-      fixture.status,
-      fixture.statusDetail,
-      fixture.statusShortDetail,
-    ]
-      .filter(Boolean)
-      .join(' ')
-      .toUpperCase();
+  private exactPriceKey(eventId: string, marketId: string, selectionKey: string, line?: unknown): string {
+    const normalizedLine = normalizeLine(line);
+    return `${eventId}:${marketId}:${selectionKey}:${normalizedLine === undefined ? '-' : normalizedLine}`;
+  }
 
-    if (
-      fixture.completed ||
-      /(^|[^A-Z])(FINISHED|FULL[_ -]?TIME|FT|AET|PEN|FINAL|COMPLETED|AFTER EXTRA TIME|AFTER PENALTIES)([^A-Z]|$)/.test(
-        status,
-      )
-    ) {
-      throw new ConflictException('This match has already been completed.');
-    }
-
-    if (
-      /POSTPON|\bPST\b|CANCEL|\bCANC\b|ABANDON|SUSPEND|INTERRUPT|DELAY|VOID|NO[_ -]?CONTEST/.test(
-        status,
-      )
-    ) {
-      throw new ConflictException(
-        'This match is not available for Bet Lab tickets.',
-      );
-    }
-
-    const live =
-      fixture.live ||
-      /LIVE|IN[_ ]?PROGRESS|IN[_ ]?PLAY|HALF[_ ]?TIME|FIRST[_ ]?HALF|SECOND[_ ]?HALF|EXTRA[_ ]?TIME/.test(
-        status,
-      );
-
-    if (!live && fixture.fixtureDate.getTime() <= Date.now()) {
-      throw new ConflictException(
-        'Ticket placement is closed for this fixture.',
-      );
-    }
+  private quoteKey(market: BetLabMarketCode, selectionCode: string, line?: number): string {
+    const normalizedLine = normalizeLine(line);
+    return `${market}:${selectionCode}:${normalizedLine === undefined ? '-' : normalizedLine}`;
   }
 
   private parseDate(value: string, field: string): Date {
     const date = new Date(value);
-    if (Number.isNaN(date.getTime()))
-      throw new BadRequestException(`${field} must be a valid date`);
+    if (Number.isNaN(date.getTime())) throw new BadRequestException(`${field} must be a valid date`);
     return date;
   }
-
-  private quoteKey(market: BetLabMarketCode, selectionCode: string): string {
-    return `${market}:${selectionCode}`;
-  }
 }
+

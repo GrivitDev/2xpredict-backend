@@ -1,10 +1,9 @@
-import { IsEmail, IsNotEmpty, IsString, MinLength, MaxLength } from 'class-validator';
+import { IsEmail, IsNotEmpty, IsString, MaxLength } from 'class-validator';
 
 export class RequestEmailChangeDto {
   @IsString()
   @IsNotEmpty()
-  @MinLength(6)
-  @MaxLength(128)
+  @MaxLength(256)
   currentPassword!: string;
 
   @IsEmail()

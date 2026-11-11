@@ -1,4 +1,4 @@
-import { PredictionModelInput } from '../../interfaces/espn-prediction-context.interface';
+import { PredictionModelInput } from '../../interfaces/prediction-match-context.interface';
 import { ExpandedMarketSelection } from '../../interfaces/market-catalog.interface';
 import { SelectionModelOutput } from '../../interfaces/market-engine-output.interface';
 import { PredictionSource } from '../../enums/prediction-source.enum';
@@ -182,4 +182,5 @@ function asianComponents(line: number): number[] {
 function clampProfile(value: number): number {
   return Math.max(0, Math.min(1, Number(value.toFixed(6))));
 }
+
 

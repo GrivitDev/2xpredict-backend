@@ -15,6 +15,10 @@ export class SlipCenterGenerationLock {
 
   @Prop({ required: true, type: Date, index: true })
   lockExpiresAt!: Date;
+
+  /** Dedicated TTL key; lockExpiresAt retains its existing operational index. */
+  @Prop({ type: Date })
+  ttlExpiresAt?: Date;
 }
 
 export type SlipCenterGenerationLockDocument =
@@ -22,4 +26,10 @@ export type SlipCenterGenerationLockDocument =
 
 export const SlipCenterGenerationLockSchema = SchemaFactory.createForClass(
   SlipCenterGenerationLock,
+);
+
+
+SlipCenterGenerationLockSchema.index(
+  { ttlExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_slip_center_generation_lock' },
 );

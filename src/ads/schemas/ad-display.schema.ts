@@ -6,17 +6,19 @@ import { AdDevice } from '../enums/ad-device.enum';
 
 @Schema({ _id: false })
 export class AdDisplay {
-  @Prop({ required: true, enum: Object.values(AdPage) }) page!: AdPage;
-  @Prop({ required: true, enum: Object.values(AdPosition) })
+  @Prop({ required: true, type: String, enum: Object.values(AdPage) }) page!: AdPage;
+  @Prop({ required: true, type: String, enum: Object.values(AdPosition) })
   position!: AdPosition;
   @Prop({
     required: true,
+    type: String,
     enum: Object.values(AdTrigger),
     default: AdTrigger.ALWAYS,
   })
   trigger!: AdTrigger;
   @Prop({
     required: true,
+    type: String,
     enum: Object.values(AdDevice),
     default: AdDevice.ALL,
   })
@@ -34,3 +36,4 @@ export class AdDisplay {
 }
 
 export const AdDisplaySchema = SchemaFactory.createForClass(AdDisplay);
+

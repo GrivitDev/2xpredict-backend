@@ -7,6 +7,7 @@ import { PromosModule } from '../promos/promos.module';
 import { PredictionsEngineModule } from '../predictions-engine/predictions-engine.module';
 import { SystemMonitorModule } from '../system-monitor/system-monitor.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
@@ -51,10 +52,11 @@ import { CustomerCareRetentionService } from './services/customer-care-retention
     PredictionsEngineModule,
     SystemMonitorModule,
     RealtimeModule,
+    NotificationsModule,
   ],
   controllers: [CustomerCareController, CustomerCareAdminController],
   providers: [
-    adminRealtimeRegistrationProvider('customer-care', '2xPredict Customer Care AI, diagnostic inspection, repair audits, incidents and Telegram broadcasts.'),
+    adminRealtimeRegistrationProvider('customer-care', '2xPredict Customer Care AI, diagnostic inspection, repair audits, incidents and AI public-channel broadcasts.'),
     CustomerCareService,
     GroqAssistantService,
     SupportDiagnosticsService,
@@ -72,3 +74,5 @@ import { CustomerCareRetentionService } from './services/customer-care-retention
   exports: [CustomerCareService, CustomerCareMonitorService],
 })
 export class CustomerCareModule {}
+
+

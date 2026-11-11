@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-registration.provider';
 
 import { MongooseModule } from '@nestjs/mongoose';
 
@@ -26,6 +27,10 @@ import { UploadsModule } from '../uploads/uploads.module';
   controllers: [InternalAdsController],
 
   providers: [
+    adminRealtimeRegistrationProvider(
+      'internal-ads',
+      'Internal promotional content management and placement delivery.',
+    ),
     InternalAdsService,
     JwtAuthGuard,
     RolesGuard,
@@ -34,4 +39,5 @@ import { UploadsModule } from '../uploads/uploads.module';
   exports: [InternalAdsService],
 })
 export class InternalAdsModule {}
+
 

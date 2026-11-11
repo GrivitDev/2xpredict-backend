@@ -141,7 +141,7 @@ function attachSelectionTemplates(
           '{ATHLETE_SHORT_NAME}',
         ],
         condition:
-          'Player selections are generated only for eligible athletes found in the ESPN Summary roster and carry the ESPN athlete ID.',
+          'Player selections require a confirmed normalized Sports roster and canonical athlete ID.',
       },
     ],
   };
@@ -160,11 +160,14 @@ export const FOOTBALL_MARKET_CATALOG: readonly MarketDefinition[] =
       fullName: market.fullName,
       abbreviation: market.abbreviation,
       family: market.family as MarketFamily,
-      model: market.model as MarketModel,
+      model: (market.model === 'PLAYER_EVENT_MODEL' ? MarketModel.PLAYER_MODEL : market.model) as MarketModel,
       selectionMode: market.selectionMode,
       period: market.period,
       lines: market.lines ? [...market.lines] : undefined,
       notes: market.notes,
+      pricingEnabled: market.pricingEnabled !== false,
+      requiredData: market.requiredData ? [...market.requiredData] : [],
+      minimumSampleSize: market.minimumSampleSize,
       selections: market.selections.map((selection) => ({
         key: selection.key,
         jsonVariable: selection.jsonVariable,
@@ -234,6 +237,95 @@ export const MARKET_DEFINITION_BY_KEY: ReadonlyMap<
   ),
 );
 
-export function getMarketDefinition(key: string): MarketDefinition | undefined {
-  return MARKET_DEFINITION_BY_KEY.get(key as PredictionMarket);
+/**
+ * Persisted identifiers retained for historical reads and old records.
+ * They are deliberately not part of the active canonical pricing catalogue.
+ * Do not remove these enum values without a separate historical-data migration.
+ */
+export const LEGACY_PREDICTION_MARKET_KEYS: readonly PredictionMarket[] =
+  Object.freeze([
+    PredictionMarket.AWAY_CORNERS_OVER_UNDER,
+    PredictionMarket.AWAY_WIN_EITHER_HALF,
+    PredictionMarket.CLEAN_SHEET,
+    PredictionMarket.FIRST_HALF_DRAW_NO_BET,
+    PredictionMarket.HALF_TIME_EUROPEAN_HANDICAP,
+    PredictionMarket.HOME_CORNERS_OVER_UNDER,
+    PredictionMarket.HOME_WIN_EITHER_HALF,
+    PredictionMarket.PLAYER_SHOTS_ON_TARGET,
+    PredictionMarket.PLAYER_TO_SCORE_TWO_OR_MORE,
+    PredictionMarket.POSSESSION_OVER_UNDER,
+    PredictionMarket.WIN_TO_NIL,
+  ]);
+
+export function isCanonicalPredictionMarketKey(value: unknown): boolean {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  return MARKET_DEFINITION_BY_KEY.has(
+    value.trim().toUpperCase() as PredictionMarket,
+  );
 }
+
+export function isPricingEnabledPredictionMarketKey(value: unknown): boolean {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  const definition = MARKET_DEFINITION_BY_KEY.get(
+    value.trim().toUpperCase() as PredictionMarket,
+  );
+  return Boolean(definition && definition.pricingEnabled !== false);
+}
+
+/** Fail fast at startup if the derived engine catalogue drifts from its contracts. */
+export function validatePredictionEngineMarketCatalog(): void {
+  const enumKeys = new Set<string>(Object.values(PredictionMarket));
+  const familyKeys = new Set<string>(Object.values(MarketFamily));
+  const modelKeys = new Set<string>(Object.values(MarketModel));
+  const calculationEngineFamilies = new Set([
+    'RESULT', 'GOALS', 'EVENTS', 'PERIOD', 'HANDICAP',
+    'STATISTICS', 'PLAYER', 'COMBINATIONS', 'SPECIAL',
+  ]);
+  const legacyKeys = new Set<string>();
+  const canonicalKeys = new Set<string>();
+
+  for (const key of LEGACY_PREDICTION_MARKET_KEYS) {
+    if (!enumKeys.has(key)) {
+      throw new Error(`Legacy prediction market key is missing from PredictionMarket: ${key}`);
+    }
+    if (legacyKeys.has(key)) {
+      throw new Error(`Duplicate legacy prediction market key: ${key}`);
+    }
+    legacyKeys.add(key);
+  }
+
+  for (const definition of FOOTBALL_MARKET_CATALOG) {
+    const key = String(definition.key);
+    if (!enumKeys.has(key)) {
+      throw new Error(`Canonical prediction market key is missing from PredictionMarket: ${key}`);
+    }
+    if (canonicalKeys.has(key)) {
+      throw new Error(`Duplicate derived prediction market key: ${key}`);
+    }
+    if (legacyKeys.has(key)) {
+      throw new Error(`Prediction market key cannot be both canonical and legacy: ${key}`);
+    }
+    if (!familyKeys.has(String(definition.family)) || !calculationEngineFamilies.has(String(definition.family))) {
+      throw new Error(`Market ${key} uses a family without a registered calculation engine: ${String(definition.family)}`);
+    }
+    if (!modelKeys.has(String(definition.model))) {
+      throw new Error(`Market ${key} uses an unsupported market model: ${String(definition.model)}`);
+    }
+    canonicalKeys.add(key);
+  }
+
+  for (const key of enumKeys) {
+    if (!canonicalKeys.has(key) && !legacyKeys.has(key)) {
+      throw new Error(`PredictionMarket key is neither canonical nor explicitly legacy: ${key}`);
+    }
+  }
+}
+
+validatePredictionEngineMarketCatalog();
+
+export function getMarketDefinition(key: string): MarketDefinition | undefined {
+  if (!key?.trim()) return undefined;
+  return MARKET_DEFINITION_BY_KEY.get(key.trim().toUpperCase() as PredictionMarket);
+}
+
+

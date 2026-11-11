@@ -1,14 +1,20 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Subscription } from './schemas/subscription.schema';
+import { SystemMonitorService } from '../system-monitor/system-monitor.service';
 
 type MonitorCheck = { name: string; status: 'OK' | 'FAILED'; value?: unknown; error?: string };
 
 @Injectable()
-export class SubscriptionsMonitorService {
+export class SubscriptionsMonitorService implements OnModuleInit {
+  onModuleInit(): void {
+    this.systemMonitor.registerModule('subscriptions');
+  }
+
   constructor(
     @InjectModel(Subscription.name) private readonly subscriptionModel: Model<Subscription>,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   private async safeQuery<T>(checks: MonitorCheck[], name: string, query: () => Promise<T>, fallback: T): Promise<T> {
@@ -23,6 +29,19 @@ export class SubscriptionsMonitorService {
   }
 
   async getOverview() {
+    try {
+      return await this.buildOverview();
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('subscriptions', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{ name: 'getOverview', status: 'FAILED', error: error instanceof Error ? error.message : String(error) }],
+      });
+      throw error;
+    }
+  }
+
+  private async buildOverview() {
     const checkedAt = new Date();
     const now = new Date();
     const threeDaysAhead = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
@@ -63,7 +82,7 @@ export class SubscriptionsMonitorService {
     if (duplicateActiveUsers > 0) warnings.push(`${duplicateActiveUsers} user(s) have multiple active subscriptions.`);
     if (checks.some((check) => check.status === 'FAILED')) warnings.push('One or more monitoring queries failed.');
 
-    return {
+    const overview = {
       module: 'subscriptions',
       checkedAt,
       status: !databaseReady || warnings.length ? 'DEGRADED' : 'OK',
@@ -76,5 +95,20 @@ export class SubscriptionsMonitorService {
       checks,
       warnings,
     };
+    this.systemMonitor.reportMonitorSnapshot('subscriptions', {
+      status: overview.status,
+      checkedAt,
+      checks,
+      warnings,
+      details: {
+        databaseConnected: databaseReady,
+        activeSubscriptions: activeNow,
+        expiredButActive,
+        expiryRemindersDue: remindersDue,
+        expiredNotificationsDue,
+        duplicateActiveUsers,
+      },
+    });
+    return overview;
   }
 }

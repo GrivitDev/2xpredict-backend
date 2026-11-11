@@ -21,6 +21,7 @@ export class CuratedPredictionSelection {
   @Prop({ required: true, trim: true }) leagueId!: string;
   @Prop({ required: true, trim: true }) leagueName!: string;
   @Prop({ required: true, type: Date }) fixtureDate!: Date;
+  @Prop({ type: Date }) retentionExpiresAt?: Date | null;
   @Prop({ required: true, trim: true }) homeTeamName!: string;
   @Prop({ required: true, trim: true }) awayTeamName!: string;
   @Prop({ required: true, trim: true }) marketPredictionId!: string;
@@ -35,8 +36,8 @@ export class CuratedPredictionSelection {
     | 'PROVIDER'
     | 'ESTIMATED';
   @Prop({ type: Boolean, default: false }) predictionReady?: boolean;
-  /** Optional at the Curated Predictions layer; downstream priced products validate odds independently. */
-  @Prop({ type: Number, min: 1.01, max: 100000 }) decimalOdds?: number;
+  /** Legacy records may omit odds; new curated publications require a valid Odds-module quote. */
+  @Prop({ type: Number, min: 1.02, max: 100000 }) decimalOdds?: number;
   /** Fair odds are informational and must not gate a probability/confidence-eligible pick. */
   @Prop({ type: Number, min: 1 }) fairOdds?: number;
   @Prop({ type: Date }) oddsUpdatedAt?: Date;
@@ -88,6 +89,11 @@ export class CuratedPredictionSelection {
   })
   matchSettlementStatus!: CuratedPredictionOutcome;
   @Prop({ type: Date }) settledAt?: Date;
+  /** Source provenance permits audited correction of provisional in-play outcomes. */
+  @Prop({ type: String, enum: ['IN_PLAY', 'HALF_TIME', 'FULL_TIME'] })
+  settlementPhase?: 'IN_PLAY' | 'HALF_TIME' | 'FULL_TIME';
+  @Prop({ type: String, trim: true }) settlementSourceFingerprint?: string;
+  @Prop({ type: [Object], default: [] }) settlementHistory?: Array<Record<string, unknown>>;
 }
 export const CuratedPredictionSelectionSchema = SchemaFactory.createForClass(
   CuratedPredictionSelection,
@@ -102,6 +108,9 @@ export class CuratedPrediction {
   generatedDateKey!: string;
   @Prop({ required: true, unique: true, sparse: true, trim: true, index: true })
   eventId!: string;
+  /** Exact retention deadline copied from the canonical Sports fixture. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date | null;
   @Prop({ required: true, trim: true }) title!: string;
   @Prop({ type: Boolean, default: false, index: true }) live?: boolean;
   @Prop({ type: Boolean, default: false, index: true }) completed?: boolean;
@@ -119,11 +128,11 @@ export class CuratedPrediction {
     default: [],
   })
   selections!: CuratedPredictionSelection[];
-  // Curated recommendations may bundle one to three distinct markets for one fixture.
-  @Prop({ required: true, min: 1, max: 3 }) selectionCount!: number;
+  // Curated recommendations may contain one to seven distinct markets for one fixture.
+  @Prop({ required: true, min: 1, max: 7 }) selectionCount!: number;
   @Prop({ required: true, min: 0, max: 1 }) combinedProbability!: number;
   /** Legacy primary-selection odds; omitted when no valid stored price exists. */
-  @Prop({ type: Number, min: 1.01, max: 1e15 }) combinedOdds?: number;
+  @Prop({ type: Number, min: 1.02, max: 1e15 }) combinedOdds?: number;
   @Prop({ required: true, min: 0, max: 98 }) confidence!: number;
   @Prop({ required: true, type: String, default: 'SINGLE_SELECTION' })
   combinedProbabilityMethod!: string;
@@ -144,3 +153,10 @@ export type CuratedPredictionDocument = HydratedDocument<CuratedPrediction>;
 export const CuratedPredictionSchema =
   SchemaFactory.createForClass(CuratedPrediction);
 CuratedPredictionSchema.index({ status: 1, fixtureDateFrom: 1 });
+
+
+
+CuratedPredictionSchema.index(
+  { retentionExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_curated_prediction_retention' },
+);

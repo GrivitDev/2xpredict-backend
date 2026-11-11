@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { SupportConversation } from '../schemas/support-conversation.schema';
@@ -9,14 +9,19 @@ import { CustomerCareBroadcast } from '../schemas/customer-care-broadcast.schema
 import { CustomerCareJob } from '../schemas/customer-care-job.schema';
 import { CustomerCareReplyJob } from '../schemas/customer-care-reply-job.schema';
 import { SupportDiagnosticsService } from './support-diagnostics.service';
+import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 
 @Injectable()
-export class CustomerCareMonitorService {
+export class CustomerCareMonitorService implements OnModuleInit {
   private cachedOverview?: {
     expiresAt: number;
     value: Record<string, unknown>;
   };
   private inflightOverview?: Promise<Record<string, unknown>>;
+
+  onModuleInit(): void {
+    this.systemMonitor.registerModule('customer-care');
+  }
 
   constructor(
     @InjectModel(SupportConversation.name)
@@ -34,6 +39,7 @@ export class CustomerCareMonitorService {
     @InjectModel(CustomerCareReplyJob.name)
     private readonly replyJobs: Model<CustomerCareReplyJob>,
     private readonly diagnostics: SupportDiagnosticsService,
+    private readonly systemMonitor: SystemMonitorService,
   ) {}
 
   async getOverview(): Promise<Record<string, unknown>> {
@@ -47,6 +53,17 @@ export class CustomerCareMonitorService {
     this.inflightOverview = request;
     try {
       return await request;
+    } catch (error) {
+      this.systemMonitor.reportMonitorSnapshot('customer-care', {
+        status: 'FAILED',
+        checkedAt: new Date(),
+        checks: [{
+          name: 'buildOverview',
+          status: 'FAILED',
+          error: error instanceof Error ? error.message : String(error),
+        }],
+      });
+      throw error;
     } finally {
       if (this.inflightOverview === request) this.inflightOverview = undefined;
     }
@@ -451,6 +468,32 @@ export class CustomerCareMonitorService {
       },
       errors,
     };
+    this.systemMonitor.reportMonitorSnapshot('customer-care', {
+      status: String(overview.status ?? 'UNKNOWN'),
+      checkedAt,
+      checks: errors.map((error, index) => ({
+        name: `diagnostic-query-${index + 1}`,
+        status: 'FAILED',
+        error,
+      })),
+      warnings: [
+        ...(v[6] > 0 ? [`${v[6]} Groq assistant failure(s) occurred in the last 24 hours.`] : []),
+        ...(v[8] > 0 ? [`${v[8]} support incident(s) remain open.`] : []),
+        ...(v[13] > 0 ? [`${v[13]} broadcast(s) require manual review.`] : []),
+        ...(v[20] > 0 ? [`${v[20]} reply job(s) are pending beyond five minutes.`] : []),
+        ...(v[21] > 0 ? [`${v[21]} reply job lease(s) have expired.`] : []),
+        ...(v[28] > 0 ? [`${v[28]} support notification job(s) failed.`] : []),
+      ],
+      details: {
+        openIncidents: v[8],
+        criticalOpenIncidents: v[9],
+        failedReplyJobs: v[19],
+        stalePendingReplyJobs: v[20],
+        expiredReplyLeases: v[21],
+        failedSupportNotifications: v[28],
+        failedMonitorQueries: errors.length,
+      },
+    });
     this.cachedOverview = { expiresAt: Date.now() + 10_000, value: overview };
     return overview;
   }

@@ -8,6 +8,7 @@ import { PredictionStatus } from '../../predictions-engine/enums/prediction-stat
 import {
   SettlementEventFacts,
   SettlementTargetCounts,
+  SettlementPhase,
 } from '../interfaces/settlement-context.interface';
 import { SettlementOutcome } from '../enums/settlement-outcome.enum';
 import { PredictionSettlementOutcome } from '../enums/settlement-prediction-outcome.enum';
@@ -25,11 +26,22 @@ type SettlementSelection = {
   settlementReason?: string;
   settlementEvidence?: unknown;
   settlementSourceFingerprint?: string;
+  settlementPhase?: SettlementPhase;
   diagnostics?: unknown;
   settlementHistory?: Array<Record<string, unknown>>;
 };
 
 const PERSISTED_OUTCOMES = new Set<string>(Object.values(PredictionSettlementOutcome));
+
+type SettlementProjection = {
+  outcome: string;
+  phase?: SettlementPhase;
+  sourceFingerprint?: string;
+  method?: string;
+  reason?: string;
+  settledAt?: Date;
+  sourceRecheck: boolean;
+};
 
 @Injectable()
 export class PredictionSettlementService {
@@ -65,7 +77,14 @@ export class PredictionSettlementService {
         if (!selection) continue;
         const existingOutcome = String(selection.actualOutcome ?? '').toUpperCase();
         const wasPreviouslySettled = PERSISTED_OUTCOMES.has(existingOutcome);
-        if (wasPreviouslySettled && !options.resettleSettled) {
+        // Non-full-time outcomes remain provisional until the fixture reaches
+        // full time. A changed Sports fingerprint reopens them for correction.
+        // Legacy terminal outcomes without a phase remain immutable here.
+        const revisableProvisionalOutcome = wasPreviouslySettled &&
+          (selection.settlementPhase === 'IN_PLAY' || selection.settlementPhase === 'HALF_TIME') &&
+          Boolean(selection.settlementSourceFingerprint) &&
+          selection.settlementSourceFingerprint !== facts.sourceFingerprint;
+        if (wasPreviouslySettled && !options.resettleSettled && !revisableProvisionalOutcome) {
           counts.predictionSelectionsSkipped += 1;
           continue;
         }
@@ -104,7 +123,7 @@ export class PredictionSettlementService {
         }
 
         const selectionKey = typeof selection.key === 'string' ? selection.key : '';
-        const result = this.marketSettlementService.settle(
+        const evaluation = this.marketSettlementService.settle(
           marketKey,
           {
             ...selection,
@@ -116,6 +135,24 @@ export class PredictionSettlementService {
           },
           facts,
         );
+        const result = {
+          ...evaluation,
+          evidence: { ...(evaluation.evidence ?? {}),
+            sourceFingerprint: facts.sourceFingerprint,
+            scoreSource: facts.scoreSource ?? null,
+            summaryFactsRevision: facts.summaryFactsRevision ?? null,
+            summaryFactsSourcePayloadHash: facts.summaryFactsSourcePayloadHash ?? null,
+            summaryFactsCollectedAt: facts.summaryFactsCollectedAt ?? null,
+            summaryFactsNormalizationVersion: facts.summaryFactsNormalizationVersion ?? null,
+            summaryFactsSectionStatus: facts.summaryFactsSectionStatus ?? null,
+            homeStatisticsSource: facts.homeStatisticsSource ?? null,
+            awayStatisticsSource: facts.awayStatisticsSource ?? null,
+            homeStatisticsCollectedAt: facts.homeStatisticsCollectedAt ?? null,
+            awayStatisticsCollectedAt: facts.awayStatisticsCollectedAt ?? null,
+            timelineCoverageComplete: facts.timelineCoverageComplete === true,
+            timelineCollectedAt: facts.timelineCollectedAt ?? null,
+          },
+        };
         if (result.outcome === SettlementOutcome.UNRESOLVED) {
           counts.predictionSelectionsUnresolved += 1;
           const reason = `${marketKey}/${selectionKey || String(selection.fullName ?? 'UNKNOWN_SELECTION')}: ${result.reason ?? 'insufficient settlement evidence'}`;
@@ -127,17 +164,69 @@ export class PredictionSettlementService {
           // visible simply because the corrected engine cannot prove a replacement.
           // Move that selection back to pending review, retain its old outcome in
           // settlementHistory, and reconcile dependent slips/curated picks below.
-          if (wasPreviouslySettled && options.resettleSettled && selectionKey) {
-            const correctionLabel = String(options.auditLabel ?? 'HISTORICAL_RESETTLE').trim() || 'HISTORICAL_RESETTLE';
+          if (revisableProvisionalOutcome && selectionKey) {
             const historyEntry = {
               correctedAt: settledAt,
-              auditLabel: correctionLabel,
+              auditLabel: 'SPORTS_SOURCE_RECHECK',
               previousOutcome: existingOutcome,
               nextOutcome: null,
               previousMethod: selection.settlementMethod ?? null,
               previousReason: selection.settlementReason ?? null,
               previousEvidence: selection.settlementEvidence ?? null,
               previousSourceFingerprint: selection.settlementSourceFingerprint ?? null,
+              previousSettlementPhase: selection.settlementPhase ?? null,
+              previousSettledAt: selection.settledAt ?? null,
+              nextMethod: 'PROVISIONAL_SETTLEMENT_REVERSED',
+              nextReason: result.reason ?? 'The updated Sports source no longer proves the provisional outcome.',
+              nextSourceFingerprint: facts.sourceFingerprint,
+            };
+            const reset = await this.marketPredictionModel.updateOne(
+              {
+                _id: market._id,
+                selections: { $elemMatch: {
+                  key: selectionKey,
+                  actualOutcome: existingOutcome,
+                  settlementSourceFingerprint: selection.settlementSourceFingerprint,
+                } },
+              },
+              {
+                $unset: {
+                  'selections.$.actualOutcome': 1,
+                  'selections.$.settledAt': 1,
+                  'selections.$.settlementPhase': 1,
+                },
+                $set: {
+                  'selections.$.settlementMethod': 'PROVISIONAL_SETTLEMENT_REVERSED',
+                  'selections.$.settlementReason': result.reason ?? 'Updated Sports evidence no longer proves the provisional outcome.',
+                  'selections.$.settlementEvidence': {
+                    ...(result.evidence ?? {}),
+                    sourceFingerprint: facts.sourceFingerprint,
+                    priorProvisionalOutcome: existingOutcome,
+                    requiresReevaluation: true,
+                    sourceDiagnostics: facts.sourceDiagnostics ?? [],
+                    settlementBlockers: facts.settlementBlockers ?? [],
+                  },
+                  'selections.$.settlementSourceFingerprint': facts.sourceFingerprint,
+                },
+                $push: { 'selections.$.settlementHistory': historyEntry },
+                $addToSet: { 'selections.$.diagnostics': 'PROVISIONAL_SETTLEMENT_REVERSED_BY_SPORTS_SOURCE' },
+              },
+            ).exec();
+            if ((reset.modifiedCount ?? 0) === 0 && unresolvedReasons.length < 100) {
+              unresolvedReasons.push(`${reason} The provisional outcome could not be reopened because the selection changed concurrently.`);
+            }
+          } else if (wasPreviouslySettled && options.resettleSettled && selectionKey) {
+            const correctionLabel = String(options.auditLabel ?? 'HISTORICAL_RESETTLE').trim() || 'HISTORICAL_RESETTLE';
+            const historyEntry = {
+              correctedAt: settledAt,
+              auditLabel: options.resettleSettled ? correctionLabel : 'SPORTS_SOURCE_RECHECK',
+              previousOutcome: existingOutcome,
+              nextOutcome: null,
+              previousMethod: selection.settlementMethod ?? null,
+              previousReason: selection.settlementReason ?? null,
+              previousEvidence: selection.settlementEvidence ?? null,
+              previousSourceFingerprint: selection.settlementSourceFingerprint ?? null,
+              previousSettlementPhase: selection.settlementPhase ?? null,
               previousSettledAt: selection.settledAt ?? null,
               nextMethod: 'HISTORICAL_CORRECTION_UNRESOLVED',
               nextReason: result.reason ?? 'Insufficient authoritative evidence after historical resettlement.',
@@ -165,6 +254,7 @@ export class PredictionSettlementService {
                 $unset: {
                   'selections.$.actualOutcome': 1,
                   'selections.$.settledAt': 1,
+                  'selections.$.settlementPhase': 1,
                 },
                 $set: {
                   'selections.$.settlementMethod': 'HISTORICAL_CORRECTION_UNRESOLVED',
@@ -229,24 +319,31 @@ export class PredictionSettlementService {
         // Update only this selection, not the full market document. This prevents
         // concurrent event jobs from overwriting settlement results for other
         // selections stored in the same market document.
-        const selectionMatch = wasPreviouslySettled && options.resettleSettled
-          ? { key: selectionKey, actualOutcome: existingOutcome }
+        const selectionMatch = wasPreviouslySettled && (options.resettleSettled || revisableProvisionalOutcome)
+          ? {
+              key: selectionKey,
+              actualOutcome: existingOutcome,
+              ...(revisableProvisionalOutcome ? { settlementSourceFingerprint: selection.settlementSourceFingerprint } : {}),
+            }
           : { key: selectionKey, actualOutcome: { $nin: [...PERSISTED_OUTCOMES] } };
         const correctionLabel = String(options.auditLabel ?? 'HISTORICAL_RESETTLE').trim() || 'HISTORICAL_RESETTLE';
-        const historyEntry = wasPreviouslySettled && options.resettleSettled
+        const provisionalOutcomeChanged = revisableProvisionalOutcome && existingOutcome !== result.outcome;
+        const historyEntry = (wasPreviouslySettled && options.resettleSettled) || provisionalOutcomeChanged
           ? {
               correctedAt: settledAt,
-              auditLabel: correctionLabel,
+              auditLabel: options.resettleSettled ? correctionLabel : 'SPORTS_SOURCE_RECHECK',
               previousOutcome: existingOutcome,
               nextOutcome: result.outcome,
               previousMethod: selection.settlementMethod ?? null,
               previousReason: selection.settlementReason ?? null,
               previousEvidence: selection.settlementEvidence ?? null,
               previousSourceFingerprint: selection.settlementSourceFingerprint ?? null,
+              previousSettlementPhase: selection.settlementPhase ?? null,
               previousSettledAt: selection.settledAt ?? null,
               nextMethod: result.method,
               nextReason: result.reason ?? null,
               nextSourceFingerprint: facts.sourceFingerprint,
+              nextSettlementPhase: result.phase ?? null,
             }
           : undefined;
         const evidence: Record<string, unknown> = {
@@ -255,10 +352,10 @@ export class PredictionSettlementService {
           sourceDiagnostics: facts.sourceDiagnostics ?? [],
           conflictingStats: facts.conflictingStats ?? [],
           settlementBlockers: facts.settlementBlockers ?? [],
-          ...(wasPreviouslySettled && options.resettleSettled
+          ...(wasPreviouslySettled && (options.resettleSettled || revisableProvisionalOutcome)
             ? {
                 resettlement: {
-                  auditLabel: correctionLabel,
+                  auditLabel: options.resettleSettled ? correctionLabel : 'SPORTS_SOURCE_RECHECK',
                   previousOutcome: existingOutcome,
                   previousSourceFingerprint: selection.settlementSourceFingerprint ?? null,
                 },
@@ -276,10 +373,13 @@ export class PredictionSettlementService {
               'selections.$.settledAt': settledAt,
               'selections.$.settlementMethod': options.resettleSettled && wasPreviouslySettled
                 ? `HISTORICAL_CORRECTION:${result.method}`
-                : result.method,
+                : provisionalOutcomeChanged
+                  ? `PROVISIONAL_RECHECK:${result.method}`
+                  : result.method,
               'selections.$.settlementReason': result.reason ?? null,
               'selections.$.settlementEvidence': evidence,
               'selections.$.settlementSourceFingerprint': facts.sourceFingerprint,
+              'selections.$.settlementPhase': result.phase ?? (facts.isFinished ? 'FULL_TIME' : facts.fixtureState === 'HALFTIME' ? 'HALF_TIME' : 'IN_PLAY'),
             },
             ...(historyEntry ? { $push: { 'selections.$.settlementHistory': historyEntry } } : {}),
             $addToSet: {
@@ -289,7 +389,9 @@ export class PredictionSettlementService {
                   ...(result.reason ? [`SETTLEMENT_NOTE:${result.reason}`] : []),
                   ...(wasPreviouslySettled && options.resettleSettled
                     ? [`RESSETTLEMENT:${correctionLabel}`, `RESSETTLEMENT_OUTCOME:${existingOutcome}->${result.outcome}`]
-                    : []),
+                    : provisionalOutcomeChanged
+                      ? ['PROVISIONAL_SETTLEMENT_SOURCE_RECHECK', `PROVISIONAL_OUTCOME:${existingOutcome}->${result.outcome}`]
+                      : []),
                 ],
               },
             },
@@ -307,8 +409,10 @@ export class PredictionSettlementService {
 
     // Reconcile dependent public records only after market selection writes have
     // completed. Missing source selections must never erase an existing outcome.
-    await this.reconcileSlipSettlements(eventId, options.resettleSettled === true);
-    await this.reconcileCuratedPredictions(eventId, options.resettleSettled === true);
+    if (facts.isFinished) {
+      await this.reconcileSlipSettlements(eventId, options.resettleSettled === true);
+      await this.reconcileCuratedPredictions(eventId, options.resettleSettled === true);
+    }
   }
 
   /** Admin-only evidence override for one unresolved Prediction Engine selection. */
@@ -470,6 +574,7 @@ export class PredictionSettlementService {
       previousReason: selection.settlementReason ?? null,
       previousEvidence: selection.settlementEvidence ?? null,
       previousSourceFingerprint: selection.settlementSourceFingerprint ?? null,
+      previousSettlementPhase: selection.settlementPhase ?? null,
       previousSettledAt: selection.settledAt ?? null,
       nextMethod: 'HISTORICAL_CORRECTION_UNRESOLVED',
       nextReason: reason,
@@ -482,7 +587,11 @@ export class PredictionSettlementService {
         [indexedKey]: { $in: ['', null] },
       },
       {
-        $unset: { [indexedOutcome]: 1, [`selections.${selectionIndex}.settledAt`]: 1 },
+        $unset: {
+          [indexedOutcome]: 1,
+          [`selections.${selectionIndex}.settledAt`]: 1,
+          [`selections.${selectionIndex}.settlementPhase`]: 1,
+        },
         $set: {
           [`selections.${selectionIndex}.settlementMethod`]: 'HISTORICAL_CORRECTION_UNRESOLVED',
           [`selections.${selectionIndex}.settlementReason`]: reason,
@@ -511,77 +620,172 @@ export class PredictionSettlementService {
     }
   }
 
+  private buildSettlementProjections(
+    markets: any[],
+    allowTerminalCorrection: boolean,
+  ): {
+    byId: Map<string, SettlementProjection>;
+    byMarketAndKey: Map<string, SettlementProjection>;
+  } {
+    const byId = new Map<string, SettlementProjection>();
+    const byMarketAndKey = new Map<string, SettlementProjection>();
+    for (const market of markets ?? []) {
+      for (const selection of Array.isArray(market.selections) ? market.selections : []) {
+        const rawOutcome = String(selection.actualOutcome ?? '').trim().toUpperCase();
+        const method = String(selection.settlementMethod ?? '');
+        const sourceRecheck =
+          method.startsWith('PROVISIONAL_RECHECK:') ||
+          method === 'PROVISIONAL_SETTLEMENT_REVERSED';
+        const hasOutcome = PERSISTED_OUTCOMES.has(rawOutcome);
+        if (!hasOutcome && !(allowTerminalCorrection || sourceRecheck)) continue;
+        const projection: SettlementProjection = {
+          outcome: hasOutcome ? rawOutcome : 'PENDING',
+          phase: selection.settlementPhase,
+          sourceFingerprint: String(selection.settlementSourceFingerprint ?? '').trim() || undefined,
+          method: method || undefined,
+          reason: String(selection.settlementReason ?? '').trim() || undefined,
+          settledAt: selection.settledAt instanceof Date ? selection.settledAt : undefined,
+          sourceRecheck,
+        };
+        const selectionKey = String(selection.key ?? '');
+        byId.set(`${String(market._id)}::${selectionKey}`, projection);
+        byMarketAndKey.set(`${String(market.marketKey ?? '')}::${selectionKey}`, projection);
+      }
+    }
+    return { byId, byMarketAndKey };
+  }
+
+  private shouldApplyProjection(
+    existing: any,
+    target: SettlementProjection,
+    allowTerminalCorrection: boolean,
+  ): { apply: boolean; correction: boolean } {
+    const currentOutcome = String(existing.settlementOutcome ?? 'PENDING').trim().toUpperCase();
+    const currentFingerprint = String(existing.settlementSourceFingerprint ?? '').trim();
+    const targetFingerprint = String(target.sourceFingerprint ?? '').trim();
+    const currentPhase = String(existing.settlementPhase ?? '').toUpperCase();
+    const currentIsTerminal = PERSISTED_OUTCOMES.has(currentOutcome);
+    const currentWasProvisional =
+      (currentPhase === 'IN_PLAY' || currentPhase === 'HALF_TIME') &&
+      Boolean(currentFingerprint) &&
+      Boolean(targetFingerprint) &&
+      currentFingerprint !== targetFingerprint;
+    const correction = currentIsTerminal && (
+      allowTerminalCorrection || currentWasProvisional || target.sourceRecheck
+    );
+    if (currentIsTerminal && !correction) return { apply: false, correction: false };
+
+    const targetPhase = String(target.phase ?? '').toUpperCase();
+    const unchanged =
+      currentOutcome === target.outcome &&
+      currentFingerprint === targetFingerprint &&
+      currentPhase === targetPhase;
+    if (unchanged) return { apply: false, correction: false };
+    return { apply: true, correction: currentIsTerminal };
+  }
+
+  private projectionElementMatch(
+    eventId: string,
+    selection: any,
+  ): Record<string, any> {
+    const element: Record<string, any> = {
+      eventId,
+      marketPredictionId: String(selection.marketPredictionId ?? ''),
+      marketKey: String(selection.marketKey ?? ''),
+      selectionKey: String(selection.selectionKey ?? ''),
+      settlementOutcome: selection.settlementOutcome ?? null,
+    };
+    const fingerprint = String(selection.settlementSourceFingerprint ?? '').trim();
+    element.settlementSourceFingerprint = fingerprint
+      ? fingerprint
+      : { $in: [null, ''] };
+    return element;
+  }
+
+  private projectionUpdate(
+    existing: any,
+    target: SettlementProjection,
+    correction: boolean,
+    reconciliationTime: Date,
+  ): Record<string, any> {
+    const set: Record<string, any> = {
+      'selections.$.settlementOutcome': target.outcome,
+    };
+    const unset: Record<string, 1> = {};
+    const fingerprint = String(target.sourceFingerprint ?? '').trim();
+    if (fingerprint) set['selections.$.settlementSourceFingerprint'] = fingerprint;
+    else unset['selections.$.settlementSourceFingerprint'] = 1;
+    if (target.phase) set['selections.$.settlementPhase'] = target.phase;
+    else unset['selections.$.settlementPhase'] = 1;
+
+    if (target.outcome === 'PENDING') {
+      set['selections.$.matchSettlementStatus'] = 'PENDING';
+      unset['selections.$.settledAt'] = 1;
+    } else {
+      set['selections.$.settledAt'] = target.settledAt ?? reconciliationTime;
+    }
+
+    const update: Record<string, any> = { $set: set };
+    if (Object.keys(unset).length) update.$unset = unset;
+    if (correction) {
+      const historyEntry = {
+        correctedAt: reconciliationTime,
+        auditLabel: 'SPORTS_SOURCE_RECHECK',
+        previousOutcome: String(existing.settlementOutcome ?? 'PENDING'),
+        nextOutcome: target.outcome,
+        previousPhase: existing.settlementPhase ?? null,
+        nextPhase: target.phase ?? null,
+        previousSourceFingerprint: existing.settlementSourceFingerprint ?? null,
+        nextSourceFingerprint: fingerprint || null,
+        previousSettledAt: existing.settledAt ?? null,
+        sourceMethod: target.method ?? null,
+        reason: target.reason ?? null,
+      };
+      update.$push = {
+        'selections.$.settlementHistory': { $each: [historyEntry], $slice: -20 },
+      };
+    }
+    return update;
+  }
+
   private async reconcileSlipSettlements(
     eventId: string,
     allowTerminalCorrection = false,
   ): Promise<void> {
     const [markets, slips] = await Promise.all([
       this.marketPredictionModel.find({ eventId }).lean().exec(),
-      this.predictionSlipModel.find({ 'legs.eventId': eventId }).select({ _id: 1, legs: 1, settlementStatus: 1 }).lean().exec(),
+      this.predictionSlipModel
+        .find({ 'legs.eventId': eventId })
+        .select({ _id: 1, legs: 1, settlementStatus: 1 })
+        .lean()
+        .exec(),
     ]);
     if (!slips.length) return;
 
-    const outcomesById = new Map<string, string>();
-    const outcomesByMarketAndKey = new Map<string, string>();
-    for (const market of markets as any[]) {
-      for (const selection of Array.isArray(market.selections) ? market.selections : []) {
-        const rawOutcome = String(selection.actualOutcome ?? '').trim().toUpperCase();
-        const selectionKey = String(selection.key ?? '');
-        if (allowTerminalCorrection) {
-          const outcome = PERSISTED_OUTCOMES.has(rawOutcome) ? rawOutcome : 'PENDING';
-          outcomesById.set(`${String(market._id)}::${selectionKey}`, outcome);
-          outcomesByMarketAndKey.set(`${String(market.marketKey ?? '')}::${selectionKey}`, outcome);
-        } else if (PERSISTED_OUTCOMES.has(rawOutcome)) {
-          outcomesById.set(`${String(market._id)}::${selectionKey}`, rawOutcome);
-          outcomesByMarketAndKey.set(`${String(market.marketKey ?? '')}::${selectionKey}`, rawOutcome);
-        }
-      }
-    }
-
-    const settledOutcomes = [...PERSISTED_OUTCOMES];
+    const projections = this.buildSettlementProjections(markets as any[], allowTerminalCorrection);
     const reconciliationTime = new Date();
     for (const slip of slips as any[]) {
+      const correctedEventIds = new Set<string>();
       for (const leg of Array.isArray(slip.legs) ? slip.legs : []) {
         if (String(leg.eventId) !== eventId) continue;
         const selectionKey = String(leg.selectionKey ?? '');
-        const outcome = outcomesById.get(`${String(leg.marketPredictionId)}::${selectionKey}`)
-          ?? outcomesByMarketAndKey.get(`${String(leg.marketKey ?? '')}::${selectionKey}`);
-        if (!outcome) continue;
+        const target = projections.byId.get(`${String(leg.marketPredictionId)}::${selectionKey}`)
+          ?? projections.byMarketAndKey.get(`${String(leg.marketKey ?? '')}::${selectionKey}`);
+        if (!target) continue;
 
-        if (!PERSISTED_OUTCOMES.has(outcome) && !(allowTerminalCorrection && outcome === 'PENDING')) continue;
-        const update: any = allowTerminalCorrection && outcome === 'PENDING'
-          ? {
-              $set: {
-                'legs.$.settlementOutcome': 'PENDING',
-                'legs.$.matchSettlementStatus': 'PENDING',
-              },
-              $unset: { 'legs.$.settledAt': 1 },
-            }
-          : {
-              $set: {
-                'legs.$.settlementOutcome': outcome,
-                'legs.$.settledAt': reconciliationTime,
-              },
-            };
-        await this.predictionSlipModel.updateOne(
-          {
-            _id: slip._id,
-            legs: {
-              $elemMatch: {
-                eventId,
-                marketPredictionId: String(leg.marketPredictionId ?? ''),
-                marketKey: String(leg.marketKey ?? ''),
-                selectionKey,
-                ...(allowTerminalCorrection ? {} : { settlementOutcome: { $nin: settledOutcomes } }),
-              },
-            },
-          },
+        const decision = this.shouldApplyProjection(leg, target, allowTerminalCorrection);
+        if (!decision.apply) continue;
+        const elementMatch = this.projectionElementMatch(eventId, leg);
+        const update = this.projectionUpdate(leg, target, decision.correction, reconciliationTime);
+        const result = await this.predictionSlipModel.updateOne(
+          { _id: slip._id, legs: { $elemMatch: elementMatch } },
           update,
         ).exec();
+        if ((result.modifiedCount ?? 0) > 0) correctedEventIds.add(eventId);
       }
 
-      // Re-read after individual atomic leg writes so concurrent jobs for other
-      // fixtures cannot lose one another's updates by saving a stale whole array.
+      // Re-read after atomic leg writes. This prevents different fixture workers
+      // from overwriting one another's nested result arrays.
       const current = await this.predictionSlipModel.findById(slip._id).lean().exec() as any;
       if (!current) continue;
       const legs = Array.isArray(current.legs) ? current.legs : [];
@@ -594,36 +798,35 @@ export class PredictionSettlementService {
       }
       for (const [fixtureEventId, group] of byEvent) {
         const matchStatus = this.aggregateSettlement(group.map((leg) => String(leg.settlementOutcome ?? 'PENDING')));
-        if (matchStatus === 'PENDING' && !allowTerminalCorrection) continue;
+        const allowGroupCorrection = allowTerminalCorrection || correctedEventIds.has(fixtureEventId);
+        if (matchStatus === 'PENDING' && !allowGroupCorrection) continue;
         await this.predictionSlipModel.updateOne(
           {
             _id: current._id,
-            ...(allowTerminalCorrection
+            ...(allowGroupCorrection
               ? { legs: { $elemMatch: { eventId: fixtureEventId } } }
               : { legs: { $elemMatch: { eventId: fixtureEventId, matchSettlementStatus: { $in: ['PENDING', null] } } } }),
           },
           { $set: { 'legs.$[leg].matchSettlementStatus': matchStatus } },
-          { arrayFilters: [{ 'leg.eventId': fixtureEventId, ...(allowTerminalCorrection ? {} : { 'leg.matchSettlementStatus': { $in: ['PENDING', null] } }) }] },
+          { arrayFilters: [{ 'leg.eventId': fixtureEventId, ...(allowGroupCorrection ? {} : { 'leg.matchSettlementStatus': { $in: ['PENDING', null] } }) }] },
         ).exec();
       }
 
-      // Aggregate states advance from PENDING to a resolved outcome only. This
-      // conditional update prevents a slow concurrent job from reverting a final
-      // result to PENDING or replacing one terminal outcome with another.
       const refreshed = await this.predictionSlipModel.findById(current._id).lean().exec() as any;
       if (!refreshed) continue;
       const overall = this.aggregateSettlement((refreshed.legs ?? []).map((leg: any) => String(leg.settlementOutcome ?? 'PENDING')));
-      if (overall !== 'PENDING' || allowTerminalCorrection) {
+      const allowAggregateCorrection = allowTerminalCorrection || correctedEventIds.size > 0;
+      if (overall !== 'PENDING' || allowAggregateCorrection) {
         const aggregateUpdate: any = overall === 'PENDING'
           ? { $set: { settlementStatus: 'PENDING' }, $unset: { settledAt: 1 } }
           : { $set: {
               settlementStatus: overall,
-              settledAt: allowTerminalCorrection ? reconciliationTime : refreshed.settledAt ?? reconciliationTime,
+              settledAt: allowAggregateCorrection ? reconciliationTime : refreshed.settledAt ?? reconciliationTime,
             } };
         await this.predictionSlipModel.updateOne(
           {
             _id: refreshed._id,
-            ...(allowTerminalCorrection ? {} : { settlementStatus: { $in: ['PENDING', null] } }),
+            ...(allowAggregateCorrection ? {} : { settlementStatus: { $in: ['PENDING', null] } }),
           },
           aggregateUpdate,
         ).exec();
@@ -637,68 +840,40 @@ export class PredictionSettlementService {
   ): Promise<void> {
     const [markets, predictions] = await Promise.all([
       this.marketPredictionModel.find({ eventId }).lean().exec(),
-      this.curatedPredictionModel.find({ 'selections.eventId': eventId }).select({ _id: 1, status: 1, selections: 1, settlementStatus: 1, settledAt: 1, publishedAt: 1 }).lean().exec(),
+      this.curatedPredictionModel
+        .find({ 'selections.eventId': eventId })
+        .select({ _id: 1, status: 1, selections: 1, settlementStatus: 1, settledAt: 1, publishedAt: 1 })
+        .lean()
+        .exec(),
     ]);
     if (!predictions.length) return;
 
-    const outcomes = new Map<string, string>();
-    const outcomesByMarketAndKey = new Map<string, string>();
-    for (const market of markets as any[]) {
-      for (const selection of Array.isArray(market.selections) ? market.selections : []) {
-        const rawOutcome = String(selection.actualOutcome ?? '').toUpperCase();
-        const selectionKey = String(selection.key ?? '');
-        if (allowTerminalCorrection) {
-          const outcome = PERSISTED_OUTCOMES.has(rawOutcome) ? rawOutcome : 'PENDING';
-          outcomes.set(`${String(market._id)}::${selectionKey}`, outcome);
-          outcomesByMarketAndKey.set(`${String(market.marketKey ?? '')}::${selectionKey}`, outcome);
-        } else if (PERSISTED_OUTCOMES.has(rawOutcome)) {
-          outcomes.set(`${String(market._id)}::${selectionKey}`, rawOutcome);
-          outcomesByMarketAndKey.set(`${String(market.marketKey ?? '')}::${selectionKey}`, rawOutcome);
-        }
-      }
-    }
-
-    const settledOutcomes = [...PERSISTED_OUTCOMES];
+    const projections = this.buildSettlementProjections(markets as any[], allowTerminalCorrection);
     const reconciliationTime = new Date();
     for (const prediction of predictions as any[]) {
       if (String(prediction.status ?? '').toUpperCase() === 'CANCELLED') continue;
+      const correctedEventIds = new Set<string>();
       const selections = Array.isArray(prediction.selections) ? prediction.selections : [];
       for (const selection of selections) {
         if (String(selection.eventId) !== eventId) continue;
         const selectionKey = String(selection.selectionKey ?? '');
-        const outcome = outcomes.get(`${String(selection.marketPredictionId)}::${selectionKey}`)
-          ?? outcomesByMarketAndKey.get(`${String(selection.marketKey ?? '')}::${selectionKey}`);
-        if (!outcome) continue;
-        if (!PERSISTED_OUTCOMES.has(outcome) && !(allowTerminalCorrection && outcome === 'PENDING')) continue;
-        const update: any = allowTerminalCorrection && outcome === 'PENDING'
-          ? {
-              $set: {
-                'selections.$.settlementOutcome': 'PENDING',
-                'selections.$.matchSettlementStatus': 'PENDING',
-              },
-              $unset: { 'selections.$.settledAt': 1 },
-            }
-          : {
-              $set: {
-                'selections.$.settlementOutcome': outcome,
-                'selections.$.settledAt': reconciliationTime,
-              },
-            };
-        await this.curatedPredictionModel.updateOne(
+        const target = projections.byId.get(`${String(selection.marketPredictionId)}::${selectionKey}`)
+          ?? projections.byMarketAndKey.get(`${String(selection.marketKey ?? '')}::${selectionKey}`);
+        if (!target) continue;
+
+        const decision = this.shouldApplyProjection(selection, target, allowTerminalCorrection);
+        if (!decision.apply) continue;
+        const elementMatch = this.projectionElementMatch(eventId, selection);
+        const update = this.projectionUpdate(selection, target, decision.correction, reconciliationTime);
+        const result = await this.curatedPredictionModel.updateOne(
           {
             _id: prediction._id,
             status: { $ne: 'CANCELLED' },
-            selections: {
-              $elemMatch: {
-                eventId,
-                marketPredictionId: String(selection.marketPredictionId ?? ''),
-                selectionKey,
-                ...(allowTerminalCorrection ? {} : { settlementOutcome: { $nin: settledOutcomes } }),
-              },
-            },
+            selections: { $elemMatch: elementMatch },
           },
           update,
         ).exec();
+        if ((result.modifiedCount ?? 0) > 0) correctedEventIds.add(eventId);
       }
 
       const current = await this.curatedPredictionModel.findById(prediction._id).lean().exec() as any;
@@ -713,27 +888,28 @@ export class PredictionSettlementService {
       }
       for (const [fixtureEventId, group] of byEvent) {
         const matchStatus = this.aggregateSettlement(group.map((item) => String(item.settlementOutcome ?? 'PENDING')));
-        if (matchStatus === 'PENDING' && !allowTerminalCorrection) continue;
+        const allowGroupCorrection = allowTerminalCorrection || correctedEventIds.has(fixtureEventId);
+        if (matchStatus === 'PENDING' && !allowGroupCorrection) continue;
         await this.curatedPredictionModel.updateOne(
           {
             _id: current._id,
             status: { $ne: 'CANCELLED' },
-            ...(allowTerminalCorrection
+            ...(allowGroupCorrection
               ? { selections: { $elemMatch: { eventId: fixtureEventId } } }
               : { selections: { $elemMatch: { eventId: fixtureEventId, matchSettlementStatus: { $in: ['PENDING', null] } } } }),
           },
           { $set: { 'selections.$[selection].matchSettlementStatus': matchStatus } },
-          { arrayFilters: [{ 'selection.eventId': fixtureEventId, ...(allowTerminalCorrection ? {} : { 'selection.matchSettlementStatus': { $in: ['PENDING', null] } }) }] },
+          { arrayFilters: [{ 'selection.eventId': fixtureEventId, ...(allowGroupCorrection ? {} : { 'selection.matchSettlementStatus': { $in: ['PENDING', null] } }) }] },
         ).exec();
       }
 
       const refreshed = await this.curatedPredictionModel.findById(current._id).lean().exec() as any;
       if (!refreshed || String(refreshed.status ?? '').toUpperCase() === 'CANCELLED') continue;
       const overall = this.aggregateSettlement((refreshed.selections ?? []).map((item: any) => String(item.settlementOutcome ?? 'PENDING')));
-      if (overall !== 'PENDING' || allowTerminalCorrection) {
-        // Historical correction can reopen a previously SETTLED recommendation
-        // only when the corrected evidence is insufficient. It is restored to
-        // PUBLISHED when it had a publication timestamp; otherwise READY.
+      const allowAggregateCorrection = allowTerminalCorrection || correctedEventIds.size > 0;
+      if (overall !== 'PENDING' || allowAggregateCorrection) {
+        // If a source recheck withdraws a provisional result, a published
+        // recommendation returns to PUBLISHED; an unpublished one returns READY.
         const aggregateUpdate: any = overall === 'PENDING'
           ? {
               $set: {
@@ -744,14 +920,14 @@ export class PredictionSettlementService {
             }
           : { $set: {
               settlementStatus: overall,
-              settledAt: allowTerminalCorrection ? reconciliationTime : refreshed.settledAt ?? reconciliationTime,
+              settledAt: allowAggregateCorrection ? reconciliationTime : refreshed.settledAt ?? reconciliationTime,
               status: 'SETTLED',
             } };
         await this.curatedPredictionModel.updateOne(
           {
             _id: refreshed._id,
             status: { $in: ['READY', 'PUBLISHED', 'SETTLED'] },
-            ...(allowTerminalCorrection ? {} : { settlementStatus: { $in: ['PENDING', null] } }),
+            ...(allowAggregateCorrection ? {} : { settlementStatus: { $in: ['PENDING', null] } }),
           },
           aggregateUpdate,
         ).exec();
@@ -780,6 +956,9 @@ export class PredictionSettlementService {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
+
+
 
 
 

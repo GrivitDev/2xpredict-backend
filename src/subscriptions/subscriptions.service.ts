@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import {
@@ -7,12 +7,13 @@ import {
   PaidPlanType,
   PlanType,
 } from './schemas/subscription.schema';
-import { EmailService } from '../notifications/email.service';
 import { BonusGrant } from '../bonuses/schemas/bonus-grant.schema';
 import { BonusStatus } from '../bonuses/enums/bonus-status.enum';
 import { BonusType } from '../bonuses/enums/bonus-type.enum';
+import { User } from '../users/schemas/user.schema';
 import { UsersService } from '../users/users.service';
 import { SystemMonitorService } from '../system-monitor/system-monitor.service';
+import { NotificationEventsService } from '../notifications/in-app/notification-events.service';
 
 const PAID_SUBSCRIPTION_DURATION_DAYS = 30;
 
@@ -21,11 +22,13 @@ export class SubscriptionsService {
   constructor(
     @InjectModel(Subscription.name)
     private subscriptionModel: Model<SubscriptionDocument>,
-    private emailService: EmailService,
     @InjectModel(BonusGrant.name)
     private readonly bonusGrantModel: Model<BonusGrant>,
+    @InjectModel(User.name)
+    private readonly userModel: Model<User>,
     private readonly usersService: UsersService,
     private readonly systemMonitor: SystemMonitorService,
+    private readonly notificationEvents: NotificationEventsService,
   ) {}
 
   // =====================================
@@ -247,6 +250,12 @@ export class SubscriptionsService {
     );
   }
 
+  async findBySourceReference(sourceReference: string) {
+    const reference = String(sourceReference ?? '').trim();
+    if (!reference) return null;
+    return this.subscriptionModel.findOne({ sourceReference: reference }).lean().exec();
+  }
+
   private async activatePlanInternal(data: {
     userId: string;
     email: string;
@@ -262,7 +271,39 @@ export class SubscriptionsService {
       const existingGrant = await this.subscriptionModel
         .findOne({ sourceReference: data.sourceReference })
         .exec();
-      if (existingGrant) return existingGrant;
+
+      if (existingGrant) {
+        // Recover the second half of an upgrade if the process stopped after
+        // creating the new term but before shortening the previous active term.
+        // Same-plan renewals and queued lower-tier purchases are not altered.
+        if (existingGrant.isActive) {
+          const planRank: Record<PaidPlanType, number> = {
+            regular: 1,
+            vip: 2,
+            premium: 3,
+          };
+          const previousActive = await this.subscriptionModel
+            .findOne({
+              userId: data.userId,
+              _id: { $ne: existingGrant._id },
+              isActive: true,
+              startDate: { $lt: existingGrant.startDate },
+              expiryDate: { $gt: existingGrant.startDate },
+            })
+            .sort({ startDate: -1 })
+            .exec();
+
+          if (
+            previousActive &&
+            planRank[existingGrant.plan] > planRank[previousActive.plan]
+          ) {
+            previousActive.expiryDate = existingGrant.startDate;
+            previousActive.isActive = false;
+            await previousActive.save();
+          }
+        }
+        return existingGrant;
+      }
     }
 
     const existing = await this.getActiveSubscription(data.userId);
@@ -437,20 +478,100 @@ export class SubscriptionsService {
     return null;
   }
 
-  async getUserPlan(userId: string): Promise<PlanType> {
+  private readonly planRank: Record<PlanType, number> = {
+    free: 0,
+    regular: 1,
+    vip: 2,
+    premium: 3,
+  };
+
+  /**
+   * The single source of truth for a user's current membership entitlement.
+   * A verified bonus elevates the effective tier only when it outranks the
+   * paid term. An equal-tier bonus keeps the paid tier and contributes to the
+   * effective allowance window used by Bet Lab.
+   */
+  async getEffectiveEntitlement(userId: string): Promise<{
+    plan: PlanType;
+    source: 'paid_subscription' | 'subscription_bonus' | 'combined' | 'free';
+    subscription: SubscriptionDocument | null;
+    bonus: {
+      plan: PaidPlanType;
+      startsAt: Date;
+      expiresAt: Date;
+    } | null;
+    startsAt: Date | null;
+    expiresAt: Date | null;
+  }> {
     const [subscription, bonus] = await Promise.all([
       this.getActiveSubscription(userId),
       this.getActiveSubscriptionBonus(userId),
     ]);
-    const rank: Record<PlanType, number> = {
-      free: 0,
-      regular: 1,
-      vip: 2,
-      premium: 3,
-    };
     const paidPlan: PlanType = subscription?.plan ?? 'free';
-    if (bonus && rank[bonus.plan] > rank[paidPlan]) return bonus.plan;
-    return paidPlan;
+    const bonusOutranksPaid = Boolean(
+      bonus && this.planRank[bonus.plan] > this.planRank[paidPlan],
+    );
+
+    if (bonus && bonusOutranksPaid) {
+      return {
+        plan: bonus.plan,
+        source: 'subscription_bonus',
+        subscription: subscription ?? null,
+        bonus,
+        startsAt: bonus.startsAt,
+        expiresAt: bonus.expiresAt,
+      };
+    }
+
+    if (subscription && bonus?.plan === subscription.plan) {
+      const paidStart = new Date(subscription.startDate);
+      const bonusStart = new Date(bonus.startsAt);
+      const paidEnd = new Date(subscription.expiryDate);
+      const bonusEnd = new Date(bonus.expiresAt);
+      return {
+        plan: subscription.plan,
+        source: 'combined',
+        subscription,
+        bonus,
+        startsAt: new Date(Math.min(paidStart.getTime(), bonusStart.getTime())),
+        expiresAt: new Date(Math.max(paidEnd.getTime(), bonusEnd.getTime())),
+      };
+    }
+
+    if (subscription) {
+      return {
+        plan: subscription.plan,
+        source: 'paid_subscription',
+        subscription,
+        bonus,
+        startsAt: new Date(subscription.startDate),
+        expiresAt: new Date(subscription.expiryDate),
+      };
+    }
+
+    if (bonus) {
+      return {
+        plan: bonus.plan,
+        source: 'subscription_bonus',
+        subscription: null,
+        bonus,
+        startsAt: bonus.startsAt,
+        expiresAt: bonus.expiresAt,
+      };
+    }
+
+    return {
+      plan: 'free',
+      source: 'free',
+      subscription: null,
+      bonus: null,
+      startsAt: null,
+      expiresAt: null,
+    };
+  }
+
+  async getUserPlan(userId: string): Promise<PlanType> {
+    return (await this.getEffectiveEntitlement(userId)).plan;
   }
 
   // =====================================
@@ -485,64 +606,63 @@ export class SubscriptionsService {
   // =====================================
   async getSubscriptionSummary(userId: string) {
     const now = new Date();
-
-    const subscription = await this.getActiveSubscription(userId);
+    const entitlement = await this.getEffectiveEntitlement(userId);
+    const subscription = entitlement.subscription;
 
     const pendingSubscription = await this.subscriptionModel
-      .findOne({
-        userId,
+      .findOne({ userId, startDate: { $gt: now } })
+      .sort({ startDate: 1 })
+      .exec();
 
-        startDate: {
-          $gt: now,
-        },
-      })
-      .sort({
-        startDate: 1,
-      });
+    const daysRemaining = entitlement.expiresAt
+      ? Math.max(
+          0,
+          Math.ceil(
+            (entitlement.expiresAt.getTime() - now.getTime()) /
+              (1000 * 60 * 60 * 24),
+          ),
+        )
+      : 0;
 
-    if (!subscription) {
+    if (!subscription && entitlement.source !== 'subscription_bonus') {
       const lastExpiredSubscription = await this.subscriptionModel
         .findOne({
           userId,
           startDate: { $lte: now },
           expiryDate: { $lte: now },
         })
-        .sort({ expiryDate: -1 });
+        .sort({ expiryDate: -1 })
+        .exec();
 
       return {
         hasSubscription: false,
-        currentPlan: 'free',
+        hasEntitlement: false,
+        currentPlan: 'free' as const,
+        entitlementSource: 'free' as const,
         status: lastExpiredSubscription ? 'expired' : 'free',
         subscription: null,
+        bonus: null,
         daysRemaining: 0,
-        // Free access does not expire. This flag only describes a previous
-        // paid subscription, not the user's current Free plan.
         expired: Boolean(lastExpiredSubscription),
         pendingSubscription,
       };
     }
 
-    const daysRemaining = Math.max(
-      0,
-      Math.ceil(
-        (subscription.expiryDate.getTime() - now.getTime()) /
-          (1000 * 60 * 60 * 24),
-      ),
-    );
-
     return {
-      hasSubscription: true,
-
-      currentPlan: subscription.plan,
-
+      // hasSubscription remains the indicator for a paid subscription record;
+      // hasEntitlement includes a temporary subscription bonus.
+      hasSubscription: Boolean(subscription),
+      hasEntitlement: entitlement.plan !== 'free',
+      currentPlan: entitlement.plan,
+      entitlementSource: entitlement.source,
       status: 'active',
-
       daysRemaining,
-
       expired: false,
-
-      subscription,
-
+      subscription: subscription ?? null,
+      bonus:
+        entitlement.source === 'subscription_bonus' || entitlement.source === 'combined'
+          ? entitlement.bonus
+          : null,
       pendingSubscription,
     };
   }
@@ -578,33 +698,117 @@ export class SubscriptionsService {
     };
   }
 
-  // Resolve account IDs for the admin directory's membership filter.
-  // Free means no currently active paid subscription, not an expired subscription.
+  /**
+   * Resolves membership filters with the same precedence as getUserPlan():
+   * latest active paid term, elevated by a verified active subscription bonus
+   * only when that bonus has a higher tier. Due queued terms are included
+   * because getActiveSubscription() activates them on demand.
+   */
   async getUserIdFilterForPlan(
-    plan: string,
+    plan: PlanType | string,
   ): Promise<{ includeUserIds?: string[]; excludeUserIds?: string[] }> {
-    const now = new Date();
-    const activeFilter = {
-      isActive: true,
-      startDate: { $lte: now },
-      expiryDate: { $gt: now },
-    };
-    if (plan !== 'free') {
-      const active = await this.subscriptionModel
-        .find({ ...activeFilter, plan: plan as PaidPlanType })
-        .select({ userId: 1 })
-        .lean()
-        .exec();
-      const ids = active.map((item) => String(item.userId));
-      return { includeUserIds: [...new Set<string>(ids)] };
+    if (!['free', 'regular', 'vip', 'premium'].includes(plan)) {
+      throw new BadRequestException(`Unsupported subscription plan filter: ${plan}`);
     }
-    const active = await this.subscriptionModel
-      .find(activeFilter)
-      .select({ userId: 1 })
-      .lean()
-      .exec();
-    const ids = active.map((item) => String(item.userId));
-    return { excludeUserIds: [...new Set<string>(ids)] };
+
+    const now = new Date();
+    const [activeSubscriptions, dueQueuedSubscriptions, activeBonuses] =
+      await Promise.all([
+        this.subscriptionModel
+          .find({
+            isActive: true,
+            startDate: { $lte: now },
+            expiryDate: { $gt: now },
+          })
+          .select({ userId: 1, plan: 1, startDate: 1 })
+          .sort({ startDate: -1 })
+          .lean()
+          .exec(),
+        this.subscriptionModel
+          .find({
+            isActive: false,
+            startDate: { $lte: now },
+            expiryDate: { $gt: now },
+          })
+          .select({ userId: 1, plan: 1, startDate: 1 })
+          .sort({ startDate: 1 })
+          .lean()
+          .exec(),
+        this.bonusGrantModel
+          .find({
+            type: BonusType.SUBSCRIPTION,
+            status: BonusStatus.GRANTED,
+            plan: { $in: ['regular', 'vip', 'premium'] },
+            startsAt: { $lte: now },
+            expiresAt: { $gt: now },
+          })
+          .select({ userId: 1, plan: 1, startsAt: 1, expiresAt: 1 })
+          .sort({ expiresAt: -1 })
+          .lean()
+          .exec(),
+      ]);
+
+    const paidPlans = new Map<string, PaidPlanType>();
+    // Match getActiveSubscription(): the most recently started active term wins.
+    for (const item of activeSubscriptions) {
+      const userId = String(item.userId);
+      if (!paidPlans.has(userId)) paidPlans.set(userId, item.plan);
+    }
+    // Match its on-demand queued-term fallback, and only use queued terms when
+    // no current active term exists for that account.
+    for (const item of dueQueuedSubscriptions) {
+      const userId = String(item.userId);
+      if (!paidPlans.has(userId)) paidPlans.set(userId, item.plan);
+    }
+
+    const bonusUserIds = [
+      ...new Set(
+        activeBonuses
+          .map((grant) => String(grant.userId ?? ''))
+          .filter(Boolean),
+      ),
+    ];
+    const verifiedUsers = bonusUserIds.length
+      ? await this.userModel
+          .find({
+            _id: { $in: bonusUserIds },
+            isVerified: true,
+            isDeleted: false,
+          })
+          .select({ _id: 1 })
+          .lean()
+          .exec()
+      : [];
+    const verifiedUserIds = new Set(
+      verifiedUsers.map((user) => String(user._id)),
+    );
+
+    const effectivePlans = new Map<string, PlanType>();
+    for (const [userId, paidPlan] of paidPlans) {
+      effectivePlans.set(userId, paidPlan);
+    }
+
+    for (const grant of activeBonuses) {
+      const userId = String(grant.userId ?? '');
+      const bonusPlan = grant.plan as PaidPlanType | undefined;
+      if (!userId || !bonusPlan || !verifiedUserIds.has(userId)) continue;
+
+      const currentPlan = effectivePlans.get(userId) ?? 'free';
+      if (this.planRank[bonusPlan] > this.planRank[currentPlan]) {
+        effectivePlans.set(userId, bonusPlan);
+      }
+    }
+
+    const matchingIds = [...effectivePlans.entries()]
+      .filter(([, effectivePlan]) => effectivePlan === plan)
+      .map(([userId]) => userId);
+
+    if (plan === 'free') {
+      const entitledIds = [...effectivePlans.keys()];
+      return { excludeUserIds: [...new Set(entitledIds)] };
+    }
+
+    return { includeUserIds: [...new Set(matchingIds)] };
   }
 
   async getVipUsers() {
@@ -688,38 +892,40 @@ export class SubscriptionsService {
   // SEND EXPIRING EMAIL
   // =====================================
   async sendExpiringEmail(subscription: SubscriptionDocument) {
-    await this.emailService.sendSubscriptionExpiringEmail({
-      email: subscription.email,
+    // Persist the one-time reminder marker first. Email delivery is independent
+    // and must never keep the subscription lifecycle operation from completing.
+    subscription.expiringReminderSent = true;
+    await subscription.save();
 
+    await this.notificationEvents.subscriptionExpiring({
+      userId: String(subscription.userId),
+      subscriptionId: String(subscription._id),
       plan: subscription.plan,
-
       expiryDate: subscription.expiryDate,
-
       daysRemaining: 3,
     });
-
-    subscription.expiringReminderSent = true;
-
-    await subscription.save();
   }
 
   // =====================================
   // SEND EXPIRED EMAIL
   // =====================================
   async sendExpiredEmail(subscription: SubscriptionDocument) {
-    await this.emailService.sendSubscriptionExpiredEmail({
-      email: subscription.email,
+    // Disable the expired entitlement and persist the reminder marker before
+    // attempting any external communication.
+    subscription.expiredNotificationSent = true;
+    subscription.isActive = false;
+    await subscription.save();
 
+    await this.notificationEvents.subscriptionExpired({
+      userId: String(subscription.userId),
+      subscriptionId: String(subscription._id),
       plan: subscription.plan,
-
       expiryDate: subscription.expiryDate,
     });
-
-    subscription.expiredNotificationSent = true;
-
-    subscription.isActive = false;
-
-    await subscription.save();
   }
+
 }
+
+
+
 

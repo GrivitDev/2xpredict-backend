@@ -3,8 +3,10 @@ import {
   SettlementEvaluation,
   SettlementEventFacts,
   SettlementSelectionInput,
+  SettlementPhase,
 } from '../interfaces/settlement-context.interface';
 import { SettlementOutcome as O } from '../enums/settlement-outcome.enum';
+import { SETTLEMENT_CONFIG } from '../config/settlement.config';
 import { FOOTBALL_MARKET_CATALOG } from '../../odds/catalog/football-market-catalog';
 import type { CanonicalMarketDefinition } from '../../odds/catalog/football-market-catalog';
 
@@ -21,13 +23,23 @@ const resolved = (
   outcome: O,
   method: string,
   evidence?: Record<string, unknown>,
-): SettlementEvaluation => ({ outcome, method, evidence });
+  phase?: SettlementPhase,
+): SettlementEvaluation => {
+  const safeEvidence = evidence;
+  return {
+    outcome,
+    method,
+    evidence: safeEvidence,
+    ...(phase ? { phase } : {}),
+  };
+};
 const boolOutcome = (
   condition: boolean,
   method: string,
   evidence?: Record<string, unknown>,
+  phase?: SettlementPhase,
 ): SettlementEvaluation =>
-  resolved(condition ? O.WON : O.LOST, method, evidence);
+  resolved(condition ? O.WON : O.LOST, method, evidence, phase);
 const str = (value: unknown): string => {
   if (value === undefined || value === null) return '';
   if (typeof value === 'string') return value.trim();
@@ -66,6 +78,20 @@ const compact = (value: unknown): string =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '');
 
+const settlementEvidenceConfig = ((
+  SETTLEMENT_CONFIG as { evidence?: Record<string, number> } | undefined
+)?.evidence ?? {
+  fullTimeStatisticsFreshnessMs: 5 * 60_000,
+  inPlayFixtureFreshnessMs: 90_000,
+  inPlayTimelineFreshnessMs: 90_000,
+  inPlayStatisticsFreshnessMs: 90_000,
+}) as {
+  fullTimeStatisticsFreshnessMs: number;
+  inPlayFixtureFreshnessMs: number;
+  inPlayTimelineFreshnessMs: number;
+  inPlayStatisticsFreshnessMs: number;
+};
+
 const EXTRA_TIME_AGGREGATE_MARKETS = new Set([
   'TOTAL_CORNERS_OVER_UNDER',
   'TOTAL_CORNERS_ODD_EVEN',
@@ -92,6 +118,7 @@ const EXTRA_TIME_AGGREGATE_MARKETS = new Set([
   'PLAYER_TO_SCORE_TWO_OR_MORE',
   'PLAYER_TO_ASSIST',
   'PLAYER_SHOTS_ON_TARGET',
+  'PLAYER_SHOTS_ON_TARGET_OVER_UNDER',
   'PLAYER_SHOTS_OVER_UNDER',
   'PLAYER_TO_BE_BOOKED',
   'PLAYER_TO_BE_SENT_OFF',
@@ -104,12 +131,13 @@ export class MarketSettlementService {
     selection: SettlementSelectionInput,
     facts: SettlementEventFacts,
   ): SettlementEvaluation {
-    if (!facts.isFinished)
-      return unresolved('Fixture is not confirmed finished.');
     if (facts.settlementBlockers?.length) {
       return unresolved(
         'Settlement was blocked because authoritative fixture facts conflict.',
-        { blockers: facts.settlementBlockers, sourceDiagnostics: facts.sourceDiagnostics },
+        {
+          blockers: facts.settlementBlockers,
+          sourceDiagnostics: facts.sourceDiagnostics,
+        },
       );
     }
     const definition = this.resolveMarketDefinition(marketKey);
@@ -121,11 +149,18 @@ export class MarketSettlementService {
     }
     const sourceMarket = norm(marketKey);
     const market = definition.predictionMarketKey;
-    const resolvedSelection = this.resolveCatalogSelection(definition, selection);
+    const resolvedSelection = this.resolveCatalogSelection(
+      definition,
+      selection,
+    );
     if (definition.selectionMode === 'STATIC' && !resolvedSelection) {
       return unresolved(
         `Selection is not defined by the Odds catalogue for market ${definition.id}.`,
-        { market: definition.id, selectionKey: selection.key, settlementKey: selection.settlementKey },
+        {
+          market: definition.id,
+          selectionKey: selection.key,
+          settlementKey: selection.settlementKey,
+        },
       );
     }
     const preferHandicapLine = definition.selectionMode === 'ASIAN_HANDICAP';
@@ -133,25 +168,35 @@ export class MarketSettlementService {
       ? this.readHandicap(selection)
       : this.readLine(selection);
     if (
-      (definition.selectionMode === 'OVER_UNDER' || definition.selectionMode === 'ASIAN_HANDICAP') &&
+      (definition.selectionMode === 'OVER_UNDER' ||
+        definition.selectionMode === 'ASIAN_HANDICAP' ||
+        definition.selectionMode === 'EUROPEAN_HANDICAP') &&
       suppliedLine !== undefined &&
       definition.lines?.length &&
-      !definition.lines.some((candidate) => Math.abs(candidate - suppliedLine) < 1e-7)
+      !definition.lines.some(
+        (candidate) => Math.abs(candidate - suppliedLine) < 1e-7,
+      )
     ) {
       return unresolved(
         `Line ${suppliedLine} is not supported by the Odds catalogue for market ${definition.id}.`,
-        { market: definition.id, line: suppliedLine, supportedLines: definition.lines },
+        {
+          market: definition.id,
+          line: suppliedLine,
+          supportedLines: definition.lines,
+        },
       );
     }
     if (facts.afterExtraTime && EXTRA_TIME_AGGREGATE_MARKETS.has(market)) {
       return unresolved(
-        'ESPN aggregate statistics may include extra time; regulation-only statistics are not available for this market.',
+        'Sports aggregate statistics may include extra time; regulation-only statistics are not available for this market.',
         { afterExtraTime: true, market },
       );
     }
     const key = norm(
       resolvedSelection?.key ??
-        selection.settlementKey ?? selection.key ?? selection.code,
+        selection.settlementKey ??
+        selection.key ??
+        selection.code,
     );
     const name = str(
       resolvedSelection?.fullName ??
@@ -162,7 +207,9 @@ export class MarketSettlementService {
     );
     const label = `${key} ${name}`.toUpperCase();
     const scoreAvailable =
-      facts.homeGoals !== undefined && facts.awayGoals !== undefined;
+      facts.regulationScoreAvailable !== false &&
+      facts.homeGoals !== undefined &&
+      facts.awayGoals !== undefined;
     const fullHome = facts.homeGoals;
     const fullAway = facts.awayGoals;
     const fullTotal = scoreAvailable ? fullHome! + fullAway! : undefined;
@@ -172,11 +219,28 @@ export class MarketSettlementService {
     const secondAway = facts.secondHalfAwayGoals;
     const side = this.selectedSide(selection, facts);
     const line = this.readLine(selection, preferHandicapLine);
+    const hasFreshTeamStatistics = (): boolean => {
+      const maxAge = settlementEvidenceConfig.fullTimeStatisticsFreshnessMs;
+      const now = Date.now();
+      const collectedAt: unknown[] = [
+        facts.homeStatisticsCollectedAt,
+        facts.awayStatisticsCollectedAt,
+      ];
+      return collectedAt.every((collectedAt) =>
+        Boolean(
+          collectedAt instanceof Date &&
+          Number.isFinite(collectedAt.getTime()) &&
+          now >= collectedAt.getTime() - 60_000 &&
+          now - collectedAt.getTime() <= maxAge,
+        ),
+      );
+    };
 
     const yesNo = (
       actual: boolean | undefined,
       method: string,
       reason: string,
+      phase?: SettlementPhase,
     ): SettlementEvaluation => {
       if (actual === undefined) return unresolved(reason);
       const no =
@@ -184,10 +248,15 @@ export class MarketSettlementService {
       const yes = /(^|_)YES($|_)|\bYES\b|\bGG\b/.test(label);
       if (!no && !yes)
         return unresolved('Selection could not be identified as Yes or No.');
-      return boolOutcome(no ? !actual : actual, method, {
-        actual,
-        selected: no ? 'NO' : 'YES',
-      });
+      return boolOutcome(
+        no ? !actual : actual,
+        method,
+        {
+          actual,
+          selected: no ? 'NO' : 'YES',
+        },
+        phase,
+      );
     };
 
     const resultOf = (
@@ -205,6 +274,7 @@ export class MarketSettlementService {
       home?: number,
       away?: number,
       mode: string = market,
+      phase?: SettlementPhase,
     ): SettlementEvaluation => {
       const result = resultOf(home, away);
       if (!result)
@@ -219,12 +289,17 @@ export class MarketSettlementService {
       ) {
         const expected = this.resultSelection(key, label);
         return expected
-          ? boolOutcome(result === expected, `${mode}_SCORE_COMPARISON`, {
-              result,
-              expected,
-              home,
-              away,
-            })
+          ? boolOutcome(
+              result === expected,
+              `${mode}_SCORE_COMPARISON`,
+              {
+                result,
+                expected,
+                home,
+                away,
+              },
+              phase,
+            )
           : unresolved(
               'Result selection could not be mapped to Home/Draw/Away.',
             );
@@ -239,29 +314,692 @@ export class MarketSettlementService {
                 ? ['HOME', 'AWAY']
                 : undefined;
         return expected
-          ? boolOutcome(expected.includes(result), `${mode}_SCORE_COMPARISON`, {
-              result,
-              expected,
-              home,
-              away,
-            })
+          ? boolOutcome(
+              expected.includes(result),
+              `${mode}_SCORE_COMPARISON`,
+              {
+                result,
+                expected,
+                home,
+                away,
+              },
+              phase,
+            )
           : unresolved('Double Chance selection could not be mapped.');
       }
       if (mode === 'DRAW_NO_BET' || mode === 'FIRST_HALF_DRAW_NO_BET') {
         if (result === 'DRAW')
-          return resolved(O.PUSH, `${mode}_DRAW_PUSH`, { home, away });
+          return resolved(O.PUSH, `${mode}_DRAW_PUSH`, { home, away }, phase);
         const expected = side;
         return expected
-          ? boolOutcome(result === expected, `${mode}_SCORE_COMPARISON`, {
-              result,
-              expected,
-              home,
-              away,
-            })
+          ? boolOutcome(
+              result === expected,
+              `${mode}_SCORE_COMPARISON`,
+              {
+                result,
+                expected,
+                home,
+                away,
+              },
+              phase,
+            )
           : unresolved('Draw No Bet team could not be identified.');
       }
       return unresolved(`No result settlement rule exists for ${mode}.`);
     };
+
+    // IN-PLAY SETTLEMENT: only outcomes that are mathematically irreversible
+    // from already-observed facts are written before the full-time whistle.
+    // Missing events never prove a negative result; only positive events,
+    // completed first-half facts, or monotonic count thresholds can resolve.
+    if (!facts.isFinished) {
+      const phase: SettlementPhase =
+        facts.fixtureState === 'HALFTIME' ? 'HALF_TIME' : 'IN_PLAY';
+      const isFresh = (date: unknown, maxAgeMs: number): boolean =>
+        Boolean(
+          date instanceof Date &&
+          Number.isFinite(date.getTime()) &&
+          Date.now() - date.getTime() <= maxAgeMs &&
+          Date.now() >= date.getTime() - 60_000,
+        );
+      const selectedYesNo = (): 'YES' | 'NO' | undefined => {
+        const no =
+          /(^|_)NO($|_)|\bNO\b|\bNG\b/.test(label) && !/NO_GOAL/.test(key);
+        const yes = /(^|_)YES($|_)|\bYES\b|\bGG\b/.test(label);
+        return no ? 'NO' : yes ? 'YES' : undefined;
+      };
+      const firstHalfReady = Boolean(
+        facts.firstHalfComplete &&
+        firstHome !== undefined &&
+        firstAway !== undefined &&
+        isFresh(
+          facts.fixtureSourceCollectedAt,
+          settlementEvidenceConfig.inPlayFixtureFreshnessMs,
+        ),
+      );
+      const liveScoreReady =
+        scoreAvailable &&
+        isFresh(
+          facts.fixtureSourceCollectedAt,
+          settlementEvidenceConfig.inPlayFixtureFreshnessMs,
+        );
+      const secondHalfScoreReady =
+        facts.periodScoresAvailable &&
+        secondHome !== undefined &&
+        secondAway !== undefined &&
+        isFresh(
+          facts.fixtureSourceCollectedAt,
+          settlementEvidenceConfig.inPlayFixtureFreshnessMs,
+        );
+      const observedGoals = facts.afterExtraTime
+        ? facts.goals.filter(
+            (goal) => goal.minute !== undefined && goal.minute <= 90.99,
+          )
+        : facts.goals;
+      const observedCards = facts.afterExtraTime
+        ? facts.cards.filter(
+            (card) => card.minute !== undefined && card.minute <= 90.99,
+          )
+        : facts.cards;
+      const timelineReady = isFresh(
+        facts.timelineCollectedAt,
+        settlementEvidenceConfig.inPlayTimelineFreshnessMs,
+      );
+      const observedGoalTotal = liveScoreReady ? fullTotal! : undefined;
+      const selectedSide = side;
+
+      // First-half markets become final as soon as Sports confirms the first
+      // half has ended; they do not wait for the full match to finish.
+      if (
+        market === 'HALF_TIME_RESULT' ||
+        market === 'FIRST_HALF_DOUBLE_CHANCE' ||
+        market === 'FIRST_HALF_DRAW_NO_BET'
+      ) {
+        if (!firstHalfReady)
+          return unresolved(
+            'The first-half period is not yet closed with fresh normalized Sports scores.',
+          );
+        const mode =
+          market === 'HALF_TIME_RESULT'
+            ? 'HALF_TIME_RESULT'
+            : market === 'FIRST_HALF_DOUBLE_CHANCE'
+              ? 'FIRST_HALF_DOUBLE_CHANCE'
+              : 'FIRST_HALF_DRAW_NO_BET';
+        return compareResultSelection(firstHome, firstAway, mode, 'HALF_TIME');
+      }
+      if (market === 'FIRST_HALF_GOALS_OVER_UNDER') {
+        if (!firstHalfReady)
+          return unresolved(
+            'First-half goals cannot be settled until the half is complete.',
+          );
+        if (line === undefined)
+          return unresolved('The selected first-half goals line is missing.');
+        return this.overUnder(
+          firstHome! + firstAway!,
+          line,
+          this.isOverSelection(key, label),
+          'FIRST_HALF_GOALS_PERIOD_SCORE',
+          'HALF_TIME',
+        );
+      }
+      if (market === 'BOTH_TEAMS_TO_SCORE_FIRST_HALF') {
+        if (!firstHalfReady)
+          return unresolved(
+            'First-half BTTS requires a confirmed completed first half.',
+          );
+        return yesNo(
+          firstHome! > 0 && firstAway! > 0,
+          'FIRST_HALF_BTTS_PERIOD_SCORE',
+          'First-half score is unavailable.',
+          'HALF_TIME',
+        );
+      }
+      if (market === 'HALF_TIME_GOALS_ODD_EVEN') {
+        if (!firstHalfReady)
+          return unresolved(
+            'Half-time odd/even requires a confirmed completed first half.',
+          );
+        const evaluation = this.oddEven(
+          firstHome! + firstAway!,
+          key,
+          label,
+          market,
+        );
+        return evaluation.outcome === O.UNRESOLVED
+          ? evaluation
+          : { ...evaluation, phase: 'HALF_TIME' };
+      }
+      if (market === 'HALF_TIME_CORRECT_SCORE') {
+        if (!firstHalfReady)
+          return unresolved(
+            'Half-time correct score requires a confirmed completed first half.',
+          );
+        const expected = this.readCorrectScore(selection);
+        if (!expected)
+          return unresolved(
+            'Half-time correct-score selection could not be parsed.',
+          );
+        return boolOutcome(
+          firstHome === expected.home && firstAway === expected.away,
+          'HALF_TIME_CORRECT_SCORE',
+          {
+            actualHome: firstHome,
+            actualAway: firstAway,
+            expectedHome: expected.home,
+            expectedAway: expected.away,
+          },
+          'HALF_TIME',
+        );
+      }
+      if (
+        market === 'GOAL_IN_BOTH_HALVES' ||
+        market === 'HOME_TEAM_TO_SCORE_IN_BOTH_HALVES' ||
+        market === 'AWAY_TEAM_TO_SCORE_IN_BOTH_HALVES'
+      ) {
+        if (!firstHalfReady)
+          return unresolved(
+            'Both-halves markets require a completed first half.',
+          );
+        const firstTotal = firstHome! + firstAway!;
+        const selectedFirstGoals =
+          market === 'HOME_TEAM_TO_SCORE_IN_BOTH_HALVES'
+            ? firstHome
+            : market === 'AWAY_TEAM_TO_SCORE_IN_BOTH_HALVES'
+              ? firstAway
+              : firstTotal;
+        const selectedYes = selectedYesNo();
+        if (!selectedYes)
+          return unresolved(
+            'Both-halves selection could not be identified as Yes or No.',
+          );
+        if (selectedFirstGoals === 0 && selectedYes === 'NO') {
+          return boolOutcome(
+            true,
+            `${market}_FIRST_HALF_NEGATIVE_PROOF`,
+            { firstHalfGoals: selectedFirstGoals },
+            'HALF_TIME',
+          );
+        }
+        if (selectedFirstGoals === 0 && selectedYes === 'YES') {
+          // Second half cannot repair a zero-goal first half.
+          return boolOutcome(
+            false,
+            `${market}_FIRST_HALF_NEGATIVE_PROOF`,
+            { firstHalfGoals: selectedFirstGoals },
+            'HALF_TIME',
+          );
+        }
+        if (
+          facts.secondHalfHomeGoals !== undefined &&
+          facts.secondHalfAwayGoals !== undefined
+        ) {
+          const secondTotal =
+            facts.secondHalfHomeGoals + facts.secondHalfAwayGoals;
+          const secondSelected =
+            market === 'HOME_TEAM_TO_SCORE_IN_BOTH_HALVES'
+              ? facts.secondHalfHomeGoals
+              : market === 'AWAY_TEAM_TO_SCORE_IN_BOTH_HALVES'
+                ? facts.secondHalfAwayGoals
+                : secondTotal;
+          if (secondSelected > 0 && selectedYes === 'YES')
+            return boolOutcome(
+              true,
+              `${market}_PERIOD_SCORE_POSITIVE_PROOF`,
+              {
+                firstHalfGoals: selectedFirstGoals,
+                secondHalfGoals: secondSelected,
+              },
+              phase,
+            );
+          if (secondSelected > 0 && selectedYes === 'NO')
+            return boolOutcome(
+              false,
+              `${market}_PERIOD_SCORE_POSITIVE_PROOF`,
+              {
+                firstHalfGoals: selectedFirstGoals,
+                secondHalfGoals: secondSelected,
+              },
+              phase,
+            );
+        }
+        return unresolved(
+          'The required second-half scoring condition has not yet been established.',
+        );
+      }
+      if (
+        market === 'HOME_WIN_EITHER_HALF' ||
+        market === 'AWAY_WIN_EITHER_HALF'
+      ) {
+        if (!firstHalfReady)
+          return unresolved(
+            'Win Either Half requires a completed first half before any early outcome can be proven.',
+          );
+        const selected = market === 'HOME_WIN_EITHER_HALF' ? 'HOME' : 'AWAY';
+        const firstResult = resultOf(firstHome, firstAway);
+        const wonFirstHalf = firstResult === selected;
+        const expected = selectedYesNo();
+        if (!expected)
+          return unresolved(
+            'Win Either Half selection could not be identified as Yes or No.',
+          );
+        if (wonFirstHalf)
+          return boolOutcome(
+            expected === 'YES',
+            `${market}_FIRST_HALF_POSITIVE_PROOF`,
+            { firstHome, firstAway, selected },
+            'HALF_TIME',
+          );
+        return unresolved(
+          'The selected team did not win the first half; the second half must finish before No can be settled.',
+        );
+      }
+
+      // Second-half BTTS is irreversible once both sides have scored in the
+      // second-half period. Do not infer No from an incomplete live period.
+      if (
+        secondHalfScoreReady &&
+        market === 'BOTH_TEAMS_TO_SCORE_SECOND_HALF' &&
+        secondHome > 0 &&
+        secondAway > 0
+      ) {
+        return yesNo(
+          true,
+          'BOTH_TEAMS_TO_SCORE_SECOND_HALF_IN_PLAY_POSITIVE_PROOF',
+          'Second-half BTTS selection could not be identified as Yes or No.',
+          phase,
+        );
+      }
+      // A second-half goal line can be decided before fulltime once its
+      // monotonic period-score lower bound has crossed the entire line.
+      if (secondHalfScoreReady && market === 'SECOND_HALF_GOALS_OVER_UNDER') {
+        if (line === undefined)
+          return unresolved('The selected second-half goals line is missing.');
+        const secondHalfTotal = secondHome + secondAway;
+        const early = this.settleOverUnderLowerBound(
+          secondHalfTotal,
+          line,
+          this.isOverSelection(key, label),
+          'SECOND_HALF_GOALS_OVER_UNDER_IN_PLAY_LOWER_BOUND',
+          phase,
+        );
+        if (early) return early;
+      }
+
+      // Positive in-play score facts can decide one-sided/event markets. A
+      // zero score while play continues is never treated as a final No.
+      if (
+        liveScoreReady &&
+        (market === 'BOTH_TEAMS_TO_SCORE' ||
+          market === 'HOME_TEAM_TO_SCORE' ||
+          market === 'AWAY_TEAM_TO_SCORE')
+      ) {
+        const actual =
+          market === 'BOTH_TEAMS_TO_SCORE'
+            ? fullHome! > 0 && fullAway! > 0
+            : market === 'HOME_TEAM_TO_SCORE'
+              ? fullHome! > 0
+              : fullAway! > 0;
+        if (actual)
+          return yesNo(
+            true,
+            `${market}_IN_PLAY_SCORE_POSITIVE_PROOF`,
+            'Positive score evidence is unavailable.',
+            phase,
+          );
+      }
+      if (
+        liveScoreReady &&
+        (market === 'CLEAN_SHEET' ||
+          market === 'HOME_TEAM_CLEAN_SHEET' ||
+          market === 'AWAY_TEAM_CLEAN_SHEET' ||
+          market === 'WIN_TO_NIL' ||
+          market === 'HOME_TEAM_TO_WIN_TO_NIL' ||
+          market === 'AWAY_TEAM_TO_WIN_TO_NIL')
+      ) {
+        const selected =
+          sourceMarket.includes('AWAY') || key.includes('AWAY')
+            ? 'AWAY'
+            : sourceMarket.includes('HOME') || key.includes('HOME')
+              ? 'HOME'
+              : selectedSide;
+        const opponentGoals =
+          selected === 'HOME'
+            ? fullAway
+            : selected === 'AWAY'
+              ? fullHome
+              : undefined;
+        if (opponentGoals !== undefined && opponentGoals > 0) {
+          const expected = selectedYesNo();
+          if (expected)
+            return boolOutcome(
+              expected === 'NO',
+              `${market}_CONCEDED_GOAL_PROOF`,
+              { selected, opponentGoals },
+              phase,
+            );
+          return boolOutcome(
+            false,
+            `${market}_CONCEDED_GOAL_PROOF`,
+            { selected, opponentGoals },
+            phase,
+          );
+        }
+      }
+      // Total-goal and team-goal lines are settleable only once the current
+      // score has crossed the entire line (both components for quarter lines).
+      if (
+        liveScoreReady &&
+        (market === 'GOALS_OVER_UNDER' ||
+          market === 'ASIAN_TOTAL_GOALS' ||
+          market === 'HOME_TEAM_GOALS_OVER_UNDER' ||
+          market === 'AWAY_TEAM_GOALS_OVER_UNDER')
+      ) {
+        const actual =
+          market === 'HOME_TEAM_GOALS_OVER_UNDER'
+            ? fullHome!
+            : market === 'AWAY_TEAM_GOALS_OVER_UNDER'
+              ? fullAway!
+              : observedGoalTotal!;
+        if (line === undefined)
+          return unresolved('The selected live goals line is missing.');
+        const early = this.settleOverUnderLowerBound(
+          actual,
+          line,
+          this.isOverSelection(key, label),
+          `${market}_IN_PLAY_LOWER_BOUND`,
+          phase,
+        );
+        if (early) return early;
+      }
+      if (liveScoreReady && market === 'BOTH_TEAMS_TO_SCORE_AND_TOTAL_GOALS') {
+        const expectedBtts = /(^|_)YES(_|$)/.test(key)
+          ? true
+          : /(^|_)NO(_|$)/.test(key)
+            ? false
+            : undefined;
+        if (expectedBtts === undefined)
+          return unresolved(
+            'BTTS & Total Goals selection requires a Yes/No outcome.',
+          );
+        const bothScored = fullHome! > 0 && fullAway! > 0;
+        if (bothScored && !expectedBtts) {
+          return boolOutcome(
+            false,
+            'BTTS_TOTAL_IN_PLAY_BOTH_SCORED',
+            {
+              bothScored,
+              expectedBtts,
+              home: fullHome,
+              away: fullAway,
+            },
+            phase,
+          );
+        }
+        if (bothScored && expectedBtts && line !== undefined) {
+          const totalPart = this.settleOverUnderLowerBound(
+            observedGoalTotal!,
+            line,
+            this.isOverSelection(key, label),
+            'BTTS_TOTAL_IN_PLAY_GOAL_LOWER_BOUND',
+            phase,
+          );
+          if (totalPart) {
+            return resolved(
+              totalPart.outcome,
+              'BTTS_TOTAL_IN_PLAY_COMPONENTS_PROVEN',
+              {
+                bothScored,
+                total: observedGoalTotal,
+                line,
+                totalOutcome: totalPart.outcome,
+              },
+              phase,
+            );
+          }
+        }
+      }
+      if (liveScoreReady && market === 'CORRECT_SCORE') {
+        const expected = this.readCorrectScore(selection);
+        if (
+          expected &&
+          (fullHome! > expected.home || fullAway! > expected.away)
+        ) {
+          return boolOutcome(
+            false,
+            'CORRECT_SCORE_IN_PLAY_IMPOSSIBLE',
+            {
+              actualHome: fullHome,
+              actualAway: fullAway,
+              expectedHome: expected.home,
+              expectedAway: expected.away,
+            },
+            phase,
+          );
+        }
+      }
+      if (liveScoreReady && market === 'EXACT_TOTAL_GOALS') {
+        const exact = this.integerFromKey(key, ['GOALS_']);
+        if (
+          key.includes('6_PLUS') ||
+          key.includes('6_OR_MORE') ||
+          /6\s*(?:\+|OR MORE)/i.test(name)
+        ) {
+          if (fullTotal! >= 6)
+            return boolOutcome(
+              true,
+              'EXACT_TOTAL_GOALS_RANGE_REACHED',
+              { actual: fullTotal, selection: '6+' },
+              phase,
+            );
+        } else if (exact !== undefined && fullTotal! > exact) {
+          return boolOutcome(
+            false,
+            'EXACT_TOTAL_GOALS_EXCEEDED',
+            { actual: fullTotal, expected: exact },
+            phase,
+          );
+        }
+      }
+      if (liveScoreReady && market === 'TOTAL_GOALS_RANGE') {
+        const range = this.readRange(key, name);
+        if (range?.high === undefined && range && fullTotal! >= range.low) {
+          return boolOutcome(
+            true,
+            'TOTAL_GOALS_OPEN_RANGE_REACHED',
+            { actual: fullTotal, ...range },
+            phase,
+          );
+        }
+        if (range?.high !== undefined && fullTotal! > range.high) {
+          return boolOutcome(
+            false,
+            'TOTAL_GOALS_RANGE_EXCEEDED',
+            { actual: fullTotal, ...range },
+            phase,
+          );
+        }
+      }
+
+      // First/last-scorer outcomes require a complete timeline; a live partial event feed
+      // cannot safely prove which scorer came first. They are evaluated at full time.
+      if (
+        timelineReady &&
+        market === 'OWN_GOAL_SCORED' &&
+        observedGoals.some((goal) => goal.ownGoal)
+      ) {
+        return yesNo(
+          true,
+          'OWN_GOAL_IN_PLAY_TIMELINE_EVENT',
+          'Own-goal selection could not be identified.',
+          phase,
+        );
+      }
+      // Penalty counts do not carry reliable regulation/extra-time separation;
+      // do not use the aggregate in-play count once extra time has started.
+      if (
+        timelineReady &&
+        !facts.afterExtraTime &&
+        market === 'PENALTY_AWARDED' &&
+        (facts.penaltiesAwarded ?? 0) > 0
+      ) {
+        return yesNo(
+          true,
+          'PENALTY_AWARDED_IN_PLAY_TIMELINE_EVENT',
+          'Penalty selection could not be identified.',
+          phase,
+        );
+      }
+      if (
+        timelineReady &&
+        market === 'RED_CARD' &&
+        observedCards.some((card) => card.red)
+      ) {
+        return yesNo(
+          true,
+          'RED_CARD_IN_PLAY_TIMELINE_EVENT',
+          'Red-card selection could not be identified.',
+          phase,
+        );
+      }
+
+      // Player/event markets may win as soon as the selected player's event is
+      // positively recorded. No player/event absence is settled before fulltime.
+      if (market.startsWith('PLAYER_') && timelineReady) {
+        const athleteId =
+          str(selection.subjectId) || this.playerIdFrom(key, name);
+        if (!athleteId)
+          return unresolved(
+            'Player selection is missing its canonical Sports athlete ID.',
+          );
+        const scorerEvents = observedGoals.filter(
+          (goal) => !goal.ownGoal && goal.playerIds.includes(athleteId),
+        );
+        if (market === 'PLAYER_ANYTIME_GOALSCORER' && scorerEvents.length > 0) {
+          return boolOutcome(
+            true,
+            'PLAYER_ANYTIME_GOALSCORER_IN_PLAY_GOAL_EVENT',
+            { athleteId, eventKeys: scorerEvents.map((goal) => goal.eventKey) },
+            phase,
+          );
+        }
+        if (
+          market === 'PLAYER_TO_SCORE_TWO_OR_MORE' &&
+          scorerEvents.length >= 2
+        ) {
+          return boolOutcome(
+            true,
+            'PLAYER_TO_SCORE_TWO_OR_MORE_IN_PLAY_GOAL_EVENTS',
+            { athleteId, count: scorerEvents.length },
+            phase,
+          );
+        }
+        if (
+          market === 'PLAYER_TO_ASSIST' &&
+          (facts.playerStats[athleteId]?.assists ?? 0) > 0
+        ) {
+          return boolOutcome(
+            true,
+            'PLAYER_TO_ASSIST_IN_PLAY_TIMELINE_EVENT',
+            { athleteId, assists: facts.playerStats[athleteId].assists },
+            phase,
+          );
+        }
+        if (
+          (market === 'PLAYER_TO_BE_BOOKED' ||
+            market === 'PLAYER_TO_BE_SENT_OFF') &&
+          observedCards.some(
+            (card) =>
+              card.playerIds.includes(athleteId) &&
+              (market === 'PLAYER_TO_BE_SENT_OFF'
+                ? card.red
+                : card.yellow || card.red),
+          )
+        ) {
+          return boolOutcome(
+            true,
+            `${market}_IN_PLAY_TIMELINE_EVENT`,
+            { athleteId },
+            phase,
+          );
+        }
+      }
+
+      // Live count statistics are monotonic. Settle only when the observed
+      // lower bound has crossed the complete whole/quarter-line boundary.
+      const statisticMarket = new Set([
+        'TOTAL_CORNERS_OVER_UNDER',
+        'HOME_TEAM_CORNERS_OVER_UNDER',
+        'AWAY_TEAM_CORNERS_OVER_UNDER',
+        'TOTAL_SHOTS_OVER_UNDER',
+        'TOTAL_SHOTS_ON_TARGET_OVER_UNDER',
+        'HOME_SHOTS_ON_TARGET_OVER_UNDER',
+        'AWAY_SHOTS_ON_TARGET_OVER_UNDER',
+        'TOTAL_FOULS_OVER_UNDER',
+        'TOTAL_OFFSIDES_OVER_UNDER',
+      ]).has(market);
+      if (statisticMarket) {
+        if (
+          ![
+            facts.homeStatisticsCollectedAt as unknown as Date | undefined,
+            facts.awayStatisticsCollectedAt as unknown as Date | undefined,
+          ].every((date) =>
+            isFresh(date, settlementEvidenceConfig.inPlayStatisticsFreshnessMs),
+          )
+        )
+          return unresolved(
+            'Fresh normalized Sports statistics are required for both teams before in-play count-market settlement.',
+          );
+        const canonicalStat = market.includes('CORNER')
+          ? 'corners'
+          : market.includes('YELLOW')
+            ? 'yellowcards'
+            : market.includes('RED')
+              ? 'redcards'
+              : market.includes('CARD')
+                ? 'cards'
+                : market.includes('SHOTS_ON_TARGET')
+                  ? 'shotsontarget'
+                  : market.includes('SHOTS')
+                    ? 'shots'
+                    : market.includes('FOUL')
+                      ? 'fouls'
+                      : 'offsides';
+        if (
+          this.hasStatConflict(facts, [
+            `home:${canonicalStat}`,
+            `away:${canonicalStat}`,
+          ])
+        )
+          return unresolved(
+            'Conflicting in-play Sports statistics prevent a safe count-market decision.',
+          );
+        const home = this.stat(facts.homeStats, [canonicalStat]);
+        const away = this.stat(facts.awayStats, [canonicalStat]);
+        if (home === undefined || away === undefined)
+          return unresolved(
+            `Both team ${canonicalStat} counts are required for an in-play market decision.`,
+          );
+        const actual = market.startsWith('HOME_')
+          ? home
+          : market.startsWith('AWAY_')
+            ? away
+            : home + away;
+        if (line === undefined)
+          return unresolved('The selected statistical line is missing.');
+        const early = this.settleOverUnderLowerBound(
+          actual,
+          line,
+          this.isOverSelection(key, label),
+          `${market}_IN_PLAY_STATISTIC_LOWER_BOUND`,
+          phase,
+        );
+        if (early) return early;
+      }
+
+      return unresolved(
+        'This market is not yet mathematically decided. It will be re-evaluated when Sports publishes another fixture, timeline or statistics update.',
+      );
+    }
 
     // Result and period-result markets.
     if (market === 'MATCH_RESULT')
@@ -432,7 +1170,11 @@ export class MarketSettlementService {
         'Final team score is unavailable.',
       );
     }
-    if (market === 'WIN_TO_NIL') {
+    if (
+      market === 'WIN_TO_NIL' ||
+      market === 'HOME_TEAM_TO_WIN_TO_NIL' ||
+      market === 'AWAY_TEAM_TO_WIN_TO_NIL'
+    ) {
       if (!scoreAvailable)
         return unresolved('Final score is required for Win to Nil.');
       const selected =
@@ -466,7 +1208,11 @@ export class MarketSettlementService {
             selected,
           });
     }
-    if (market === 'CLEAN_SHEET') {
+    if (
+      market === 'CLEAN_SHEET' ||
+      market === 'HOME_TEAM_CLEAN_SHEET' ||
+      market === 'AWAY_TEAM_CLEAN_SHEET'
+    ) {
       if (!scoreAvailable)
         return unresolved('Final score is required for Clean Sheet.');
       const selected =
@@ -795,7 +1541,8 @@ export class MarketSettlementService {
       if (
         !facts.goalEventsComplete ||
         !facts.goals.length ||
-        (facts.afterExtraTime && facts.goals.some((goal) => goal.minute === undefined))
+        (facts.afterExtraTime &&
+          facts.goals.some((goal) => goal.minute === undefined))
       )
         return unresolved(
           'Final score confirms goals, but complete ordered regulation-time goal events are unavailable.',
@@ -836,10 +1583,22 @@ export class MarketSettlementService {
       market === 'CORNER_MATCH_RESULT' ||
       market === 'TOTAL_CORNERS_ODD_EVEN'
     ) {
+      if (!hasFreshTeamStatistics()) {
+        return unresolved(
+          'Fresh normalized Sports corner totals for both teams are required before full-time settlement.',
+          {
+            homeStatisticsCollectedAt: facts.homeStatisticsCollectedAt,
+            awayStatisticsCollectedAt: facts.awayStatisticsCollectedAt,
+          },
+        );
+      }
       if (this.hasStatConflict(facts, ['home:corners', 'away:corners'])) {
-        return unresolved('Conflicting ESPN Summary/event snapshots contain different corner totals.', {
-          conflictingStats: facts.conflictingStats,
-        });
+        return unresolved(
+          'Conflicting normalized Sports match data/event snapshots contain different corner totals.',
+          {
+            conflictingStats: facts.conflictingStats,
+          },
+        );
       }
       const home = this.stat(facts.homeStats, [
         'corners',
@@ -855,7 +1614,7 @@ export class MarketSettlementService {
       ]);
       if (home === undefined || away === undefined)
         return unresolved(
-          'ESPN Summary does not contain sufficient home and away corner totals.',
+          'normalized Sports match data does not contain sufficient home and away corner totals.',
         );
       if (market === 'CORNER_MATCH_RESULT')
         return compareResultSelection(home, away, market);
@@ -885,12 +1644,29 @@ export class MarketSettlementService {
       market === 'AWAY_TEAM_CARDS_OVER_UNDER' ||
       market === 'TOTAL_CARDS_ODD_EVEN'
     ) {
-      if (this.hasStatConflict(facts, [
-        'home:yellowcards', 'away:yellowcards', 'home:redcards', 'away:redcards',
-      ])) {
-        return unresolved('Conflicting ESPN Summary/event snapshots contain different card totals.', {
-          conflictingStats: facts.conflictingStats,
-        });
+      if (!hasFreshTeamStatistics()) {
+        return unresolved(
+          'Fresh normalized Sports card totals for both teams are required before full-time settlement.',
+          {
+            homeStatisticsCollectedAt: facts.homeStatisticsCollectedAt,
+            awayStatisticsCollectedAt: facts.awayStatisticsCollectedAt,
+          },
+        );
+      }
+      if (
+        this.hasStatConflict(facts, [
+          'home:yellowcards',
+          'away:yellowcards',
+          'home:redcards',
+          'away:redcards',
+        ])
+      ) {
+        return unresolved(
+          'Conflicting normalized Sports match data/event snapshots contain different card totals.',
+          {
+            conflictingStats: facts.conflictingStats,
+          },
+        );
       }
       const homeYellow = this.stat(facts.homeStats, ['yellowcards']);
       const awayYellow = this.stat(facts.awayStats, ['yellowcards']);
@@ -904,17 +1680,26 @@ export class MarketSettlementService {
           actual = homeYellow + awayYellow;
           exact = true;
         }
-      } else if (!facts.afterExtraTime && market === 'TOTAL_RED_CARDS_OVER_UNDER') {
+      } else if (
+        !facts.afterExtraTime &&
+        market === 'TOTAL_RED_CARDS_OVER_UNDER'
+      ) {
         if (homeRed !== undefined && awayRed !== undefined) {
           actual = homeRed + awayRed;
           exact = true;
         }
-      } else if (!facts.afterExtraTime && market === 'HOME_TEAM_CARDS_OVER_UNDER') {
+      } else if (
+        !facts.afterExtraTime &&
+        market === 'HOME_TEAM_CARDS_OVER_UNDER'
+      ) {
         if (homeYellow !== undefined && homeRed !== undefined) {
           actual = homeYellow + homeRed;
           exact = true;
         }
-      } else if (!facts.afterExtraTime && market === 'AWAY_TEAM_CARDS_OVER_UNDER') {
+      } else if (
+        !facts.afterExtraTime &&
+        market === 'AWAY_TEAM_CARDS_OVER_UNDER'
+      ) {
         if (awayYellow !== undefined && awayRed !== undefined) {
           actual = awayYellow + awayRed;
           exact = true;
@@ -939,8 +1724,7 @@ export class MarketSettlementService {
         return this.oddEven(actual, key, label, market);
       }
 
-      if (line === undefined)
-        return unresolved('Card total line is missing.');
+      if (line === undefined) return unresolved('Card total line is missing.');
       const over = this.isOverSelection(key, label);
       if (over === undefined)
         return unresolved('Over/Under card selection could not be identified.');
@@ -955,7 +1739,8 @@ export class MarketSettlementService {
         if (
           facts.afterExtraTime &&
           (card.minute === undefined || card.minute > 90.99)
-        ) return false;
+        )
+          return false;
         if (market === 'TOTAL_YELLOW_CARDS_OVER_UNDER') return card.yellow;
         if (market === 'TOTAL_RED_CARDS_OVER_UNDER') return card.red;
         if (market === 'HOME_TEAM_CARDS_OVER_UNDER')
@@ -971,7 +1756,9 @@ export class MarketSettlementService {
       // Settle only when the observed count is beyond the entire split-line
       // boundary, which proves the same full outcome for every possible total.
       const isQuarterLine = Math.abs(line * 2 - Math.round(line * 2)) > 1e-7;
-      const provenBoundary = isQuarterLine ? Math.floor(line * 2) / 2 + 0.5 : line;
+      const provenBoundary = isQuarterLine
+        ? Math.floor(line * 2) / 2 + 0.5
+        : line;
       if (observedCount > provenBoundary) {
         return boolOutcome(over, `${market}_OBSERVED_EVENT_LOWER_BOUND`, {
           observedCount,
@@ -996,6 +1783,15 @@ export class MarketSettlementService {
       market === 'TOTAL_FOULS_OVER_UNDER' ||
       market === 'POSSESSION_OVER_UNDER'
     ) {
+      if (!hasFreshTeamStatistics()) {
+        return unresolved(
+          'Fresh normalized Sports statistics for both teams are required before full-time settlement.',
+          {
+            homeStatisticsCollectedAt: facts.homeStatisticsCollectedAt,
+            awayStatisticsCollectedAt: facts.awayStatisticsCollectedAt,
+          },
+        );
+      }
       const relevantStatistic =
         market === 'TOTAL_SHOTS_OVER_UNDER'
           ? 'shots'
@@ -1006,10 +1802,18 @@ export class MarketSettlementService {
               : market === 'TOTAL_FOULS_OVER_UNDER'
                 ? 'fouls'
                 : 'possession';
-      if (this.hasStatConflict(facts, [`home:${relevantStatistic}`, `away:${relevantStatistic}`])) {
-        return unresolved(`Conflicting ESPN Summary/event snapshots contain different ${relevantStatistic} values.`, {
-          conflictingStats: facts.conflictingStats,
-        });
+      if (
+        this.hasStatConflict(facts, [
+          `home:${relevantStatistic}`,
+          `away:${relevantStatistic}`,
+        ])
+      ) {
+        return unresolved(
+          `Conflicting normalized Sports match data/event snapshots contain different ${relevantStatistic} values.`,
+          {
+            conflictingStats: facts.conflictingStats,
+          },
+        );
       }
       const homeKey =
         market === 'TOTAL_SHOTS_OVER_UNDER'
@@ -1027,7 +1831,7 @@ export class MarketSettlementService {
       const away = this.stat(facts.awayStats, [homeKey]);
       if (home === undefined || away === undefined)
         return unresolved(
-          `ESPN Summary does not contain both required ${homeKey} statistics.`,
+          `normalized Sports match data does not contain both required ${homeKey} statistics.`,
         );
       const actual =
         market === 'HOME_SHOTS_ON_TARGET_OVER_UNDER'
@@ -1048,17 +1852,26 @@ export class MarketSettlementService {
     }
 
     if (market === 'RED_CARD') {
-      const observedRedCards = facts.cards.filter((card) =>
-        card.red &&
-        (!facts.afterExtraTime ||
-          (card.minute !== undefined && card.minute <= 90.99)),
+      const observedRedCards = facts.cards.filter(
+        (card) =>
+          card.red &&
+          (!facts.afterExtraTime ||
+            (card.minute !== undefined && card.minute <= 90.99)),
       ).length;
       if (observedRedCards > 0) {
-        return yesNo(true, 'RED_CARD_OBSERVED_EVENT', 'A red-card event was not observed.');
+        return yesNo(
+          true,
+          'RED_CARD_OBSERVED_EVENT',
+          'A red-card event was not observed.',
+        );
       }
       // Aggregate card totals may include extra time. Without a regulation-time
       // red card, the provider data cannot safely settle a negative selection.
-      if (!facts.afterExtraTime && facts.redCards !== undefined) {
+      if (
+        !facts.afterExtraTime &&
+        facts.redCards !== undefined &&
+        hasFreshTeamStatistics()
+      ) {
         return yesNo(
           facts.redCards > 0,
           'RED_CARD_TEAM_STATISTICS',
@@ -1083,16 +1896,35 @@ export class MarketSettlementService {
       );
     }
     if (market === 'OWN_GOAL_SCORED') {
-      if (facts.afterExtraTime && facts.goals.some((goal) => goal.minute === undefined)) {
-        return unresolved('Goal event times are incomplete, so regulation-time own-goal settlement is unsafe.');
+      if (
+        facts.afterExtraTime &&
+        facts.goals.some((goal) => goal.minute === undefined)
+      ) {
+        return unresolved(
+          'Goal event times are incomplete, so regulation-time own-goal settlement is unsafe.',
+        );
       }
       const settlementGoals = this.goalsInSettlementPeriod(facts);
-      const observedOwnGoals = settlementGoals.filter((goal) => goal.ownGoal).length;
+      const observedOwnGoals = settlementGoals.filter(
+        (goal) => goal.ownGoal,
+      ).length;
       if (observedOwnGoals > 0) {
-        return yesNo(true, 'OWN_GOAL_OBSERVED_EVENT', 'Own-goal flags are not available in the stored match details.');
+        return yesNo(
+          true,
+          'OWN_GOAL_OBSERVED_EVENT',
+          'Own-goal flags are not available in the stored match details.',
+        );
       }
-      if (facts.goalEventsComplete && (!facts.afterExtraTime || facts.goals.every((goal) => goal.minute !== undefined))) {
-        return yesNo(false, 'OWN_GOAL_COMPLETE_GOAL_EVENTS', 'Own-goal flags are not available in the stored match details.');
+      if (
+        facts.goalEventsComplete &&
+        (!facts.afterExtraTime ||
+          facts.goals.every((goal) => goal.minute !== undefined))
+      ) {
+        return yesNo(
+          false,
+          'OWN_GOAL_COMPLETE_GOAL_EVENTS',
+          'Own-goal flags are not available in the stored match details.',
+        );
       }
       return unresolved(
         'No own goal was observed, but the stored goal events are incomplete.',
@@ -1104,17 +1936,20 @@ export class MarketSettlementService {
       const athleteId =
         str(selection.subjectId) || this.playerIdFrom(key, name);
       if (!athleteId)
-        return unresolved('Player selection is missing an ESPN athlete ID.');
+        return unresolved('Player selection is missing an Sports athlete ID.');
       if (market === 'PLAYER_ANYTIME_GOALSCORER') {
         if (
           !facts.goalEventsComplete ||
-          (facts.afterExtraTime && facts.goals.some((goal) => goal.minute === undefined))
+          (facts.afterExtraTime &&
+            facts.goals.some((goal) => goal.minute === undefined))
         )
           return unresolved(
             'Complete goal event data is required to settle an anytime goalscorer.',
           );
         return boolOutcome(
-          this.goalsInSettlementPeriod(facts).some((goal) => !goal.ownGoal && goal.playerIds.includes(athleteId)),
+          this.goalsInSettlementPeriod(facts).some(
+            (goal) => !goal.ownGoal && goal.playerIds.includes(athleteId),
+          ),
           'PLAYER_GOAL_EVENT_ID',
           { athleteId },
         );
@@ -1125,12 +1960,15 @@ export class MarketSettlementService {
       ) {
         if (
           !facts.goalEventsComplete ||
-          (facts.afterExtraTime && facts.goals.some((goal) => goal.minute === undefined))
+          (facts.afterExtraTime &&
+            facts.goals.some((goal) => goal.minute === undefined))
         )
           return unresolved(
             'Complete ordered goal events are required to settle this player scorer market.',
           );
-        const creditedGoals = this.goalsInSettlementPeriod(facts).filter((goal) => !goal.ownGoal);
+        const creditedGoals = this.goalsInSettlementPeriod(facts).filter(
+          (goal) => !goal.ownGoal,
+        );
         if (!creditedGoals.length)
           return unresolved(
             'The match contains no credited player goal (for example, only own goals); the applicable player-scorer void rule cannot be inferred from the fixture feed.',
@@ -1155,13 +1993,14 @@ export class MarketSettlementService {
       if (market === 'PLAYER_TO_SCORE_TWO_OR_MORE') {
         if (
           !facts.goalEventsComplete ||
-          (facts.afterExtraTime && facts.goals.some((goal) => goal.minute === undefined))
+          (facts.afterExtraTime &&
+            facts.goals.some((goal) => goal.minute === undefined))
         )
           return unresolved(
             "Complete goal events are required to count an individual player's goals.",
           );
-        const count = this.goalsInSettlementPeriod(facts).filter((goal) =>
-          !goal.ownGoal && goal.playerIds.includes(athleteId),
+        const count = this.goalsInSettlementPeriod(facts).filter(
+          (goal) => !goal.ownGoal && goal.playerIds.includes(athleteId),
         ).length;
         return boolOutcome(count >= 2, 'PLAYER_GOAL_EVENT_COUNT', {
           athleteId,
@@ -1172,10 +2011,11 @@ export class MarketSettlementService {
         market === 'PLAYER_TO_BE_BOOKED' ||
         market === 'PLAYER_TO_BE_SENT_OFF'
       ) {
-        const cards = facts.cards.filter((card) =>
-          card.playerIds.includes(athleteId) &&
-          (!facts.afterExtraTime ||
-            (card.minute !== undefined && card.minute <= 90.99)),
+        const cards = facts.cards.filter(
+          (card) =>
+            card.playerIds.includes(athleteId) &&
+            (!facts.afterExtraTime ||
+              (card.minute !== undefined && card.minute <= 90.99)),
         );
         if (facts.afterExtraTime) {
           const observed = cards.some((card) =>
@@ -1184,15 +2024,21 @@ export class MarketSettlementService {
               : card.yellow || card.red,
           );
           return observed
-            ? boolOutcome(true, `${market}_REGULATION_PLAYER_EVENT_ID`, { athleteId, observedCards: cards.length })
-            : unresolved('Regulation-time player card statistics are unavailable for a fixture that went to extra time.', { athleteId, observedCards: cards.length });
+            ? boolOutcome(true, `${market}_REGULATION_PLAYER_EVENT_ID`, {
+                athleteId,
+                observedCards: cards.length,
+              })
+            : unresolved(
+                'Regulation-time player card statistics are unavailable for a fixture that went to extra time.',
+                { athleteId, observedCards: cards.length },
+              );
         }
         const playerStats = facts.playerStats[athleteId] ?? {};
         const playerYellows = this.stat(playerStats, ['yellowcards']);
         const playerReds = this.stat(playerStats, ['redcards']);
         if (market === 'PLAYER_TO_BE_SENT_OFF') {
           // One observed red-card event proves the selection. A missing red-card
-          // event does not prove a loss unless ESPN supplies the player's count.
+          // event does not prove a loss unless Sports supplies the player's count.
           if (cards.some((card) => card.red)) {
             return boolOutcome(true, `${market}_PLAYER_EVENT_ID`, {
               athleteId,
@@ -1238,7 +2084,7 @@ export class MarketSettlementService {
         const assists = this.stat(player, ['assists', 'goalassists']);
         return assists === undefined
           ? unresolved(
-              'Individual assists are not available in the stored ESPN Summary player statistics.',
+              'Individual assists are not available in the stored normalized Sports match data player statistics.',
             )
           : boolOutcome(assists > 0, 'PLAYER_ASSIST_BOX_SCORE', {
               athleteId,
@@ -1247,11 +2093,14 @@ export class MarketSettlementService {
       }
       if (
         market === 'PLAYER_SHOTS_ON_TARGET' ||
+        market === 'PLAYER_SHOTS_ON_TARGET_OVER_UNDER' ||
         market === 'PLAYER_SHOTS_OVER_UNDER'
       ) {
         const player = facts.playerStats[athleteId] ?? {};
         const statKey =
-          market === 'PLAYER_SHOTS_ON_TARGET' ? 'shotsontarget' : 'shots';
+          market === 'PLAYER_SHOTS_ON_TARGET' || market === 'PLAYER_SHOTS_ON_TARGET_OVER_UNDER'
+            ? 'shotsontarget'
+            : 'shots';
         let actual = this.stat(player, [statKey]);
         let method = `${market}_PLAYER_BOX_SCORE`;
 
@@ -1261,7 +2110,9 @@ export class MarketSettlementService {
           actual === undefined &&
           line === 0.5 &&
           facts.goalEventsComplete &&
-          facts.goals.some((goal) => !goal.ownGoal && goal.playerIds.includes(athleteId))
+          facts.goals.some(
+            (goal) => !goal.ownGoal && goal.playerIds.includes(athleteId),
+          )
         ) {
           actual = 1;
           method = `${market}_MINIMUM_INFERRED_FROM_CREDITED_GOAL`;
@@ -1295,10 +2146,15 @@ export class MarketSettlementService {
 
   /** Resolve market identity exclusively against the Odds module catalogue. */
   canonicalMarket(marketKey: string): string {
-    return this.resolveMarketDefinition(marketKey)?.predictionMarketKey ?? 'UNSUPPORTED_MARKET';
+    return (
+      this.resolveMarketDefinition(marketKey)?.predictionMarketKey ??
+      'UNSUPPORTED_MARKET'
+    );
   }
 
-  private resolveMarketDefinition(marketKey: string): CanonicalMarketDefinition | undefined {
+  private resolveMarketDefinition(
+    marketKey: string,
+  ): CanonicalMarketDefinition | undefined {
     const key = norm(marketKey);
     const matched = FOOTBALL_MARKET_CATALOG.find((definition) =>
       [
@@ -1323,8 +2179,11 @@ export class MarketSettlementService {
     const target = legacyAliases[key];
     if (!target) return undefined;
     return FOOTBALL_MARKET_CATALOG.find((definition) =>
-      [definition.id, definition.predictionMarketKey, definition.betLabMarketCode]
-        .some((candidate) => norm(candidate) === norm(target)),
+      [
+        definition.id,
+        definition.predictionMarketKey,
+        definition.betLabMarketCode,
+      ].some((candidate) => norm(candidate) === norm(target)),
     );
   }
 
@@ -1340,10 +2199,17 @@ export class MarketSettlementService {
       selection.jsonVariable,
       selection.fullName,
       selection.abbreviation,
-    ].map(norm).filter(Boolean);
+    ]
+      .map(norm)
+      .filter(Boolean);
     return market.selections.find((item) =>
-      [item.key, item.jsonVariable, item.fullName, item.abbreviation, item.settlementKey]
-        .some((value) => candidates.includes(norm(value))),
+      [
+        item.key,
+        item.jsonVariable,
+        item.fullName,
+        item.abbreviation,
+        item.settlementKey,
+      ].some((value) => candidates.includes(norm(value))),
     );
   }
 
@@ -1416,7 +2282,8 @@ export class MarketSettlementService {
       preferHandicap &&
       selection.handicap !== undefined &&
       Number.isFinite(selection.handicap)
-    ) return selection.handicap;
+    )
+      return selection.handicap;
     if (selection.line !== undefined && Number.isFinite(selection.line))
       return selection.line;
     if (selection.handicap !== undefined && Number.isFinite(selection.handicap))
@@ -1484,6 +2351,7 @@ export class MarketSettlementService {
     line: number,
     over: boolean | undefined,
     method: string,
+    phase?: SettlementPhase,
   ): SettlementEvaluation {
     if (over === undefined)
       return unresolved('Over/Under selection could not be identified.');
@@ -1503,14 +2371,22 @@ export class MarketSettlementService {
         componentOutcomes: [first, second],
       };
       return outcome === O.UNRESOLVED
-        ? unresolved('Quarter-line outcomes could not be combined safely.', evidence)
-        : resolved(outcome, `${method}_QUARTER_LINE_SPLIT`, evidence);
+        ? unresolved(
+            'Quarter-line outcomes could not be combined safely.',
+            evidence,
+          )
+        : resolved(outcome, `${method}_QUARTER_LINE_SPLIT`, evidence, phase);
     }
-    return resolved(this.simpleOverUnder(actual, line, over), method, {
-      actual,
-      line,
-      over,
-    });
+    return resolved(
+      this.simpleOverUnder(actual, line, over),
+      method,
+      {
+        actual,
+        line,
+        over,
+      },
+      phase,
+    );
   }
 
   private simpleOverUnder(actual: number, line: number, over: boolean): O {
@@ -1550,7 +2426,10 @@ export class MarketSettlementService {
       const outcome = this.combineSplit(first, second);
       const details = { ...evidence, adjusted, components: [first, second] };
       return outcome === O.UNRESOLVED
-        ? unresolved('Quarter-handicap outcomes could not be combined safely.', details)
+        ? unresolved(
+            'Quarter-handicap outcomes could not be combined safely.',
+            details,
+          )
         : resolved(outcome, `${method}_QUARTER_LINE_SPLIT`, details);
     }
     return resolved(
@@ -1662,6 +2541,36 @@ export class MarketSettlementService {
     return keys.some((key) => conflicts.has(key));
   }
 
+  private settleOverUnderLowerBound(
+    actual: number,
+    line: number,
+    over: boolean | undefined,
+    method: string,
+    phase: SettlementPhase,
+  ): SettlementEvaluation | undefined {
+    if (over === undefined) return undefined;
+    const hundredths = Math.round(line * 100);
+    const remainder = Math.abs(hundredths) % 50;
+    const isQuarterLine = remainder === 25;
+    const upperComponent = isQuarterLine
+      ? Math.floor(line * 2) / 2 + 0.5
+      : line;
+    if (actual <= upperComponent) return undefined;
+    return boolOutcome(
+      over,
+      method,
+      {
+        observedLowerBound: actual,
+        line,
+        over,
+        upperSplitBoundary: upperComponent,
+        quarterLine: isQuarterLine,
+        evidenceComplete: false,
+      },
+      phase,
+    );
+  }
+
   private stat(
     stats: Record<string, number>,
     aliases: string[],
@@ -1672,12 +2581,12 @@ export class MarketSettlementService {
       if (value !== undefined) return value;
       // Exact normalized aliases only. Substring matching made "shots" collide
       // with "shotsOnTarget" and could settle a market using the wrong statistic.
-      const matching = Object.entries(stats).find(([name]) => compact(name) === key);
+      const matching = Object.entries(stats).find(
+        ([name]) => compact(name) === key,
+      );
       if (matching) return matching[1];
     }
     return undefined;
   }
 }
-
-
 

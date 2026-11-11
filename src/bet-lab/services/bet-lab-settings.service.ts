@@ -59,7 +59,7 @@ export class BetLabSettingsService {
         },
         $setOnInsert: { key: SETTINGS_KEY },
       },
-      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true },
+      { returnDocument: 'after', upsert: true, runValidators: true, setDefaultsOnInsert: true },
     ).lean().exec();
 
     const updated: BetLabVirtualPointsSettings = {

@@ -21,13 +21,19 @@ import {
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 import { PredictionMathUtil } from '../utils/prediction-math.util';
+import { isOddsQuoteFresh } from '../../odds/config/odds.config';
 
 /* eslint-disable prettier/prettier, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
 type SureOddsProduct = 'SURE_2' | 'SURE_5' | 'SURE_7';
 type CandidateGroups = SlipLegInput[][];
 
-function configOddsMinimum(): number { return PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds; }
+function configOddsMinimum(): number {
+  return Math.max(
+    PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds,
+    PREDICTION_ENGINE_CONFIG.slipCenter.minimumLegDecimalOdds,
+  );
+}
 function configOddsMaximum(): number { return PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds; }
 function asDate(value: unknown): Date {
   return value instanceof Date ? value : new Date(value as string | number);
@@ -47,11 +53,13 @@ function publicationWindow(now = new Date()): { from: Date; to: Date } {
 }
 
 function isInPublicationWindow(fixtureDateValue: unknown, live: boolean, now = new Date()): boolean {
-  if (live) return true;
+  // Slip products are pre-match only. A legacy live flag must never bypass
+  // the kickoff boundary, even when an old Pick Center row is still present.
+  if (live) return false;
   const fixtureDate = asDate(fixtureDateValue);
   if (!Number.isFinite(fixtureDate.getTime())) return false;
-  const { from, to } = publicationWindow(now);
-  return fixtureDate.getTime() >= from.getTime() && fixtureDate.getTime() <= to.getTime();
+  const { to } = publicationWindow(now);
+  return fixtureDate.getTime() > now.getTime() && fixtureDate.getTime() <= to.getTime();
 }
 
 /** Product of stored Pick Center probabilities; never recalculate a leg prediction. */
@@ -160,7 +168,7 @@ export class SlipCenterService {
       const reclaimed = await this.generationLockModel
         .findOneAndUpdate(
           expiredLockFilter,
-          { $set: { lockToken, lockExpiresAt } },
+          { $set: { lockToken, lockExpiresAt, ttlExpiresAt: lockExpiresAt } },
           { upsert: false, returnDocument: 'after' },
         )
         .lean()
@@ -188,6 +196,7 @@ export class SlipCenterService {
             dateKey: lockKey,
             lockToken,
             lockExpiresAt,
+            ttlExpiresAt: lockExpiresAt,
           });
           acquired = created.lockToken === lockToken;
         } catch (error) {
@@ -278,45 +287,21 @@ export class SlipCenterService {
         })
         .map((slip) => String(slip._id)),
     );
-    let legacyMixedSlipsWithdrawn = 0;
-    if (legacyMixedSlipIds.size > 0) {
-      const withdrawal = await this.slipModel.updateMany(
-        {
-          _id: { $in: [...legacyMixedSlipIds] },
-          automatic: true,
-          status: SlipStatus.PUBLISHED,
-          $or: [
-            { settlementStatus: 'PENDING' },
-            { settlementStatus: { $exists: false } },
-            { settlementStatus: null },
-          ],
-        },
-        {
-          $set: { status: SlipStatus.CANCELLED },
-          $addToSet: {
-            diagnostics: 'Withdrawn because automatic Slip Center products must contain fixtures from one Nigeria kickoff date only.',
-          },
-        },
-      ).exec();
-      legacyMixedSlipsWithdrawn = Number(
-        (withdrawal as any).modifiedCount ?? (withdrawal as any).nModified ?? 0,
-      );
-      if (legacyMixedSlipsWithdrawn > 0) {
-        this.logger.warn(
-          `Withdrawn ${legacyMixedSlipsWithdrawn} published automatic slips that mixed kickoff dates, before generating date-isolated products.`,
-        );
-      }
-    }
+    // Existing PUBLISHED slips are immutable snapshots, including legacy
+    // records created before the one-kickoff-date allocation rule. Preserve
+    // those records and exclude mixed-date slips from date-specific quota and
+    // event-coverage accounting instead of cancelling or rewriting them.
+    const legacyMixedSlipsPreserved = legacyMixedSlipIds.size;
 
     const allQueriedPicks = await this.pickCenterModel.find({
       'selectedMarkets.0': { $exists: true },
       completed: { $ne: true },
-      $or: [{ fixtureDate: { $gte: window.from, $lte: window.to } }, { live: true }],
+      live: { $ne: true },
+      fixtureDate: { $gt: window.from, $lte: window.to },
     }).sort({ fixtureDate: 1 }).lean().exec() as any[];
 
-    // Ignore live records whose kickoff belongs to a date outside today's and
-    // tomorrow's allocations. In particular, do not allow an older live fixture
-    // to leak into either date's automatic slips.
+    // Keep the automatic allocation restricted to today's and tomorrow's
+    // pre-match fixtures. The kickoff-time query above excludes started games.
     const picks = allQueriedPicks.filter((pick) => {
       const fixtureDate = asDate(pick.fixtureDate);
       return Number.isFinite(fixtureDate.getTime())
@@ -727,7 +712,7 @@ export class SlipCenterService {
       dataQualityAndSafetyAreHardGates: false,
       createdOrUpdated,
       skipped,
-      legacyMixedSlipsWithdrawn,
+      legacyMixedSlipsPreserved,
       fixtureCandidates: eligibleFixtureGroups,
       eligibleFixtures,
       eligibleFixtureDays: eligibleDateKeys.size,
@@ -761,7 +746,7 @@ export class SlipCenterService {
       maximumAutomaticSlips: config.maxAutoSlipsPerDate,
     };
     this.logger.log(
-      `Slip refresh completed in ${refreshSummary.durationMs}ms: ${createdOrUpdated} products created/updated; ${legacyMixedSlipsWithdrawn} legacy mixed-date published slips withdrawn; ${eligibleFixtureGroups} eligible fixture groups from ${eligibleFixtures} Pick Center fixtures. Per-kickoff-date quota: ${dailyProgressText}; one slip per product type per kickoff date per refresh; tomorrow's slips contain tomorrow-only fixtures; ${eligibleEventIdsWithoutCandidateGroup.length} fixtures had no eligible slip selections; event coverage ${coveredEventIds.size}/${eligibleEventIds.size}; ${skipped} combinations skipped${missingCoverageEvents.length ? `; ${missingCoverageEvents.length} eligible fixtures remain uncovered (first: ${missingCoverageEvents.slice(0, 12).join(', ')})` : ''}.`,
+      `Slip refresh completed in ${refreshSummary.durationMs}ms: ${createdOrUpdated} products created/updated; ${legacyMixedSlipsPreserved} legacy mixed-date published slips preserved; ${eligibleFixtureGroups} eligible fixture groups from ${eligibleFixtures} Pick Center fixtures. Per-kickoff-date quota: ${dailyProgressText}; one slip per product type per kickoff date per refresh; tomorrow's slips contain tomorrow-only fixtures; ${eligibleEventIdsWithoutCandidateGroup.length} fixtures had no eligible slip selections; event coverage ${coveredEventIds.size}/${eligibleEventIds.size}; ${skipped} combinations skipped${missingCoverageEvents.length ? `; ${missingCoverageEvents.length} eligible fixtures remain uncovered (first: ${missingCoverageEvents.slice(0, 12).join(', ')})` : ''}.`,
     );
     await this.monitor.recordSlipRefresh(refreshSummary);
     return refreshSummary;
@@ -799,7 +784,8 @@ export class SlipCenterService {
       if (requestedFrom.getTime() > requestedTo.getTime()) {
         throw new BadRequestException('The requested fixture range does not overlap current and next Nigeria calendar-date publication window.');
       }
-      query.$or = [{ fixtureDate: { $gte: requestedFrom, $lte: requestedTo } }, { live: true }];
+      query.live = { $ne: true };
+      query.fixtureDate = { $gt: requestedFrom, $lte: requestedTo };
     }
     const picks = await this.pickCenterModel.find(query).sort({ fixtureDate: 1 }).lean().exec() as any[];
     const candidateLimit = config.maximumSelectionsPerMatch;
@@ -832,7 +818,7 @@ export class SlipCenterService {
       name: request.name?.trim() || `2xPredict ${sureOddsProduct ?? this.productLabel(productType)} — ${this.nigeriaDateKey(new Date())}`,
       automatic: false,
       createdBy: request.createdBy,
-      publish: true,
+      publish: request.publish === true,
       productType,
       requiredPlan,
       sureOddsTier,
@@ -878,6 +864,15 @@ export class SlipCenterService {
   ): Promise<any> {
     const current = await this.slipModel.findById(slipId).lean().exec() as any;
     if (!current) throw new NotFoundException('Slip was not found.');
+    const currentStatus = String(current.status ?? '').toUpperCase();
+    const currentSettlementStatus = String(current.settlementStatus ?? 'PENDING').toUpperCase();
+    if (
+      ![SlipStatus.DRAFT, SlipStatus.READY].includes(currentStatus as SlipStatus)
+      || currentSettlementStatus !== 'PENDING'
+      || current.snapshotFrozenAt
+    ) {
+      throw new BadRequestException('Published, cancelled, or settled slips are immutable. Only an unsettled draft or READY slip can be edited.');
+    }
     if (!Array.isArray(selections) || selections.length < PREDICTION_ENGINE_CONFIG.slipCenter.minimumLegs) throw new BadRequestException(`A slip must contain at least ${PREDICTION_ENGINE_CONFIG.slipCenter.minimumLegs} legs.`);
 
     const uniqueSelections = new Set<string>();
@@ -896,9 +891,10 @@ export class SlipCenterService {
       const window = publicationWindow(new Date());
       const pick = await this.pickCenterModel.findOne({
         eventId,
-          'selectedMarkets.0': { $exists: true },
+        'selectedMarkets.0': { $exists: true },
         completed: { $ne: true },
-        $or: [{ fixtureDate: { $gte: window.from, $lte: window.to } }, { live: true }],
+        live: { $ne: true },
+        fixtureDate: { $gt: window.from, $lte: window.to },
       }).lean().exec() as any;
       if (!pick || !isInPublicationWindow(pick.fixtureDate, pick.live === true)) {
         throw new BadRequestException(`No current unfinished Pick Center prediction exists for match ${eventId} inside current and next Nigeria calendar-date publication window.`);
@@ -911,7 +907,9 @@ export class SlipCenterService {
       if (!selected) throw new BadRequestException(`The selected market is no longer available for match ${eventId}.`);
       const config = PREDICTION_ENGINE_CONFIG.slipCenter;
       const decimalOdds = Number(selected.decimalOdds);
-      const priceType: 'PROVIDER' | 'ESTIMATED' = selected.priceType === 'PROVIDER' ? 'PROVIDER' : 'ESTIMATED';
+      const priceType = selected.priceType === 'PROVIDER' || selected.priceType === 'ESTIMATED'
+        ? selected.priceType
+        : null;
       const probability = Number(selected.probability);
       const confidenceValue = Number(selected.confidence);
       const fairOddsInput = Number(selected.fairOdds);
@@ -930,23 +928,29 @@ export class SlipCenterService {
       const oddsCalculationMethod = typeof selected.oddsCalculationMethod === 'string' && selected.oddsCalculationMethod.trim()
         ? selected.oddsCalculationMethod.trim()
         : undefined;
+      if (!oddsBasis || !oddsCalculationMethod) continue;
       const settlementProfile = selected.settlementProfile && typeof selected.settlementProfile === 'object'
         ? selected.settlementProfile
         : undefined;
       const expectedValue = priceType === 'PROVIDER' && oddsBasis === 'BOOKMAKER_ONLY'
         ? PredictionMathUtil.expectedValue(probability, decimalOdds, settlementProfile)
         : null;
-      if (!Number.isFinite(decimalOdds) || decimalOdds < configOddsMinimum() || decimalOdds > configOddsMaximum()
+      if (!priceType || selected.isFinalSelection !== true || selected.oddsPredictionReady !== true
+        || !oddsBasis || !oddsCalculationMethod || !isOddsQuoteFresh(oddsUpdatedAt)
+        || !Number.isFinite(decimalOdds) || decimalOdds < configOddsMinimum() || decimalOdds > configOddsMaximum()
         || !Number.isFinite(probability) || probability < config.minimumLegProbability || probability >= 1
         || !Number.isFinite(confidenceValue) || confidenceValue < config.minimumLegConfidence || confidenceValue > PREDICTION_ENGINE_CONFIG.model.maximumConfidence
         || !Number.isFinite(fairOdds) || fairOdds <= 1) {
-        throw new BadRequestException('The selected market must have valid stored odds and meet the configured probability and confidence thresholds.');
+        throw new BadRequestException('The selected market must be the current final Odds-ready selection, have fresh stored odds, and meet the configured probability and confidence thresholds.');
       }
       legs.push({
         eventId,
         homeTeamName: String(pick.homeTeamName),
         awayTeamName: String(pick.awayTeamName),
         fixtureDate: new Date(pick.fixtureDate),
+        retentionExpiresAt: Number.isFinite(asDate(pick.retentionExpiresAt).getTime())
+          ? asDate(pick.retentionExpiresAt)
+          : null,
         marketPredictionId,
         marketKey,
         marketName: String(selected.marketName ?? marketKey),
@@ -975,6 +979,12 @@ export class SlipCenterService {
     const perMatchLimit = isSureSlip
       ? PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.maximumSelectionsPerMatch
       : PREDICTION_ENGINE_CONFIG.slipCenter.maximumSelectionsPerMatch;
+    const maximumLegs = isSureSlip
+      ? PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.maximumLegs
+      : PREDICTION_ENGINE_CONFIG.slipCenter.maximumLegs;
+    if (legs.length < PREDICTION_ENGINE_CONFIG.slipCenter.minimumLegs || legs.length > maximumLegs) {
+      throw new BadRequestException(`The updated slip must contain between ${PREDICTION_ENGINE_CONFIG.slipCenter.minimumLegs} and ${maximumLegs} valid legs.`);
+    }
     const selectionsPerMatch = new Map<string, number>();
     const marketsPerMatch = new Set<string>();
     for (const leg of legs) {
@@ -1026,7 +1036,18 @@ export class SlipCenterService {
       group.forEach((leg) => { leg.matchSettlementStatus = matchStatus; });
     }
     const settlementStatus = this.aggregateSettlement(settledLegs.map((leg) => leg.settlementOutcome));
-    const updated = await this.slipModel.findByIdAndUpdate(slipId, {
+    const legRetentionDates = settledLegs.map((leg) => asDate(leg.retentionExpiresAt));
+    const allLegsHaveRetention = legRetentionDates.length > 0
+      && legRetentionDates.every((date) => Number.isFinite(date.getTime()));
+    const slipRetentionExpiresAt = allLegsHaveRetention
+      ? new Date(Math.max(...legRetentionDates.map((date) => date.getTime())))
+      : null;
+    const updated = await this.slipModel.findOneAndUpdate({
+      _id: slipId,
+      status: { $in: [SlipStatus.DRAFT, SlipStatus.READY] },
+      settlementStatus: { $in: ['PENDING', null] },
+      snapshotFrozenAt: { $in: [null] },
+    }, {
       $set: {
         legs: settledLegs,
         settlementStatus,
@@ -1041,10 +1062,11 @@ export class SlipCenterService {
         minimumLegProbability: Math.min(...legs.map((leg) => leg.probability)),
         fixtureDateFrom: new Date(sortedDates[0]),
         fixtureDateTo: new Date(sortedDates[sortedDates.length - 1]),
+        retentionExpiresAt: slipRetentionExpiresAt,
       },
       $unset: { fingerprint: 1 },
     }, { returnDocument: 'after', runValidators: true }).lean().exec();
-    if (!updated) throw new NotFoundException('Slip was not found.');
+    if (!updated) throw new BadRequestException('The slip was published, settled, or changed while the edit was being saved. Only an unsettled draft or READY slip can be edited.');
     await this.monitor.recordEvent({ type: 'ADMIN_ACTION', level: 'INFO', message: `Slip ${updated.slipCode} legs updated by admin.`, metadata: { slipId, legCount: legs.length, combinedOdds: updated.combinedOdds } });
     return updated;
   }
@@ -1065,6 +1087,15 @@ export class SlipCenterService {
   async publishSlip(slipId: string): Promise<any> {
     const slip = await this.slipModel.findById(slipId).lean().exec() as any;
     if (!slip) throw new NotFoundException('Slip was not found.');
+    const slipStatus = String(slip.status ?? '').toUpperCase();
+    if (slipStatus === SlipStatus.PUBLISHED) return slip;
+    if (
+      ![SlipStatus.DRAFT, SlipStatus.READY].includes(slipStatus as SlipStatus)
+      || String(slip.settlementStatus ?? 'PENDING').toUpperCase() !== 'PENDING'
+      || slip.snapshotFrozenAt
+    ) {
+      throw new BadRequestException('Only an unsettled draft or READY slip can be published. Published and settled slips cannot be republished or rewritten.');
+    }
     const isSure = slip.productType === SlipProductType.SURE_ODDS || slip.sureOdds === true;
     const currentProductTypes: SlipProductType[] = [SlipProductType.ODDS_10, SlipProductType.ODDS_25, SlipProductType.ODDS_50, SlipProductType.SURE_ODDS];
     const isCurrentProduct = currentProductTypes.includes(slip.productType as SlipProductType);
@@ -1095,7 +1126,8 @@ export class SlipCenterService {
       eventId: { $in: eventIds },
       'selectedMarkets.0': { $exists: true },
       completed: { $ne: true },
-      $or: [{ fixtureDate: { $gte: window.from, $lte: window.to } }, { live: true }],
+      live: { $ne: true },
+      fixtureDate: { $gt: window.from, $lte: window.to },
     }).lean().exec() as any[];
     const pickByEvent = new Map(picks.map((pick) => [String(pick.eventId), pick]));
     for (const leg of slip.legs) {
@@ -1116,14 +1148,34 @@ export class SlipCenterService {
         && String(item.marketKey) === String(leg.marketKey)
         && String(item.selectionKey) === String(leg.selectionKey)
       );
-      const probability = Number(leg.probability);
-      const confidence = Number(leg.confidence);
+      const currentProbability = Number(currentSelection?.probability);
+      const currentConfidence = Number(currentSelection?.confidence);
       const offeredOdds = Number(currentSelection?.decimalOdds);
+      const currentOddsUpdatedAt = asDate(currentSelection?.oddsUpdatedAt);
+      const storedOddsUpdatedAt = asDate(leg.oddsUpdatedAt);
+      const sameSnapshot = currentSelection
+        && Math.abs(currentProbability - Number(leg.probability)) <= 0.000001
+        && Math.abs(currentConfidence - Number(leg.confidence)) <= 0.000001
+        && Math.abs(offeredOdds - Number(leg.decimalOdds)) <= 0.000001
+        && currentSelection.priceType === leg.priceType
+        && String(currentSelection.oddsBasis ?? '') === String(leg.oddsBasis ?? '')
+        && String(currentSelection.oddsCalculationMethod ?? '') === String(leg.oddsCalculationMethod ?? '')
+        && String(currentSelection.oddsProvider ?? '') === String(leg.oddsProvider ?? '')
+        && String(currentSelection.bookmaker ?? '') === String(leg.bookmaker ?? '')
+        && Number.isFinite(currentOddsUpdatedAt.getTime())
+        && currentOddsUpdatedAt.getTime() === storedOddsUpdatedAt.getTime();
       if (!currentSelection
-        || !Number.isFinite(probability) || probability < config.minimumLegProbability || probability >= 1
-        || !Number.isFinite(confidence) || confidence < config.minimumLegConfidence || confidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence
-        || !Number.isFinite(offeredOdds) || offeredOdds < configOddsMinimum() || offeredOdds > configOddsMaximum()) {
-        throw new BadRequestException('A slip selection must retain a valid current stored price and meet the configured probability and confidence thresholds in Pick Center.');
+        || currentSelection.isFinalSelection !== true
+        || currentSelection.oddsPredictionReady !== true
+        || (currentSelection.priceType !== 'PROVIDER' && currentSelection.priceType !== 'ESTIMATED')
+        || !sameSnapshot
+        || !isOddsQuoteFresh(currentOddsUpdatedAt, nowMs)
+        || !isOddsQuoteFresh(storedOddsUpdatedAt, nowMs)
+        || !Number.isFinite(currentProbability) || currentProbability < config.minimumLegProbability || currentProbability >= 1
+        || !Number.isFinite(currentConfidence) || currentConfidence < config.minimumLegConfidence || currentConfidence > PREDICTION_ENGINE_CONFIG.model.maximumConfidence
+        || !Number.isFinite(offeredOdds) || offeredOdds < configOddsMinimum() || offeredOdds > configOddsMaximum()
+        || !currentSelection.oddsBasis || !currentSelection.oddsCalculationMethod) {
+        throw new BadRequestException('A slip selection or its Odds quote changed, expired, or no longer meets the Slip Center rules after the draft was created. Rebuild the draft before publishing.');
       }
     }
     const odds = this.calculateCombinedOdds(slip.legs);
@@ -1146,9 +1198,15 @@ export class SlipCenterService {
       ? (slip.sureOddsProduct === 'SURE_2' || slip.sureOddsTier === 'VIP' ? 'vip' : 'premium')
       : (slip.productType === SlipProductType.ODDS_10 || slip.productType === SlipProductType.EXTENDED_ODDS || slip.productType === SlipProductType.UNLIMITED_ODDS) ? 'regular'
         : (slip.productType === SlipProductType.ODDS_50 || slip.productType === SlipProductType.HIGH_ODDS) ? 'premium' : 'vip';
-    return this.slipModel.findByIdAndUpdate(
-      slipId,
-      { $set: { status: SlipStatus.PUBLISHED, publishedAt: new Date(), combinedOdds: Number(odds.toFixed(4)), combinedProbability: Number(combinedProbability.toFixed(8)), combinedProbabilityMethod: 'PRODUCT_OF_STORED_PICK_CENTER_SELECTION_PROBABILITIES', requiredPlan, diagnostics: [
+    const publishedAt = new Date(nowMs);
+    const published = await this.slipModel.findOneAndUpdate(
+      {
+        _id: slipId,
+        status: { $in: [SlipStatus.DRAFT, SlipStatus.READY] },
+        settlementStatus: { $in: ['PENDING', null] },
+        snapshotFrozenAt: { $in: [null] },
+      },
+      { $set: { status: SlipStatus.PUBLISHED, publishedAt, snapshotFrozenAt: publishedAt, combinedOdds: Number(odds.toFixed(4)), combinedProbability: Number(combinedProbability.toFixed(8)), combinedProbabilityMethod: 'PRODUCT_OF_STORED_PICK_CENTER_SELECTION_PROBABILITIES', requiredPlan, diagnostics: [
         'Combined probability is the product of probabilities stored in Pick Center. It is a model estimate, not a guaranteed win rate.',
         'Combined odds are the mathematical product of individual stored prices. A combined same-fixture bookmaker price is not claimed unless the bookmaker explicitly offers it.',
         ...(slip.legs.some((leg: any) => leg.priceType === 'ESTIMATED')
@@ -1157,6 +1215,10 @@ export class SlipCenterService {
       ] } },
       { returnDocument: 'after', runValidators: true },
     ).lean().exec();
+    if (!published) {
+      throw new BadRequestException('The slip changed while publication was in progress. Reload it before trying again.');
+    }
+    return published;
   }
 
   async getSlip(slipId: string): Promise<Record<string, unknown>> {
@@ -1226,7 +1288,11 @@ export class SlipCenterService {
       const marketPredictionId = String(selected.marketPredictionId ?? '').trim();
       const selectionKey = String(selected.selectionKey ?? '').trim();
       if (!marketKey || !marketPredictionId || !selectionKey || seenMarkets.has(marketIdentity)) continue;
-      const priceType: 'PROVIDER' | 'ESTIMATED' = selected.priceType === 'PROVIDER' ? 'PROVIDER' : 'ESTIMATED';
+      if (selected.isFinalSelection !== true || selected.oddsPredictionReady !== true) continue;
+      const priceType = selected.priceType === 'PROVIDER' || selected.priceType === 'ESTIMATED'
+        ? selected.priceType
+        : null;
+      if (!priceType) continue;
 
       const probability = Number(selected.probability);
       const confidence = Number(selected.confidence ?? 0);
@@ -1242,7 +1308,8 @@ export class SlipCenterService {
       const rawUpdatedAt = selected.oddsUpdatedAt instanceof Date
         ? selected.oddsUpdatedAt
         : new Date(selected.oddsUpdatedAt ?? '');
-      const validUpdatedAt = Number.isFinite(rawUpdatedAt.getTime()) ? rawUpdatedAt : undefined;
+      const validUpdatedAt = isOddsQuoteFresh(rawUpdatedAt) ? rawUpdatedAt : undefined;
+      if (!validUpdatedAt) continue;
       const oddsBasisRaw = String(selected.oddsBasis ?? '');
       const oddsBasis = ['BOOKMAKER_ONLY', 'BOOKMAKER_PLUS_HISTORY', 'HISTORICAL_ONLY', 'PRIOR_ONLY'].includes(oddsBasisRaw)
         ? oddsBasisRaw as SlipLegInput['oddsBasis']
@@ -1250,6 +1317,7 @@ export class SlipCenterService {
       const oddsCalculationMethod = typeof selected.oddsCalculationMethod === 'string' && selected.oddsCalculationMethod.trim()
         ? selected.oddsCalculationMethod.trim()
         : undefined;
+      if (!oddsBasis || !oddsCalculationMethod) continue;
       const settlementProfile = selected.settlementProfile && typeof selected.settlementProfile === 'object'
         ? selected.settlementProfile
         : undefined;
@@ -1262,6 +1330,9 @@ export class SlipCenterService {
         homeTeamName: String(pick.homeTeamName ?? ''),
         awayTeamName: String(pick.awayTeamName ?? ''),
         fixtureDate,
+        retentionExpiresAt: Number.isFinite(asDate(pick.retentionExpiresAt).getTime())
+          ? asDate(pick.retentionExpiresAt)
+          : null,
         marketPredictionId,
         marketKey,
         marketName: String(selected.marketName ?? marketKey),
@@ -1365,6 +1436,10 @@ export class SlipCenterService {
       if (count > perMatchLimit) throw new BadRequestException(`A ${isSure ? 'Sure Odds' : 'normal'} slip cannot contain more than ${perMatchLimit} selections from one fixture.`);
       eventCounts.set(leg.eventId, count);
       if ((leg.priceType !== 'PROVIDER' && leg.priceType !== 'ESTIMATED')
+        || leg.oddsPredictionReady !== true
+        || !leg.oddsBasis
+        || !leg.oddsCalculationMethod
+        || !isOddsQuoteFresh(leg.oddsUpdatedAt)
         || !Number.isFinite(leg.decimalOdds)
         || leg.decimalOdds < configOddsMinimum()
         || leg.decimalOdds > configOddsMaximum()
@@ -1403,9 +1478,18 @@ export class SlipCenterService {
       }
     }
     const averageConfidence = Math.max(0, Math.min(98, Math.round(input.legs.reduce((sum, leg) => sum + leg.confidence, 0) / input.legs.length)));
+    const legRetentionDates = input.legs.map((leg) => asDate(leg.retentionExpiresAt));
+    const allLegsHaveRetention = legRetentionDates.every((date) => Number.isFinite(date.getTime()));
+    const slipRetentionExpiresAt = allLegsHaveRetention
+      ? new Date(Math.max(...legRetentionDates.map((date) => date.getTime())))
+      : null;
     const legs = input.legs.map((leg) => ({
       eventId: leg.eventId, homeTeamName: leg.homeTeamName, awayTeamName: leg.awayTeamName,
-      fixtureDate: leg.fixtureDate, marketPredictionId: leg.marketPredictionId,
+      fixtureDate: leg.fixtureDate,
+      retentionExpiresAt: Number.isFinite(asDate(leg.retentionExpiresAt).getTime())
+        ? asDate(leg.retentionExpiresAt)
+        : null,
+      marketPredictionId: leg.marketPredictionId,
       marketKey: leg.marketKey, marketName: leg.marketName, selectionKey: leg.selectionKey,
       selectionName: leg.selectionName, probability: leg.probability, confidence: leg.confidence,
       fairOdds: leg.fairOdds, decimalOdds: leg.decimalOdds, priceType: leg.priceType,
@@ -1415,6 +1499,7 @@ export class SlipCenterService {
       ...(leg.bookmakerOdds !== undefined ? { bookmakerOdds: leg.bookmakerOdds } : {}),
     }));
     const status = input.publish ? SlipStatus.PUBLISHED : SlipStatus.READY;
+    const publishedAt = input.publish ? new Date() : undefined;
     if (input.publish && combinedOdds === null) throw new BadRequestException('Cannot publish a slip without a valid Odds-module price for each leg.');
     const payload: Record<string, any> = {
       slipCode: `2XP-${randomUUID().slice(0, 8).toUpperCase()}`,
@@ -1432,6 +1517,7 @@ export class SlipCenterService {
       minimumLegProbability: Math.min(...legs.map((leg) => leg.probability)),
       fixtureDateFrom: input.fixtureDateFrom ?? new Date(Math.min(...legs.map((leg) => leg.fixtureDate.getTime()))),
       fixtureDateTo: input.fixtureDateTo ?? new Date(Math.max(...legs.map((leg) => leg.fixtureDate.getTime()))),
+      retentionExpiresAt: slipRetentionExpiresAt,
       createdBy: input.createdBy,
       automatic: input.automatic,
       fingerprint: input.fingerprint,
@@ -1453,13 +1539,14 @@ export class SlipCenterService {
           ? ['Contains estimated Odds-module prices; combinedOdds is an indicative mathematical product, not a bookmaker-quoted accumulator price.']
           : ['Leg prices are provider-backed; combinedOdds is the mathematical product of leg prices and may differ from a bookmaker accumulator quote.']),
       ],
-      publishedAt: input.publish ? new Date() : undefined,
+      publishedAt,
+      snapshotFrozenAt: publishedAt,
     };
 
     let saved: any;
     if (input.fingerprint) {
       const fingerprintRecord = await this.slipModel.findOne({ fingerprint: input.fingerprint })
-        .select({ _id: 1, status: 1, settlementStatus: 1 })
+        .select({ _id: 1, status: 1, settlementStatus: 1, snapshotFrozenAt: 1 })
         .lean().exec() as any;
       if (matchSetFingerprint) {
         const duplicateMatchSet = await this.slipModel.findOne({
@@ -1471,13 +1558,23 @@ export class SlipCenterService {
       if (fingerprintRecord) {
         const priorSettlement = String(fingerprintRecord.settlementStatus ?? 'PENDING').toUpperCase();
         const priorStatus = String(fingerprintRecord.status ?? '').toUpperCase();
-        // Historical/settled slips are immutable. A manual cancellation is also
-        // preserved instead of being silently republished by the automatic worker.
-        if (priorSettlement !== 'PENDING' || priorStatus === String(SlipStatus.CANCELLED).toUpperCase()) return null;
+        // Published snapshots, settled slips and manual cancellations are immutable.
+        // A repeated automatic generation must never replace the published legs or prices.
+        if (
+          priorSettlement !== 'PENDING'
+          || priorStatus === String(SlipStatus.CANCELLED).toUpperCase()
+          || priorStatus === String(SlipStatus.PUBLISHED).toUpperCase()
+          || Boolean(fingerprintRecord.snapshotFrozenAt)
+        ) return null;
       }
       const { slipCode, ...updatePayload } = payload;
       saved = await this.slipModel.findOneAndUpdate(
-        { fingerprint: input.fingerprint, settlementStatus: { $in: ['PENDING', null] }, status: { $ne: SlipStatus.CANCELLED } },
+        {
+          fingerprint: input.fingerprint,
+          settlementStatus: { $in: ['PENDING', null] },
+          status: { $nin: [SlipStatus.CANCELLED, SlipStatus.PUBLISHED] },
+          snapshotFrozenAt: { $in: [null] },
+        },
         { $set: updatePayload, $setOnInsert: { slipCode } },
         { upsert: !fingerprintRecord, returnDocument: 'after', setDefaultsOnInsert: true, runValidators: true },
       ).lean().exec();
@@ -1485,6 +1582,7 @@ export class SlipCenterService {
       saved = await this.slipModel.create(payload);
       saved = saved.toObject();
     }
+    if (!saved) return null;
     await this.monitor.recordEvent({
       type: 'SLIP_CREATED', level: combinedOdds === null ? 'WARNING' : 'INFO',
       message: `${input.automatic ? 'Automatic' : 'Manual'} ${input.sureOddsProduct ?? input.productType} slip ${saved.slipCode} saved (${legs.length} legs).`,
@@ -1996,4 +2094,5 @@ export class SlipCenterService {
   return result;
 }
 }
+
 

@@ -145,6 +145,10 @@ export class PickCenter {
   @Prop({ required: true, type: Date, index: true })
   fixtureDate!: Date;
 
+  /** Exact retention deadline copied from the canonical Sports fixture. */
+  @Prop({ type: Date })
+  retentionExpiresAt?: Date | null;
+
   @Prop({ type: Boolean, default: false, index: true })
   live?: boolean;
 
@@ -195,3 +199,9 @@ PickCenterSchema.index({ 'selectedMarkets.rankingScore': -1, fixtureDate: 1 });
 
 
 
+
+
+PickCenterSchema.index(
+  { retentionExpiresAt: 1 },
+  { expireAfterSeconds: 0, name: 'ttl_pick_center_retention' },
+);
