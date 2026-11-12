@@ -18,7 +18,7 @@ export const SETTLEMENT_CONFIG = {
     initialRetryDelayMs: 30_000,
     maximumRetryDelayMs: 30 * 60_000,
     /** Bound one drain so a busy instance yields back to the event loop. */
-    maximumJobsPerDrain: 100,
+    maximumJobsPerDrain: 20,
   },
   evidence: {
     /** Maximum age for a scoreboard source before it can settle a market early. */
@@ -40,4 +40,5 @@ export const SETTLEMENT_CONFIG = {
     eventRetentionDays: 90,
   },
 } as const;
+
 

@@ -12,6 +12,7 @@ import { SportsQueueJobProcessorService } from './sports-queue-job-processor.ser
 import { SportsQueueService } from './sports-queue.service';
 import { SportsCollectionStateService } from './sports-collection-state.service';
 import type { ClaimedSportsQueueJob } from './sports-queue.service';
+import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
 
 interface SportsWorkerLastJob {
   jobKey: string;
@@ -38,17 +39,17 @@ interface LaneRuntime {
   lastError?: string;
 }
 
-const LANE_CONCURRENCY = 2;
-const IDLE_POLL_MS = 1_500;
-const ACTIVE_POLL_MS = 20;
+const LANE_CONCURRENCY = 1;
+const IDLE_POLL_MS = 5_000;
+const ACTIVE_POLL_MS = 1_000;
 const LEASE_MS = 10 * 60_000;
 const HEARTBEAT_MS = 60_000;
 const LEASE_RECOVERY_MS = 30_000;
 
 /**
  * Independent durable queue lane for every SportsQueueJobType.
- * Each lane claims and executes up to two jobs concurrently; a backlog in one
- * type cannot consume the claim slots of another type.
+ * Each lane claims and executes one job at a time. The shared background-work
+ * limiter caps all module workers at twelve active operations process-wide.
  */
 @Injectable()
 export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -68,6 +69,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     private readonly queue: SportsQueueService,
     private readonly jobProcessor: SportsQueueJobProcessorService,
     private readonly collectionStates: SportsCollectionStateService,
+    private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {
     const sportsOwnedTypes = Object.values(SportsQueueJobType).filter(
       (type) => type !== SportsQueueJobType.ODDS_PRICING_RECALCULATION
@@ -99,7 +101,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     for (const type of this.lanes.keys()) this.scheduleLane(type, 0);
     void this.recoverLeases();
     this.scheduleLeaseRecovery();
-    this.logger.log(`Sports queue lanes started (${this.lanes.size} Sports-owned job types × ${LANE_CONCURRENCY} workers).`);
+    this.logger.log(`Sports queue lanes started (${this.lanes.size} Sports-owned lanes; one job per lane; shared global limit=12).`);
   }
 
   onModuleDestroy(): void {
@@ -176,46 +178,50 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
   private async pumpLane(type: SportsQueueJobType): Promise<void> {
     const lane = this.lanes.get(type);
     if (!lane || lane.running || this.stopped) return;
+
     lane.running = true;
     lane.passes += 1;
-    lane.lastStartedAt = new Date();
-    const claims: Array<{ job: ClaimedSportsQueueJob; workerId: string }> = [];
     let processed = 0;
-    let claimFailed = false;
+    let releasePermit: (() => void) | undefined;
 
     try {
-      // Claim only this job type. Two slots are filled before executing so a
-      // slow first job does not prevent the second slot from making progress.
-      for (let slot = 0; slot < LANE_CONCURRENCY && !this.stopped; slot += 1) {
-        const workerId = `${this.instanceId}:${type}:${slot}`;
-        try {
-          const job = await this.queue.claimNext(workerId, LEASE_MS, type);
-          if (!job) break;
-          lane.claimed += 1;
-          claims.push({ job, workerId });
-        } catch (error) {
-          claimFailed = true;
-          lane.lastError = this.errorMessage(error);
-          lane.failedPasses += 1;
-          this.logger.error(`Sports queue lane ${type} could not claim slot ${slot}: ${lane.lastError}`);
-          break;
-        }
-      }
+      // A permit is acquired before the durable claim, so waiting lanes do not
+      // hold processing leases while another module is using all twelve slots.
+      releasePermit = await this.backgroundWork.acquire(`sports:${type}`);
+      if (this.stopped) return;
 
-      const outcomes = await Promise.all(claims.map(({ job, workerId }) => this.processClaimedJob(job, workerId)));
-      processed = outcomes.filter(Boolean).length;
-      lane.lastCompletedAt = new Date();
-      if (!claimFailed) lane.lastError = undefined;
+      lane.lastStartedAt = new Date();
+      const workerId = `${this.instanceId}:${type}:0`;
+      try {
+        const job = await this.queue.claimNext(workerId, LEASE_MS, type);
+        if (job) {
+          lane.claimed += 1;
+          processed = (await this.processClaimedJob(job, workerId)) ? 1 : 0;
+        }
+        lane.lastCompletedAt = new Date();
+        lane.lastError = undefined;
+      } catch (error) {
+        lane.lastError = this.errorMessage(error);
+        lane.failedPasses += 1;
+        this.logger.error(`Sports queue lane ${type} failed: ${lane.lastError}`,
+          error instanceof Error ? error.stack : undefined);
+      }
     } catch (error) {
-      lane.failedPasses += 1;
-      lane.lastError = this.errorMessage(error);
-      this.logger.error(`Sports queue lane ${type} failed: ${lane.lastError}`, error instanceof Error ? error.stack : undefined);
+      if (!this.stopped) {
+        lane.lastError = this.errorMessage(error);
+        lane.failedPasses += 1;
+        this.logger.error(`Sports queue lane ${type} could not acquire background capacity: ${lane.lastError}`);
+      }
     } finally {
+      releasePermit?.();
       lane.running = false;
-      const wakeImmediately = lane.wakeRequested;
+      const wakeRequested = lane.wakeRequested;
       lane.wakeRequested = false;
       if (!this.stopped) {
-        this.scheduleLane(type, wakeImmediately ? 0 : processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+        // Event wakes may request an immediate check, but the limiter still
+        // enforces at least one second between starts in this lane.
+        const delayMs = wakeRequested || processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        this.scheduleLane(type, delayMs);
       }
     }
   }
@@ -291,7 +297,10 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
   private async recoverLeases(): Promise<void> {
     if (this.stopped || this.recoveryRunning) return;
     this.recoveryRunning = true;
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('sports:lease-recovery');
+      if (this.stopped) return;
       const recovered = await this.queue.recoverExpiredProcessing(200);
       this.recoveredExpiredLeases += recovered;
       const recoveredCollectionStates =
@@ -307,6 +316,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     } catch (error) {
       this.logger.error(`Sports queue lease recovery failed: ${this.errorMessage(error)}`);
     } finally {
+      releasePermit?.();
       this.recoveryRunning = false;
     }
   }
@@ -326,6 +336,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
       : String(error).replace(/[\r\n]+/g, ' ').slice(0, 500);
   }
 }
+
 
 
 

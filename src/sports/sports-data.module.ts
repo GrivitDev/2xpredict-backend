@@ -2,6 +2,7 @@ import { forwardRef, Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
 import { SettlementModule } from '../settlement/settlement.module';
+import { BackgroundWorkModule } from '../common/background-work/background-work.module';
 
 import { SportsDomainReadController } from './controllers/sports-domain-read.controller';
 import { SportsDerivedReadController } from './controllers/sports-derived-read.controller';
@@ -85,6 +86,7 @@ import {
 /** Normalized Sports providers, queue orchestration, derived projections and read APIs. */
 @Module({
   imports: [
+    BackgroundWorkModule,
     forwardRef(() => SettlementModule),
     MongooseModule.forFeature([
       { name: SportsCompetition.name, schema: SportsCompetitionSchema },
@@ -153,4 +155,5 @@ import {
   ],
 })
 export class SportsDataModule {}
+
 

@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
 import { BET_LAB_CONFIG } from '../config/bet-lab.config';
 import {
   BetLabEventCategory,
@@ -22,6 +23,7 @@ export class BetLabRetentionService implements OnModuleInit {
     @InjectModel(BetLabEvent.name)
     private readonly eventModel: Model<BetLabEvent>,
     private readonly events: BetLabEventService,
+    private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -51,34 +53,66 @@ export class BetLabRetentionService implements OnModuleInit {
   }
 
   async pruneExpiredRecords() {
-    const now = new Date();
-    const ticketResult = await this.ticketModel
-      .deleteMany({
+    const releasePermit = await this.backgroundWork.acquire('bet-lab:retention');
+    try {
+      const now = new Date();
+      const ticketsDeleted = await this.deleteInBatches(this.ticketModel, {
         status: { $in: BET_LAB_TERMINAL_TICKET_STATUSES },
         visibleUntil: { $lte: now },
-      })
-      .exec();
-    const eventCutoff = new Date(
-      now.getTime() -
-        BET_LAB_CONFIG.monitor.eventRetentionDays * 24 * 60 * 60 * 1000,
-    );
-    const eventResult = await this.eventModel
-      .deleteMany({ createdAt: { $lt: eventCutoff } })
-      .exec();
-    const result = {
-      ticketsDeleted: ticketResult.deletedCount ?? 0,
-      oldEventsDeleted: eventResult.deletedCount ?? 0,
-      runAt: now,
-    };
-    await this.events.record({
-      level: BetLabEventLevel.INFO,
-      category: BetLabEventCategory.RETENTION,
-      action: 'RETENTION_CLEANUP_COMPLETED',
-      message:
-        'Bet Lab expired settled-ticket details and old operational events were cleaned up.',
-      metadata: result,
-    });
-    return result;
+      });
+      const eventCutoff = new Date(
+        now.getTime() -
+          BET_LAB_CONFIG.monitor.eventRetentionDays * 24 * 60 * 60 * 1000,
+      );
+      const oldEventsDeleted = await this.deleteInBatches(this.eventModel, {
+        createdAt: { $lt: eventCutoff },
+      });
+      const result = {
+        ticketsDeleted,
+        oldEventsDeleted,
+        batchSize: BET_LAB_CONFIG.retention.batchSize,
+        maximumBatchesPerCollection: BET_LAB_CONFIG.retention.maximumBatchesPerRun,
+        runAt: now,
+      };
+      await this.events.record({
+        level: BetLabEventLevel.INFO,
+        category: BetLabEventCategory.RETENTION,
+        action: 'RETENTION_CLEANUP_COMPLETED',
+        message:
+          'Bet Lab expired settled-ticket details and old operational events were cleaned up in bounded batches.',
+        metadata: result,
+      });
+      return result;
+    } finally {
+      releasePermit();
+    }
+  }
+
+  private async deleteInBatches(
+    model: Model<any>,
+    filter: Record<string, any>,
+  ): Promise<number> {
+    const { batchSize, maximumBatchesPerRun } = BET_LAB_CONFIG.retention;
+    let deletedTotal = 0;
+
+    for (let batch = 0; batch < maximumBatchesPerRun; batch += 1) {
+      const rows = await model
+        .find(filter)
+        .select('_id')
+        .sort({ _id: 1 })
+        .limit(batchSize)
+        .lean()
+        .exec() as Array<{ _id: unknown }>;
+
+      if (!rows.length) break;
+      const result = await model
+        .deleteMany({ _id: { $in: rows.map((row) => row._id) } })
+        .exec();
+      deletedTotal += result.deletedCount ?? 0;
+      if (rows.length < batchSize) break;
+    }
+
+    return deletedTotal;
   }
 
   private errorMessage(error: unknown): string {

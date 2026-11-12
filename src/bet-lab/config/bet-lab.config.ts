@@ -28,9 +28,16 @@ export const BET_LAB_CONFIG = {
     maximumHistoryPageSize: 100,
     eventRetentionDays: 90,
   },
+  retention: {
+    /** Keep each cleanup query and delete operation small on production. */
+    batchSize: 250,
+    /** Bound startup/daily cleanup to at most 1,000 records per collection. */
+    maximumBatchesPerRun: 4,
+  },
 } as const;
 
 export type BetLabPlan =
   keyof typeof BET_LAB_CONFIG.virtualPoints.monthlyAllowanceByPlan;
+
 
 

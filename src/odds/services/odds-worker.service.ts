@@ -6,6 +6,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { AdminGateway } from '../../realtime/admin.gateway';
+import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
 import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
 import { SportsQueueJobType } from '../../sports/interfaces/sports-queue.interface';
 import type { SportsFixtureRecord } from '../../sports/interfaces/sports-domain.interface';
@@ -85,6 +86,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     private readonly oddsService: OddsService,
     private readonly adminGateway: AdminGateway,
     private readonly queue: SportsQueueService,
+    private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {}
 
   onModuleInit(): void {
@@ -261,7 +263,11 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.lastCycleStartedAt = new Date(startedAt);
     this.beginInventorySweep(new Date(startedAt));
 
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('odds:inventory');
+      if (this.stopping) return;
+
       let result = await this.sportsRead.getFixtures({
         limit: ODDS_CONFIG.workerBatchSize,
         cursor: this.cursor,
@@ -361,6 +367,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       });
       this.logger.error(`Grivit inventory pricing batch failed: ${message}`);
     } finally {
+      releasePermit?.();
       this.lastCycleCompletedAt = new Date();
       this.lastCycleDurationMs = Date.now() - startedAt;
       this.busy = false;
@@ -373,7 +380,11 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.queueBusy = true;
     this.queuePasses += 1;
     this.lastQueuePassAt = new Date();
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('odds:pricing-queue');
+      if (this.stopping) return;
+
       const claims: Array<{ job: ClaimedSportsQueueJob; workerId: string }> = [];
       for (let slot = 0; slot < ODDS_CONFIG.workerConcurrency; slot += 1) {
         const workerId = `${this.workerId}:${slot}`;
@@ -391,6 +402,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       this.lastQueueError = this.errorMessage(error).slice(0, 500);
       this.logger.warn(`Odds source-change queue pass failed: ${this.lastQueueError}`);
     } finally {
+      releasePermit?.();
       this.queueBusy = false;
     }
   }
@@ -476,7 +488,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         );
       }
 
-      const enqueueConcurrency = 20;
+      const enqueueConcurrency = 2;
       for (let cursor = 0; cursor < batch.length; cursor += enqueueConcurrency) {
         const enqueueBatch = batch.slice(cursor, cursor + enqueueConcurrency);
         const results = await Promise.all(enqueueBatch.map(async (fixture) => {
@@ -531,7 +543,10 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.cleanupBusy = true;
     const startedAt = Date.now();
     this.lastRetentionStartedAt = new Date(startedAt);
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('odds:retention');
+      if (this.stopping) return;
       const deleted = await this.oddsService.pruneExpiredPrices(ODDS_CONFIG.expiredPriceCleanupBatchSize);
       this.lastRetentionFixtureCount = deleted;
       this.lastRetentionPages = deleted > 0 ? 1 : 0;
@@ -556,6 +571,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         message: message.slice(0, 300), occurredAt: new Date().toISOString(),
       });
     } finally {
+      releasePermit?.();
       this.lastRetentionCompletedAt = new Date();
       this.lastRetentionDurationMs = Date.now() - startedAt;
       this.cleanupBusy = false;
@@ -566,4 +582,5 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 

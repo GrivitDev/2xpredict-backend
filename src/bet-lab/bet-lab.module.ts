@@ -1,5 +1,6 @@
 import { forwardRef, Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
+import { BackgroundWorkModule } from '../common/background-work/background-work.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { EmailVerifiedGuard } from '../common/guards/email-verified.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -42,6 +43,7 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
 import { SettlementModule } from '../settlement/settlement.module';
 @Module({
   imports: [
+    BackgroundWorkModule,
     SubscriptionsModule,
     OddsModule,
     SportsModule,
@@ -85,4 +87,5 @@ import { SettlementModule } from '../settlement/settlement.module';
   ],
 })
 export class BetLabModule {}
+
 

@@ -4,10 +4,10 @@ export const PREDICTION_ENGINE_CONFIG = {
   queue: {
     /** Periodic full-inventory reconciliation; Stage 2 adds direct Sports/Odds event enqueueing. */
     syncIntervalMs: 10 * 60_000,
-    /** Poll quickly and dispatch the full configured worker concurrency per tick. */
-    workerIntervalMs: 5_000,
-    /** Bounded parallelism keeps full-season backfills moving without unbounded DB pressure. */
-    workerConcurrency: 2,
+    /** Ten-second polling avoids rapid queue checks while preserving responsiveness. */
+    workerIntervalMs: 10_000,
+    /** One active calculation at a time; the shared limiter also caps all modules globally. */
+    workerConcurrency: 1,
     /** Temporary safety-net refresh; Stage 2 will make source-change events the primary trigger. */
     completedRefreshIntervalMs: 12 * 60 * 60 * 1000,
     /** Retry exhausted jobs after a cooldown, even if source timestamps did not change. */
@@ -174,3 +174,4 @@ export const PREDICTION_ENGINE_CONFIG = {
 } as const;
 
 export type PredictionEngineConfig = typeof PREDICTION_ENGINE_CONFIG;
+

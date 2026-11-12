@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { RolesGuard } from '../common/guards/roles.guard';
+import { BackgroundWorkModule } from '../common/background-work/background-work.module';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { PredictionAccessModule } from '../prediction-access/prediction-access.module';
@@ -74,6 +75,7 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
 import { SettlementModule } from '../settlement/settlement.module';
 @Module({
   imports: [
+    BackgroundWorkModule,
     PredictionAccessModule,
     OddsModule,
     SportsModule,
@@ -137,6 +139,7 @@ import { SettlementModule } from '../settlement/settlement.module';
   ],
 })
 export class PredictionsEngineModule {}
+
 
 
 

@@ -7,11 +7,11 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
   ESPN: {
     enabled: true,
     rateLimit: {
-      // ESPN has no published application quota. The client enforces a shared
-      // 350ms start interval, two normal in-flight requests and one reserved
-      // live-scoreboard request slot.
-      minIntervalSeconds: 0.35,
-      normalConcurrency: 2,
+      // Keep provider traffic bounded on the small production instance.
+      // Normal and reserved live slots each allow one in-flight request, with
+      // at least one second between request starts.
+      minIntervalSeconds: 1,
+      normalConcurrency: 1,
       liveConcurrency: 1,
     },
   },
@@ -27,5 +27,3 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 } as const;
 
 export type SportsDataCollectionConfig = typeof SPORTS_DATA_COLLECTION_CONFIG;
-
-

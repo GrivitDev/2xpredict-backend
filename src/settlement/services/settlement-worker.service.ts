@@ -14,6 +14,7 @@ import { SETTLEMENT_CONFIG } from '../config/settlement.config';
 import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 import { AdminGateway } from '../../realtime/admin.gateway';
 import { SettlementWorkerRuntimeStatus } from '../interfaces/settlement-monitor.interface';
+import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
 
 @Injectable()
 export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
@@ -61,6 +62,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
   private leaseRecoveryTimer?: ReturnType<typeof setInterval>;
   private targetReconciliationTimer?: ReturnType<typeof setInterval>;
   private targetReconciliationBusy = false;
+  private leaseRecoveryBusy = false;
   private targetReconciliationRuns = 0;
   private targetReconciliationQueued = 0;
   private lastTargetReconciliationAt?: Date;
@@ -73,6 +75,7 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     private readonly eventLog: SettlementEventLogService,
     private readonly systemMonitor: SystemMonitorService,
     private readonly adminGateway: AdminGateway,
+    private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {}
 
   getRuntimeStatus(): SettlementWorkerRuntimeStatus {
@@ -166,7 +169,10 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     if (!this.initialized || this.targetReconciliationBusy) return;
     this.targetReconciliationBusy = true;
     this.targetReconciliationRuns += 1;
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('settlement:target-reconciliation');
+      if (!this.initialized) return;
       const result = await this.queue.reconcileExistingUnsettledTargets();
       this.lastTargetReconciliationAt = new Date();
       this.lastTargetReconciliationError = undefined;
@@ -199,12 +205,17 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
         stack: error instanceof Error ? error.stack : undefined,
       });
     } finally {
+      releasePermit?.();
       this.targetReconciliationBusy = false;
     }
   }
 
   private async recoverAbandonedLeases(): Promise<void> {
+    if (this.leaseRecoveryBusy) return;
+    this.leaseRecoveryBusy = true;
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('settlement:lease-recovery');
       const recovered = await this.queue.recoverExpiredProcessingJobs();
       if (recovered.total > 0) {
         this.logger.warn(
@@ -228,12 +239,17 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
         source: 'worker-lease-recovery',
         message: this.errorMessage(error),
       });
+    } finally {
+      releasePermit?.();
+      this.leaseRecoveryBusy = false;
     }
   }
 
   private async startupRecovery(): Promise<void> {
     this.startupAttempts += 1;
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('settlement:startup-recovery');
       const recovered = await this.queue.recoverExpiredProcessingJobs();
       // Temporary, durable one-time correction pass. It is a no-op unless
       // SETTLEMENT_HISTORICAL_RESETTLE_ON_STARTUP=true is explicitly enabled.
@@ -345,6 +361,8 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
           `Could not persist Settlement startup recovery error: ${this.errorMessage(loggingError)}`,
         );
       }
+    } finally {
+      releasePermit?.();
     }
   }
 
@@ -370,10 +388,13 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     }
     this.busy = true;
     this.wakeRequested = false;
-    this.drainCycles += 1;
-    this.lastDrainStartedAt = new Date();
     let processed = 0;
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('settlement:queue');
+      if (!this.initialized) return;
+      this.drainCycles += 1;
+      this.lastDrainStartedAt = new Date();
       this.systemMonitor.reportActivity({
         module: 'settlement',
         source: 'worker',
@@ -438,17 +459,18 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
         );
       }
     } finally {
+      releasePermit?.();
       this.busy = false;
       this.lastDrainCompletedAt = new Date();
       if (
         this.wakeRequested ||
         processed >= SETTLEMENT_CONFIG.queue.maximumJobsPerDrain
       ) {
-        this.wake(0);
+        this.wake(1_000);
       } else {
         try {
           const nextAt = await this.queue.getNextWakeAt();
-          if (nextAt) this.wake(Math.max(0, nextAt.getTime() - Date.now()));
+          if (nextAt) this.wake(Math.max(1_000, nextAt.getTime() - Date.now()));
         } catch (error) {
           this.logger.warn(
             `Settlement next-wake lookup failed: ${this.errorMessage(error)}`,
@@ -692,5 +714,6 @@ export class SettlementWorkerService implements OnModuleInit, OnModuleDestroy {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 
 

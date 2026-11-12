@@ -6,7 +6,7 @@ export const ODDS_CONFIG = {
   /** Full catalogue scan; this is not limited to a pre-match lookahead. */
   workerIntervalMs: 60_000,
   workerBatchSize: 100,
-  workerConcurrency: 2,
+  workerConcurrency: 1,
   /** Maximum age of an external bookmaker reference, never a Grivit price. */
   maximumQuoteAgeHours: 72,
   futureTimestampToleranceMs: 5 * 60_000,
@@ -49,5 +49,6 @@ export function isOddsQuoteFresh(value: unknown, now = Date.now()): boolean {
   return age >= -ODDS_CONFIG.futureTimestampToleranceMs &&
     age <= ODDS_CONFIG.maximumQuoteAgeHours * 3_600_000;
 }
+
 
 

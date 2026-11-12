@@ -24,6 +24,7 @@ import { PickCenterService } from './pick-center.service';
 import { SportsQueueJobType } from '../../sports/interfaces/sports-queue.interface';
 import { SportsQueueService } from '../../sports/services/sports-queue.service';
 import { PredictionSourceRevisionChangedError } from './prediction-data.service';
+import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
 
 @Injectable()
 export class PredictionQueueWorkerService
@@ -55,6 +56,7 @@ export class PredictionQueueWorkerService
     private readonly slipCenterService: SlipCenterService,
     private readonly pickCenterService: PickCenterService,
     private readonly sportsQueue: SportsQueueService,
+    private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {}
 
   onModuleInit(): void {
@@ -172,7 +174,12 @@ export class PredictionQueueWorkerService
     eventId?: string;
     failed?: boolean;
   }> {
-    return this.processOne();
+    const releasePermit = await this.backgroundWork.acquire('predictions:queue');
+    try {
+      return await this.processOne();
+    } finally {
+      releasePermit();
+    }
   }
 
   /** Fill all available worker slots on every poll instead of dispatching one job per tick. */
@@ -195,14 +202,19 @@ export class PredictionQueueWorkerService
       || !this.started
       || !PREDICTION_ENGINE_CONFIG.enabled
     ) return;
+
     this.activeWorkers += 1;
-    this.monitor.recordOperationStart('prediction-worker', {
-      activeWorkers: this.activeWorkers,
-      configuredConcurrency: PREDICTION_ENGINE_CONFIG.queue.workerConcurrency,
-    });
+    let releasePermit: (() => void) | undefined;
     let failed = false;
     let processedWork = false;
     try {
+      releasePermit = await this.backgroundWork.acquire('predictions:queue');
+      if (!this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
+
+      this.monitor.recordOperationStart('prediction-worker', {
+        activeWorkers: this.activeWorkers,
+        configuredConcurrency: PREDICTION_ENGINE_CONFIG.queue.workerConcurrency,
+      });
       const outcome = await this.processOne();
       processedWork = outcome.processed;
       if (outcome.failed) {
@@ -237,8 +249,9 @@ export class PredictionQueueWorkerService
         message: `Prediction worker cycle failed: ${this.errorMessage(error)}`,
       });
     } finally {
+      releasePermit?.();
       this.activeWorkers = Math.max(0, this.activeWorkers - 1);
-      if (!failed) {
+      if (releasePermit && !failed) {
         this.monitor.recordOperationSuccess('prediction-worker', {
           processed: processedWork,
           activeWorkers: this.activeWorkers,
@@ -255,11 +268,15 @@ export class PredictionQueueWorkerService
   private async refreshProductPipelineSafely(): Promise<void> {
     if (this.productPipelineBusy || !this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
     this.productPipelineBusy = true;
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('predictions:product-pipeline');
+      if (!this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
       await this.refreshPickCenterSafely();
       await this.refreshCuratedSafely();
       await this.refreshSlipSafely();
     } finally {
+      releasePermit?.();
       this.productPipelineBusy = false;
     }
   }
@@ -314,7 +331,10 @@ export class PredictionQueueWorkerService
     this.calibrationBusy = true;
     const startedAt = Date.now();
     this.monitor.recordOperationStart('calibration');
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('predictions:calibration');
+      if (!this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
       const result = await this.marketCalibrationService.refreshAllIfStale();
       await this.monitor.recordCalibrationCycle(result);
       this.monitor.recordOperationSuccess('calibration', {
@@ -348,6 +368,7 @@ export class PredictionQueueWorkerService
         stack: error instanceof Error ? error.stack : undefined,
       });
     } finally {
+      releasePermit?.();
       this.calibrationBusy = false;
     }
   }
@@ -700,8 +721,11 @@ export class PredictionQueueWorkerService
     if (this.syncBusy || !this.started || !PREDICTION_ENGINE_CONFIG.enabled)
       return;
     this.syncBusy = true;
-    this.monitor.recordOperationStart('queue-sync');
+    let releasePermit: (() => void) | undefined;
     try {
+      releasePermit = await this.backgroundWork.acquire('predictions:queue-sync');
+      if (!this.started || !PREDICTION_ENGINE_CONFIG.enabled) return;
+      this.monitor.recordOperationStart('queue-sync');
       const recovered = await this.queue.recoverStaleProcessing();
       const syncResult = await this.queue.syncUpcomingFixtures();
       this.monitor.recordOperationSuccess('queue-sync', {
@@ -730,6 +754,7 @@ export class PredictionQueueWorkerService
         message: `Prediction queue sync failed: ${this.errorMessage(error)}`,
       });
     } finally {
+      releasePermit?.();
       this.syncBusy = false;
     }
   }
@@ -738,3 +763,4 @@ export class PredictionQueueWorkerService
     return error instanceof Error ? error.message : String(error);
   }
 }
+

@@ -21,9 +21,11 @@ type FixtureIdRow = { id: string };
  */
 @Injectable()
 export class SportsDataChangeEventProcessorService {
-  private readonly logger = new Logger(SportsDataChangeEventProcessorService.name);
-  private readonly fixturePageSize = 500;
-  private readonly oddsEnqueueConcurrency = 20;
+  private readonly logger = new Logger(
+    SportsDataChangeEventProcessorService.name,
+  );
+  private readonly fixturePageSize = 100;
+  private readonly oddsEnqueueConcurrency = 2;
 
   constructor(
     private readonly changeEvents: SportsDataChangeEventService,
@@ -40,58 +42,59 @@ export class SportsDataChangeEventProcessorService {
    * The outbox is acknowledged only after all downstream jobs have been
    * durably queued. A failed handoff remains retryable.
    */
-  async drain(limit = 100, workerId = 'sports-outbox-worker'): Promise<number> {
-    await this.changeEvents.recoverExpiredProcessing(limit);
-    const pending = await this.changeEvents.getPendingEvents(limit);
+  async drain(limit = 20, workerId = 'sports-outbox-worker'): Promise<number> {
+    const requestedLimit = Number.isFinite(limit) ? Math.floor(limit) : 20;
+    const boundedLimit = Math.max(1, Math.min(20, requestedLimit));
+    await this.changeEvents.recoverExpiredProcessing(boundedLimit);
+    const pending = await this.changeEvents.getPendingEvents(boundedLimit);
     const events = pending as unknown as SportsDataChangedEvent[];
-    const concurrency = 4;
-    const claimedEvents: SportsDataChangedEvent[] = [];
-
-    let claimCursor = 0;
-    await Promise.all(Array.from({ length: Math.min(concurrency, events.length) }, async () => {
-      while (true) {
-        const index = claimCursor++;
-        if (index >= events.length) return;
-        const event = events[index];
-        if (await this.changeEvents.markProcessing(event.eventId, workerId)) {
-          claimedEvents.push(event);
-        }
-      }
-    }));
-
     let processed = 0;
-    let cursor = 0;
-    await Promise.all(Array.from({ length: Math.min(concurrency, claimedEvents.length) }, async () => {
-      while (true) {
-        const index = cursor++;
-        if (index >= claimedEvents.length) return;
-        const event = claimedEvents[index];
-        const heartbeat = setInterval(() => {
-          void this.changeEvents.markHeartbeat(event.eventId, workerId, 120_000)
-            .then((renewed) => {
-              if (!renewed) this.logger.warn(`Outbox lease for ${event.eventId} is no longer owned by ${workerId}.`);
-            })
-            .catch((error: unknown) => {
-              this.logger.warn(`Could not renew outbox lease ${event.eventId}: ${error instanceof Error ? error.message : String(error)}`);
-            });
-        }, 30_000);
-        (heartbeat as unknown as { unref?: () => void }).unref?.();
 
-        try {
-          await this.dispatch(event);
-          await this.changeEvents.markCompleted(event.eventId, workerId);
-          processed += 1;
-        } catch (error) {
-          const outcome = await this.changeEvents.markFailed(event.eventId, error, workerId);
-          this.logger.error(
-            `Sports data-change event ${event.eventId} dispatch failed (${outcome}).`,
-            error instanceof Error ? error.stack : undefined,
-          );
-        } finally {
-          clearInterval(heartbeat);
-        }
+    // Keep outbox work sequential. The event is claimed immediately before it
+    // is dispatched, so a slow event does not leave a large set of records in
+    // PROCESSING while they wait for execution.
+    for (const event of events) {
+      const claimed = await this.changeEvents.markProcessing(
+        event.eventId,
+        workerId,
+      );
+      if (!claimed) continue;
+
+      const heartbeat = setInterval(() => {
+        void this.changeEvents
+          .markHeartbeat(event.eventId, workerId, 120_000)
+          .then((renewed) => {
+            if (!renewed)
+              this.logger.warn(
+                `Outbox lease for ${event.eventId} is no longer owned by ${workerId}.`,
+              );
+          })
+          .catch((error: unknown) => {
+            this.logger.warn(
+              `Could not renew outbox lease ${event.eventId}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+      }, 30_000);
+      (heartbeat as unknown as { unref?: () => void }).unref?.();
+
+      try {
+        await this.dispatch(event);
+        await this.changeEvents.markCompleted(event.eventId, workerId);
+        processed += 1;
+      } catch (error) {
+        const outcome = await this.changeEvents.markFailed(
+          event.eventId,
+          error,
+          workerId,
+        );
+        this.logger.error(
+          `Sports data-change event ${event.eventId} dispatch failed (${outcome}).`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      } finally {
+        clearInterval(heartbeat);
       }
-    }));
+    }
 
     return processed;
   }
@@ -105,14 +108,23 @@ export class SportsDataChangeEventProcessorService {
     // A pre-match fixture update is a Prediction/Odds input change, not a
     // settlement trigger. Keep Settlement restricted to live and final facts.
     if (
-      ['FIXTURE', 'MATCH_TIMELINE', 'MATCH_STATISTICS', 'MATCH_LINEUP'].includes(event.entity) &&
+      [
+        'FIXTURE',
+        'MATCH_TIMELINE',
+        'MATCH_STATISTICS',
+        'MATCH_LINEUP',
+      ].includes(event.entity) &&
       fixtureIds.length > 0
     ) {
       const settleableIds = await this.getSettleableFixtureIds(fixtureIds);
       if (settleableIds.length > 0) {
         await this.settlementTrigger.onSportsDataChanged(
           settleableIds,
-          event.entity as 'FIXTURE' | 'MATCH_TIMELINE' | 'MATCH_STATISTICS' | 'MATCH_LINEUP',
+          event.entity as
+            | 'FIXTURE'
+            | 'MATCH_TIMELINE'
+            | 'MATCH_STATISTICS'
+            | 'MATCH_LINEUP',
         );
       }
       await this.enqueueAffectedSeasonProjections(fixtureIds, event.eventId);
@@ -123,14 +135,24 @@ export class SportsDataChangeEventProcessorService {
     await this.enqueueAffectedOddsPricing(event, fixtureIds);
   }
 
-  private async getSettleableFixtureIds(fixtureIds: string[]): Promise<string[]> {
-    const rows = await this.fixtureModel.find({
-      id: { $in: fixtureIds },
-      $or: [
-        { 'status.state': { $in: ['LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES', 'COMPLETED'] } },
-        { 'status.isFinal': true },
-      ],
-    }).select('id').lean().exec() as FixtureIdRow[];
+  private async getSettleableFixtureIds(
+    fixtureIds: string[],
+  ): Promise<string[]> {
+    const rows = (await this.fixtureModel
+      .find({
+        id: { $in: fixtureIds },
+        $or: [
+          {
+            'status.state': {
+              $in: ['LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES', 'COMPLETED'],
+            },
+          },
+          { 'status.isFinal': true },
+        ],
+      })
+      .select('id')
+      .lean()
+      .exec()) as FixtureIdRow[];
     return this.unique(rows.map((row) => row.id));
   }
 
@@ -145,7 +167,8 @@ export class SportsDataChangeEventProcessorService {
 
     let query: Record<string, any> | undefined;
     if (
-      event.entity === 'TEAM' || event.entity === 'TEAM_ROSTER' ||
+      event.entity === 'TEAM' ||
+      event.entity === 'TEAM_ROSTER' ||
       event.entity === 'ATHLETE'
     ) {
       const teamIds = this.unique([
@@ -161,10 +184,15 @@ export class SportsDataChangeEventProcessorService {
       query = {
         'competitors.teamId': { $in: teamIds },
         kickoffAt: { $gte: new Date() },
-        'status.state': { $nin: ['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'] },
+        'status.state': {
+          $nin: ['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'],
+        },
       };
     } else if (event.entity === 'MATCH_ODDS') {
-      const targetIds = this.unique([...(event.fixtureIds ?? []), event.entityId]);
+      const targetIds = this.unique([
+        ...(event.fixtureIds ?? []),
+        event.entityId,
+      ]);
       await this.enqueueOddsPricingForIds(targetIds, event);
       return;
     } else if (event.entity === 'COMPETITION' || event.entity === 'SEASON') {
@@ -177,13 +205,16 @@ export class SportsDataChangeEventProcessorService {
         ...(event.entity === 'SEASON' ? [event.entityId] : []),
       ]);
       const scopes: Record<string, unknown>[] = [];
-      if (competitionIds.length) scopes.push({ competitionId: { $in: competitionIds } });
+      if (competitionIds.length)
+        scopes.push({ competitionId: { $in: competitionIds } });
       if (seasonIds.length) scopes.push({ seasonId: { $in: seasonIds } });
       if (!scopes.length) return;
       query = {
         $or: scopes,
         kickoffAt: { $gte: new Date() },
-        'status.state': { $nin: ['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'] },
+        'status.state': {
+          $nin: ['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'],
+        },
       };
     }
 
@@ -199,15 +230,16 @@ export class SportsDataChangeEventProcessorService {
     let scanned = 0;
 
     while (true) {
-      const page = await this.fixtureModel.find({
-        ...baseQuery,
-        ...(cursor ? { id: { $gt: cursor } } : {}),
-      })
+      const page = (await this.fixtureModel
+        .find({
+          ...baseQuery,
+          ...(cursor ? { id: { $gt: cursor } } : {}),
+        })
         .select('id')
         .sort({ id: 1 })
         .limit(this.fixturePageSize)
         .lean()
-        .exec() as FixtureIdRow[];
+        .exec()) as FixtureIdRow[];
 
       if (!page.length) break;
       const ids = page.map((row) => String(row.id));
@@ -229,17 +261,23 @@ export class SportsDataChangeEventProcessorService {
     event: SportsDataChangedEvent,
   ): Promise<void> {
     const ids = this.unique(fixtureIds);
-    for (let offset = 0; offset < ids.length; offset += this.oddsEnqueueConcurrency) {
+    for (
+      let offset = 0;
+      offset < ids.length;
+      offset += this.oddsEnqueueConcurrency
+    ) {
       const batch = ids.slice(offset, offset + this.oddsEnqueueConcurrency);
-      const results = await Promise.all(batch.map((fixtureId) =>
-        this.queue.enqueueIfNoActiveFixtureJob({
-          type: SportsQueueJobType.ODDS_PRICING_RECALCULATION,
-          scope: { fixtureId },
-          priority: 65,
-          scheduledFor: event.changedAt,
-          triggerEventId: `odds:source:${event.eventId}:${fixtureId}`,
-        }),
-      ));
+      const results = await Promise.all(
+        batch.map((fixtureId) =>
+          this.queue.enqueueIfNoActiveFixtureJob({
+            type: SportsQueueJobType.ODDS_PRICING_RECALCULATION,
+            scope: { fixtureId },
+            priority: 65,
+            scheduledFor: event.changedAt,
+            triggerEventId: `odds:source:${event.eventId}:${fixtureId}`,
+          }),
+        ),
+      );
       const created = results.filter((result) => result.created).length;
       if (created > 0) {
         this.logger.debug(
@@ -253,26 +291,45 @@ export class SportsDataChangeEventProcessorService {
     fixtureIds: string[],
     sourceEventId: string,
   ): Promise<void> {
-    const fixtures = await this.fixtureModel.find({
-      id: { $in: fixtureIds },
-      $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }],
-    }).select('id competitionId seasonId').lean().exec() as Array<{
+    const fixtures = (await this.fixtureModel
+      .find({
+        id: { $in: fixtureIds },
+        $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }],
+      })
+      .select('id competitionId seasonId')
+      .lean()
+      .exec()) as Array<{
       id: string;
       competitionId: string;
       seasonId?: string;
     }>;
 
-    const competitionIds = [...new Set(fixtures.map((fixture) => fixture.competitionId).filter(Boolean))];
+    const competitionIds = [
+      ...new Set(
+        fixtures.map((fixture) => fixture.competitionId).filter(Boolean),
+      ),
+    ];
     if (!competitionIds.length) return;
-    const currentSeasons = await this.seasonModel.find({
-      competitionId: { $in: competitionIds },
-      isCurrent: true,
-    }).select('competitionId id').lean().exec() as Array<{
+    const currentSeasons = (await this.seasonModel
+      .find({
+        competitionId: { $in: competitionIds },
+        isCurrent: true,
+      })
+      .select('competitionId id')
+      .lean()
+      .exec()) as Array<{
       competitionId: string;
       id: string;
     }>;
-    const window = String(Math.floor(Date.now() / SPORTS_COLLECTION_SCHEDULE.derivedData.coalesceWindowMs));
-    const scopes = new Map<string, { competitionId: string; seasonId: string }>();
+    const window = String(
+      Math.floor(
+        Date.now() / SPORTS_COLLECTION_SCHEDULE.derivedData.coalesceWindowMs,
+      ),
+    );
+    const scopes = new Map<
+      string,
+      { competitionId: string; seasonId: string }
+    >();
 
     // Rebuild the exact season containing each corrected/completed fixture.
     // Historical projections are retained and feed the rolling team history;
@@ -280,11 +337,17 @@ export class SportsDataChangeEventProcessorService {
     for (const fixture of fixtures) {
       if (!fixture.seasonId) continue;
       const key = `${fixture.competitionId}:${fixture.seasonId}`;
-      scopes.set(key, { competitionId: fixture.competitionId, seasonId: fixture.seasonId });
+      scopes.set(key, {
+        competitionId: fixture.competitionId,
+        seasonId: fixture.seasonId,
+      });
     }
     for (const season of currentSeasons) {
       const key = `${season.competitionId}:${season.id}`;
-      scopes.set(key, { competitionId: season.competitionId, seasonId: season.id });
+      scopes.set(key, {
+        competitionId: season.competitionId,
+        seasonId: season.id,
+      });
     }
 
     for (const scope of scopes.values()) {
@@ -299,8 +362,10 @@ export class SportsDataChangeEventProcessorService {
   }
 
   private unique(values: string[]): string[] {
-    return [...new Set(values.map((value) => String(value ?? '').trim()).filter(Boolean))];
+    return [
+      ...new Set(
+        values.map((value) => String(value ?? '').trim()).filter(Boolean),
+      ),
+    ];
   }
 }
-
-

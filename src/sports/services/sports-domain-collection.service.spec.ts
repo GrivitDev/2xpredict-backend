@@ -2,16 +2,27 @@ import { SportsDomainCollectionService } from './sports-domain-collection.servic
 
 describe('SportsDomainCollectionService settlement evidence gates', () => {
   const now = new Date('2026-11-10T12:00:00.000Z');
+
   let state: { getState: jest.Mock };
+  let persistence: { getMatchSummaryByEventId: jest.Mock };
   let service: SportsDomainCollectionService;
 
   beforeEach(() => {
     jest.useFakeTimers().setSystemTime(now);
-    state = { getState: jest.fn() };
+
+    state = {
+      getState: jest.fn(),
+    };
+
+    persistence = {
+      getMatchSummaryByEventId: jest.fn().mockResolvedValue(null),
+    };
+
     service = new SportsDomainCollectionService(
       {} as any,
-      {} as any,
+      persistence as any,
       state as any,
+      {} as any,
       {} as any,
     );
   });
@@ -20,15 +31,33 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
 
   it('allows Summary collection when there is no prior collection state', async () => {
     state.getState.mockResolvedValue(null);
-    await expect(service.shouldCollectFixtureSummary('espn-1')).resolves.toBe(true);
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1'),
+    ).resolves.toBe(true);
   });
 
-  it('does not request another Summary while the last successful snapshot is fresh', async () => {
+  it('does not request another Summary while the persisted snapshot is fresh', async () => {
+    persistence.getMatchSummaryByEventId.mockResolvedValue({
+      lastCollectedAt: new Date(now.getTime() - 10 * 60_000),
+    });
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1', 20 * 60_000),
+    ).resolves.toBe(false);
+
+    expect(state.getState).not.toHaveBeenCalled();
+  });
+
+  it('does not request another Summary while the last successful collection state is fresh', async () => {
     state.getState.mockResolvedValue({
       status: 'SUCCEEDED',
       lastSuccessfulAt: new Date(now.getTime() - 10 * 60_000),
     });
-    await expect(service.shouldCollectFixtureSummary('espn-1', 20 * 60_000)).resolves.toBe(false);
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1', 20 * 60_000),
+    ).resolves.toBe(false);
   });
 
   it('allows Summary refresh after its freshness window expires', async () => {
@@ -36,7 +65,10 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
       status: 'SUCCEEDED',
       lastSuccessfulAt: new Date(now.getTime() - 25 * 60_000),
     });
-    await expect(service.shouldCollectFixtureSummary('espn-1', 20 * 60_000)).resolves.toBe(true);
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1', 20 * 60_000),
+    ).resolves.toBe(true);
   });
 
   it('respects the cooldown for an active or recently failed Summary request', async () => {
@@ -49,16 +81,34 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
         status: 'FAILED',
         updatedAt: new Date(now.getTime() - 60_000),
       });
-    await expect(service.shouldCollectFixtureSummary('espn-1')).resolves.toBe(false);
-    await expect(service.shouldCollectFixtureSummary('espn-1')).resolves.toBe(false);
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1'),
+    ).resolves.toBe(false);
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1'),
+    ).resolves.toBe(false);
   });
 
   it('recognizes only a successful Core Plays endpoint as complete timeline coverage', async () => {
     state.getState
-      .mockResolvedValueOnce({ status: 'SUCCEEDED', endpoint: '/leagues/eng.1/events/espn-1/competitions/1/plays' })
-      .mockResolvedValueOnce({ status: 'SUCCEEDED', endpoint: '/summary?event=espn-1#plays' });
-    await expect(service.hasCompleteMatchPlays('fixture-1')).resolves.toBe(true);
-    await expect(service.hasCompleteMatchPlays('fixture-1')).resolves.toBe(false);
+      .mockResolvedValueOnce({
+        status: 'SUCCEEDED',
+        endpoint: '/leagues/eng.1/events/espn-1/competitions/1/plays',
+      })
+      .mockResolvedValueOnce({
+        status: 'SUCCEEDED',
+        endpoint: '/summary?event=espn-1#plays',
+      });
+
+    await expect(
+      service.hasCompleteMatchPlays('fixture-1'),
+    ).resolves.toBe(true);
+
+    await expect(
+      service.hasCompleteMatchPlays('fixture-1'),
+    ).resolves.toBe(false);
   });
 
   it('does not re-request successful Core Plays coverage', async () => {
@@ -66,7 +116,10 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
       status: 'SUCCEEDED',
       endpoint: '/leagues/eng.1/events/espn-1/competitions/1/plays',
     });
-    await expect(service.shouldCollectMatchPlays('fixture-1')).resolves.toBe(false);
+
+    await expect(
+      service.shouldCollectMatchPlays('fixture-1'),
+    ).resolves.toBe(false);
   });
 
   it('suppresses another Plays request during the no-data cooldown', async () => {
@@ -74,7 +127,10 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
       status: 'NO_DATA',
       updatedAt: new Date(now.getTime() - 5 * 60_000),
     });
-    await expect(service.shouldCollectMatchPlays('fixture-1')).resolves.toBe(false);
+
+    await expect(
+      service.shouldCollectMatchPlays('fixture-1'),
+    ).resolves.toBe(false);
   });
 
   it('allows a no-data Plays checkpoint to retry after the 30-minute cooldown', async () => {
@@ -82,7 +138,10 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
       status: 'NO_DATA',
       updatedAt: new Date(now.getTime() - 31 * 60_000),
     });
-    await expect(service.shouldCollectMatchPlays('fixture-1')).resolves.toBe(true);
+
+    await expect(
+      service.shouldCollectMatchPlays('fixture-1'),
+    ).resolves.toBe(true);
   });
 
   it('allows a Summary-only Plays fallback to be retried after the 30-minute cooldown', async () => {
@@ -97,8 +156,13 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
         endpoint: '/summary?event=espn-1#plays',
         lastSuccessfulAt: new Date(now.getTime() - 60_000),
       });
-    await expect(service.shouldCollectMatchPlays('fixture-1')).resolves.toBe(true);
-    await expect(service.shouldCollectMatchPlays('fixture-1')).resolves.toBe(false);
+
+    await expect(
+      service.shouldCollectMatchPlays('fixture-1'),
+    ).resolves.toBe(true);
+
+    await expect(
+      service.shouldCollectMatchPlays('fixture-1'),
+    ).resolves.toBe(false);
   });
 });
-
