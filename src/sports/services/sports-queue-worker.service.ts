@@ -55,7 +55,9 @@ const LEASE_RECOVERY_MS = 60_000;
  * limiter caps all module workers at six active operations process-wide and prioritizes time-sensitive lanes.
  */
 @Injectable()
-export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
+export class SportsQueueWorkerService
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
   private readonly logger = new Logger(SportsQueueWorkerService.name);
   private readonly instanceId = `sports-worker:${process.env.HOSTNAME ?? 'node'}:${randomUUID()}`;
   private readonly lanes = new Map<SportsQueueJobType, LaneRuntime>();
@@ -75,8 +77,9 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {
     const sportsOwnedTypes = Object.values(SportsQueueJobType).filter(
-      (type) => type !== SportsQueueJobType.ODDS_PRICING_RECALCULATION
-        && type !== SportsQueueJobType.PREDICTION_ENGINE_RECALCULATION,
+      (type) =>
+        type !== SportsQueueJobType.ODDS_PRICING_RECALCULATION &&
+        type !== SportsQueueJobType.PREDICTION_ENGINE_RECALCULATION,
     );
     for (const type of sportsOwnedTypes) {
       this.lanes.set(type, {
@@ -104,7 +107,9 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     for (const type of this.lanes.keys()) this.scheduleLane(type, 0);
     void this.recoverLeases();
     this.scheduleLeaseRecovery();
-    this.logger.log(`Sports queue lanes started (${this.lanes.size} Sports-owned lanes; one job per lane; shared global limit=${BACKGROUND_WORK_LIMITS.maximumConcurrentJobs}; priority scheduling enabled).`);
+    this.logger.log(
+      `Sports queue lanes started (${this.lanes.size} Sports-owned lanes; one job per lane; shared global limit=${BACKGROUND_WORK_LIMITS.maximumConcurrentJobs}; priority scheduling enabled).`,
+    );
   }
 
   onModuleDestroy(): void {
@@ -118,19 +123,24 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
 
   /** Payload-free worker telemetry consumed by SportsMonitorService. */
   getMonitorStatus(): Record<string, unknown> {
-    const lanes = Object.fromEntries([...this.lanes.entries()].map(([type, lane]) => [type, {
-      running: lane.running,
-      concurrency: LANE_CONCURRENCY,
-      passes: lane.passes,
-      failedPasses: lane.failedPasses,
-      jobsClaimed: lane.claimed,
-      jobsCompleted: lane.completed,
-      jobsRetried: lane.retried,
-      jobsQuarantined: lane.quarantined,
-      lastPassStartedAt: lane.lastStartedAt,
-      lastPassCompletedAt: lane.lastCompletedAt,
-      lastError: lane.lastError,
-    }]));
+    const lanes = Object.fromEntries(
+      [...this.lanes.entries()].map(([type, lane]) => [
+        type,
+        {
+          running: lane.running,
+          concurrency: LANE_CONCURRENCY,
+          passes: lane.passes,
+          failedPasses: lane.failedPasses,
+          jobsClaimed: lane.claimed,
+          jobsCompleted: lane.completed,
+          jobsRetried: lane.retried,
+          jobsQuarantined: lane.quarantined,
+          lastPassStartedAt: lane.lastStartedAt,
+          lastPassCompletedAt: lane.lastCompletedAt,
+          lastError: lane.lastError,
+        },
+      ]),
+    );
     const laneValues = [...this.lanes.values()];
     return {
       workerId: this.instanceId,
@@ -144,10 +154,22 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
       jobsClaimed: laneValues.reduce((sum, lane) => sum + lane.claimed, 0),
       jobsCompleted: laneValues.reduce((sum, lane) => sum + lane.completed, 0),
       jobsRetried: laneValues.reduce((sum, lane) => sum + lane.retried, 0),
-      jobsQuarantined: laneValues.reduce((sum, lane) => sum + lane.quarantined, 0),
-      failedPassCount: laneValues.reduce((sum, lane) => sum + lane.failedPasses, 0),
-      lastPassStartedAt: laneValues.map((lane) => lane.lastStartedAt).filter(Boolean).sort((a, b) => (b?.getTime() ?? 0) - (a?.getTime() ?? 0))[0],
-      lastPassCompletedAt: laneValues.map((lane) => lane.lastCompletedAt).filter(Boolean).sort((a, b) => (b?.getTime() ?? 0) - (a?.getTime() ?? 0))[0],
+      jobsQuarantined: laneValues.reduce(
+        (sum, lane) => sum + lane.quarantined,
+        0,
+      ),
+      failedPassCount: laneValues.reduce(
+        (sum, lane) => sum + lane.failedPasses,
+        0,
+      ),
+      lastPassStartedAt: laneValues
+        .map((lane) => lane.lastStartedAt)
+        .filter(Boolean)
+        .sort((a, b) => (b?.getTime() ?? 0) - (a?.getTime() ?? 0))[0],
+      lastPassCompletedAt: laneValues
+        .map((lane) => lane.lastCompletedAt)
+        .filter(Boolean)
+        .sort((a, b) => (b?.getTime() ?? 0) - (a?.getTime() ?? 0))[0],
       jobsOwnershipLost: this.jobsOwnershipLost,
       recoveredExpiredLeases: this.recoveredExpiredLeases,
       lastJob: this.lastJob ? { ...this.lastJob } : undefined,
@@ -172,10 +194,13 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     const lane = this.lanes.get(type);
     if (!lane || lane.running) return;
     if (lane.timer) clearTimeout(lane.timer);
-    lane.timer = setTimeout(() => {
-      lane.timer = undefined;
-      void this.pumpLane(type);
-    }, Math.max(0, delayMs));
+    lane.timer = setTimeout(
+      () => {
+        lane.timer = undefined;
+        void this.pumpLane(type);
+      },
+      Math.max(0, delayMs),
+    );
     (lane.timer as unknown as { unref?: () => void }).unref?.();
   }
 
@@ -207,14 +232,18 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
       } catch (error) {
         lane.lastError = this.errorMessage(error);
         lane.failedPasses += 1;
-        this.logger.error(`Sports queue lane ${type} failed: ${lane.lastError}`,
-          error instanceof Error ? error.stack : undefined);
+        this.logger.error(
+          `Sports queue lane ${type} failed: ${lane.lastError}`,
+          error instanceof Error ? error.stack : undefined,
+        );
       }
     } catch (error) {
       if (!this.stopped) {
         lane.lastError = this.errorMessage(error);
         lane.failedPasses += 1;
-        this.logger.error(`Sports queue lane ${type} could not acquire background capacity: ${lane.lastError}`);
+        this.logger.error(
+          `Sports queue lane ${type} could not acquire background capacity: ${lane.lastError}`,
+        );
       }
     } finally {
       releasePermit?.();
@@ -224,22 +253,32 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
       if (!this.stopped) {
         // Event wakes may request an immediate check, but the limiter still
         // enforces at least one second between starts in this lane.
-        const delayMs = wakeRequested || processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        const delayMs =
+          wakeRequested || processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
         this.scheduleLane(type, delayMs);
       }
     }
   }
 
-  private async processClaimedJob(job: ClaimedSportsQueueJob, workerId: string): Promise<boolean> {
+  private async processClaimedJob(
+    job: ClaimedSportsQueueJob,
+    workerId: string,
+  ): Promise<boolean> {
     const startedAt = Date.now();
     const heartbeat = setInterval(() => {
-      void this.queue.markHeartbeat(job.jobKey, workerId, LEASE_MS)
+      void this.queue
+        .markHeartbeat(job.jobKey, workerId, LEASE_MS)
         .then((renewed) => {
-          if (!renewed) this.logger.warn(`Lease for Sports queue job ${job.jobKey} is no longer owned by this worker.`);
+          if (!renewed)
+            this.logger.warn(
+              `Lease for Sports queue job ${job.jobKey} is no longer owned by this worker.`,
+            );
         })
-        .catch((error: unknown) => this.logger.warn(
-          `Could not renew Sports queue job lease ${job.jobKey}: ${this.errorMessage(error)}`,
-        ));
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `Could not renew Sports queue job lease ${job.jobKey}: ${this.errorMessage(error)}`,
+          ),
+        );
     }, HEARTBEAT_MS);
     (heartbeat as unknown as { unref?: () => void }).unref?.();
 
@@ -275,7 +314,9 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
       } catch (markError) {
         // Leave the durable processing record leased. Central lease recovery
         // will return it to pending if this acknowledgement write also fails.
-        this.logger.error(`Could not record failure for Sports job ${job.jobKey}: ${this.errorMessage(markError)}`);
+        this.logger.error(
+          `Could not record failure for Sports job ${job.jobKey}: ${this.errorMessage(markError)}`,
+        );
         return false;
       }
       const lane = this.lanes.get(job.type);
@@ -291,7 +332,10 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
         occurredAt: new Date(),
         error: this.errorMessage(error),
       };
-      this.logger.error(`Sports queue job ${job.type} (${job.jobKey}) failed; ${outcome.toLowerCase()}.`, error instanceof Error ? error.stack : undefined);
+      this.logger.error(
+        `Sports queue job ${job.type} (${job.jobKey}) failed; ${outcome.toLowerCase()}.`,
+        error instanceof Error ? error.stack : undefined,
+      );
       return false;
     } finally {
       clearInterval(heartbeat);
@@ -303,7 +347,9 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     this.recoveryRunning = true;
     let releasePermit: (() => void) | undefined;
     try {
-      releasePermit = await this.backgroundWork.acquire('sports:lease-recovery');
+      releasePermit = await this.backgroundWork.acquire(
+        'sports:lease-recovery',
+      );
       if (this.stopped) return;
       const recovered = await this.queue.recoverExpiredProcessing(100);
       this.recoveredExpiredLeases += recovered;
@@ -318,7 +364,9 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
         );
       }
     } catch (error) {
-      this.logger.error(`Sports queue lease recovery failed: ${this.errorMessage(error)}`);
+      this.logger.error(
+        `Sports queue lease recovery failed: ${this.errorMessage(error)}`,
+      );
     } finally {
       releasePermit?.();
       this.recoveryRunning = false;
@@ -337,10 +385,8 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
   private errorMessage(error: unknown): string {
     return error instanceof Error
       ? error.message.replace(/[\r\n]+/g, ' ').slice(0, 500)
-      : String(error).replace(/[\r\n]+/g, ' ').slice(0, 500);
+      : String(error)
+          .replace(/[\r\n]+/g, ' ')
+          .slice(0, 500);
   }
 }
-
-
-
-
