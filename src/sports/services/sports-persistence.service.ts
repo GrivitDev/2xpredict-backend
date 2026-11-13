@@ -6,6 +6,7 @@ import { Model } from 'mongoose';
 import type { ClientSession } from 'mongoose';
 
 import type { SportsMatchFactsWrite } from '../interfaces/sports-match-facts.interface';
+import type { SportsFixtureReadResult } from '../interfaces/sports-read.interface';
 
 import type {
   SportsCompetitionRecord,
@@ -1284,26 +1285,93 @@ export class SportsPersistenceService {
     return records;
   }
 
-  async getAllCompletedFixtures(): Promise<SportsFixtureRecord[]> {
-    const records = (await this.fixtureModel
-      .find({
-        $and: [
-          {
-            $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }],
-          },
-          {
-            $or: [
-              { retentionExpiresAt: { $gt: new Date() } },
-              { retentionExpiresAt: { $exists: false } },
-            ],
-          },
+  /**
+   * Read retained completed fixtures in deterministic keyset pages. The cursor
+   * is based on (kickoffAt, id), so equal kickoff timestamps cannot cause rows
+   * to be skipped or repeated between pages.
+   */
+  async getCompletedFixturesPage(query: {
+    competitionId?: string;
+    seasonId?: string;
+    cursor?: string;
+    limit?: number;
+    /** Include normalized statistics and Summary payload for projection repair passes. */
+    includeProjectionData?: boolean;
+  } = {}): Promise<SportsFixtureReadResult> {
+    const requestedLimit = Number.isFinite(query.limit)
+      ? Math.floor(Number(query.limit))
+      : 100;
+    const limit = Math.max(1, Math.min(250, requestedLimit));
+    const conditions: Record<string, unknown>[] = [
+      {
+        $or: [
+          { 'status.state': 'COMPLETED' },
+          { 'status.isFinal': true },
         ],
+      },
+      {
+        $or: [
+          { retentionExpiresAt: { $gt: new Date() } },
+          { retentionExpiresAt: { $exists: false } },
+          { retentionExpiresAt: null },
+        ],
+      },
+    ];
+
+    if (query.competitionId) conditions.push({ competitionId: query.competitionId });
+    if (query.seasonId) conditions.push({ seasonId: query.seasonId });
+
+    if (query.cursor) {
+      let decoded: { kickoffAt: Date; id: string } | null = null;
+      try {
+        const parsed = JSON.parse(
+          Buffer.from(query.cursor, 'base64url').toString('utf8'),
+        ) as { kickoffAt?: string; id?: string };
+        const kickoffAt = new Date(String(parsed.kickoffAt ?? ''));
+        if (!Number.isNaN(kickoffAt.getTime()) && parsed.id) {
+          decoded = { kickoffAt, id: String(parsed.id) };
+        }
+      } catch {
+        decoded = null;
+      }
+      if (!decoded) throw new Error('Invalid completed-fixture cursor.');
+      conditions.push({
+        $or: [
+          { kickoffAt: { $lt: decoded.kickoffAt } },
+          { kickoffAt: decoded.kickoffAt, id: { $lt: decoded.id } },
+        ],
+      });
+    }
+
+    const rows = await this.fixtureModel
+      .find({ $and: conditions })
+      .sort({ kickoffAt: -1, id: -1 })
+      .limit(limit + 1)
+      .select(query.includeProjectionData ? '-_id' : {
+        _id: 0,
+        id: 1,
+        competitionId: 1,
+        seasonId: 1,
+        kickoffAt: 1,
+        completedAt: 1,
+        status: 1,
+        espnEventId: 1,
       })
-      .sort({ kickoffAt: -1 })
-      .select('-_id')
       .lean()
-      .exec()) as unknown as SportsFixtureRecord[];
-    return records;
+      .exec() as SportsFixtureRecord[];
+
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+    const last = items[items.length - 1];
+    return {
+      items,
+      nextCursor: hasMore && last
+        ? Buffer.from(JSON.stringify({
+            kickoffAt: new Date(last.kickoffAt).toISOString(),
+            id: last.id,
+          })).toString('base64url')
+        : undefined,
+    };
   }
 
   private isSportsFixtureInProgress(fixture: SportsFixtureRecord): boolean {
@@ -1538,5 +1606,3 @@ export class SportsPersistenceService {
     ) as T;
   }
 }
-
-

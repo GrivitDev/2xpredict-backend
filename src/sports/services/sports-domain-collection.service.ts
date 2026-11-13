@@ -14,12 +14,12 @@ import type {
   SportsSeasonRecord,
   SportsTeamRecord,
 } from '../interfaces/sports-domain.interface';
+import type { SportsFixtureReadResult } from '../interfaces/sports-read.interface';
 import { SportsCollectionStateService } from './sports-collection-state.service';
 import { SportsPersistenceService } from './sports-persistence.service';
 import { SportsProviderCollectionService } from './sports-provider-collection.service';
 import { SportsOddsCollectionService } from './sports-odds-collection.service';
 import { SportsMatchFactsNormalizationService } from './sports-match-facts-normalization.service';
-
 
 const timestampOf = (value: unknown): number => {
   if (value instanceof Date) return value.getTime();
@@ -46,12 +46,27 @@ export class SportsDomainCollectionService {
     private readonly matchFactsNormalization: SportsMatchFactsNormalizationService,
   ) {}
 
-  async discoverLeagueCatalogue(): Promise<{ leagueIds: string[]; endpoint: string; totalCount?: number; rawResponse?: Record<string, unknown> }> {
-    const input = this.stateInput('LEAGUE_CATALOGUE', 'GLOBAL', 'ESPN_SOCCER', '/leagues', 7 * 24 * 60 * 60_000);
+  async discoverLeagueCatalogue(): Promise<{
+    leagueIds: string[];
+    endpoint: string;
+    totalCount?: number;
+    rawResponse?: Record<string, unknown>;
+  }> {
+    const input = this.stateInput(
+      'LEAGUE_CATALOGUE',
+      'GLOBAL',
+      'ESPN_SOCCER',
+      '/leagues',
+      7 * 24 * 60 * 60_000,
+    );
     await this.state.markStarted(input);
     try {
       const result = await this.provider.discoverLeagueCatalogue();
-      await this.state.markSucceeded(input, result.rawResponse, result.endpoint);
+      await this.state.markSucceeded(
+        input,
+        result.rawResponse,
+        result.endpoint,
+      );
       return result;
     } catch (error) {
       await this.state.markFailed(input, error);
@@ -59,8 +74,16 @@ export class SportsDomainCollectionService {
     }
   }
 
-  async collectLeagueDetails(leagueId: string): Promise<SportsCompetitionRecord> {
-    const input = this.stateInput('LEAGUE_DETAILS', 'GLOBAL', leagueId, `/leagues/${leagueId}`, 7 * 24 * 60 * 60_000);
+  async collectLeagueDetails(
+    leagueId: string,
+  ): Promise<SportsCompetitionRecord> {
+    const input = this.stateInput(
+      'LEAGUE_DETAILS',
+      'GLOBAL',
+      leagueId,
+      `/leagues/${leagueId}`,
+      7 * 24 * 60 * 60_000,
+    );
     await this.state.markStarted(input);
     try {
       const competition = await this.provider.collectLeagueDetails(leagueId);
@@ -73,7 +96,9 @@ export class SportsDomainCollectionService {
     }
   }
 
-  async getCompetition(competitionId: string): Promise<SportsCompetitionRecord | null> {
+  async getCompetition(
+    competitionId: string,
+  ): Promise<SportsCompetitionRecord | null> {
     return this.persistence.getCompetitionById(competitionId);
   }
 
@@ -88,26 +113,54 @@ export class SportsDomainCollectionService {
   async collectSeasonCatalogue(
     leagueId: string,
     competitionId: string,
-  ): Promise<{ items: SportsSeasonRecord[]; newlyDiscovered: SportsSeasonRecord[]; endpoint: string; rawResponse?: Record<string, unknown> }> {
-    const competition = await this.persistence.getCompetitionById(competitionId);
-    if (!competition) throw new Error(`Cannot collect seasons: competition ${competitionId} is not persisted.`);
-    const input = this.stateInput('SEASON_CATALOGUE', 'COMPETITION', competitionId, `/leagues/${leagueId}#current-season`, 7 * 24 * 60 * 60_000);
+  ): Promise<{
+    items: SportsSeasonRecord[];
+    newlyDiscovered: SportsSeasonRecord[];
+    endpoint: string;
+    rawResponse?: Record<string, unknown>;
+  }> {
+    const competition =
+      await this.persistence.getCompetitionById(competitionId);
+    if (!competition)
+      throw new Error(
+        `Cannot collect seasons: competition ${competitionId} is not persisted.`,
+      );
+    const input = this.stateInput(
+      'SEASON_CATALOGUE',
+      'COMPETITION',
+      competitionId,
+      `/leagues/${leagueId}#current-season`,
+      7 * 24 * 60 * 60_000,
+    );
     await this.state.markStarted(input);
     try {
-      const existing = await this.persistence.getAllSeasonsForCompetition(competitionId);
-      const result = await this.provider.collectSeasonCatalogue(leagueId, competition);
-      const currentSeason = result.items.find(
-        (season) => season.year === competition.currentSeasonYear,
-      ) ?? result.items.find((season) => season.isCurrent);
+      const existing =
+        await this.persistence.getAllSeasonsForCompetition(competitionId);
+      const result = await this.provider.collectSeasonCatalogue(
+        leagueId,
+        competition,
+      );
+      const currentSeason =
+        result.items.find(
+          (season) => season.year === competition.currentSeasonYear,
+        ) ?? result.items.find((season) => season.isCurrent);
       if (!currentSeason) {
-        throw new Error(`ESPN did not provide a current season for ${leagueId}; historical seasons were not persisted.`);
+        throw new Error(
+          `ESPN did not provide a current season for ${leagueId}; historical seasons were not persisted.`,
+        );
       }
       const persistedCurrentSeason = { ...currentSeason, isCurrent: true };
       await this.persistence.saveCurrentSeason(persistedCurrentSeason);
-      await this.state.markSucceeded(input, result.rawResponse, result.endpoint);
+      await this.state.markSucceeded(
+        input,
+        result.rawResponse,
+        result.endpoint,
+      );
       return {
         items: [persistedCurrentSeason],
-        newlyDiscovered: existing.some((season) => season.id === persistedCurrentSeason.id)
+        newlyDiscovered: existing.some(
+          (season) => season.id === persistedCurrentSeason.id,
+        )
           ? []
           : [persistedCurrentSeason],
         endpoint: result.endpoint,
@@ -123,21 +176,44 @@ export class SportsDomainCollectionService {
     return this.persistence.getSeasonById(seasonId);
   }
 
-  async getSeasonByYear(competitionId: string, year: number): Promise<SportsSeasonRecord | null> {
+  async getSeasonByYear(
+    competitionId: string,
+    year: number,
+  ): Promise<SportsSeasonRecord | null> {
     return this.persistence.getSeasonByYear(competitionId, year);
   }
 
-  async collectTeamCatalogue(leagueId: string, competitionId: string): Promise<TeamCatalogueResult> {
-    const competition = await this.persistence.getCompetitionById(competitionId);
-    if (!competition) throw new Error(`Cannot collect teams: competition ${competitionId} is not persisted.`);
-    const input = this.stateInput('TEAM_CATALOGUE', 'COMPETITION', competitionId, `/leagues/${leagueId}/seasons/${competition.currentSeasonYear ?? ''}/teams`, 7 * 24 * 60 * 60_000);
+  async collectTeamCatalogue(
+    leagueId: string,
+    competitionId: string,
+  ): Promise<TeamCatalogueResult> {
+    const competition =
+      await this.persistence.getCompetitionById(competitionId);
+    if (!competition)
+      throw new Error(
+        `Cannot collect teams: competition ${competitionId} is not persisted.`,
+      );
+    const input = this.stateInput(
+      'TEAM_CATALOGUE',
+      'COMPETITION',
+      competitionId,
+      `/leagues/${leagueId}/seasons/${competition.currentSeasonYear ?? ''}/teams`,
+      7 * 24 * 60 * 60_000,
+    );
     await this.state.markStarted(input);
     try {
-      const result = await this.provider.collectTeamCatalogue(leagueId, competition);
+      const result = await this.provider.collectTeamCatalogue(
+        leagueId,
+        competition,
+      );
       // Team membership is season-scoped. Keep only current-season participants
       // attached to this league while preserving memberships in other leagues.
       await this.persistence.reconcileTeamsForLeague(leagueId, result.teamIds);
-      await this.state.markSucceeded(input, result.rawResponse, result.endpoint);
+      await this.state.markSucceeded(
+        input,
+        result.rawResponse,
+        result.endpoint,
+      );
       return result;
     } catch (error) {
       await this.state.markFailed(input, error);
@@ -149,11 +225,25 @@ export class SportsDomainCollectionService {
     return this.persistence.getTeamsForLeague(leagueId);
   }
 
-  async collectTeamDetails(leagueId: string, espnTeamId: string, teamReference?: string): Promise<SportsTeamRecord> {
-    const input = this.stateInput('TEAM_DETAILS', 'TEAM', `team:${espnTeamId}`, teamReference ?? `/leagues/${leagueId}/teams/${espnTeamId}`, 30 * 24 * 60 * 60_000);
+  async collectTeamDetails(
+    leagueId: string,
+    espnTeamId: string,
+    teamReference?: string,
+  ): Promise<SportsTeamRecord> {
+    const input = this.stateInput(
+      'TEAM_DETAILS',
+      'TEAM',
+      `team:${espnTeamId}`,
+      teamReference ?? `/leagues/${leagueId}/teams/${espnTeamId}`,
+      30 * 24 * 60 * 60_000,
+    );
     await this.state.markStarted(input);
     try {
-      const result = await this.provider.collectTeamDetails(leagueId, espnTeamId, teamReference);
+      const result = await this.provider.collectTeamDetails(
+        leagueId,
+        espnTeamId,
+        teamReference,
+      );
       await this.persistence.saveTeams([result]);
       await this.state.markSucceeded(input, result.rawPayload);
       return result;
@@ -169,10 +259,20 @@ export class SportsDomainCollectionService {
     scope: { competitionId: string; seasonId: string; seasonYear: number },
   ): Promise<FixtureCollectionResult> {
     const monthKey = `${scope.seasonId}:${month.replace('-', '')}`;
-    const input = this.stateInput('FIXTURE_MONTHLY_BOOTSTRAP', 'SEASON', monthKey, `/leagues/${leagueId}/scoreboard?dates=${month.replace('-', '')}`, 0);
+    const input = this.stateInput(
+      'FIXTURE_MONTHLY_BOOTSTRAP',
+      'SEASON',
+      monthKey,
+      `/leagues/${leagueId}/scoreboard?dates=${month.replace('-', '')}`,
+      0,
+    );
     await this.state.markStarted(input);
     try {
-      const result = await this.provider.collectMonthlyFixtures(leagueId, month, scope);
+      const result = await this.provider.collectMonthlyFixtures(
+        leagueId,
+        month,
+        scope,
+      );
       const unresolved: string[] = [];
       const recovered: SportsFixtureRecord[] = [];
       let retryableFallbackError: unknown;
@@ -182,18 +282,25 @@ export class SportsDomainCollectionService {
           continue;
         }
         try {
-          const summaryFixture = await this.collectFixtureSummary(leagueId, rejected.eventId, scope);
+          const summaryFixture = await this.collectFixtureSummary(
+            leagueId,
+            rejected.eventId,
+            scope,
+          );
           if (summaryFixture) recovered.push(summaryFixture);
           else unresolved.push(rejected.eventId);
         } catch (error) {
           unresolved.push(rejected.eventId);
-          if (this.isRetryableProviderError(error)) retryableFallbackError ??= error;
+          if (this.isRetryableProviderError(error))
+            retryableFallbackError ??= error;
         }
       }
       if (recovered.length) result.items.push(...recovered);
       if (unresolved.length) {
         if (retryableFallbackError) throw retryableFallbackError;
-        throw new Error(`Monthly fixture collection ${leagueId}/${month} has ${unresolved.length} unresolved event(s): ${unresolved.slice(0, 10).join(', ')}.`);
+        throw new Error(
+          `Monthly fixture collection ${leagueId}/${month} has ${unresolved.length} unresolved event(s): ${unresolved.slice(0, 10).join(', ')}.`,
+        );
       }
       const saved = await this.persistence.saveFixtures(result.items);
       result.previousStates = saved.previousStates;
@@ -210,10 +317,20 @@ export class SportsDomainCollectionService {
     date: string,
     scope: { competitionId: string; seasonId: string; seasonYear: number },
   ): Promise<FixtureCollectionResult> {
-    const input = this.stateInput('FIXTURE_DAILY_SCOREBOARD', 'COMPETITION', `${scope.competitionId}:${scope.seasonId}:${date}`, `/leagues/${leagueId}/scoreboard?dates=${date.replace(/-/g, '')}`, 0);
+    const input = this.stateInput(
+      'FIXTURE_DAILY_SCOREBOARD',
+      'COMPETITION',
+      `${scope.competitionId}:${scope.seasonId}:${date}`,
+      `/leagues/${leagueId}/scoreboard?dates=${date.replace(/-/g, '')}`,
+      0,
+    );
     await this.state.markStarted(input);
     try {
-      const result = await this.provider.collectDailyFixtures(leagueId, date, scope);
+      const result = await this.provider.collectDailyFixtures(
+        leagueId,
+        date,
+        scope,
+      );
       const saved = await this.persistence.saveFixtures(result.items);
       result.previousStates = saved.previousStates;
       await this.state.markSucceeded(input, undefined, result.endpoint);
@@ -224,11 +341,21 @@ export class SportsDomainCollectionService {
     }
   }
 
-  async isFixtureSummaryFallbackFresh(eventId: string, maxAgeMs = 24 * 60 * 60_000): Promise<boolean> {
-    const state = await this.state.getState('MATCH_SUMMARY_FALLBACK', 'FIXTURE', `fixture:${eventId}`);
+  async isFixtureSummaryFallbackFresh(
+    eventId: string,
+    maxAgeMs = 24 * 60 * 60_000,
+  ): Promise<boolean> {
+    const state = await this.state.getState(
+      'MATCH_SUMMARY_FALLBACK',
+      'FIXTURE',
+      `fixture:${eventId}`,
+    );
     if (state?.status !== 'SUCCEEDED' || !state.lastSuccessfulAt) return false;
     const succeededAt = new Date(state.lastSuccessfulAt).getTime();
-    return Number.isFinite(succeededAt) && Date.now() - succeededAt < Math.max(0, maxAgeMs);
+    return (
+      Number.isFinite(succeededAt) &&
+      Date.now() - succeededAt < Math.max(0, maxAgeMs)
+    );
   }
 
   /**
@@ -241,14 +368,16 @@ export class SportsDomainCollectionService {
     maxAgeMs = 20 * 60_000,
     retryCooldownMs = 5 * 60_000,
   ): Promise<boolean> {
-    const storedSummary = await this.persistence.getMatchSummaryByEventId(eventId);
+    const storedSummary =
+      await this.persistence.getMatchSummaryByEventId(eventId);
     const rawCollectedAt = timestampOf(storedSummary?.lastCollectedAt);
     const now = Date.now();
     if (
       Number.isFinite(rawCollectedAt) &&
       now >= rawCollectedAt &&
       now - rawCollectedAt < Math.max(0, maxAgeMs)
-    ) return false;
+    )
+      return false;
 
     const state = await this.state.getState(
       'MATCH_SUMMARY_FALLBACK',
@@ -268,9 +397,10 @@ export class SportsDomainCollectionService {
     }
 
     if (state.status === 'PROCESSING' || state.status === 'FAILED') {
-      const recentAttemptValue = state.status === 'PROCESSING'
-        ? state.lastStartedAt ?? state.updatedAt
-        : state.updatedAt ?? state.lastStartedAt;
+      const recentAttemptValue =
+        state.status === 'PROCESSING'
+          ? (state.lastStartedAt ?? state.updatedAt)
+          : (state.updatedAt ?? state.lastStartedAt);
       const recentAttemptAt = timestampOf(recentAttemptValue);
       if (
         Number.isFinite(recentAttemptAt) &&
@@ -297,9 +427,14 @@ export class SportsDomainCollectionService {
     );
     await this.state.markStarted(input);
     try {
-      const result = await this.provider.collectFixtureSummary(leagueId, eventId, scope);
+      const result = await this.provider.collectFixtureSummary(
+        leagueId,
+        eventId,
+        scope,
+      );
       const existingFixture = await this.persistence.getFixtureById(eventId);
-      const fixtureId = result.fixture?.id ?? existingFixture?.id ?? `fixture:${eventId}`;
+      const fixtureId =
+        result.fixture?.id ?? existingFixture?.id ?? `fixture:${eventId}`;
       const endpoint = `/leagues/${leagueId}/summary?event=${eventId}`;
 
       // Persist the complete provider response before attempting fixture fallback persistence.
@@ -308,8 +443,14 @@ export class SportsDomainCollectionService {
         fixtureId,
         espnEventId: eventId,
         competitionId: scope.competitionId,
-        seasonId: result.fixture?.seasonId ?? scope.seasonId ?? existingFixture?.seasonId,
-        seasonYear: result.fixture?.seasonYear ?? scope.seasonYear ?? existingFixture?.seasonYear,
+        seasonId:
+          result.fixture?.seasonId ??
+          scope.seasonId ??
+          existingFixture?.seasonId,
+        seasonYear:
+          result.fixture?.seasonYear ??
+          scope.seasonYear ??
+          existingFixture?.seasonYear,
         endpoint,
         rawPayload: result.rawResponse,
         collectedAt,
@@ -321,8 +462,14 @@ export class SportsDomainCollectionService {
         fixtureId,
         espnEventId: eventId,
         competitionId: scope.competitionId,
-        seasonId: result.fixture?.seasonId ?? scope.seasonId ?? existingFixture?.seasonId,
-        seasonYear: result.fixture?.seasonYear ?? scope.seasonYear ?? existingFixture?.seasonYear,
+        seasonId:
+          result.fixture?.seasonId ??
+          scope.seasonId ??
+          existingFixture?.seasonId,
+        seasonYear:
+          result.fixture?.seasonYear ??
+          scope.seasonYear ??
+          existingFixture?.seasonYear,
         endpoint,
         sourcePayloadHash: storedSummary.payloadHash,
         sourceRevision: storedSummary.revision,
@@ -355,7 +502,13 @@ export class SportsDomainCollectionService {
     date?: string,
   ): Promise<FixtureCollectionResult> {
     const endpoint = '/scoreboard';
-    const input = this.stateInput('LIVE_SCOREBOARD', 'COMPETITION', `${scope.competitionId}:${date ?? 'CURRENT'}`, endpoint, 2 * 60_000);
+    const input = this.stateInput(
+      'LIVE_SCOREBOARD',
+      'COMPETITION',
+      `${scope.competitionId}:${date ?? 'CURRENT'}`,
+      endpoint,
+      2 * 60_000,
+    );
     await this.state.markStarted(input);
     try {
       const result = await this.provider.collectLiveScoreboard(leagueId, scope);
@@ -368,17 +521,24 @@ export class SportsDomainCollectionService {
           continue;
         }
         try {
-          const summaryFixture = await this.collectFixtureSummary(leagueId, rejected.eventId, scope);
+          const summaryFixture = await this.collectFixtureSummary(
+            leagueId,
+            rejected.eventId,
+            scope,
+          );
           if (summaryFixture) recovered.push(summaryFixture);
           else unresolved.push(rejected.eventId);
         } catch (error) {
           unresolved.push(rejected.eventId);
-          if (this.isRetryableProviderError(error)) retryableFallbackError ??= error;
+          if (this.isRetryableProviderError(error))
+            retryableFallbackError ??= error;
         }
       }
       if (unresolved.length) {
         if (retryableFallbackError) throw retryableFallbackError;
-        throw new Error(`Live scoreboard ${leagueId} has ${unresolved.length} event(s) that could not be recovered from Summary.`);
+        throw new Error(
+          `Live scoreboard ${leagueId} has ${unresolved.length} event(s) that could not be recovered from Summary.`,
+        );
       }
       if (recovered.length) result.items.push(...recovered);
       const saved = await this.persistence.saveFixtures(result.items);
@@ -391,20 +551,44 @@ export class SportsDomainCollectionService {
     }
   }
 
-  async collectMatchOdds(fixture: SportsFixtureRecord): Promise<OddsCollectionResult> {
-    if (fixture.status.isFinal || fixture.status.state !== 'SCHEDULED' || Date.now() >= fixture.kickoffAt.getTime()) {
-      return { snapshot: null, endpoint: 'pre-match-only', fallbackUsed: false };
+  async collectMatchOdds(
+    fixture: SportsFixtureRecord,
+  ): Promise<OddsCollectionResult> {
+    if (
+      fixture.status.isFinal ||
+      fixture.status.state !== 'SCHEDULED' ||
+      Date.now() >= fixture.kickoffAt.getTime()
+    ) {
+      return {
+        snapshot: null,
+        endpoint: 'pre-match-only',
+        fallbackUsed: false,
+      };
     }
     const home = fixture.competitors.find((item) => item.homeAway === 'HOME');
     const away = fixture.competitors.find((item) => item.homeAway === 'AWAY');
-    if (!home || !away) throw new Error(`Fixture ${fixture.id} has no home/away team context for odds.`);
+    if (!home || !away)
+      throw new Error(
+        `Fixture ${fixture.id} has no home/away team context for odds.`,
+      );
     const [homeTeam, awayTeam] = await Promise.all([
       this.persistence.getTeamById(home.teamId),
       this.persistence.getTeamById(away.teamId),
     ]);
-    const league = await this.persistence.getCompetitionById(fixture.competitionId);
-    if (!league) throw new Error(`Fixture ${fixture.id} references missing competition ${fixture.competitionId}.`);
-    const input = this.stateInput('MATCH_ODDS', 'FIXTURE', fixture.id, `/leagues/${league.slug}/events/${fixture.espnEventId}/competitions/${fixture.espnCompetitionId ?? fixture.espnEventId}/odds`, 0);
+    const league = await this.persistence.getCompetitionById(
+      fixture.competitionId,
+    );
+    if (!league)
+      throw new Error(
+        `Fixture ${fixture.id} references missing competition ${fixture.competitionId}.`,
+      );
+    const input = this.stateInput(
+      'MATCH_ODDS',
+      'FIXTURE',
+      fixture.id,
+      `/leagues/${league.slug}/events/${fixture.espnEventId}/competitions/${fixture.espnCompetitionId ?? fixture.espnEventId}/odds`,
+      0,
+    );
     await this.state.markStarted(input);
     try {
       const result = await this.oddsCollection.collectFixtureOdds({
@@ -419,7 +603,8 @@ export class SportsDomainCollectionService {
       });
 
       if (!result.snapshot) {
-        const reason = result.reason ||
+        const reason =
+          result.reason ||
           `ESPN and configured fallback providers have no usable odds for fixture ${fixture.id}.`;
         // A successfully completed lookup with no published prices is an
         // expected checkpoint outcome, not a failed collection. Do not throw:
@@ -457,11 +642,25 @@ export class SportsDomainCollectionService {
     }
   }
 
-  async collectMatchPlays(fixture: SportsFixtureRecord): Promise<PlaysCollectionResult | null> {
-    if (!(fixture.status.isFinal || fixture.status.state === 'COMPLETED')) return null;
-    const competition = await this.persistence.getCompetitionById(fixture.competitionId);
-    if (!competition) throw new Error(`Fixture ${fixture.id} references a missing competition.`);
-    const input = this.stateInput('MATCH_PLAYS', 'FIXTURE', fixture.id, `/leagues/${competition.slug}/events/${fixture.espnEventId}/competitions/${fixture.espnCompetitionId ?? fixture.espnEventId}/plays`, 0);
+  async collectMatchPlays(
+    fixture: SportsFixtureRecord,
+  ): Promise<PlaysCollectionResult | null> {
+    if (!(fixture.status.isFinal || fixture.status.state === 'COMPLETED'))
+      return null;
+    const competition = await this.persistence.getCompetitionById(
+      fixture.competitionId,
+    );
+    if (!competition)
+      throw new Error(
+        `Fixture ${fixture.id} references a missing competition.`,
+      );
+    const input = this.stateInput(
+      'MATCH_PLAYS',
+      'FIXTURE',
+      fixture.id,
+      `/leagues/${competition.slug}/events/${fixture.espnEventId}/competitions/${fixture.espnCompetitionId ?? fixture.espnEventId}/plays`,
+      0,
+    );
     await this.state.markStarted(input);
     try {
       const result = await this.provider.collectMatchPlays({
@@ -471,7 +670,8 @@ export class SportsDomainCollectionService {
         competitionId: fixture.espnCompetitionId ?? fixture.espnEventId,
       });
       if (result.noDataReason || result.items.length === 0) {
-        const reason = result.noDataReason ||
+        const reason =
+          result.noDataReason ||
           'ESPN Core Plays and Summary returned no normalizable timeline events.';
         await this.state.markNoData(
           input,
@@ -500,9 +700,17 @@ export class SportsDomainCollectionService {
     }
   }
 
-
-  async markSeasonMonthlyBootstrapCompleted(seasonId: string, endpoint: string): Promise<void> {
-    const input = this.stateInput('FIXTURE_MONTHLY_BOOTSTRAP_COMPLETE', 'SEASON', seasonId, endpoint, 0);
+  async markSeasonMonthlyBootstrapCompleted(
+    seasonId: string,
+    endpoint: string,
+  ): Promise<void> {
+    const input = this.stateInput(
+      'FIXTURE_MONTHLY_BOOTSTRAP_COMPLETE',
+      'SEASON',
+      seasonId,
+      endpoint,
+      0,
+    );
     await this.state.markSucceeded(input);
   }
 
@@ -511,40 +719,93 @@ export class SportsDomainCollectionService {
     return state?.status === 'SUCCEEDED';
   }
 
-  async isMonthlyFixtureMonthCollected(seasonId: string, month: string): Promise<boolean> {
+  async isMonthlyFixtureMonthCollected(
+    seasonId: string,
+    month: string,
+  ): Promise<boolean> {
     const scopeId = `${seasonId}:${month.replace('-', '')}`;
-    const state = await this.state.getState('FIXTURE_MONTHLY_BOOTSTRAP', 'SEASON', scopeId);
+    const state = await this.state.getState(
+      'FIXTURE_MONTHLY_BOOTSTRAP',
+      'SEASON',
+      scopeId,
+    );
     return state?.status === 'SUCCEEDED';
   }
 
-  async isDailyValidationComplete(competitionId: string, seasonId: string, date: string): Promise<boolean> {
-    const state = await this.state.getFixtureDayValidation(competitionId, seasonId, date);
-    return ['FIXTURES_FOUND', 'NO_FIXTURES_CONFIRMED', 'RECOVERED_FROM_SUMMARY'].includes(String(state?.validationResult));
+  async isDailyValidationComplete(
+    competitionId: string,
+    seasonId: string,
+    date: string,
+  ): Promise<boolean> {
+    const state = await this.state.getFixtureDayValidation(
+      competitionId,
+      seasonId,
+      date,
+    );
+    return [
+      'FIXTURES_FOUND',
+      'NO_FIXTURES_CONFIRMED',
+      'RECOVERED_FROM_SUMMARY',
+    ].includes(String(state?.validationResult));
   }
 
-  async isSeasonDailyValidationComplete(competitionId: string, seasonId: string, fixedEndDate?: string): Promise<boolean> {
+  async isSeasonDailyValidationComplete(
+    competitionId: string,
+    seasonId: string,
+    fixedEndDate?: string,
+  ): Promise<boolean> {
     const season = await this.persistence.getSeasonById(seasonId);
     if (!season) return false;
     if (!season.startDate) return false;
-    const start = new Date(Date.UTC(new Date(season.startDate).getUTCFullYear(), new Date(season.startDate).getUTCMonth(), new Date(season.startDate).getUTCDate()));
-    const rawEnd = fixedEndDate ? new Date(`${fixedEndDate}T00:00:00.000Z`) : season.endDate ?? (season.isCurrent ? new Date() : undefined);
+    const start = new Date(
+      Date.UTC(
+        new Date(season.startDate).getUTCFullYear(),
+        new Date(season.startDate).getUTCMonth(),
+        new Date(season.startDate).getUTCDate(),
+      ),
+    );
+    const rawEnd = fixedEndDate
+      ? new Date(`${fixedEndDate}T00:00:00.000Z`)
+      : (season.endDate ?? (season.isCurrent ? new Date() : undefined));
     if (!rawEnd) return false;
     const endDate = new Date(rawEnd);
-    const end = new Date(Date.UTC(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate()));
-    const existingFixtureDates = new Set(await this.persistence.getFixtureDateKeysForSeason(competitionId, seasonId));
-    const validatedDates = new Set(await this.state.getSeasonValidatedDates(competitionId, seasonId));
+    const end = new Date(
+      Date.UTC(
+        endDate.getUTCFullYear(),
+        endDate.getUTCMonth(),
+        endDate.getUTCDate(),
+      ),
+    );
+    const existingFixtureDates = new Set(
+      await this.persistence.getFixtureDateKeysForSeason(
+        competitionId,
+        seasonId,
+      ),
+    );
+    const validatedDates = new Set(
+      await this.state.getSeasonValidatedDates(competitionId, seasonId),
+    );
     // Bootstrap validation is required only for dates with zero persisted
     // fixtures. Dates that already contain fixtures are reconciled by their
     // scheduled date-level refresh jobs (48h, 18h and post-match).
-    for (const cursor = new Date(start); cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    for (
+      const cursor = new Date(start);
+      cursor <= end;
+      cursor.setUTCDate(cursor.getUTCDate() + 1)
+    ) {
       const date = cursor.toISOString().slice(0, 10);
-      if (!existingFixtureDates.has(date) && !validatedDates.has(date)) return false;
+      if (!existingFixtureDates.has(date) && !validatedDates.has(date))
+        return false;
     }
     return true;
   }
 
   async hasCollectedMatchPlays(fixtureId: string): Promise<boolean> {
-    const state = await this.state.getState('MATCH_PLAYS', 'FIXTURE', fixtureId);
+    const state = await this.state.getState(
+      'MATCH_PLAYS',
+      'FIXTURE',
+      fixtureId,
+    );
     return state?.status === 'SUCCEEDED';
   }
 
@@ -553,8 +814,15 @@ export class SportsDomainCollectionService {
    * is not proof that the complete Core Plays collection was obtained.
    */
   async hasCompleteMatchPlays(fixtureId: string): Promise<boolean> {
-    const state = await this.state.getState('MATCH_PLAYS', 'FIXTURE', fixtureId);
-    return state?.status === 'SUCCEEDED' && /\/plays(?:[?#]|$)/i.test(String(state.endpoint ?? ''));
+    const state = await this.state.getState(
+      'MATCH_PLAYS',
+      'FIXTURE',
+      fixtureId,
+    );
+    return (
+      state?.status === 'SUCCEEDED' &&
+      /\/plays(?:[?#]|$)/i.test(String(state.endpoint ?? ''))
+    );
   }
 
   /**
@@ -566,7 +834,11 @@ export class SportsDomainCollectionService {
     fixtureId: string,
     retryCooldownMs = 30 * 60_000,
   ): Promise<boolean> {
-    const state = await this.state.getState('MATCH_PLAYS', 'FIXTURE', fixtureId);
+    const state = await this.state.getState(
+      'MATCH_PLAYS',
+      'FIXTURE',
+      fixtureId,
+    );
     if (!state) return true;
     if (
       state.status === 'SUCCEEDED' &&
@@ -575,11 +847,12 @@ export class SportsDomainCollectionService {
       return false;
     }
 
-    const attemptValue = state.status === 'PROCESSING'
-      ? state.lastStartedAt ?? state.updatedAt
-      : state.status === 'SUCCEEDED'
-        ? state.lastSuccessfulAt ?? state.updatedAt
-        : state.updatedAt ?? state.lastStartedAt;
+    const attemptValue =
+      state.status === 'PROCESSING'
+        ? (state.lastStartedAt ?? state.updatedAt)
+        : state.status === 'SUCCEEDED'
+          ? (state.lastSuccessfulAt ?? state.updatedAt)
+          : (state.updatedAt ?? state.lastStartedAt);
     const attemptAt = timestampOf(attemptValue);
     const now = Date.now();
     if (
@@ -592,10 +865,21 @@ export class SportsDomainCollectionService {
     return true;
   }
 
-  async shouldContinueLiveScoreboard(competitionId: string, date: string): Promise<boolean> {
-    const fixtures = await this.persistence.getFixturesForCompetitionDate(competitionId, date);
+  async shouldContinueLiveScoreboard(
+    competitionId: string,
+    date: string,
+  ): Promise<boolean> {
+    const fixtures = await this.persistence.getFixturesForCompetitionDate(
+      competitionId,
+      date,
+    );
     if (!fixtures.length) return false;
-    const terminal = new Set(['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED']);
+    const terminal = new Set([
+      'COMPLETED',
+      'POSTPONED',
+      'CANCELLED',
+      'ABANDONED',
+    ]);
     return fixtures.some((fixture) => !terminal.has(fixture.status.state));
   }
 
@@ -604,18 +888,29 @@ export class SportsDomainCollectionService {
     cursorKickoffAt?: string;
     cursorFixtureId?: string;
     limit: number;
-  }): Promise<Array<{
-    fixture: SportsFixtureRecord;
-    summaryPayloadHash?: string;
-    factsPayloadHash?: string;
-  }>> {
+  }): Promise<
+    Array<{
+      fixture: SportsFixtureRecord;
+      summaryPayloadHash?: string;
+      factsPayloadHash?: string;
+    }>
+  > {
     return this.persistence.getSummaryBackfillPage(input);
   }
 
   /** Rebuild normalized facts from a retained raw Summary without an ESPN call. */
-  async normalizeStoredMatchSummary(fixture: SportsFixtureRecord): Promise<boolean> {
-    const summary = await this.persistence.getMatchSummaryByFixtureId(fixture.id);
-    if (!summary || !summary.rawPayload || typeof summary.rawPayload !== 'object') return false;
+  async normalizeStoredMatchSummary(
+    fixture: SportsFixtureRecord,
+  ): Promise<boolean> {
+    const summary = await this.persistence.getMatchSummaryByFixtureId(
+      fixture.id,
+    );
+    if (
+      !summary ||
+      !summary.rawPayload ||
+      typeof summary.rawPayload !== 'object'
+    )
+      return false;
 
     const normalized = await this.matchFactsNormalization.normalizeAndPersist({
       fixtureId: fixture.id,
@@ -623,11 +918,16 @@ export class SportsDomainCollectionService {
       competitionId: fixture.competitionId,
       seasonId: fixture.seasonId ?? summary.seasonId,
       seasonYear: fixture.seasonYear ?? summary.seasonYear,
-      endpoint: String(summary.endpoint ?? `/summary?event=${fixture.espnEventId}`),
+      endpoint: String(
+        summary.endpoint ?? `/summary?event=${fixture.espnEventId}`,
+      ),
       sourcePayloadHash: String(summary.payloadHash ?? ''),
       sourceRevision: Math.max(1, Number(summary.revision ?? 1)),
       sourceCollectedAt: new Date(
-        summary.lastCollectedAt ?? summary.firstCollectedAt ?? fixture.completedAt ?? fixture.kickoffAt,
+        summary.lastCollectedAt ??
+          summary.firstCollectedAt ??
+          fixture.completedAt ??
+          fixture.kickoffAt,
       ),
       rawPayload: summary.rawPayload as Record<string, unknown>,
       fixture,
@@ -639,15 +939,26 @@ export class SportsDomainCollectionService {
     return this.persistence.getFixtureById(fixtureId);
   }
 
-  async getFixturesForCompetitionDate(competitionId: string, date: string): Promise<SportsFixtureRecord[]> {
+  async getFixturesForCompetitionDate(
+    competitionId: string,
+    date: string,
+  ): Promise<SportsFixtureRecord[]> {
     return this.persistence.getFixturesForCompetitionDate(competitionId, date);
   }
 
-  async getAllCompletedFixtures(): Promise<SportsFixtureRecord[]> {
-    return this.persistence.getAllCompletedFixtures();
+  async getCompletedFixturesPage(query: {
+    competitionId?: string;
+    seasonId?: string;
+    cursor?: string;
+    limit?: number;
+    includeProjectionData?: boolean;
+  } = {}): Promise<SportsFixtureReadResult> {
+    return this.persistence.getCompletedFixturesPage(query);
   }
 
-  async pruneExpiredFixtures(batchSize = 250): Promise<{ deletedCount: number; affectedCompetitionIds: string[] }> {
+  async pruneExpiredFixtures(
+    batchSize = 250,
+  ): Promise<{ deletedCount: number; affectedCompetitionIds: string[] }> {
     return this.persistence.pruneExpiredFixtures(batchSize);
   }
 
@@ -655,12 +966,21 @@ export class SportsDomainCollectionService {
     return this.persistence.getCurrentSeasonCompetitions();
   }
 
-  async getCurrentSeasonFixtures(competitionId: string, seasonId: string): Promise<SportsFixtureRecord[]> {
+  async getCurrentSeasonFixtures(
+    competitionId: string,
+    seasonId: string,
+  ): Promise<SportsFixtureRecord[]> {
     return this.persistence.getCurrentSeasonFixtures(competitionId, seasonId);
   }
 
-  async getFixtureDateKeysForSeason(competitionId: string, seasonId: string): Promise<string[]> {
-    return this.persistence.getFixtureDateKeysForSeason(competitionId, seasonId);
+  async getFixtureDateKeysForSeason(
+    competitionId: string,
+    seasonId: string,
+  ): Promise<string[]> {
+    return this.persistence.getFixtureDateKeysForSeason(
+      competitionId,
+      seasonId,
+    );
   }
 
   async recordFixtureDayValidation(input: {
@@ -669,7 +989,11 @@ export class SportsDomainCollectionService {
     leagueId: string;
     date: string;
     endpoint: string;
-    result: 'FIXTURES_FOUND' | 'NO_FIXTURES_CONFIRMED' | 'RECOVERED_FROM_SUMMARY' | 'INCOMPLETE';
+    result:
+      | 'FIXTURES_FOUND'
+      | 'NO_FIXTURES_CONFIRMED'
+      | 'RECOVERED_FROM_SUMMARY'
+      | 'INCOMPLETE';
     receivedCount: number;
     persistedCount: number;
     missingCount: number;
@@ -679,8 +1003,12 @@ export class SportsDomainCollectionService {
   }
 
   private isRetryableProviderError(error: unknown): boolean {
-    return Boolean(error && typeof error === 'object' && 'retryable' in error
-      && (error as { retryable?: unknown }).retryable === true);
+    return Boolean(
+      error &&
+      typeof error === 'object' &&
+      'retryable' in error &&
+      (error as { retryable?: unknown }).retryable === true,
+    );
   }
 
   private stateInput(
@@ -690,8 +1018,14 @@ export class SportsDomainCollectionService {
     endpoint: string,
     intervalMs: number,
   ) {
-    return { collectionType, scopeType, scopeId, endpoint, intervalMs, provider: 'ESPN' as const, enabled: true };
+    return {
+      collectionType,
+      scopeType,
+      scopeId,
+      endpoint,
+      intervalMs,
+      provider: 'ESPN' as const,
+      enabled: true,
+    };
   }
 }
-
-

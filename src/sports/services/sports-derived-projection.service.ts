@@ -37,6 +37,12 @@ type TeamTally = {
 };
 type NumericStat = { key: string; label?: string; value: number };
 
+/** Bounded MongoDB reads/writes for derived projection recalculation. */
+const DERIVED_PROJECTION_READ_BATCH_SIZE = 100;
+const DERIVED_PROJECTION_WRITE_BATCH_SIZE = 100;
+const DERIVED_PROJECTION_WRITE_CONCURRENCY = 2;
+const TEAM_FORM_HISTORY_LIMIT = 40;
+
 /**
  * Event-triggered factual projections. Only completed fixtures are used; this
  * service never calls ESPN and never fabricates values for absent source stats.
@@ -75,7 +81,7 @@ export class SportsDerivedProjectionService {
     const [season, seasonFixtures] = await Promise.all([
       this.seasonModel.findOne({ competitionId, id: seasonId }).select('-_id').lean().exec(),
       this.fixtureModel.find({ competitionId, seasonId, ...retainedFixtureCondition })
-        .sort({ kickoffAt: 1 }).select('-_id').lean().exec() as Promise<SportsFixtureRecord[]>,
+        .sort({ kickoffAt: 1 }).select('id competitionId seasonId kickoffAt status competitors rawPayload.rosters rawPayload.boxscore.teams rawPayload.boxscore.rosters rawPayload.summaryFallback.rosters rawPayload.summaryFallback.boxscore.teams rawPayload.summaryFallback.boxscore.rosters').lean().exec() as Promise<SportsFixtureRecord[]>,
     ]);
     if (!season) {
       this.logger.warn(`Skipping derived recalculation for unknown season ${competitionId}/${seasonId}.`);
@@ -105,87 +111,96 @@ export class SportsDerivedProjectionService {
       seasonId,
       ...historicalSeasons.map((row) => String(row.id ?? '').trim()).filter(Boolean),
     ])];
-    const historyFixtures = await this.fixtureModel.find({
-      competitionId,
-      seasonId: { $in: historicalSeasonIds },
-      $and: [
-        { $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }] },
-        retainedFixtureCondition,
-      ],
-    }).sort({ kickoffAt: -1 }).select('id competitionId seasonId kickoffAt status competitors')
-      .lean().exec() as SportsFixtureRecord[];
-    const historicalFixtureIds = historyFixtures.map((fixture) => fixture.id);
-    const factRows = historicalFixtureIds.length
-      ? await this.matchFactsModel.find({ fixtureId: { $in: historicalFixtureIds } })
-        .select('fixtureId matchResult teamStatistics playerAppearances')
-        .lean().exec() as SportsMatchFactsRecord[]
-      : [];
-    const matchFactsByFixture = new Map(
-      factRows.map((facts) => [facts.fixtureId, facts] as const),
-    );
 
-    const matches = seasonFixtures
-      .map((fixture) => this.toCompletedMatch(fixture, matchFactsByFixture.get(fixture.id)))
-      .filter((item): item is Match => Boolean(item));
-    const historicalMatches = historyFixtures
-      .map((fixture) => this.toCompletedMatch(fixture, matchFactsByFixture.get(fixture.id)))
-      .filter((item): item is Match => Boolean(item));
-    const calculatedAt = new Date();
     const teamIds = new Set<string>();
     for (const fixture of seasonFixtures) {
       for (const competitor of fixture.competitors ?? []) {
         if (competitor.teamId) teamIds.add(competitor.teamId);
       }
     }
-    const forms = this.calculateTeamForms(
-      historicalMatches,
-      calculatedAt,
+
+    const calculatedAt = new Date();
+    // Team form and head-to-head both use completed retained history. A single
+    // cursor scan now feeds both projections, and each match-facts lookup is
+    // limited to the current 100-fixture page.
+    const historical = await this.calculateHistoricalProjections(
       competitionId,
-      seasonId,
+      historicalSeasonIds,
       teamIds,
+      seasonId,
+      retainedFixtureCondition,
+      calculatedAt,
     );
-    const h2h = await this.calculateHeadToHead(competitionId, calculatedAt);
+
+    // Full Summary facts are required only for this season's projections. Do
+    // not hydrate team/player arrays for every historical fixture.
+    const currentSeasonFixtureIds = seasonFixtures.map((fixture) => fixture.id);
+    const matchFactsByFixture = await this.loadMatchFactsInBatches(
+      currentSeasonFixtureIds,
+      'fixtureId matchResult teamStatistics playerAppearances',
+    );
+
+    const matches = seasonFixtures
+      .map((fixture) => this.toCompletedMatch(fixture, matchFactsByFixture.get(fixture.id)))
+      .filter((item): item is Match => Boolean(item));
+    const forms = historical.forms;
+    const h2h = historical.headToHead;
 
     if (!matches.length) {
-      await Promise.all([
-        this.prune(this.standingsModel, { competitionId, seasonId }, []),
-        this.upsertRows(this.formModel, forms),
-        this.prune(this.formModel, { competitionId, seasonId }, forms),
-        this.prune(this.homeAwayModel, { competitionId, seasonId }, []),
-        this.prune(this.scoringModel, { competitionId, seasonId }, []),
-        this.prune(this.competitionScoringModel, { competitionId, seasonId }, []),
-        this.prune(this.statisticsModel, { competitionId, seasonId }, []),
-        this.prune(this.playerEventsModel, { competitionId, seasonId }, []),
-        this.upsertRows(this.h2hModel, h2h),
-        this.prune(this.h2hModel, { competitionId }, h2h),
-      ]);
+      await this.runTasksWithConcurrency([
+        () => this.upsertRows(this.formModel, forms),
+        () => this.upsertRows(this.h2hModel, h2h),
+      ], DERIVED_PROJECTION_WRITE_CONCURRENCY);
+      await this.runTasksWithConcurrency([
+        () => this.prune(this.standingsModel, { competitionId, seasonId }, []),
+        () => this.prune(this.formModel, { competitionId, seasonId }, forms),
+        () => this.prune(this.homeAwayModel, { competitionId, seasonId }, []),
+        () => this.prune(this.scoringModel, { competitionId, seasonId }, []),
+        () => this.prune(this.competitionScoringModel, { competitionId, seasonId }, []),
+        () => this.prune(this.statisticsModel, { competitionId, seasonId }, []),
+        () => this.prune(this.playerEventsModel, { competitionId, seasonId }, []),
+        () => this.prune(this.h2hModel, { competitionId }, h2h),
+      ], DERIVED_PROJECTION_WRITE_CONCURRENCY);
       this.logger.debug(
-        `No completed fixtures to project for ${competitionId}/${seasonId}; retained ${forms.length} rolling team-form projections from ${historicalMatches.length} historical matches.`,
+        `No completed fixtures to project for ${competitionId}/${seasonId}; retained ${forms.length} rolling team-form projections from ${historical.formMatchesScanned} historical matches.`,
       );
       return { fixtures: 0, teams: teamIds.size, headToHeadPairs: h2h.length, players: 0 };
     }
 
     const fixtureIds = matches.map((item) => item.fixture.id);
-    const [timeline, playsCoverageRows] = await Promise.all([
-      this.timelineModel.find({ fixtureId: { $in: fixtureIds } })
-        .sort({ fixtureId: 1, sequence: 1 }).select('-_id').lean().exec() as Promise<SportsMatchTimelineEventRecord[]>,
-      this.collectionStateModel.find({
-        collectionType: 'MATCH_PLAYS',
-        scopeType: 'FIXTURE',
-        scopeId: { $in: fixtureIds },
-        status: 'SUCCEEDED',
-      }).select({ scopeId: 1, endpoint: 1 }).lean().exec(),
-    ]);
-    // A completed Plays job is a coverage fact even when ESPN returned an
-    // empty event list. Summary keyEvents are a partial fallback, so they must
-    // not inflate the denominator used to price event-frequency markets.
-    const timelineCoverageFixtureIds = new Set<string>(
-      (playsCoverageRows as Array<{ scopeId?: string; endpoint?: string }>)
-        .filter((row) => /\/plays(?:[?#]|$)/i.test(String(row.endpoint ?? '')))
-        .map((row) => String(row.scopeId ?? '').trim())
-        .filter(Boolean),
-    );
-    const timelineByFixture = this.groupBy(timeline, (item) => item.fixtureId);
+    // Keep each timeline/coverage lookup bounded. Timeline events are retained
+    // by fixture for the season-level scoring and player aggregates below.
+    const timelineByFixture = new Map<string, SportsMatchTimelineEventRecord[]>();
+    const timelineCoverageFixtureIds = new Set<string>();
+    for (let offset = 0; offset < fixtureIds.length; offset += DERIVED_PROJECTION_READ_BATCH_SIZE) {
+      const fixtureIdBatch = fixtureIds.slice(
+        offset,
+        offset + DERIVED_PROJECTION_READ_BATCH_SIZE,
+      );
+      const [timelineRows, playsCoverageRows] = await Promise.all([
+        this.timelineModel.find({ fixtureId: { $in: fixtureIdBatch } })
+          .sort({ fixtureId: 1, sequence: 1 }).select('-_id').lean().exec() as Promise<SportsMatchTimelineEventRecord[]>,
+        this.collectionStateModel.find({
+          collectionType: 'MATCH_PLAYS',
+          scopeType: 'FIXTURE',
+          scopeId: { $in: fixtureIdBatch },
+          status: 'SUCCEEDED',
+        }).select({ scopeId: 1, endpoint: 1 }).lean().exec(),
+      ]);
+
+      for (const event of timelineRows) {
+        const rows = timelineByFixture.get(event.fixtureId) ?? [];
+        rows.push(event);
+        timelineByFixture.set(event.fixtureId, rows);
+      }
+      // A completed Plays job is a coverage fact even when ESPN returned an
+      // empty event list. Summary keyEvents are only a partial fallback.
+      for (const row of playsCoverageRows as Array<{ scopeId?: string; endpoint?: string }>) {
+        if (!/\/plays(?:[?#]|$)/i.test(String(row.endpoint ?? ''))) continue;
+        const fixtureId = String(row.scopeId ?? '').trim();
+        if (fixtureId) timelineCoverageFixtureIds.add(fixtureId);
+      }
+    }
 
     const standings = this.calculateStandings(matches, calculatedAt);
     const homeAway = this.calculateHomeAway(matches, calculatedAt);
@@ -194,27 +209,27 @@ export class SportsDerivedProjectionService {
     const statistics = this.calculateTeamStatistics(matches, calculatedAt, matchFactsByFixture);
     const playerEvents = this.calculatePlayerEventTotals(matches, timelineByFixture, calculatedAt, matchFactsByFixture);
 
-    await Promise.all([
-      this.upsertRows(this.standingsModel, standings),
-      this.upsertRows(this.formModel, forms),
-      this.upsertRows(this.homeAwayModel, homeAway),
-      this.upsertRows(this.scoringModel, scoring),
-      this.upsertRows(this.competitionScoringModel, [competitionScoring]),
-      this.upsertRows(this.statisticsModel, statistics),
-      this.upsertRows(this.playerEventsModel, playerEvents),
-      this.upsertRows(this.h2hModel, h2h),
-    ]);
+    await this.runTasksWithConcurrency([
+      () => this.upsertRows(this.standingsModel, standings),
+      () => this.upsertRows(this.formModel, forms),
+      () => this.upsertRows(this.homeAwayModel, homeAway),
+      () => this.upsertRows(this.scoringModel, scoring),
+      () => this.upsertRows(this.competitionScoringModel, [competitionScoring]),
+      () => this.upsertRows(this.statisticsModel, statistics),
+      () => this.upsertRows(this.playerEventsModel, playerEvents),
+      () => this.upsertRows(this.h2hModel, h2h),
+    ], DERIVED_PROJECTION_WRITE_CONCURRENCY);
 
-    await Promise.all([
-      this.prune(this.standingsModel, { competitionId, seasonId }, standings),
-      this.prune(this.formModel, { competitionId, seasonId }, forms),
-      this.prune(this.homeAwayModel, { competitionId, seasonId }, homeAway),
-      this.prune(this.scoringModel, { competitionId, seasonId }, scoring),
-      this.prune(this.competitionScoringModel, { competitionId, seasonId }, [competitionScoring]),
-      this.prune(this.statisticsModel, { competitionId, seasonId }, statistics),
-      this.prune(this.playerEventsModel, { competitionId, seasonId }, playerEvents),
-      this.prune(this.h2hModel, { competitionId }, h2h),
-    ]);
+    await this.runTasksWithConcurrency([
+      () => this.prune(this.standingsModel, { competitionId, seasonId }, standings),
+      () => this.prune(this.formModel, { competitionId, seasonId }, forms),
+      () => this.prune(this.homeAwayModel, { competitionId, seasonId }, homeAway),
+      () => this.prune(this.scoringModel, { competitionId, seasonId }, scoring),
+      () => this.prune(this.competitionScoringModel, { competitionId, seasonId }, [competitionScoring]),
+      () => this.prune(this.statisticsModel, { competitionId, seasonId }, statistics),
+      () => this.prune(this.playerEventsModel, { competitionId, seasonId }, playerEvents),
+      () => this.prune(this.h2hModel, { competitionId }, h2h),
+    ], DERIVED_PROJECTION_WRITE_CONCURRENCY);
 
     const result = {
       fixtures: matches.length,
@@ -223,7 +238,7 @@ export class SportsDerivedProjectionService {
       players: playerEvents.length,
     };
     this.logger.log(
-      `Derived projections refreshed for ${competitionId}/${seasonId}: ${JSON.stringify(result)}; rolling form used ${historicalMatches.length} retained matches.`,
+      `Derived projections refreshed for ${competitionId}/${seasonId}: ${JSON.stringify(result)}; rolling form used ${historical.formMatchesScanned} retained matches.`,
     );
     return result;
   }
@@ -343,12 +358,284 @@ export class SportsDerivedProjectionService {
     }));
   }
 
+  private async calculateHistoricalProjections(
+    competitionId: string,
+    historicalSeasonIds: string[],
+    targetTeamIds: Set<string>,
+    currentSeasonId: string,
+    retainedFixtureCondition: Record<string, unknown>,
+    calculatedAt: Date,
+  ): Promise<{
+    forms: any[];
+    headToHead: any[];
+    formMatchesScanned: number;
+  }> {
+    const historicalSeasonIdSet = new Set(historicalSeasonIds);
+    const sourceFixtureCounts = new Map<string, number>(
+      [...targetTeamIds].map((teamId) => [teamId, 0]),
+    );
+    const selectedFormMatches = new Map<string, Match>();
+
+    type TeamSummary = {
+      played: number;
+      wins: number;
+      draws: number;
+      losses: number;
+      goalsFor: number;
+      goalsAgainst: number;
+    };
+    const createSummary = (): TeamSummary => ({
+      played: 0, wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0,
+    });
+    const addSummary = (summary: TeamSummary, goalsFor: number, goalsAgainst: number): void => {
+      summary.played += 1;
+      summary.goalsFor += goalsFor;
+      summary.goalsAgainst += goalsAgainst;
+      if (goalsFor > goalsAgainst) summary.wins += 1;
+      else if (goalsFor < goalsAgainst) summary.losses += 1;
+      else summary.draws += 1;
+    };
+
+    type PairAggregate = {
+      teamAId: string;
+      teamBId: string;
+      totalMeetings: number;
+      teamAWins: number;
+      teamBWins: number;
+      draws: number;
+      teamAGoals: number;
+      teamBGoals: number;
+      btts: number;
+      over25: number;
+      weightedTotal: number;
+      weightedTeamAWins: number;
+      weightedTeamBWins: number;
+      weightedDraws: number;
+      weightedTeamAGoals: number;
+      weightedTeamBGoals: number;
+      weightedBtts: number;
+      weightedOver25: number;
+      teamAHome: TeamSummary;
+      teamAAway: TeamSummary;
+      teamBHome: TeamSummary;
+      teamBAway: TeamSummary;
+      recent: Match[];
+    };
+
+    const pairs = new Map<string, PairAggregate>();
+    const cursor = this.fixtureModel.find({
+      competitionId,
+      $and: [
+        { $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }] },
+        retainedFixtureCondition,
+      ],
+    })
+      .sort({ kickoffAt: -1 })
+      .select('id competitionId seasonId kickoffAt status competitors')
+      .lean()
+      .cursor({ batchSize: DERIVED_PROJECTION_READ_BATCH_SIZE });
+
+    let fixtureBatch: SportsFixtureRecord[] = [];
+    let formMatchesScanned = 0;
+    const processBatch = async (fixtures: SportsFixtureRecord[]): Promise<void> => {
+      if (!fixtures.length) return;
+      const factsByFixture = await this.loadMatchFactsInBatches(
+        fixtures.map((fixture) => fixture.id),
+        'fixtureId matchResult',
+      );
+
+      for (const fixture of fixtures) {
+        const match = this.toCompletedMatch(fixture, factsByFixture.get(fixture.id));
+        if (!match) continue;
+
+        // Rolling form retains every valid source count, but only materializes
+        // the latest forty matches per current-season team.
+        if (historicalSeasonIdSet.has(String(fixture.seasonId))) {
+          formMatchesScanned += 1;
+          let neededForRecentWindow = false;
+          for (const teamId of [match.home.teamId, match.away.teamId]) {
+            if (!targetTeamIds.has(teamId)) continue;
+            const count = sourceFixtureCounts.get(teamId) ?? 0;
+            if (count < TEAM_FORM_HISTORY_LIMIT) neededForRecentWindow = true;
+            sourceFixtureCounts.set(teamId, count + 1);
+          }
+          if (neededForRecentWindow) selectedFormMatches.set(match.fixture.id, match);
+        }
+
+        // Head-to-head is reduced to per-pair counters and the ten newest
+        // meetings; retaining every historical Match object is unnecessary.
+        const [teamAId, teamBId] = [match.home.teamId, match.away.teamId].sort();
+        const key = `${teamAId}|${teamBId}`;
+        let pair = pairs.get(key);
+        if (!pair) {
+          pair = {
+            teamAId,
+            teamBId,
+            totalMeetings: 0,
+            teamAWins: 0,
+            teamBWins: 0,
+            draws: 0,
+            teamAGoals: 0,
+            teamBGoals: 0,
+            btts: 0,
+            over25: 0,
+            weightedTotal: 0,
+            weightedTeamAWins: 0,
+            weightedTeamBWins: 0,
+            weightedDraws: 0,
+            weightedTeamAGoals: 0,
+            weightedTeamBGoals: 0,
+            weightedBtts: 0,
+            weightedOver25: 0,
+            teamAHome: createSummary(),
+            teamAAway: createSummary(),
+            teamBHome: createSummary(),
+            teamBAway: createSummary(),
+            recent: [],
+          };
+          pairs.set(key, pair);
+        }
+
+        const aIsHome = match.home.teamId === teamAId;
+        const aGoals = aIsHome ? match.homeGoals : match.awayGoals;
+        const bGoals = aIsHome ? match.awayGoals : match.homeGoals;
+        const weight = 1 / (pair.totalMeetings + 1);
+
+        pair.totalMeetings += 1;
+        pair.teamAGoals += aGoals;
+        pair.teamBGoals += bGoals;
+        if (aGoals > bGoals) {
+          pair.teamAWins += 1;
+          pair.weightedTeamAWins += weight;
+        } else if (aGoals < bGoals) {
+          pair.teamBWins += 1;
+          pair.weightedTeamBWins += weight;
+        } else {
+          pair.draws += 1;
+          pair.weightedDraws += weight;
+        }
+        if (aGoals > 0 && bGoals > 0) {
+          pair.btts += 1;
+          pair.weightedBtts += weight;
+        }
+        if (aGoals + bGoals > 2.5) {
+          pair.over25 += 1;
+          pair.weightedOver25 += weight;
+        }
+        pair.weightedTotal += weight;
+        pair.weightedTeamAGoals += aGoals * weight;
+        pair.weightedTeamBGoals += bGoals * weight;
+
+        addSummary(aIsHome ? pair.teamAHome : pair.teamAAway, aGoals, bGoals);
+        addSummary(aIsHome ? pair.teamBAway : pair.teamBHome, bGoals, aGoals);
+        if (pair.recent.length < 10) pair.recent.push(match);
+      }
+    };
+
+    for await (const fixture of cursor) {
+      fixtureBatch.push(fixture as SportsFixtureRecord);
+      if (fixtureBatch.length >= DERIVED_PROJECTION_READ_BATCH_SIZE) {
+        await processBatch(fixtureBatch);
+        fixtureBatch = [];
+      }
+    }
+    if (fixtureBatch.length) await processBatch(fixtureBatch);
+
+    const summarize = (summary: TeamSummary) => ({
+      played: summary.played,
+      wins: summary.wins,
+      draws: summary.draws,
+      losses: summary.losses,
+      winRate: this.percent(summary.wins, summary.played),
+      goalsFor: summary.goalsFor,
+      goalsAgainst: summary.goalsAgainst,
+      averageGoalsFor: this.ratio(summary.goalsFor, summary.played),
+      averageGoalsAgainst: this.ratio(summary.goalsAgainst, summary.played),
+    });
+
+    const headToHead = [...pairs.values()].map((pair) => {
+      const totalWeight = pair.weightedTotal;
+      const recencyWeighted = {
+        method: 'rank-decay: 1 / (recencyRank + 1)',
+        sampleSize: pair.totalMeetings,
+        totalWeight: Number(totalWeight.toFixed(4)),
+        teamAWinRate: this.percent(pair.weightedTeamAWins, totalWeight),
+        teamBWinRate: this.percent(pair.weightedTeamBWins, totalWeight),
+        drawRate: this.percent(pair.weightedDraws, totalWeight),
+        averageTeamAGoals: this.ratio(pair.weightedTeamAGoals, totalWeight),
+        averageTeamBGoals: this.ratio(pair.weightedTeamBGoals, totalWeight),
+        averageTotalGoals: this.ratio(pair.weightedTeamAGoals + pair.weightedTeamBGoals, totalWeight),
+        bttsRate: this.percent(pair.weightedBtts, totalWeight),
+        over25Rate: this.percent(pair.weightedOver25, totalWeight),
+      };
+      return {
+        id: `h2h:${competitionId}:${pair.teamAId}:${pair.teamBId}`,
+        competitionId,
+        teamAId: pair.teamAId,
+        teamBId: pair.teamBId,
+        calculatedAt,
+        sourceFixtureCount: pair.totalMeetings,
+        metrics: {
+          totalMeetings: pair.totalMeetings,
+          teamAWins: pair.teamAWins,
+          teamBWins: pair.teamBWins,
+          draws: pair.draws,
+          teamAWinRate: this.percent(pair.teamAWins, pair.totalMeetings),
+          teamBWinRate: this.percent(pair.teamBWins, pair.totalMeetings),
+          drawRate: this.percent(pair.draws, pair.totalMeetings),
+          teamAGoals: pair.teamAGoals,
+          teamBGoals: pair.teamBGoals,
+          averageTotalGoals: this.ratio(pair.teamAGoals + pair.teamBGoals, pair.totalMeetings),
+          bttsRate: this.percent(pair.btts, pair.totalMeetings),
+          over25Rate: this.percent(pair.over25, pair.totalMeetings),
+          recencyWeighted,
+          last5: pair.recent.slice(0, 5).map((match, index) => this.h2hResult(match, pair.teamAId, pair.teamBId, index)),
+          last10: pair.recent.slice(0, 10).map((match, index) => this.h2hResult(match, pair.teamAId, pair.teamBId, index)),
+          homeAway: {
+            teamAHome: summarize(pair.teamAHome),
+            teamAAway: summarize(pair.teamAAway),
+            teamBHome: summarize(pair.teamBHome),
+            teamBAway: summarize(pair.teamBAway),
+          },
+        },
+      };
+    });
+
+    const forms = this.calculateTeamForms(
+      [...selectedFormMatches.values()],
+      calculatedAt,
+      competitionId,
+      currentSeasonId,
+      targetTeamIds,
+      sourceFixtureCounts,
+    );
+    return { forms, headToHead, formMatchesScanned };
+  }
+
+  private async loadMatchFactsInBatches(
+    fixtureIds: string[],
+    projection: string,
+  ): Promise<Map<string, SportsMatchFactsRecord>> {
+    const factsByFixture = new Map<string, SportsMatchFactsRecord>();
+    for (let offset = 0; offset < fixtureIds.length; offset += DERIVED_PROJECTION_READ_BATCH_SIZE) {
+      const batchIds = fixtureIds.slice(offset, offset + DERIVED_PROJECTION_READ_BATCH_SIZE);
+      if (!batchIds.length) continue;
+      const rows = await this.matchFactsModel.find({ fixtureId: { $in: batchIds } })
+        .select(projection)
+        .lean()
+        .exec() as SportsMatchFactsRecord[];
+      for (const row of rows) factsByFixture.set(row.fixtureId, row);
+    }
+    return factsByFixture;
+  }
+
   private calculateTeamForms(
     matches: Match[],
     calculatedAt: Date,
     competitionId: string,
     seasonId: string,
     targetTeamIds: Set<string>,
+    sourceFixtureCounts?: Map<string, number>,
   ): any[] {
     const byTeam = new Map<string, Match[]>();
     for (const match of matches) {
@@ -380,7 +667,7 @@ export class SportsDerivedProjectionService {
         seasonId,
         teamId,
         calculatedAt,
-        sourceFixtureCount: rows.length,
+        sourceFixtureCount: sourceFixtureCounts?.get(teamId) ?? rows.length,
         metrics,
       };
     });
@@ -631,100 +918,6 @@ export class SportsDerivedProjectionService {
     return { matchesWithTimeline: timelineMatches, firstGoalMatches, firstGoalRate: this.percent(firstGoalMatches, timelineMatches), lastGoalMatches, lastGoalRate: this.percent(lastGoalMatches, timelineMatches), averageFirstGoalMinute: firstGoals ? firstGoalMinutesTotal / firstGoals : null, firstHalfGoals, secondHalfGoals, earlyGoals, lateGoals, goalsAfter75, redCardMatches, redCardMatchRate: this.percent(redCardMatches, timelineMatches), penaltyAwardedMatches, penaltyAwardedEvents, penaltyAwardedMatchRate: this.percent(penaltyAwardedMatches, timelineMatches), ownGoalMatches, ownGoalEvents, ownGoalMatchRate: this.percent(ownGoalMatches, timelineMatches), substitutions };
   }
 
-  private async calculateHeadToHead(competitionId: string, calculatedAt: Date): Promise<any[]> {
-    const retainedAt = new Date();
-    const history = await this.fixtureModel.find({
-      competitionId,
-      $and: [
-        { $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }] },
-        { $or: [
-          { retentionExpiresAt: { $gt: retainedAt } },
-          { retentionExpiresAt: { $exists: false } },
-          { retentionExpiresAt: null },
-        ] },
-      ],
-    }).sort({ kickoffAt: 1 }).select('id competitionId seasonId kickoffAt status competitors').lean().exec() as SportsFixtureRecord[];
-    const historyIds = history.map((fixture) => fixture.id);
-    const factRows = historyIds.length
-      ? await this.matchFactsModel.find({ fixtureId: { $in: historyIds } })
-        .select('fixtureId matchResult').lean().exec() as SportsMatchFactsRecord[]
-      : [];
-    const factsByFixture = new Map(factRows.map((facts) => [facts.fixtureId, facts] as const));
-    const matches = history
-      .map((fixture) => this.toCompletedMatch(fixture, factsByFixture.get(fixture.id)))
-      .filter((item): item is Match => Boolean(item));
-    const pairs = new Map<string, Match[]>();
-    for (const match of matches) {
-      const [a, b] = [match.home.teamId, match.away.teamId].sort();
-      const key = `${a}|${b}`;
-      const rows = pairs.get(key) ?? []; rows.push(match); pairs.set(key, rows);
-    }
-    return [...pairs.entries()].map(([key, rows]) => {
-      const [teamAId, teamBId] = key.split('|');
-      let teamAWins = 0, teamBWins = 0, draws = 0, teamAGoals = 0, teamBGoals = 0, btts = 0, over25 = 0;
-      const teamAHome: Match[] = [], teamAAway: Match[] = [];
-      for (const match of rows) {
-        const aIsHome = match.home.teamId === teamAId;
-        const aGoals = aIsHome ? match.homeGoals : match.awayGoals;
-        const bGoals = aIsHome ? match.awayGoals : match.homeGoals;
-        teamAGoals += aGoals; teamBGoals += bGoals;
-        if (aGoals > bGoals) teamAWins += 1; else if (aGoals < bGoals) teamBWins += 1; else draws += 1;
-        if (aGoals > 0 && bGoals > 0) btts += 1;
-        if (aGoals + bGoals > 2.5) over25 += 1;
-        (aIsHome ? teamAHome : teamAAway).push(match);
-      }
-      const recent = [...rows].sort((a, b) => b.fixture.kickoffAt.getTime() - a.fixture.kickoffAt.getTime());
-      // Rank-decay weighting gives the latest meeting weight 1, the previous
-      // meeting 1/2, then 1/3, etc. The weighting is explicit in the payload so
-      // prediction consumers can use the weighted values or apply another policy.
-      const weightedRows = recent.map((match, index) => ({ match, weight: 1 / (index + 1) }));
-      const totalWeight = weightedRows.reduce((sum, row) => sum + row.weight, 0);
-      let weightedTeamAWins = 0, weightedTeamBWins = 0, weightedDraws = 0;
-      let weightedTeamAGoals = 0, weightedTeamBGoals = 0, weightedBtts = 0, weightedOver25 = 0;
-      for (const { match, weight } of weightedRows) {
-        const aIsHome = match.home.teamId === teamAId;
-        const aGoals = aIsHome ? match.homeGoals : match.awayGoals;
-        const bGoals = aIsHome ? match.awayGoals : match.homeGoals;
-        weightedTeamAGoals += aGoals * weight;
-        weightedTeamBGoals += bGoals * weight;
-        if (aGoals > bGoals) weightedTeamAWins += weight;
-        else if (aGoals < bGoals) weightedTeamBWins += weight;
-        else weightedDraws += weight;
-        if (aGoals > 0 && bGoals > 0) weightedBtts += weight;
-        if (aGoals + bGoals > 2.5) weightedOver25 += weight;
-      }
-      const recencyWeighted = {
-        method: 'rank-decay: 1 / (recencyRank + 1)',
-        sampleSize: rows.length,
-        totalWeight: Number(totalWeight.toFixed(4)),
-        teamAWinRate: this.percent(weightedTeamAWins, totalWeight),
-        teamBWinRate: this.percent(weightedTeamBWins, totalWeight),
-        drawRate: this.percent(weightedDraws, totalWeight),
-        averageTeamAGoals: this.ratio(weightedTeamAGoals, totalWeight),
-        averageTeamBGoals: this.ratio(weightedTeamBGoals, totalWeight),
-        averageTotalGoals: this.ratio(weightedTeamAGoals + weightedTeamBGoals, totalWeight),
-        bttsRate: this.percent(weightedBtts, totalWeight),
-        over25Rate: this.percent(weightedOver25, totalWeight),
-      };
-      const winSummary = (items: Match[], focalTeamId: string) => {
-        let wins = 0, draws = 0, losses = 0, goalsFor = 0, goalsAgainst = 0;
-        for (const item of items) {
-          const focalIsHome = item.home.teamId === focalTeamId;
-          const gf = focalIsHome ? item.homeGoals : item.awayGoals;
-          const ga = focalIsHome ? item.awayGoals : item.homeGoals;
-          goalsFor += gf; goalsAgainst += ga;
-          if (gf > ga) wins += 1; else if (gf === ga) draws += 1; else losses += 1;
-        }
-        return { played: items.length, wins, draws, losses, winRate: this.percent(wins, items.length), goalsFor, goalsAgainst, averageGoalsFor: this.ratio(goalsFor, items.length), averageGoalsAgainst: this.ratio(goalsAgainst, items.length) };
-      };
-      const teamBHome = rows.filter((match) => match.home.teamId === teamBId);
-      const teamBAway = rows.filter((match) => match.away.teamId === teamBId);
-      return {
-        id: `h2h:${competitionId}:${teamAId}:${teamBId}`, competitionId, teamAId, teamBId, calculatedAt, sourceFixtureCount: rows.length,
-        metrics: { totalMeetings: rows.length, teamAWins, teamBWins, draws, teamAWinRate: this.percent(teamAWins, rows.length), teamBWinRate: this.percent(teamBWins, rows.length), drawRate: this.percent(draws, rows.length), teamAGoals, teamBGoals, averageTotalGoals: this.ratio(teamAGoals + teamBGoals, rows.length), bttsRate: this.percent(btts, rows.length), over25Rate: this.percent(over25, rows.length), recencyWeighted, last5: recent.slice(0, 5).map((m, index) => this.h2hResult(m, teamAId, teamBId, index)), last10: recent.slice(0, 10).map((m, index) => this.h2hResult(m, teamAId, teamBId, index)), homeAway: { teamAHome: winSummary(teamAHome, teamAId), teamAAway: winSummary(teamAAway, teamAId), teamBHome: winSummary(teamBHome, teamBId), teamBAway: winSummary(teamBAway, teamBId) } },
-      };
-    });
-  }
 
   private h2hResult(match: Match, teamAId: string, teamBId: string, recencyRank = 0): Record<string, unknown> {
     const aGoals = match.home.teamId === teamAId ? match.homeGoals : match.awayGoals;
@@ -1264,6 +1457,32 @@ export class SportsDerivedProjectionService {
     return denominator > 0 ? Number((numerator / denominator).toFixed(3)) : null;
   }
 
+  private async runTasksWithConcurrency(
+    tasks: Array<() => Promise<void>>,
+    concurrency: number,
+  ): Promise<void> {
+    if (!tasks.length) return;
+    const workerCount = Math.max(1, Math.min(tasks.length, Math.floor(concurrency) || 1));
+    let nextTask = 0;
+    let hasError = false;
+    let firstError: unknown;
+
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (!hasError && nextTask < tasks.length) {
+        const task = tasks[nextTask++];
+        try {
+          await task();
+        } catch (error) {
+          if (!hasError) firstError = error;
+          hasError = true;
+        }
+      }
+    });
+
+    await Promise.all(workers);
+    if (hasError) throw firstError;
+  }
+
   private groupBy<T>(items: T[], keyOf: (item: T) => string): Map<string, T[]> {
     const result = new Map<string, T[]>();
     for (const item of items) { const key = keyOf(item); const rows = result.get(key) ?? []; rows.push(item); result.set(key, rows); }
@@ -1271,19 +1490,36 @@ export class SportsDerivedProjectionService {
   }
 
   private async upsertRows(model: Model<any>, rows: any[]): Promise<void> {
-    if (!rows.length) return;
-    await model.bulkWrite(rows.map((row) => ({ updateOne: { filter: { id: row.id }, update: { $set: row, $setOnInsert: { createdAt: new Date() } }, upsert: true } })), { ordered: false });
+    for (let offset = 0; offset < rows.length; offset += DERIVED_PROJECTION_WRITE_BATCH_SIZE) {
+      const batch = rows.slice(offset, offset + DERIVED_PROJECTION_WRITE_BATCH_SIZE);
+      const operations = batch.map((row) => ({
+        updateOne: {
+          filter: { id: row.id },
+          update: { $set: row, $setOnInsert: { createdAt: new Date() } },
+          upsert: true,
+        },
+      }));
+      await model.bulkWrite(operations, { ordered: false });
+    }
   }
 
   private async prune(model: Model<any>, scope: Record<string, unknown>, rows: any[]): Promise<void> {
-    const ids = rows.map((row) => row.id);
-    if (!ids.length) {
+    if (!rows.length) {
       await model.deleteMany(scope).exec();
       return;
     }
+
+    // Every projection row in a recalculation shares one calculatedAt value.
+    // Generation-based pruning avoids sending a potentially huge $nin array.
+    const generation = rows[0]?.calculatedAt;
+    if (generation instanceof Date && Number.isFinite(generation.getTime())) {
+      await model.deleteMany({ ...scope, calculatedAt: { $ne: generation } }).exec();
+      return;
+    }
+
+    // Defensive compatibility path for any future projection without a
+    // generation timestamp. Normal derived rows use the bounded path above.
+    const ids = rows.map((row) => row.id);
     await model.deleteMany({ ...scope, id: { $nin: ids } }).exec();
   }
 }
-
-
-

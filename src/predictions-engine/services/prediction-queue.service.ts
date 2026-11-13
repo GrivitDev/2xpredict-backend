@@ -25,6 +25,9 @@ export type ClaimedPredictionQueueJob = Pick<
   | 'fixtureSourceRevision'
 > & { lockToken: string };
 
+const PREDICTION_QUEUE_SYNC_PAGE_SIZE = 100;
+const PREDICTION_QUEUE_SYNC_WRITE_BATCH_SIZE = 100;
+
 const TERMINAL_FIXTURE_STATES = new Set([
   'COMPLETED',
   'POSTPONED',
@@ -73,7 +76,7 @@ export class PredictionQueueService {
     force = false,
   ): Promise<PredictionQueueSyncResult> {
     const now = new Date();
-    const pageSize = 500;
+    const pageSize = PREDICTION_QUEUE_SYNC_PAGE_SIZE;
     let cursor: string | undefined;
     let pagesScanned = 0;
 
@@ -211,7 +214,7 @@ export class PredictionQueueService {
     );
 
     const operations: AnyBulkWriteOperation<PredictionQueue>[] = [];
-    const bulkWriteBatchSize = 500;
+    const bulkWriteBatchSize = PREDICTION_QUEUE_SYNC_WRITE_BATCH_SIZE;
     let firstBulkWriteError: unknown;
     let bulkWriteFailed = false;
 
@@ -1152,4 +1155,3 @@ export class PredictionQueueService {
     return true;
   }
 }
-

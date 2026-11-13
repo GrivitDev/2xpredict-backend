@@ -13,7 +13,7 @@ import { SportsDataChangeEventService } from './sports-data-change-event.service
 
 const OUTBOX_BATCH_SIZE = 20;
 const MIN_DRAIN_DELAY_MS = 1_000;
-const IDLE_RECOVERY_POLL_MS = 5_000;
+const IDLE_RECOVERY_POLL_MS = 10_000;
 
 /** Dedicated at-least-once worker for the transactional Sports source outbox. */
 @Injectable()
@@ -83,8 +83,8 @@ export class SportsDataChangeEventWorkerService
       this.wakeRequested = false;
 
       if (!this.stopped) {
-        // Even a full batch yields for one second before the next drain. An idle
-        // worker checks every five seconds to recover missed wake notifications.
+        // Even a full batch yields for one second before the next drain. Event wakes
+        // remain immediate; the idle poll is only a ten-second recovery fallback.
         const delayMs = wasWokenDuringDrain || processed > 0
           ? MIN_DRAIN_DELAY_MS
           : IDLE_RECOVERY_POLL_MS;

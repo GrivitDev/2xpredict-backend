@@ -525,12 +525,48 @@ export class SportsQueueJobProcessorService {
     }
   }
 
+  private async forEachCompletedFixturePage(
+    handler: (fixtures: SportsFixtureRecord[]) => Promise<void>,
+    scope: {
+      competitionId?: string;
+      seasonId?: string;
+      includeProjectionData?: boolean;
+    } = {},
+  ): Promise<number> {
+    const pageSize = 100;
+    let cursor: string | undefined;
+    let processed = 0;
+
+    do {
+      const page = await this.collection.getCompletedFixturesPage({
+        ...scope,
+        limit: pageSize,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (page.items.length) {
+        await handler(page.items);
+        processed += page.items.length;
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+
+    return processed;
+  }
+
   private async finishBootstrap(runId: string): Promise<void> {
-    // Startup Plays is intentionally limited to already-finished event IDs.
-    const completed = await this.collection.getAllCompletedFixtures();
-    for (const fixture of completed)
-      await this.enqueuePlays(fixture, `bootstrap:${runId}:plays`);
-    await this.enqueueRecentCompletedNews(completed, `bootstrap:${runId}:news`);
+    // Startup recovery is keyset-paginated. Each page is fully handed off before
+    // the next one is read, so a large historical fixture catalogue is never
+    // retained as one process-wide array.
+    const completedCount = await this.forEachCompletedFixturePage(
+      async (completed) => {
+        for (const fixture of completed)
+          await this.enqueuePlays(fixture, `bootstrap:${runId}:plays`);
+        await this.enqueueRecentCompletedNews(
+          completed,
+          `bootstrap:${runId}:news`,
+        );
+      },
+    );
 
     // Historical derived projections are queued after the Summary backfill
     // finishes, so the baseline consumes normalized match facts rather than
@@ -565,7 +601,7 @@ export class SportsQueueJobProcessorService {
       .exec();
 
     this.logger.log(
-      `ESPN bootstrap ${runId} completed. Queued Plays for ${completed.length} completed fixtures. Settlement catch-up: ${JSON.stringify(settlementCatchup)}.`,
+      `ESPN bootstrap ${runId} completed. Queued Plays for ${completedCount} completed fixtures. Settlement catch-up: ${JSON.stringify(settlementCatchup)}.`,
     );
   }
 
@@ -1014,20 +1050,20 @@ export class SportsQueueJobProcessorService {
     )
       return;
 
-    const fixtures = await this.collection.getCurrentSeasonFixtures(
-      competitionId,
-      seasonId,
-    );
-    const completed = fixtures.filter(
-      (fixture) =>
-        fixture.status.state === 'COMPLETED' || fixture.status.isFinal,
-    );
-    for (const fixture of completed) {
-      await this.enqueuePlays(fixture, `season-bootstrap-complete:${seasonId}`);
-    }
-    await this.enqueueRecentCompletedNews(
-      completed,
-      `season-bootstrap:${seasonId}:news`,
+    const completedCount = await this.forEachCompletedFixturePage(
+      async (completed) => {
+        for (const fixture of completed) {
+          await this.enqueuePlays(
+            fixture,
+            `season-bootstrap-complete:${seasonId}`,
+          );
+        }
+        await this.enqueueRecentCompletedNews(
+          completed,
+          `season-bootstrap:${seasonId}:news`,
+        );
+      },
+      { competitionId, seasonId },
     );
     await this.enqueueDerivedProjection(
       competitionId,
@@ -1035,7 +1071,7 @@ export class SportsQueueJobProcessorService {
       `season-validation:${seasonId}`,
     );
     this.logger.log(
-      `Season ${seasonId} passed daily fixture validation; Plays and initial derived projections queued.`,
+      `Season ${seasonId} passed daily fixture validation; recovered ${completedCount} completed fixtures and queued Plays and initial derived projections.`,
     );
   }
 
@@ -1663,72 +1699,78 @@ export class SportsQueueJobProcessorService {
       this.logger.warn(`Skipping derived recalculation: season ${seasonId} does not belong to ${competitionId}.`);
       return;
     }
-    const fixtures = await this.collection.getCurrentSeasonFixtures(
-      competitionId,
-      seasonId,
-    );
-    for (const fixture of fixtures) {
-      if (!(fixture.status.state === 'COMPLETED' || fixture.status.isFinal))
-        continue;
-      // Stage 3's historical Summary backfill owns older match collection.
-      // Historical projection jobs consume stored normalized facts only; they
-      // must not issue provider calls or repeatedly inspect raw payload blobs.
-      if (!season.isCurrent) continue;
-      const hasPrimaryStatistics =
-        fixture.competitors.length === 2 &&
-        fixture.competitors.every(
-          (competitor) => (competitor.statistics?.length ?? 0) > 0,
-        );
-      const rawPayload = asRecord(fixture.rawPayload);
-      const summary = asRecord(rawPayload.summaryFallback ?? rawPayload);
-      const summaryTeams = asArray(asRecord(summary.boxscore).teams);
-      const summaryHasStatistics =
-        fixture.competitors.length === 2 &&
-        fixture.competitors.every((competitor) => {
-          const espnTeamId = competitor.teamId.replace(/^team:/, '');
-          return summaryTeams.some((teamValue) => {
-            const team = asRecord(teamValue);
-            const nestedTeam = asRecord(team.team ?? teamValue);
-            return (
-              asText(nestedTeam.id) === espnTeamId &&
-              asArray(team.statistics).length > 0
-            );
-          });
-        });
-      const summaryHasPlayerAppearances =
-        this.hasSummaryPlayerAppearanceData(summary);
-      const summaryFallbackFresh = fixture.espnEventId
-        ? await this.collection.isFixtureSummaryFallbackFresh(
-            fixture.espnEventId,
-          )
-        : false;
-      const missingTeamStatistics =
-        !hasPrimaryStatistics && !summaryHasStatistics;
-      const missingPlayerAppearances = !summaryHasPlayerAppearances;
-      if (
-        (missingTeamStatistics || missingPlayerAppearances) &&
-        !summaryFallbackFresh &&
-        fixture.espnEventId
-      ) {
-        const competition = await this.collection.getCompetition(
-          fixture.competitionId,
-        );
-        if (competition) {
-          // ESPN Summary is also the reliable source for the root-level rosters[]
-          // lineup payload. Fetch it when either team statistics or player
-          // appearance facts are absent, then retain the complete raw response.
-          await this.collection.collectFixtureSummary(
-            competition.slug,
-            fixture.espnEventId,
-            {
-              competitionId,
-              seasonId,
-              seasonYear: fixture.seasonYear,
-            },
-          );
-        }
-      }
+
+    // Current-season Summary fallback checks only need completed fixtures.
+    // Stream those rows so the recovery pass never loads the full season.
+    const completedTeamIds = new Set<string>();
+    if (season.isCurrent) {
+      await this.forEachCompletedFixturePage(
+        async (completed) => {
+          for (const fixture of completed) {
+            for (const competitor of fixture.competitors ?? []) {
+              if (competitor.teamId) completedTeamIds.add(competitor.teamId);
+            }
+
+            const hasPrimaryStatistics =
+              fixture.competitors.length === 2 &&
+              fixture.competitors.every(
+                (competitor) => (competitor.statistics?.length ?? 0) > 0,
+              );
+            const rawPayload = asRecord(fixture.rawPayload);
+            const summary = asRecord(rawPayload.summaryFallback ?? rawPayload);
+            const summaryTeams = asArray(asRecord(summary.boxscore).teams);
+            const summaryHasStatistics =
+              fixture.competitors.length === 2 &&
+              fixture.competitors.every((competitor) => {
+                const espnTeamId = competitor.teamId.replace(/^team:/, '');
+                return summaryTeams.some((teamValue) => {
+                  const team = asRecord(teamValue);
+                  const nestedTeam = asRecord(team.team ?? teamValue);
+                  return (
+                    asText(nestedTeam.id) === espnTeamId &&
+                    asArray(team.statistics).length > 0
+                  );
+                });
+              });
+            const summaryHasPlayerAppearances =
+              this.hasSummaryPlayerAppearanceData(summary);
+            const summaryFallbackFresh = fixture.espnEventId
+              ? await this.collection.isFixtureSummaryFallbackFresh(
+                  fixture.espnEventId,
+                )
+              : false;
+            const missingTeamStatistics =
+              !hasPrimaryStatistics && !summaryHasStatistics;
+            const missingPlayerAppearances = !summaryHasPlayerAppearances;
+            if (
+              (missingTeamStatistics || missingPlayerAppearances) &&
+              !summaryFallbackFresh &&
+              fixture.espnEventId
+            ) {
+              const competition = await this.collection.getCompetition(
+                fixture.competitionId,
+              );
+              if (competition) {
+                // ESPN Summary is also the reliable source for the root-level rosters[]
+                // lineup payload. Fetch it when either team statistics or player
+                // appearance facts are absent, then retain the complete raw response.
+                await this.collection.collectFixtureSummary(
+                  competition.slug,
+                  fixture.espnEventId,
+                  {
+                    competitionId,
+                    seasonId,
+                    seasonYear: fixture.seasonYear,
+                  },
+                );
+              }
+            }
+          }
+        },
+        { competitionId, seasonId, includeProjectionData: true },
+      );
     }
+
     await this.derived.recalculateSeason(competitionId, seasonId);
 
     // Repriced Grivit markets must consume the freshly calculated form,
@@ -1740,12 +1782,7 @@ export class SportsQueueJobProcessorService {
       ),
     );
     const now = new Date();
-    const completedTeamIds = [...new Set(
-      fixtures
-        .filter((fixture) => fixture.status?.state === 'COMPLETED' || fixture.status?.isFinal === true)
-        .flatMap((fixture) => fixture.competitors.map((competitor) => competitor.teamId))
-        .filter(Boolean),
-    )];
+    const completedTeamIdList = [...completedTeamIds];
 
     // A season projection may be used by upcoming fixtures from another
     // competition when one of the participating teams also appears there.
@@ -1756,7 +1793,7 @@ export class SportsQueueJobProcessorService {
       from: now,
     });
     const crossCompetitionUpcoming = await this.getUpcomingCrossCompetitionFixtures(
-      completedTeamIds,
+      completedTeamIdList,
       competitionId,
       now,
     );
@@ -2509,5 +2546,3 @@ export class SportsQueueJobProcessorService {
     return normalized;
   }
 }
-
-

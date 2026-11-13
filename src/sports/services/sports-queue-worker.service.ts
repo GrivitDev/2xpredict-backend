@@ -12,7 +12,10 @@ import { SportsQueueJobProcessorService } from './sports-queue-job-processor.ser
 import { SportsQueueService } from './sports-queue.service';
 import { SportsCollectionStateService } from './sports-collection-state.service';
 import type { ClaimedSportsQueueJob } from './sports-queue.service';
-import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
+import {
+  BACKGROUND_WORK_LIMITS,
+  BackgroundWorkLimiterService,
+} from '../../common/background-work/background-work-limiter.service';
 
 interface SportsWorkerLastJob {
   jobKey: string;
@@ -40,16 +43,16 @@ interface LaneRuntime {
 }
 
 const LANE_CONCURRENCY = 1;
-const IDLE_POLL_MS = 5_000;
+const IDLE_POLL_MS = 10_000;
 const ACTIVE_POLL_MS = 1_000;
 const LEASE_MS = 10 * 60_000;
 const HEARTBEAT_MS = 60_000;
-const LEASE_RECOVERY_MS = 30_000;
+const LEASE_RECOVERY_MS = 60_000;
 
 /**
  * Independent durable queue lane for every SportsQueueJobType.
  * Each lane claims and executes one job at a time. The shared background-work
- * limiter caps all module workers at twelve active operations process-wide.
+ * limiter caps all module workers at six active operations process-wide and prioritizes time-sensitive lanes.
  */
 @Injectable()
 export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -101,7 +104,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     for (const type of this.lanes.keys()) this.scheduleLane(type, 0);
     void this.recoverLeases();
     this.scheduleLeaseRecovery();
-    this.logger.log(`Sports queue lanes started (${this.lanes.size} Sports-owned lanes; one job per lane; shared global limit=12).`);
+    this.logger.log(`Sports queue lanes started (${this.lanes.size} Sports-owned lanes; one job per lane; shared global limit=${BACKGROUND_WORK_LIMITS.maximumConcurrentJobs}; priority scheduling enabled).`);
   }
 
   onModuleDestroy(): void {
@@ -148,6 +151,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
       jobsOwnershipLost: this.jobsOwnershipLost,
       recoveredExpiredLeases: this.recoveredExpiredLeases,
       lastJob: this.lastJob ? { ...this.lastJob } : undefined,
+      backgroundWork: this.backgroundWork.getStatus(),
       lanes,
     };
   }
@@ -186,7 +190,7 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
 
     try {
       // A permit is acquired before the durable claim, so waiting lanes do not
-      // hold processing leases while another module is using all twelve slots.
+      // hold processing leases while another module is using shared capacity.
       releasePermit = await this.backgroundWork.acquire(`sports:${type}`);
       if (this.stopped) return;
 
@@ -301,10 +305,10 @@ export class SportsQueueWorkerService implements OnApplicationBootstrap, OnModul
     try {
       releasePermit = await this.backgroundWork.acquire('sports:lease-recovery');
       if (this.stopped) return;
-      const recovered = await this.queue.recoverExpiredProcessing(200);
+      const recovered = await this.queue.recoverExpiredProcessing(100);
       this.recoveredExpiredLeases += recovered;
       const recoveredCollectionStates =
-        await this.collectionStates.recoverStaleProcessing(20 * 60_000, 200);
+        await this.collectionStates.recoverStaleProcessing(20 * 60_000, 100);
       if (recovered > 0) {
         for (const type of this.lanes.keys()) this.wakeLane(type);
       }

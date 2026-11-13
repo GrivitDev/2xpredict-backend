@@ -8,7 +8,7 @@ export const SPORTS_PROVIDER_CONFIG = {
     minIntervalMs: 1_000,
     maxRetries: 4,
     pageSize: 100,
-    maxPages: 500,
+    maxPages: 200,
     referenceConcurrency: 1,
     playsPageSize: 100,
     playsSourceId: '38',

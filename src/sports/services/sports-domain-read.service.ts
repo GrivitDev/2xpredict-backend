@@ -44,66 +44,113 @@ import {
 @Injectable()
 export class SportsDomainReadService {
   constructor(
-    @InjectModel(SportsCompetition.name) private readonly competitionModel: Model<any>,
+    @InjectModel(SportsCompetition.name)
+    private readonly competitionModel: Model<any>,
     @InjectModel(SportsSeason.name) private readonly seasonModel: Model<any>,
     @InjectModel(SportsTeam.name) private readonly teamModel: Model<any>,
     @InjectModel(SportsFixture.name) private readonly fixtureModel: Model<any>,
-    @InjectModel(SportsMatchTimelineEvent.name) private readonly timelineModel: Model<any>,
-    @InjectModel(SportsMatchOddsSnapshot.name) private readonly oddsModel: Model<any>,
-    @InjectModel(SportsMatchFacts.name) private readonly matchFactsModel: Model<any>,
-    @InjectModel(SportsMatchSummary.name) private readonly matchSummaryModel: Model<any>,
+    @InjectModel(SportsMatchTimelineEvent.name)
+    private readonly timelineModel: Model<any>,
+    @InjectModel(SportsMatchOddsSnapshot.name)
+    private readonly oddsModel: Model<any>,
+    @InjectModel(SportsMatchFacts.name)
+    private readonly matchFactsModel: Model<any>,
+    @InjectModel(SportsMatchSummary.name)
+    private readonly matchSummaryModel: Model<any>,
     private readonly derived: SportsDerivedProjectionService,
   ) {}
 
-  async countCompetitions(query: SportsCompetitionListQuery = {}): Promise<number> {
-    return this.competitionModel.countDocuments(this.competitionFilter(query)).exec();
+  async countCompetitions(
+    query: SportsCompetitionListQuery = {},
+  ): Promise<number> {
+    return this.competitionModel
+      .countDocuments(this.competitionFilter(query))
+      .exec();
   }
 
-  async getCompetitions(query: SportsCompetitionListQuery = {}): Promise<SportsCompetitionRecord[]> {
+  async getCompetitions(
+    query: SportsCompetitionListQuery = {},
+  ): Promise<SportsCompetitionRecord[]> {
     const limit = Math.max(1, Math.min(query.limit ?? 250, 1_000));
-    const rows = await this.competitionModel.find(this.competitionFilter(query))
-      .sort({ name: 1, id: 1 }).limit(limit).select('-_id').lean().exec();
+    const rows = await this.competitionModel
+      .find(this.competitionFilter(query))
+      .sort({ name: 1, id: 1 })
+      .limit(limit)
+      .select('-_id')
+      .lean()
+      .exec();
     return rows as SportsCompetitionRecord[];
   }
 
-  async getCompetition(competitionId: string): Promise<SportsCompetitionRecord | null> {
-    const row = await this.competitionModel.findOne({ $or: [{ id: competitionId }, { slug: competitionId }] })
-      .select('-_id').lean().exec();
+  async getCompetition(
+    competitionId: string,
+  ): Promise<SportsCompetitionRecord | null> {
+    const row = await this.competitionModel
+      .findOne({ $or: [{ id: competitionId }, { slug: competitionId }] })
+      .select('-_id')
+      .lean()
+      .exec();
     return (row as SportsCompetitionRecord | null) ?? null;
   }
 
   async getSeasons(competitionId?: string): Promise<SportsSeasonRecord[]> {
     const filter = competitionId ? { competitionId } : {};
-    const rows = await this.seasonModel.find(filter).sort({ competitionId: 1, year: -1 }).select('-_id').lean().exec();
+    const rows = await this.seasonModel
+      .find(filter)
+      .sort({ competitionId: 1, year: -1 })
+      .select('-_id')
+      .lean()
+      .exec();
     return rows as SportsSeasonRecord[];
   }
 
   async getSeason(seasonId: string): Promise<SportsSeasonRecord | null> {
-    const row = await this.seasonModel.findOne({ id: seasonId }).select('-_id').lean().exec();
+    const row = await this.seasonModel
+      .findOne({ id: seasonId })
+      .select('-_id')
+      .lean()
+      .exec();
     return (row as SportsSeasonRecord | null) ?? null;
   }
 
   async getTeams(query: SportsTeamListQuery = {}): Promise<SportsTeamRecord[]> {
     const filter: Record<string, unknown> = {};
     if (query.leagueId) filter.leagueIds = query.leagueId.trim().toLowerCase();
-    if (query.country) filter.country = new RegExp(this.escapeRegex(query.country), 'i');
+    if (query.country)
+      filter.country = new RegExp(this.escapeRegex(query.country), 'i');
     if (query.search?.trim()) {
       const expression = new RegExp(this.escapeRegex(query.search.trim()), 'i');
-      filter.$or = [{ name: expression }, { displayName: expression }, { abbreviation: expression }];
+      filter.$or = [
+        { name: expression },
+        { displayName: expression },
+        { abbreviation: expression },
+      ];
     }
-    const rows = await this.teamModel.find(filter).sort({ name: 1, id: 1 })
-      .limit(Math.max(1, Math.min(query.limit ?? 250, 1_000))).select('-_id').lean().exec();
+    const rows = await this.teamModel
+      .find(filter)
+      .sort({ name: 1, id: 1 })
+      .limit(Math.max(1, Math.min(query.limit ?? 250, 1_000)))
+      .select('-_id')
+      .lean()
+      .exec();
     return rows as SportsTeamRecord[];
   }
 
   async getTeam(teamId: string): Promise<SportsTeamRecord | null> {
-    const row = await this.teamModel.findOne({ $or: [{ id: teamId }, { espnId: teamId }] }).select('-_id').lean().exec();
+    const row = await this.teamModel
+      .findOne({ $or: [{ id: teamId }, { espnId: teamId }] })
+      .select('-_id')
+      .lean()
+      .exec();
     return (row as SportsTeamRecord | null) ?? null;
   }
 
   async getFixture(fixtureId: string): Promise<SportsFixtureRecord | null> {
-    const row = await this.fixtureModel.findOne({ $or: [{ id: fixtureId }, { espnEventId: fixtureId }] })
-      .select('-_id').lean().exec();
+    const row = await this.fixtureModel
+      .findOne({ $or: [{ id: fixtureId }, { espnEventId: fixtureId }] })
+      .select('-_id')
+      .lean()
+      .exec();
     return (row as SportsFixtureRecord | null) ?? null;
   }
 
@@ -120,18 +167,22 @@ export class SportsDomainReadService {
       };
     }
     if (query.retainedOnly) {
-      filter.$and = [{
-        $or: [
-          { retentionExpiresAt: { $gt: new Date() } },
-          { retentionExpiresAt: { $exists: false } },
-          { retentionExpiresAt: null },
-        ],
-      }];
+      filter.$and = [
+        {
+          $or: [
+            { retentionExpiresAt: { $gt: new Date() } },
+            { retentionExpiresAt: { $exists: false } },
+            { retentionExpiresAt: null },
+          ],
+        },
+      ];
     }
     return this.fixtureModel.countDocuments(filter).exec();
   }
 
-  async getFixtures(query: SportsFixtureQuery = {}): Promise<SportsFixtureReadResult> {
+  async getFixtures(
+    query: SportsFixtureQuery = {},
+  ): Promise<SportsFixtureReadResult> {
     const filter: Record<string, unknown> = {};
     if (query.competitionId) filter.competitionId = query.competitionId;
     if (query.seasonId) filter.seasonId = query.seasonId;
@@ -170,40 +221,108 @@ export class SportsDomainReadService {
     }
     if (andConditions.length) filter.$and = andConditions;
 
-    const rows = await this.fixtureModel.find(filter).sort({ kickoffAt: sortDirection, id: sortDirection })
-      .limit(limit + 1).select('-_id').lean().exec();
+    const rows = await this.fixtureModel
+      .find(filter)
+      .sort({ kickoffAt: sortDirection, id: sortDirection })
+      .limit(limit + 1)
+      .select('-_id')
+      .lean()
+      .exec();
     const hasMore = rows.length > limit;
-    const page = (hasMore ? rows.slice(0, limit) : rows) as SportsFixtureRecord[];
+    const page = (
+      hasMore ? rows.slice(0, limit) : rows
+    ) as SportsFixtureRecord[];
     const last = page[page.length - 1];
     return {
       items: page,
-      nextCursor: hasMore && last ? this.encodeCursor({ kickoffAt: new Date(last.kickoffAt).toISOString(), id: last.id }) : undefined,
+      nextCursor:
+        hasMore && last
+          ? this.encodeCursor({
+              kickoffAt: new Date(last.kickoffAt).toISOString(),
+              id: last.id,
+            })
+          : undefined,
     };
   }
 
-  async getFixtureContexts(fixtureIds: string[]): Promise<SportsFixtureContextReadModel[]> {
+  async getFixtureContexts(
+    fixtureIds: string[],
+  ): Promise<SportsFixtureContextReadModel[]> {
     if (!fixtureIds.length) return [];
-    const fixtures = await this.fixtureModel.find({ $or: [{ id: { $in: fixtureIds } }, { espnEventId: { $in: fixtureIds } }] })
-      .select('-_id').lean().exec() as SportsFixtureRecord[];
-    const competitionIds = [...new Set(fixtures.map((item) => item.competitionId))];
-    const seasonIds = [...new Set(fixtures.map((item) => item.seasonId).filter((id): id is string => Boolean(id)))];
-    const teamIds = [...new Set(fixtures.flatMap((item) => item.competitors.map((competitor) => competitor.teamId)))];
+    const fixtures = (await this.fixtureModel
+      .find({
+        $or: [
+          { id: { $in: fixtureIds } },
+          { espnEventId: { $in: fixtureIds } },
+        ],
+      })
+      .select('-_id')
+      .lean()
+      .exec()) as SportsFixtureRecord[];
+    const competitionIds = [
+      ...new Set(fixtures.map((item) => item.competitionId)),
+    ];
+    const seasonIds = [
+      ...new Set(
+        fixtures
+          .map((item) => item.seasonId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const teamIds = [
+      ...new Set(
+        fixtures.flatMap((item) =>
+          item.competitors.map((competitor) => competitor.teamId),
+        ),
+      ),
+    ];
 
-    const [competitions, seasons, teams] = await Promise.all([
-      this.competitionModel.find({ id: { $in: competitionIds } }).select('-_id').lean().exec(),
-      this.seasonModel.find({ id: { $in: seasonIds } }).select('-_id').lean().exec(),
-      this.teamModel.find({ id: { $in: teamIds } }).select('-_id').lean().exec(),
+    // A match context normally contains one competition, season and two
+    // teams. Load reference collections in two bounded waves instead of
+    // issuing all three reads at once.
+    const [competitions, seasons] = await Promise.all([
+      this.competitionModel
+        .find({ id: { $in: competitionIds } })
+        .select('-_id')
+        .lean()
+        .exec(),
+      this.seasonModel
+        .find({ id: { $in: seasonIds } })
+        .select('-_id')
+        .lean()
+        .exec(),
     ]);
-    const competitionMap = new Map<string, SportsCompetitionRecord>(competitions.map((item: any) => [String(item.id), item]));
-    const seasonMap = new Map<string, SportsSeasonRecord>(seasons.map((item: any) => [String(item.id), item]));
-    const teamMap = new Map<string, SportsTeamRecord>(teams.map((item: any) => [String(item.id), item]));
+    const teams = await this.teamModel
+      .find({ id: { $in: teamIds } })
+      .select('-_id')
+      .lean()
+      .exec();
+    const competitionMap = new Map<string, SportsCompetitionRecord>(
+      competitions.map((item: any) => [String(item.id), item]),
+    );
+    const seasonMap = new Map<string, SportsSeasonRecord>(
+      seasons.map((item: any) => [String(item.id), item]),
+    );
+    const teamMap = new Map<string, SportsTeamRecord>(
+      teams.map((item: any) => [String(item.id), item]),
+    );
 
     return fixtures.map((fixture) => ({
       fixture,
       competition: competitionMap.get(fixture.competitionId) ?? null,
-      season: fixture.seasonId ? seasonMap.get(fixture.seasonId) ?? null : null,
-      homeTeam: teamMap.get(fixture.competitors.find((item) => item.homeAway === 'HOME')?.teamId ?? '') ?? null,
-      awayTeam: teamMap.get(fixture.competitors.find((item) => item.homeAway === 'AWAY')?.teamId ?? '') ?? null,
+      season: fixture.seasonId
+        ? (seasonMap.get(fixture.seasonId) ?? null)
+        : null,
+      homeTeam:
+        teamMap.get(
+          fixture.competitors.find((item) => item.homeAway === 'HOME')
+            ?.teamId ?? '',
+        ) ?? null,
+      awayTeam:
+        teamMap.get(
+          fixture.competitors.find((item) => item.homeAway === 'AWAY')
+            ?.teamId ?? '',
+        ) ?? null,
     }));
   }
 
@@ -212,9 +331,11 @@ export class SportsDomainReadService {
     if (!fixture) return null;
     const [context] = await this.getFixtureContexts([fixture.id]);
     if (!context) return null;
-    const [timeline, latestOdds, matchFacts, matchSummary] = await Promise.all([
+    const [timeline, latestOdds] = await Promise.all([
       this.getMatchTimeline(fixture.id),
       this.getMatchOdds(fixture.id),
+    ]);
+    const [matchFacts, matchSummary] = await Promise.all([
       this.matchFactsModel
         .findOne({ fixtureId: fixture.id })
         .select('-_id -__v')
@@ -231,7 +352,8 @@ export class SportsDomainReadService {
       timeline,
       latestOdds,
       matchFacts: (matchFacts as SportsMatchReadModel['matchFacts']) ?? null,
-      matchSummary: (matchSummary as SportsMatchReadModel['matchSummary']) ?? null,
+      matchSummary:
+        (matchSummary as SportsMatchReadModel['matchSummary']) ?? null,
     };
   }
 
@@ -252,23 +374,37 @@ export class SportsDomainReadService {
       limit: Math.max(5, Math.min(100, Math.floor(limit) || 40)),
     });
     const recentFixtures = fixturesPage.items
-      .filter((fixture) => fixture.status?.state === 'COMPLETED' || fixture.status?.isFinal === true)
-      .sort((left, right) => new Date(right.kickoffAt).getTime() - new Date(left.kickoffAt).getTime());
+      .filter(
+        (fixture) =>
+          fixture.status?.state === 'COMPLETED' ||
+          fixture.status?.isFinal === true,
+      )
+      .sort(
+        (left, right) =>
+          new Date(right.kickoffAt).getTime() -
+          new Date(left.kickoffAt).getTime(),
+      );
 
     // Read all retained season projections once. A requested current season may
     // not have a completed fixture yet, so the latest prior-season rolling form
     // is a valid fallback until the current season projection is recalculated.
-    const projectionRows = (await this.derived.getTeamFormsForTeam(team.id, competitionId))
+    const projectionRows = (
+      await this.derived.getTeamFormsForTeam(team.id, competitionId)
+    )
       .map((value) => this.asRecord(value))
       .filter((record): record is Record<string, any> => Boolean(record));
-    const targetScopes = new Map<string, { competitionId: string; seasonId?: string }>();
+    const targetScopes = new Map<
+      string,
+      { competitionId: string; seasonId?: string }
+    >();
     if (competitionId) {
       targetScopes.set(competitionId, { competitionId, seasonId });
     } else {
       // recentFixtures is newest-first; the first fixture for each competition
       // identifies the season whose rolling snapshot should be returned.
       for (const fixture of recentFixtures) {
-        if (!fixture.competitionId || targetScopes.has(fixture.competitionId)) continue;
+        if (!fixture.competitionId || targetScopes.has(fixture.competitionId))
+          continue;
         targetScopes.set(fixture.competitionId, {
           competitionId: fixture.competitionId,
           seasonId: fixture.seasonId,
@@ -278,46 +414,77 @@ export class SportsDomainReadService {
 
     const form: SportsTeamFormRecord[] = [];
     for (const scope of targetScopes.values()) {
-      const candidates = projectionRows.filter((record) =>
-        String(record.competitionId ?? '') === scope.competitionId,
+      const candidates = projectionRows.filter(
+        (record) => String(record.competitionId ?? '') === scope.competitionId,
       );
       const exact = scope.seasonId
-        ? candidates.find((record) => String(record.seasonId ?? '') === scope.seasonId)
+        ? candidates.find(
+            (record) => String(record.seasonId ?? '') === scope.seasonId,
+          )
         : undefined;
-      const historySeasonIds = [...new Set(
-        recentFixtures
-          .filter((fixture) => fixture.competitionId === scope.competitionId)
-          .map((fixture) => fixture.seasonId)
-          .filter((value): value is string => Boolean(value)),
-      )];
+      const historySeasonIds = [
+        ...new Set(
+          recentFixtures
+            .filter((fixture) => fixture.competitionId === scope.competitionId)
+            .map((fixture) => fixture.seasonId)
+            .filter((value): value is string => Boolean(value)),
+        ),
+      ];
       const latestHistoryProjection = historySeasonIds
-        .map((historySeasonId) => candidates.find(
-          (record) => String(record.seasonId ?? '') === historySeasonId,
-        ))
+        .map((historySeasonId) =>
+          candidates.find(
+            (record) => String(record.seasonId ?? '') === historySeasonId,
+          ),
+        )
         .find((record) => Boolean(record));
-      const source = exact
-        ?? latestHistoryProjection
-        ?? [...candidates].sort((a, b) =>
-          (this.date(b.calculatedAt)?.getTime() ?? 0) - (this.date(a.calculatedAt)?.getTime() ?? 0),
+      const source =
+        exact ??
+        latestHistoryProjection ??
+        [...candidates].sort(
+          (a, b) =>
+            (this.date(b.calculatedAt)?.getTime() ?? 0) -
+            (this.date(a.calculatedAt)?.getTime() ?? 0),
         )[0];
       if (!source) continue;
 
       const metrics = this.asRecord(source.metrics) ?? {};
-      const rows = Array.isArray(metrics.recentMatchFacts) ? metrics.recentMatchFacts : [];
-      const results = rows.flatMap((candidate) => {
-        const row = this.asRecord(candidate);
-        if (!row) return [];
-        const fixtureId = String(row.fixtureId ?? '').trim();
-        const kickoffAt = this.date(row.kickoffAt);
-        const goalsFor = this.number(row.goalsFor);
-        const goalsAgainst = this.number(row.goalsAgainst);
-        const homeAway = row.homeAway === 'HOME' || row.homeAway === 'AWAY' ? row.homeAway : null;
-        if (!fixtureId || !kickoffAt || goalsFor === null || goalsAgainst === null || !homeAway) return [];
-        const result = row.result === 'W' || row.result === 'D' || row.result === 'L'
-          ? row.result
-          : goalsFor > goalsAgainst ? 'W' as const : goalsFor < goalsAgainst ? 'L' as const : 'D' as const;
-        return [{ fixtureId, kickoffAt, result, goalsFor, goalsAgainst, homeAway }];
-      }).sort((a, b) => b.kickoffAt.getTime() - a.kickoffAt.getTime()).slice(0, 40);
+      const rows = Array.isArray(metrics.recentMatchFacts)
+        ? metrics.recentMatchFacts
+        : [];
+      const results = rows
+        .flatMap((candidate) => {
+          const row = this.asRecord(candidate);
+          if (!row) return [];
+          const fixtureId = String(row.fixtureId ?? '').trim();
+          const kickoffAt = this.date(row.kickoffAt);
+          const goalsFor = this.number(row.goalsFor);
+          const goalsAgainst = this.number(row.goalsAgainst);
+          const homeAway =
+            row.homeAway === 'HOME' || row.homeAway === 'AWAY'
+              ? row.homeAway
+              : null;
+          if (
+            !fixtureId ||
+            !kickoffAt ||
+            goalsFor === null ||
+            goalsAgainst === null ||
+            !homeAway
+          )
+            return [];
+          const result =
+            row.result === 'W' || row.result === 'D' || row.result === 'L'
+              ? row.result
+              : goalsFor > goalsAgainst
+                ? ('W' as const)
+                : goalsFor < goalsAgainst
+                  ? ('L' as const)
+                  : ('D' as const);
+          return [
+            { fixtureId, kickoffAt, result, goalsFor, goalsAgainst, homeAway },
+          ];
+        })
+        .sort((a, b) => b.kickoffAt.getTime() - a.kickoffAt.getTime())
+        .slice(0, 40);
       if (!results.length) continue;
 
       form.push({
@@ -346,7 +513,9 @@ export class SportsDomainReadService {
     seasonId: string,
     scope: 'SEASON' | 'HOME' | 'AWAY' | 'LAST5' | 'LAST10' = 'SEASON',
   ): Promise<SportsTeamScoringRecord | null> {
-    const source = this.asRecord(await this.derived.getTeamScoring(teamId, competitionId, seasonId));
+    const source = this.asRecord(
+      await this.derived.getTeamScoring(teamId, competitionId, seasonId),
+    );
     if (!source) return null;
     const metrics = this.asRecord(source.metrics) ?? {};
     const window = this.asRecord(metrics[scope.toLowerCase()]);
@@ -357,9 +526,12 @@ export class SportsDomainReadService {
     // An empty or malformed scoring window is unavailable data, not a 0-goal
     // scoring rate. Keep the existing consumer contract non-null by returning
     // null for the whole window when no valid denominator/rates exist.
-    if (played < 1 || averageGoalsFor === null || averageGoalsAgainst === null) return null;
+    if (played < 1 || averageGoalsFor === null || averageGoalsAgainst === null)
+      return null;
     return {
-      id: String(source.id ?? `scoring:${competitionId}:${seasonId}:${teamId}:${scope}`),
+      id: String(
+        source.id ?? `scoring:${competitionId}:${seasonId}:${teamId}:${scope}`,
+      ),
       teamId,
       competitionId,
       seasonId,
@@ -373,7 +545,7 @@ export class SportsDomainReadService {
       computedAt: this.date(source.calculatedAt) ?? new Date(0),
       sourceRevision: this.number(source.sourceRevision) ?? 0,
       metrics,
-    } as SportsTeamScoringRecord;
+    };
   }
 
   /** Read the canonical season/home/away record and all retained recent venue windows. */
@@ -382,7 +554,9 @@ export class SportsDomainReadService {
     competitionId: string,
     seasonId: string,
   ): Promise<SportsTeamHomeAwayRecord | null> {
-    const source = this.asRecord(await this.derived.getTeamHomeAway(teamId, competitionId, seasonId));
+    const source = this.asRecord(
+      await this.derived.getTeamHomeAway(teamId, competitionId, seasonId),
+    );
     if (!source) return null;
     const metrics = this.asRecord(source.metrics) ?? {};
     const season = this.asRecord(metrics.season);
@@ -403,22 +577,29 @@ export class SportsDomainReadService {
       last5Away: this.recordWindow(this.asRecord(metrics.last5Away)),
       last10Away: this.recordWindow(this.asRecord(metrics.last10Away)),
       metrics,
-    } as SportsTeamHomeAwayRecord;
+    };
   }
 
   async getCompetitionScoringTotals(
     competitionId: string,
     seasonId: string,
   ): Promise<SportsCompetitionScoringTotalsRecord | null> {
-    const source = this.asRecord(await this.derived.getCompetitionScoring(competitionId, seasonId));
+    const source = this.asRecord(
+      await this.derived.getCompetitionScoring(competitionId, seasonId),
+    );
     if (!source) return null;
     const metrics = this.asRecord(source.metrics) ?? {};
     const totalGoals = this.number(metrics.totalGoals) ?? 0;
     return {
-      id: String(source.id ?? `competition-scoring:${competitionId}:${seasonId}`),
+      id: String(
+        source.id ?? `competition-scoring:${competitionId}:${seasonId}`,
+      ),
       competitionId,
       seasonId,
-      fixturesPlayed: this.number(metrics.matches) ?? this.number(source.sourceFixtureCount) ?? 0,
+      fixturesPlayed:
+        this.number(metrics.matches) ??
+        this.number(source.sourceFixtureCount) ??
+        0,
       totalGoals,
       homeGoals: this.number(metrics.homeGoals) ?? 0,
       awayGoals: this.number(metrics.awayGoals) ?? 0,
@@ -433,7 +614,7 @@ export class SportsDomainReadService {
       cleanSheetRate: this.number(metrics.cleanSheetRate),
       eventMetrics: this.asRecord(metrics.eventMetrics) ?? {},
       metrics,
-    } as SportsCompetitionScoringTotalsRecord;
+    };
   }
 
   async getTeamStatisticsAggregate(
@@ -442,7 +623,9 @@ export class SportsDomainReadService {
     seasonId: string,
     scope: 'SEASON' | 'HOME' | 'AWAY' | 'LAST5' | 'LAST10' = 'SEASON',
   ): Promise<SportsTeamStatisticsAggregateRecord | null> {
-    const source = this.asRecord(await this.derived.getTeamStatistics(teamId, competitionId, seasonId));
+    const source = this.asRecord(
+      await this.derived.getTeamStatistics(teamId, competitionId, seasonId),
+    );
     if (!source) return null;
     const metrics = this.asRecord(source.metrics) ?? {};
     const window = this.asRecord(metrics[scope.toLowerCase()]);
@@ -455,7 +638,8 @@ export class SportsDomainReadService {
       if (!row) continue;
       const average = this.number(row.average);
       const sampleSize = this.number(row.samples) ?? 0;
-      const total = this.number(row.total) ?? (average !== null ? average * sampleSize : 0);
+      const total =
+        this.number(row.total) ?? (average !== null ? average * sampleSize : 0);
       const varianceValue = this.number(row.variance);
       const minimumValue = this.number(row.minimum);
       const maximumValue = this.number(row.maximum);
@@ -467,7 +651,9 @@ export class SportsDomainReadService {
         sampleSize,
         total,
         average,
-        ...(varianceValue !== null && varianceValue >= 0 ? { variance: varianceValue } : {}),
+        ...(varianceValue !== null && varianceValue >= 0
+          ? { variance: varianceValue }
+          : {}),
         ...(minimumValue !== null ? { minimum: minimumValue } : {}),
         ...(maximumValue !== null ? { maximum: maximumValue } : {}),
       });
@@ -479,30 +665,54 @@ export class SportsDomainReadService {
       if (average === null) continue;
       const normalized = this.normalizeStatisticKey(key);
       if (statistics.has(normalized)) continue;
-      const related = [...statistics.values()].filter((item) => this.statisticAliases(key).includes(this.normalizeStatisticKey(item.key)));
-      const sampleSize = related.length ? Math.min(...related.map((item) => item.sampleSize)) : 0;
+      const related = [...statistics.values()].filter((item) =>
+        this.statisticAliases(key).includes(
+          this.normalizeStatisticKey(item.key),
+        ),
+      );
+      const sampleSize = related.length
+        ? Math.min(...related.map((item) => item.sampleSize))
+        : 0;
       if (sampleSize < 1) continue;
-      statistics.set(normalized, { key, name: key, label: key, sampleSize, total: average * sampleSize, average });
+      statistics.set(normalized, {
+        key,
+        name: key,
+        label: key,
+        sampleSize,
+        total: average * sampleSize,
+        average,
+      });
     }
 
     const rows = [...statistics.values()];
     return {
-      id: String(source.id ?? `team-statistics:${competitionId}:${seasonId}:${teamId}`),
+      id: String(
+        source.id ?? `team-statistics:${competitionId}:${seasonId}:${teamId}`,
+      ),
       teamId,
       competitionId,
       seasonId,
-      fixturesWithStatistics: rows.reduce((maximum, row) => Math.max(maximum, row.sampleSize), 0),
+      fixturesWithStatistics: rows.reduce(
+        (maximum, row) => Math.max(maximum, row.sampleSize),
+        0,
+      ),
       statistics: rows,
       computedAt: this.date(source.calculatedAt) ?? new Date(0),
       sourceRevision: this.number(source.sourceRevision) ?? 0,
       scope,
       scopeMetrics: window,
       metrics,
-    } as SportsTeamStatisticsAggregateRecord;
+    };
   }
 
-  async getHeadToHead(teamAId: string, teamBId: string, competitionId: string): Promise<SportsHeadToHeadRecord | null> {
-    const source = this.asRecord(await this.derived.getHeadToHead(teamAId, teamBId, competitionId));
+  async getHeadToHead(
+    teamAId: string,
+    teamBId: string,
+    competitionId: string,
+  ): Promise<SportsHeadToHeadRecord | null> {
+    const source = this.asRecord(
+      await this.derived.getHeadToHead(teamAId, teamBId, competitionId),
+    );
     if (!source) return null;
     const storedTeamA = String(source.teamAId ?? teamAId);
     const storedTeamB = String(source.teamBId ?? teamBId);
@@ -516,18 +726,27 @@ export class SportsDomainReadService {
       const kickoffAt = this.date(row.kickoffAt);
       const scoreA = this.number(row.teamAScore);
       const scoreB = this.number(row.teamBScore);
-      if (!fixtureId || !kickoffAt || !homeTeamId || scoreA === null || scoreB === null) return [];
+      if (
+        !fixtureId ||
+        !kickoffAt ||
+        !homeTeamId ||
+        scoreA === null ||
+        scoreB === null
+      )
+        return [];
       const aIsHome = homeTeamId === storedTeamA;
-      return [{
-        fixtureId,
-        kickoffAt,
-        homeTeamId,
-        awayTeamId: aIsHome ? storedTeamB : storedTeamA,
-        homeScore: aIsHome ? scoreA : scoreB,
-        awayScore: aIsHome ? scoreB : scoreA,
-        recencyRank: this.number(row.recencyRank) ?? 0,
-        recencyWeight: this.number(row.recencyWeight) ?? 1,
-      }];
+      return [
+        {
+          fixtureId,
+          kickoffAt,
+          homeTeamId,
+          awayTeamId: aIsHome ? storedTeamB : storedTeamA,
+          homeScore: aIsHome ? scoreA : scoreB,
+          awayScore: aIsHome ? scoreB : scoreA,
+          recencyRank: this.number(row.recencyRank) ?? 0,
+          recencyWeight: this.number(row.recencyWeight) ?? 1,
+        },
+      ];
     });
     return {
       teamAId: storedTeamA,
@@ -537,7 +756,7 @@ export class SportsDomainReadService {
       computedAt: this.date(source.calculatedAt) ?? new Date(0),
       sourceRevision: this.number(source.sourceRevision) ?? 0,
       metrics,
-    } as SportsHeadToHeadRecord;
+    };
   }
 
   async getPlayerEventTotals(
@@ -545,14 +764,23 @@ export class SportsDomainReadService {
     competitionId: string,
     seasonId: string,
   ): Promise<SportsPlayerEventTotalsRecord | null> {
-    return this.derived.getPlayerEventTotals(playerId, competitionId, seasonId) as Promise<SportsPlayerEventTotalsRecord | null>;
+    return this.derived.getPlayerEventTotals(
+      playerId,
+      competitionId,
+      seasonId,
+    ) as Promise<SportsPlayerEventTotalsRecord | null>;
   }
 
-  async getStandings(competitionId: string, seasonId: string): Promise<unknown[]> {
+  async getStandings(
+    competitionId: string,
+    seasonId: string,
+  ): Promise<unknown[]> {
     return this.derived.getStandings(competitionId, seasonId);
   }
 
-  private recordWindow(value: Record<string, unknown> | null): SportsTeamHomeAwayRecord['home'] | null {
+  private recordWindow(
+    value: Record<string, unknown> | null,
+  ): SportsTeamHomeAwayRecord['home'] | null {
     if (!value) return null;
     return {
       played: this.number(value.played) ?? 0,
@@ -566,7 +794,7 @@ export class SportsDomainReadService {
 
   private asRecord(value: unknown): Record<string, any> | null {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, any>
+      ? (value as Record<string, any>)
       : null;
   }
 
@@ -586,13 +814,21 @@ export class SportsDomainReadService {
   }
 
   private normalizeStatisticKey(value: unknown): string {
-    return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    return String(value ?? '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
   }
 
   private statisticAliases(value: string): string[] {
     const key = this.normalizeStatisticKey(value);
     const aliases: Record<string, string[]> = {
-      corners: ['corners', 'woncorners', 'cornerkicks', 'cornerkickswon', 'totalcorners'],
+      corners: [
+        'corners',
+        'woncorners',
+        'cornerkicks',
+        'cornerkickswon',
+        'totalcorners',
+      ],
       shots: ['shots', 'totalshots', 'shotsattempted'],
       shotsontarget: ['shotsontarget', 'shotsongoal', 'ontargetattempts'],
       possession: ['possession', 'possessionpct'],
@@ -606,30 +842,58 @@ export class SportsDomainReadService {
     return aliases[key] ?? [key];
   }
 
-  async getMatchTimeline(fixtureId: string): Promise<SportsMatchTimelineEventRecord[]> {
-    const rows = await this.timelineModel.find({ fixtureId }).sort({ sequence: 1, id: 1 }).select('-_id').lean().exec();
+  async getMatchTimeline(
+    fixtureId: string,
+  ): Promise<SportsMatchTimelineEventRecord[]> {
+    const rows = await this.timelineModel
+      .find({ fixtureId })
+      .sort({ sequence: 1, id: 1 })
+      .select('-_id')
+      .lean()
+      .exec();
     return rows as SportsMatchTimelineEventRecord[];
   }
 
-  async getMatchOdds(fixtureId: string): Promise<SportsMatchOddsSnapshotRecord | null> {
-    const row = await this.oddsModel.findOne({ fixtureId }).sort({ collectedAt: -1 }).select('-_id').lean().exec();
+  async getMatchOdds(
+    fixtureId: string,
+  ): Promise<SportsMatchOddsSnapshotRecord | null> {
+    const row = await this.oddsModel
+      .findOne({ fixtureId })
+      .sort({ collectedAt: -1 })
+      .select('-_id')
+      .lean()
+      .exec();
     return (row as SportsMatchOddsSnapshotRecord | null) ?? null;
   }
 
-  async getMatchOddsHistory(fixtureId: string, requestedLimit = 20): Promise<SportsMatchOddsSnapshotRecord[]> {
-    const rows = await this.oddsModel.find({ fixtureId }).sort({ collectedAt: -1 })
-      .limit(Math.max(1, Math.min(requestedLimit, 100))).select('-_id').lean().exec();
+  async getMatchOddsHistory(
+    fixtureId: string,
+    requestedLimit = 20,
+  ): Promise<SportsMatchOddsSnapshotRecord[]> {
+    const rows = await this.oddsModel
+      .find({ fixtureId })
+      .sort({ collectedAt: -1 })
+      .limit(Math.max(1, Math.min(requestedLimit, 100)))
+      .select('-_id')
+      .lean()
+      .exec();
     return rows as SportsMatchOddsSnapshotRecord[];
   }
 
-  private competitionFilter(query: SportsCompetitionListQuery): Record<string, unknown> {
+  private competitionFilter(
+    query: SportsCompetitionListQuery,
+  ): Record<string, unknown> {
     const filter: Record<string, unknown> = {};
     if (query.activeOnly !== false) filter.isActive = true;
     if (query.region) filter.region = query.region;
     if (query.type) filter.type = query.type;
     if (query.search?.trim()) {
       const expression = new RegExp(this.escapeRegex(query.search.trim()), 'i');
-      filter.$or = [{ name: expression }, { displayName: expression }, { slug: expression }];
+      filter.$or = [
+        { name: expression },
+        { displayName: expression },
+        { slug: expression },
+      ];
     }
     return filter;
   }
@@ -644,7 +908,9 @@ export class SportsDomainReadService {
 
   private decodeCursor(value: string): { kickoffAt: Date; id: string } | null {
     try {
-      const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as { kickoffAt?: string; id?: string };
+      const parsed = JSON.parse(
+        Buffer.from(value, 'base64url').toString('utf8'),
+      ) as { kickoffAt?: string; id?: string };
       const kickoffAt = new Date(String(parsed.kickoffAt ?? ''));
       if (Number.isNaN(kickoffAt.getTime()) || !parsed.id) return null;
       return { kickoffAt, id: String(parsed.id) };
@@ -653,4 +919,3 @@ export class SportsDomainReadService {
     }
   }
 }
-

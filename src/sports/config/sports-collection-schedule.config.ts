@@ -66,4 +66,3 @@ export type SportsCollectionScheduleKey =
   keyof typeof SPORTS_COLLECTION_SCHEDULE;
 
 export const SPORTS_COLLECTION_TIME = { MINUTE, HOUR, DAY } as const;
-

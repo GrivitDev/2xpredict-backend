@@ -44,3 +44,66 @@ describe('SportsQueueJobProcessorService cross-competition repricing reads', () 
     expect(sportsRead.getFixtures).toHaveBeenCalledTimes(3);
   });
 });
+
+describe('SportsQueueJobProcessorService completed-fixture recovery', () => {
+  it('consumes every completed-fixture page sequentially without accumulating pages', async () => {
+    const firstPage = {
+      items: [fixture('fixture-3', 'competition-1', 'team-a', new Date('2026-11-03T00:00:00.000Z'), 'COMPLETED')],
+      nextCursor: 'cursor-1',
+    };
+    const secondPage = {
+      items: [fixture('fixture-2', 'competition-1', 'team-a', new Date('2026-11-02T00:00:00.000Z'), 'COMPLETED')],
+      nextCursor: 'cursor-2',
+    };
+    const thirdPage = {
+      items: [fixture('fixture-1', 'competition-1', 'team-a', new Date('2026-11-01T00:00:00.000Z'), 'COMPLETED')],
+      nextCursor: undefined,
+    };
+    const pages = [firstPage, secondPage, thirdPage];
+    const collection = {
+      getCompletedFixturesPage: jest.fn(async () => pages.shift()!),
+    };
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = collection;
+
+    const handled: string[] = [];
+    const result = await service.forEachCompletedFixturePage(
+      async (items: Array<{ id: string }>) => {
+        handled.push(...items.map((item) => item.id));
+      },
+      { competitionId: 'competition-1', seasonId: 'season-1' },
+    );
+
+    expect(result).toBe(3);
+    expect(handled).toEqual(['fixture-3', 'fixture-2', 'fixture-1']);
+    expect(collection.getCompletedFixturesPage).toHaveBeenNthCalledWith(1, {
+      competitionId: 'competition-1',
+      seasonId: 'season-1',
+      limit: 100,
+    });
+    expect(collection.getCompletedFixturesPage).toHaveBeenNthCalledWith(2, {
+      competitionId: 'competition-1',
+      seasonId: 'season-1',
+      limit: 100,
+      cursor: 'cursor-1',
+    });
+    expect(collection.getCompletedFixturesPage).toHaveBeenNthCalledWith(3, {
+      competitionId: 'competition-1',
+      seasonId: 'season-1',
+      limit: 100,
+      cursor: 'cursor-2',
+    });
+  });
+
+  it('stops after an empty final page and reports zero processed fixtures', async () => {
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = {
+      getCompletedFixturesPage: jest.fn().mockResolvedValue({ items: [], nextCursor: undefined }),
+    };
+    const handler = jest.fn();
+
+    await expect(service.forEachCompletedFixturePage(handler)).resolves.toBe(0);
+    expect(handler).not.toHaveBeenCalled();
+    expect(service.collection.getCompletedFixturesPage).toHaveBeenCalledTimes(1);
+  });
+});
