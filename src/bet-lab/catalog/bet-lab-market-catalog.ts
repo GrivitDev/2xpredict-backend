@@ -1,7 +1,15 @@
 import { BetLabMarketCategory } from '../enums/bet-lab-market-category.enum';
 import { BetLabMarketCode } from '../enums/bet-lab-market-code.enum';
-import { FOOTBALL_MARKET_CATALOG as CANONICAL_MARKETS, canonicalLineSlug, expandCanonicalSelections } from '../../odds/catalog/football-market-catalog';
-import type { CanonicalMarketDefinition, CanonicalPeriod, CanonicalSelectionMode } from '../../odds/catalog/football-market-catalog';
+import {
+  FOOTBALL_MARKET_CATALOG as CANONICAL_MARKETS,
+  canonicalLineSlug,
+  expandCanonicalSelections,
+} from '../../odds/catalog/football-market-catalog';
+import type {
+  CanonicalMarketDefinition,
+  CanonicalPeriod,
+  CanonicalSelectionMode,
+} from '../../odds/catalog/football-market-catalog';
 
 export type BetLabPeriod = CanonicalPeriod;
 export type BetLabSelectionMode = CanonicalSelectionMode;
@@ -24,6 +32,8 @@ export interface BetLabSelectionDefinition {
 
 export interface BetLabMarketDefinition {
   code: BetLabMarketCode;
+  /** Canonical Prediction Engine market key from the shared Odds catalogue. */
+  predictionMarketKey: string;
   jsonVariable: string;
   fullName: string;
   abbreviation: string;
@@ -72,6 +82,7 @@ function categoryFor(market: CanonicalMarketDefinition): BetLabMarketCategory {
 export const BET_LAB_MARKET_CATALOG: BetLabMarketDefinition[] =
   CANONICAL_MARKETS.map((market) => ({
     code: market.betLabMarketCode as BetLabMarketCode,
+    predictionMarketKey: market.predictionMarketKey,
     jsonVariable: market.jsonVariable,
     fullName: market.fullName,
     abbreviation: market.abbreviation,
@@ -140,7 +151,9 @@ export const BET_LAB_MARKET_BY_CODE: ReadonlyMap<
 
 /** Active API market allow-list derived exclusively from the Odds catalogue. */
 export const BET_LAB_ACTIVE_MARKET_CODES: readonly string[] = Object.freeze(
-  BET_LAB_MARKET_CATALOG.filter((market) => market.pricingEnabled !== false).map((market) => String(market.code)),
+  BET_LAB_MARKET_CATALOG.filter(
+    (market) => market.pricingEnabled !== false,
+  ).map((market) => String(market.code)),
 );
 
 export function formatLine(line: number): string {
@@ -220,4 +233,3 @@ export function assertBetLabCatalogValid(): void {
 }
 
 assertBetLabCatalogValid();
-

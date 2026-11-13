@@ -7,6 +7,7 @@ import { BackgroundWorkModule } from '../common/background-work/background-work.
 import { SportsDomainReadController } from './controllers/sports-domain-read.controller';
 import { SportsDerivedReadController } from './controllers/sports-derived-read.controller';
 import { SportsNewsController } from './controllers/sports-news.controller';
+import { SportsHighlightsController } from './controllers/sports-highlights.controller';
 import { SportsMonitorController } from './controllers/sports-monitor.controller';
 import { EspnV2Client } from './providers/espn-v2.client';
 import { EspnV2Normalizer } from './providers/espn-v2.normalizer';
@@ -50,10 +51,22 @@ import {
   SportsPlayerEventTotals,
   SportsPlayerEventTotalsSchema,
 } from './schemas';
-import { SportsBootstrapState, SportsBootstrapStateSchema } from './schemas/operations/sports-bootstrap-state.schema';
-import { SportsCollectionState, SportsCollectionStateSchema } from './schemas/operations/sports-collection-state.schema';
-import { SportsDataChangeEvent, SportsDataChangeEventSchema } from './schemas/operations/sports-data-change-event.schema';
-import { SportsEntityRevision, SportsEntityRevisionSchema } from './schemas/operations/sports-entity-revision.schema';
+import {
+  SportsBootstrapState,
+  SportsBootstrapStateSchema,
+} from './schemas/operations/sports-bootstrap-state.schema';
+import {
+  SportsCollectionState,
+  SportsCollectionStateSchema,
+} from './schemas/operations/sports-collection-state.schema';
+import {
+  SportsDataChangeEvent,
+  SportsDataChangeEventSchema,
+} from './schemas/operations/sports-data-change-event.schema';
+import {
+  SportsEntityRevision,
+  SportsEntityRevisionSchema,
+} from './schemas/operations/sports-entity-revision.schema';
 import { SportsCollectionStateService } from './services/sports-collection-state.service';
 import { SportsDataChangeEventService } from './services/sports-data-change-event.service';
 import { SportsDataChangeEventProcessorService } from './services/sports-data-change-event-processor.service';
@@ -93,8 +106,14 @@ import {
       { name: SportsSeason.name, schema: SportsSeasonSchema },
       { name: SportsTeam.name, schema: SportsTeamSchema },
       { name: SportsFixture.name, schema: SportsFixtureSchema },
-      { name: SportsMatchTimelineEvent.name, schema: SportsMatchTimelineEventSchema },
-      { name: SportsMatchOddsSnapshot.name, schema: SportsMatchOddsSnapshotSchema },
+      {
+        name: SportsMatchTimelineEvent.name,
+        schema: SportsMatchTimelineEventSchema,
+      },
+      {
+        name: SportsMatchOddsSnapshot.name,
+        schema: SportsMatchOddsSnapshotSchema,
+      },
       { name: SportsMatchSummary.name, schema: SportsMatchSummarySchema },
       { name: SportsMatchFacts.name, schema: SportsMatchFactsSchema },
       { name: SportsCollectionState.name, schema: SportsCollectionStateSchema },
@@ -102,20 +121,50 @@ import {
       { name: SportsEntityRevision.name, schema: SportsEntityRevisionSchema },
       { name: SportsBootstrapState.name, schema: SportsBootstrapStateSchema },
       { name: SportsQueue.name, schema: SportsQueueSchema },
-      { name: SportsYoutubeHighlight.name, schema: SportsYoutubeHighlightSchema },
-      { name: SportsProviderRateLimit.name, schema: SportsProviderRateLimitSchema },
+      {
+        name: SportsYoutubeHighlight.name,
+        schema: SportsYoutubeHighlightSchema,
+      },
+      {
+        name: SportsProviderRateLimit.name,
+        schema: SportsProviderRateLimitSchema,
+      },
       { name: SportsNewsArticle.name, schema: SportsNewsArticleSchema },
-      { name: SportsCalculatedStandings.name, schema: SportsCalculatedStandingsSchema },
+      {
+        name: SportsCalculatedStandings.name,
+        schema: SportsCalculatedStandingsSchema,
+      },
       { name: SportsTeamForm.name, schema: SportsTeamFormSchema },
-      { name: SportsTeamHomeAwayRecord.name, schema: SportsTeamHomeAwayRecordSchema },
-      { name: SportsTeamScoringRecord.name, schema: SportsTeamScoringRecordSchema },
+      {
+        name: SportsTeamHomeAwayRecord.name,
+        schema: SportsTeamHomeAwayRecordSchema,
+      },
+      {
+        name: SportsTeamScoringRecord.name,
+        schema: SportsTeamScoringRecordSchema,
+      },
       { name: SportsHeadToHead.name, schema: SportsHeadToHeadSchema },
-      { name: SportsCompetitionScoringTotals.name, schema: SportsCompetitionScoringTotalsSchema },
-      { name: SportsTeamStatisticsAggregate.name, schema: SportsTeamStatisticsAggregateSchema },
-      { name: SportsPlayerEventTotals.name, schema: SportsPlayerEventTotalsSchema },
+      {
+        name: SportsCompetitionScoringTotals.name,
+        schema: SportsCompetitionScoringTotalsSchema,
+      },
+      {
+        name: SportsTeamStatisticsAggregate.name,
+        schema: SportsTeamStatisticsAggregateSchema,
+      },
+      {
+        name: SportsPlayerEventTotals.name,
+        schema: SportsPlayerEventTotalsSchema,
+      },
     ]),
   ],
-  controllers: [SportsDomainReadController, SportsDerivedReadController, SportsNewsController, SportsMonitorController],
+  controllers: [
+    SportsDomainReadController,
+    SportsDerivedReadController,
+    SportsNewsController,
+    SportsHighlightsController,
+    SportsMonitorController,
+  ],
   providers: [
     EspnV2Client,
     EspnV2Normalizer,
@@ -155,5 +204,3 @@ import {
   ],
 })
 export class SportsDataModule {}
-
-
