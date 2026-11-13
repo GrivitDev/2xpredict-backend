@@ -73,16 +73,11 @@ export class EspnV2Normalizer {
     const year =
       this.readNumber(raw.currentSeasonYear, raw.seasonYear, season.year) ??
       this.yearFromRef(season.$ref);
-    const startDate = this.readDate(
-      season.startDate,
-      season.start,
-      raw.currentSeasonStartDate,
-    );
-    const endDate = this.readDate(
-      season.endDate,
-      season.end,
-      raw.currentSeasonEndDate,
-    );
+    const { startDate, endDate } = this.normalizeSeasonDateRange({
+      ...season,
+      startDate: season.startDate ?? raw.currentSeasonStartDate,
+      endDate: season.endDate ?? raw.currentSeasonEndDate,
+    });
     const competitionId = this.competitionId(slug);
     const country = this.asRecord(raw.country);
     const typeObject = this.asRecord(raw.type);
@@ -152,8 +147,7 @@ export class EspnV2Normalizer {
       year,
       displayName: this.readString(raw.displayName, raw.name),
       shortDisplayName: this.readString(raw.shortDisplayName, raw.abbreviation),
-      startDate: this.readDate(raw.startDate, raw.start),
-      endDate: this.readDate(raw.endDate, raw.end),
+      ...this.normalizeSeasonDateRange(raw),
       isCurrent:
         isCurrent ||
         (this.readBoolean(raw.isCurrent, raw.current, raw.active) ?? false),
@@ -1661,6 +1655,64 @@ export class EspnV2Normalizer {
     return undefined;
   }
 
+  /**
+   * ESPN occasionally publishes an invalid aggregate season boundary while
+   * its season types/phases contain valid ranges. Prefer valid aggregate dates,
+   * and repair only missing/reversed boundaries from the union of phase dates.
+   * This is generic for multi-phase competitions and seasons crossing years.
+   */
+  private normalizeSeasonDateRange(raw: ProviderJsonObject): {
+    startDate?: Date;
+    endDate?: Date;
+  } {
+    let startDate = this.readDate(raw.startDate, raw.start);
+    let endDate = this.readDate(raw.endDate, raw.end);
+
+    const types = this.asRecord(raw.types);
+    const phaseRows = [
+      this.asRecord(raw.type),
+      ...this.readArray(types?.items).map((item) => this.asRecord(item)),
+    ].filter((item): item is ProviderJsonObject => Boolean(item));
+
+    const phaseStarts = phaseRows
+      .map((phase) => this.readDate(phase.startDate, phase.start))
+      .filter((value): value is Date => Boolean(value));
+    const phaseEnds = phaseRows
+      .map((phase) => this.readDate(phase.endDate, phase.end))
+      .filter((value): value is Date => Boolean(value));
+
+    const earliestPhaseStart = phaseStarts.length
+      ? new Date(Math.min(...phaseStarts.map((value) => value.getTime())))
+      : undefined;
+    const latestPhaseEnd = phaseEnds.length
+      ? new Date(Math.max(...phaseEnds.map((value) => value.getTime())))
+      : undefined;
+
+    if (!startDate) startDate = earliestPhaseStart;
+    if (!endDate) endDate = latestPhaseEnd;
+
+    if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
+      // Preserve a valid aggregate start (e.g. season opening), but replace
+      // the reversed aggregate end with the latest valid phase boundary.
+      if (latestPhaseEnd && latestPhaseEnd.getTime() >= startDate.getTime()) {
+        endDate = latestPhaseEnd;
+      } else if (
+        earliestPhaseStart &&
+        earliestPhaseStart.getTime() <= endDate.getTime()
+      ) {
+        startDate = earliestPhaseStart;
+      } else if (
+        earliestPhaseStart && latestPhaseEnd &&
+        earliestPhaseStart.getTime() <= latestPhaseEnd.getTime()
+      ) {
+        startDate = earliestPhaseStart;
+        endDate = latestPhaseEnd;
+      }
+    }
+
+    return { startDate, endDate };
+  }
+
   private readDate(...values: unknown[]): Date | undefined {
     for (const value of values) {
       if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
@@ -1672,4 +1724,5 @@ export class EspnV2Normalizer {
     return undefined;
   }
 }
+
 

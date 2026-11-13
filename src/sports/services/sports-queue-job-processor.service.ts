@@ -36,6 +36,7 @@ type BootstrapStateRecord = {
   status?: string;
   currentPhase?: string;
   discoveredTeams?: Array<Record<string, unknown>>;
+  phaseFailures?: unknown[];
   [key: string]: unknown;
 };
 
@@ -90,8 +91,9 @@ function describeError(value: unknown): string {
 /**
  * Executes the ESPN-only collection workflow.
  *
- * Bootstrap is a strict phase machine. A phase gate cannot advance until all
- * jobs belonging to that phase are completed. Fixtures are then discovered in
+ * Bootstrap is a strict phase machine. A phase gate waits until every job
+ * in its phase is terminal; failures are isolated and recoverable per league.
+ * Fixtures are then discovered in
  * bulk through monthly Site scoreboards and validated day-by-day. After the
  * bootstrap, all maintenance is date/match-event timed.
  *
@@ -352,19 +354,18 @@ export class SportsQueueJobProcessorService {
     if (state.currentPhase !== phase) return; // stale gate from a phase already advanced
 
     const progress = await this.queue.getBootstrapPhaseProgress(runId, phase);
-    if (progress.hasTerminalFailure) {
-      const message = `Bootstrap phase ${phase} has quarantined jobs (${progress.quarantined}).`;
-      await this.bootstrapModel
-        .updateOne(
-          { key: 'espn-soccer-v2', runId },
-          { $set: { status: 'FAILED', lastError: message } },
-        )
-        .exec();
-      throw new Error(message);
-    }
-    if (!progress.isComplete) {
+    // A phase is ready to advance when every league job has reached a terminal
+    // state. Failed/quarantined work is recorded for isolated recovery instead
+    // of allowing one competition to stop the global bootstrap.
+    if (!progress.isSettled) {
       await this.enqueuePhaseGate(runId, phase);
       return;
+    }
+    if (progress.hasTerminalFailure) {
+      await this.recordBootstrapPhaseFailures(runId, phase);
+      this.logger.warn(
+        `ESPN bootstrap ${runId}: ${phase} settled with ${progress.failed + progress.quarantined} failed/quarantined job(s); continuing other leagues.`,
+      );
     }
 
     const next = this.nextPhase(phase);
@@ -384,6 +385,36 @@ export class SportsQueueJobProcessorService {
     this.logger.log(
       `ESPN bootstrap ${runId}: phase ${phase} completed; entered ${next}.`,
     );
+  }
+
+  private async recordBootstrapPhaseFailures(
+    runId: string,
+    phase: SportsBootstrapPhase,
+  ): Promise<void> {
+    const failures = await this.queue.getBootstrapPhaseFailures(runId, phase);
+    if (!failures.length) return;
+
+    const records = failures.map((failure) => ({
+      key: `${phase}:${failure.jobKey}`,
+      phase,
+      jobKey: failure.jobKey,
+      type: failure.type,
+      status: failure.status,
+      scope: failure.scope,
+      leagueId: failure.scope.leagueId,
+      competitionId: failure.scope.competitionId,
+      seasonId: failure.scope.seasonId,
+      calendarDate: failure.scope.calendarDate,
+      lastError: failure.lastError ?? 'Queue job ended in a failed state.',
+      failedAt: failure.failedAt ?? new Date(),
+    }));
+
+    await this.bootstrapModel
+      .updateOne(
+        { key: 'espn-soccer-v2', runId },
+        { $addToSet: { phaseFailures: { $each: records } } },
+      )
+      .exec();
   }
 
   private nextPhase(
@@ -502,7 +533,19 @@ export class SportsQueueJobProcessorService {
           (item) => item.id === season.competitionId,
         );
         if (!competition) continue;
-        const { start, end } = this.seasonDateRange(season);
+        let range: { start: Date; end: Date };
+        try {
+          range = this.seasonDateRange(season);
+        } catch (error) {
+          // The monthly bootstrap job for this season is independently tracked
+          // as failed. Do not let its bad dates abort daily validation for all
+          // other competitions.
+          this.logger.warn(
+            `Skipping daily validation for ${season.id}; its season range is invalid: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          continue;
+        }
+        const { start, end } = range;
         for (const date of this.eachDate(start, end)) {
           await this.queue.enqueue({
             type: SportsQueueJobType.FIXTURE_DAILY_VALIDATION,
@@ -590,18 +633,25 @@ export class SportsQueueJobProcessorService {
     const settlementCatchup =
       await this.settlementTrigger.onSportsBootstrapCompleted();
 
+    const bootstrapState = await this.bootstrapModel
+      .findOne({ key: 'espn-soccer-v2', runId })
+      .lean()
+      .exec();
+    const failureCount = bootstrapState?.phaseFailures?.length ?? 0;
+    const finalStatus = failureCount > 0 ? 'PARTIAL' : 'COMPLETED';
+
     await this.bootstrapModel
       .updateOne(
         { key: 'espn-soccer-v2', runId },
         {
-          $set: { status: 'COMPLETED', completedAt: new Date() },
+          $set: { status: finalStatus, completedAt: new Date() },
           $unset: { currentPhase: 1, lastError: 1 },
         },
       )
       .exec();
 
     this.logger.log(
-      `ESPN bootstrap ${runId} completed. Queued Plays for ${completedCount} completed fixtures. Settlement catch-up: ${JSON.stringify(settlementCatchup)}.`,
+      `ESPN bootstrap ${runId} ${finalStatus.toLowerCase()}: ${failureCount} league/job failure(s) retained for isolated recovery. Queued Plays for ${completedCount} completed fixtures. Settlement catch-up: ${JSON.stringify(settlementCatchup)}.`,
     );
   }
 
@@ -1303,7 +1353,7 @@ export class SportsQueueJobProcessorService {
       | undefined;
     if (scope.bootstrapRunId) {
       const bootstrap = await this.getBootstrapState(scope.bootstrapRunId);
-      const bootstrapCompleted = bootstrap?.status === 'COMPLETED';
+      const bootstrapCompleted = bootstrap?.status === 'COMPLETED' || bootstrap?.status === 'PARTIAL';
       allowPlays = !validateCoverage && bootstrapCompleted;
       if (!bootstrapCompleted)
         bootstrapContext = { bootstrapRunId: scope.bootstrapRunId };
@@ -1399,7 +1449,7 @@ export class SportsQueueJobProcessorService {
       | undefined;
     if (scope.bootstrapRunId) {
       const bootstrap = await this.getBootstrapState(scope.bootstrapRunId);
-      allowPlays = bootstrap?.status === 'COMPLETED';
+      allowPlays = bootstrap?.status === 'COMPLETED' || bootstrap?.status === 'PARTIAL';
       if (!allowPlays)
         bootstrapContext = { bootstrapRunId: scope.bootstrapRunId };
     } else if (scope.seasonBootstrap && scope.seasonId) {
@@ -2471,13 +2521,13 @@ export class SportsQueueJobProcessorService {
     end: Date;
   } {
     if (!season.startDate)
-      throw new Error(
+      throw this.permanentSeasonRangeError(
         `Season ${season.id} has no startDate; refusing an incomplete fixture bootstrap.`,
       );
     const start = this.utcDay(new Date(season.startDate));
     const rawEnd = season.endDate;
     if (!rawEnd)
-      throw new Error(
+      throw this.permanentSeasonRangeError(
         `Season ${season.id} has no endDate; refusing to truncate its monthly and daily fixture coverage.`,
       );
     const end = this.utcDay(new Date(rawEnd));
@@ -2486,9 +2536,17 @@ export class SportsQueueJobProcessorService {
       Number.isNaN(end.getTime()) ||
       start > end
     ) {
-      throw new Error(`Season ${season.id} has an invalid date range.`);
+      throw this.permanentSeasonRangeError(
+        `Season ${season.id} has an invalid date range.`,
+      );
     }
     return { start, end };
+  }
+
+  private permanentSeasonRangeError(message: string): Error & { retryable: false } {
+    const error = new Error(message) as Error & { retryable: false };
+    error.retryable = false;
+    return error;
   }
 
   private eachMonth(start: Date, end: Date): string[] {
@@ -2546,3 +2604,4 @@ export class SportsQueueJobProcessorService {
     return normalized;
   }
 }
+

@@ -7,6 +7,7 @@ import { SPORTS_COLLECTION_SCHEDULE } from '../config/sports-collection-schedule
 import {
   SportsQueueJobType,
   SportsBootstrapPhase,
+  SportsQueueScope,
 } from '../interfaces/sports-queue.interface';
 import { SportsBootstrapState } from '../schemas/operations/sports-bootstrap-state.schema';
 import { SportsSeason } from '../schemas';
@@ -31,10 +32,12 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
       .lean()
       .exec()) as SportsBootstrapState | null;
 
-    if (existing?.status === 'COMPLETED') {
+    if (existing?.status === 'COMPLETED' || existing?.status === 'PARTIAL') {
       await this.ensureRecurringDiscovery();
       this.logger.log(
-        'ESPN Sports bootstrap already completed; recurring discovery is active.',
+        existing.status === 'PARTIAL'
+          ? `ESPN Sports bootstrap completed with ${existing.phaseFailures?.length ?? 0} isolated failure(s); recurring discovery is active. Failed work can be retried from the admin Sports monitor.`
+          : 'ESPN Sports bootstrap already completed; recurring discovery is active.',
       );
       return;
     }
@@ -68,6 +71,7 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
             startedAt: new Date(),
             discoveredLeagueIds: [],
             discoveredTeams: [],
+            phaseFailures: [],
           },
           // Leave currentPhase unset until the league catalogue is actually read.
           // This lets a restart recover the bootstrap-start job without skipping discovery.
@@ -84,6 +88,76 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
       triggerEventId: `espn-bootstrap-start:${runId}`,
     });
     this.logger.log(`Started ESPN Sports bootstrap (${runId}).`);
+  }
+
+  /**
+   * Re-enqueues only failed/quarantined jobs captured by the last partial
+   * bootstrap. The original successful league jobs are never replayed.
+   */
+  async retryFailedBootstrapJobs(): Promise<{
+    queued: number;
+    skipped: number;
+    runId?: string;
+  }> {
+    const state = (await this.bootstrapModel
+      .findOne({ key: this.stateKey })
+      .lean()
+      .exec()) as (SportsBootstrapState & { phaseFailures?: Array<Record<string, any>> }) | null;
+
+    if (state?.status !== 'PARTIAL' || !state.runId || !state.phaseFailures?.length) {
+      return { queued: 0, skipped: state?.phaseFailures?.length ?? 0 };
+    }
+
+    const recoveryId = randomUUID();
+    let queued = 0;
+    let skipped = 0;
+
+    for (const failure of state.phaseFailures) {
+      const type = failure.type as SportsQueueJobType | undefined;
+      const sourceScope = failure.scope as Record<string, unknown> | undefined;
+      const key = String(failure.key ?? '');
+      if (
+        !type ||
+        !Object.values(SportsQueueJobType).includes(type) ||
+        !sourceScope ||
+        !key ||
+        failure.recoveryQueuedAt
+      ) {
+        skipped += 1;
+        continue;
+      }
+
+      const scope = { ...sourceScope };
+      delete scope.bootstrapRunId;
+      delete scope.bootstrapPhase;
+
+      const result = await this.queue.enqueue({
+        type,
+        scope: scope as SportsQueueScope,
+        priority: 35,
+        scheduledFor: new Date(),
+        triggerEventId: `bootstrap-recovery:${state.runId}:${key}:${recoveryId}`,
+      });
+
+      await this.bootstrapModel
+        .updateOne(
+          { key: this.stateKey, runId: state.runId },
+          {
+            $set: {
+              'phaseFailures.$[failure].recoveryQueuedAt': new Date(),
+              'phaseFailures.$[failure].recoveryJobKey': result.jobKey,
+            },
+          },
+          { arrayFilters: [{ 'failure.key': key }] },
+        )
+        .exec();
+      queued += 1;
+    }
+
+    this.logger.log(
+      `Queued ${queued} isolated bootstrap recovery job(s); skipped ${skipped}.`,
+    );
+    return { queued, skipped, runId: state.runId };
   }
 
   private async ensureRecurringDiscovery(): Promise<void> {
@@ -188,5 +262,6 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
     });
   }
 }
+
 
 

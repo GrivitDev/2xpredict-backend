@@ -28,7 +28,18 @@ export interface BootstrapPhaseProgress {
   failed: number;
   quarantined: number;
   isComplete: boolean;
+  /** True once every tracked phase job is completed, failed, or quarantined. */
+  isSettled: boolean;
   hasTerminalFailure: boolean;
+}
+
+export interface BootstrapPhaseFailure {
+  jobKey: string;
+  type: SportsQueueJobType;
+  scope: SportsQueueScope;
+  status: SportsQueueJobStatus;
+  lastError?: string;
+  failedAt?: Date;
 }
 
 @Injectable()
@@ -353,8 +364,43 @@ export class SportsQueueService {
     return {
       total, completed, pending, processing, failed, quarantined,
       isComplete: total === completed,
+      isSettled: pending === 0 && processing === 0,
       hasTerminalFailure: quarantined > 0 || failed > 0,
     };
+  }
+
+  /** Returns only terminal failures belonging to one startup phase. */
+  async getBootstrapPhaseFailures(
+    runId: string,
+    phase: SportsBootstrapPhase,
+  ): Promise<BootstrapPhaseFailure[]> {
+    const rows = await this.queueModel
+      .find({
+        'scope.bootstrapRunId': runId,
+        'scope.bootstrapPhase': phase,
+        status: {
+          $in: [SportsQueueJobStatus.FAILED, SportsQueueJobStatus.QUARANTINED],
+        },
+        type: {
+          $nin: [
+            SportsQueueJobType.BOOTSTRAP_PHASE_GATE,
+            SportsQueueJobType.SEASON_DISCOVERY_PHASE_GATE,
+          ],
+        },
+      })
+      .select({ jobKey: 1, type: 1, scope: 1, status: 1, lastError: 1, failedAt: 1 })
+      .limit(5_000)
+      .lean()
+      .exec();
+
+    return (rows as any[]).map((row) => ({
+      jobKey: String(row.jobKey),
+      type: row.type as SportsQueueJobType,
+      scope: (row.scope ?? {}) as SportsQueueScope,
+      status: row.status as SportsQueueJobStatus,
+      lastError: typeof row.lastError === 'string' ? row.lastError : undefined,
+      failedAt: row.failedAt instanceof Date ? row.failedAt : undefined,
+    }));
   }
 
   async claimNext(
@@ -530,6 +576,7 @@ export class SportsQueueService {
       ]));
   }
 }
+
 
 
 
