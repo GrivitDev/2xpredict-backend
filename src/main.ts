@@ -2,10 +2,56 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { realtimeCorsOptions } from './realtime/realtime-cors';
+
+const DEFAULT_FRONTEND_URL = 'https://www.2xpredict.com';
+
+function normalizeFrontendUrl(logger: Logger): void {
+  const configuredUrl =
+    process.env.FRONTEND_URL?.trim() || DEFAULT_FRONTEND_URL;
+
+  try {
+    const url = new URL(configuredUrl);
+
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      throw new Error('FRONTEND_URL must use HTTP or HTTPS.');
+    }
+
+    const isLocalhost = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(
+      url.hostname.toLowerCase(),
+    );
+
+    if (
+      process.env.NODE_ENV === 'production' &&
+      (url.protocol !== 'https:' || isLocalhost)
+    ) {
+      logger.warn(
+        'Invalid production FRONTEND_URL detected. Using the canonical production frontend URL.',
+      );
+
+      process.env.FRONTEND_URL = DEFAULT_FRONTEND_URL;
+      return;
+    }
+
+    // Store only the normalized origin, without a trailing slash or path.
+    process.env.FRONTEND_URL = url.origin;
+  } catch {
+    logger.warn(
+      'Invalid FRONTEND_URL detected. Using the canonical production frontend URL.',
+    );
+
+    process.env.FRONTEND_URL = DEFAULT_FRONTEND_URL;
+  }
+}
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
   const logger = new Logger('Bootstrap');
+
+  // ConfigModule.forRoot() is loaded through AppModule before bootstrap runs.
+  // Normalize FRONTEND_URL before NestJS instantiates application providers.
+  normalizeFrontendUrl(logger);
+
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   // Configure trusted reverse proxies.
   const trustProxyHopsValue = process.env.TRUST_PROXY_HOPS;
@@ -24,52 +70,8 @@ async function bootstrap() {
     app.getHttpAdapter().getInstance().set('trust proxy', trustProxyHops);
   }
 
-  // Explicitly approved frontend origins.
-  // localhost is intentionally allowed even in production so local
-  // development can communicate with the production API.
-  const configuredOrigins = [
-    process.env.FRONTEND_URL,
-    process.env.CORS_ORIGINS,
-    'https://www.2xpredict.com',
-    'https://2xpredict.com',
-    'http://localhost:3000',
-  ];
-
-  const allowedOrigins = new Set(
-    configuredOrigins
-      .flatMap((value) => (value ?? '').split(','))
-      .map((value) => value.trim())
-      .filter(Boolean)
-      .map((value) => {
-        try {
-          return new URL(value).origin;
-        } catch {
-          return value;
-        }
-      }),
-  );
-
-  app.enableCors({
-    origin: (
-      origin: string | undefined,
-      callback: (error: Error | null, allow?: boolean) => void,
-    ): void => {
-      if (!origin || allowedOrigins.has(origin)) {
-        callback(null, true);
-        return;
-      }
-
-      logger.warn(`CORS request rejected from origin: ${origin}`);
-      callback(null, false);
-    },
-
-    credentials: true,
-
-    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-
-    optionsSuccessStatus: 204,
-    maxAge: 86400,
-  });
+  // HTTP and Socket.IO now share the same approved origin configuration.
+  app.enableCors(realtimeCorsOptions);
 
   app.use(helmet());
 

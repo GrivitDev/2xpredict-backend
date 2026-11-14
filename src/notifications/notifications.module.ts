@@ -99,4 +99,3 @@ import { AdminNotificationsController } from './admin-notifications.controller';
   ],
 })
 export class NotificationsModule {}
-

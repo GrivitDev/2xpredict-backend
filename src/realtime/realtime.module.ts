@@ -23,4 +23,3 @@ import { AdminGateway } from './admin.gateway';
   exports: [AdminGateway],
 })
 export class RealtimeModule {}
-

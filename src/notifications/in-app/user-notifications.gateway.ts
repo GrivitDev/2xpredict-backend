@@ -12,38 +12,15 @@ import { ConfigService } from '@nestjs/config';
 import { UsersService } from '../../users/users.service';
 import { UserSessionService } from '../../user-session/user-session.service';
 import { UserStatus } from '../../users/schemas/user.schema';
+import { realtimeCorsOptions } from '../../realtime/realtime-cors';
 
-interface AuthenticatedNotificationSocket extends Socket {
-  data: Socket['data'] & { userId?: string };
-}
-
-function normalizeOrigin(value: string | undefined): string | undefined {
-  if (!value?.trim()) return undefined;
-  try {
-    return new URL(value.trim()).origin;
-  } catch {
-    return undefined;
-  }
-}
+type AuthenticatedNotificationSocket = Socket & {
+  data: Record<string, unknown> & { userId?: string };
+};
 
 @WebSocketGateway({
   namespace: '/user-notifications',
-  cors: {
-    origin: (origin, callback) => {
-      const allowed = [
-        normalizeOrigin(process.env.FRONTEND_URL),
-        'https://www.2xpredict.com',
-        'https://2xpredict.com',
-        ...(process.env.NODE_ENV === 'production'
-          ? []
-          : ['http://localhost:3000']),
-      ].filter((item): item is string => Boolean(item));
-
-      if (!origin || allowed.includes(origin)) callback(null, true);
-      else callback(new Error('Origin not allowed by CORS'));
-    },
-    credentials: true,
-  },
+  cors: realtimeCorsOptions,
 })
 export class UserNotificationsGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
@@ -64,22 +41,31 @@ export class UserNotificationsGateway
     this.logger.log('User notification namespace initialized.');
   }
 
-  async handleConnection(client: AuthenticatedNotificationSocket): Promise<void> {
+  async handleConnection(
+    client: AuthenticatedNotificationSocket,
+  ): Promise<void> {
     try {
       const token = this.getToken(client);
+
       if (!token) return this.rejectConnection(client);
 
-      const payload = await this.jwtService.verifyAsync<Record<string, unknown>>(
-        token,
-        { secret: this.configService.getOrThrow<string>('JWT_SECRET') },
-      );
+      const payload = await this.jwtService.verifyAsync<
+        Record<string, unknown>
+      >(token, {
+        secret: this.configService.getOrThrow<string>('JWT_SECRET'),
+      });
 
       const userId = typeof payload.userId === 'string' ? payload.userId : '';
+
       const sessionId =
         typeof payload.sessionId === 'string' ? payload.sessionId : '';
-      if (!userId || !sessionId) return this.rejectConnection(client);
+
+      if (!userId || !sessionId) {
+        return this.rejectConnection(client);
+      }
 
       const user = await this.usersService.findById(userId);
+
       if (
         !user ||
         user.isDeleted ||
@@ -93,12 +79,15 @@ export class UserNotificationsGateway
       }
 
       const session = await this.sessionsService.findSessionById(sessionId);
+
       if (!session || !session.isActive || String(session.userId) !== userId) {
         return this.rejectConnection(client);
       }
 
       client.data.userId = userId;
+
       await client.join(this.userRoom(userId));
+
       client.emit('notification:ready', {
         connected: true,
         connectedAt: new Date().toISOString(),
@@ -114,6 +103,7 @@ export class UserNotificationsGateway
 
   emitToUser(userId: string, event: string, payload: unknown): void {
     if (!this.server || !userId) return;
+
     this.server.to(this.userRoom(userId)).emit(event, payload);
   }
 
@@ -122,12 +112,20 @@ export class UserNotificationsGateway
   }
 
   private getToken(client: Socket): string | undefined {
-    const authToken = client.handshake.auth?.token;
+    const auth = client.handshake.auth as { token?: unknown } | undefined;
+
+    const authToken = auth?.token;
+
     if (typeof authToken === 'string' && authToken.trim()) {
       return authToken.trim();
     }
 
-    const header = client.handshake.headers.authorization;
+    const headers = client.handshake.headers as {
+      authorization?: string;
+    };
+
+    const header = headers.authorization;
+
     if (typeof header === 'string' && header.startsWith('Bearer ')) {
       return header.slice(7).trim();
     }
@@ -137,7 +135,7 @@ export class UserNotificationsGateway
 
   private rejectConnection(client: Socket): void {
     this.logger.warn('Rejected unauthenticated user notification socket.');
+
     client.disconnect(true);
   }
 }
-
