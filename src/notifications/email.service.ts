@@ -42,11 +42,12 @@ export class EmailService {
 
   async sendOtpEmail(email: string, otp: string, idempotencyKey?: string) {
     try {
-      const response = await this.resend.emails.send({
-        from: '2XPredict <register@2xpredict.com>',
-        to: email,
-        subject: 'Verify Your Email Address',
-        html: `
+      const response = await this.resend.emails.send(
+        {
+          from: '2XPredict <register@2xpredict.com>',
+          to: email,
+          subject: 'Verify Your Email Address',
+          html: `
 <!DOCTYPE html>
 <html>
 
@@ -289,7 +290,9 @@ www.2xpredict.com
 
 </html>
 `,
-      }, idempotencyKey ? ({ idempotencyKey } as any) : undefined);
+        },
+        idempotencyKey ? { idempotencyKey } : undefined,
+      );
 
       return response;
     } catch (error) {
@@ -299,13 +302,18 @@ www.2xpredict.com
     }
   }
 
-  async sendPasswordResetEmail(email: string, resetLink: string, idempotencyKey?: string) {
+  async sendPasswordResetEmail(
+    email: string,
+    resetLink: string,
+    idempotencyKey?: string,
+  ) {
     const safeResetLink = escapeHtml(resetLink);
-    return this.resend.emails.send({
-      from: '2XPredict <passwordreset@2xpredict.com>',
-      to: email,
-      subject: 'Reset Your Password',
-      html: `
+    return this.resend.emails.send(
+      {
+        from: '2XPredict <passwordreset@2xpredict.com>',
+        to: email,
+        subject: 'Reset Your Password',
+        html: `
 <!DOCTYPE html>
 <html>
 <head>
@@ -554,7 +562,9 @@ www.2xpredict.com
 
 </html>
 `,
-    }, idempotencyKey ? ({ idempotencyKey } as any) : undefined);
+      },
+      idempotencyKey ? { idempotencyKey } : undefined,
+    );
   }
   async sendPaymentReceivedEmail(data: {
     email: string;
@@ -835,25 +845,29 @@ We appreciate your continued support of 2XPredict.
     });
   }
 
-  async sendWelcomeEmail(data: { email: string; fullName: string }, idempotencyKey?: string) {
+  async sendWelcomeEmail(
+    data: { email: string; fullName: string },
+    idempotencyKey?: string,
+  ) {
     const safeFullName = escapeHtml(data.fullName);
     const predictionsUrl = 'https://www.2xpredict.com/predictions';
 
     const betlabUrl = 'https://www.2xpredict.com/bet-lab';
 
-    return this.resend.emails.send({
-      from: '2XPredict <welcome@2xpredict.com>',
+    return this.resend.emails.send(
+      {
+        from: '2XPredict <welcome@2xpredict.com>',
 
-      to: data.email,
+        to: data.email,
 
-      subject: 'Welcome to 2XPredict 🎉',
+        subject: 'Welcome to 2XPredict 🎉',
 
-      html: emailLayout({
-        title: 'Welcome to 2XPredict',
+        html: emailLayout({
+          title: 'Welcome to 2XPredict',
 
-        preheader: 'Your account has been verified successfully.',
+          preheader: 'Your account has been verified successfully.',
 
-        body: `
+          body: `
 ${sectionTitle('Welcome to 2XPredict! ⚽')}
 
 ${paragraph(`
@@ -909,8 +923,10 @@ Thank you for choosing 2XPredict.
 We wish you success and hope you enjoy everything our platform has to offer.
 `)}
 `,
-      }),
-    }, idempotencyKey ? ({ idempotencyKey } as any) : undefined);
+        }),
+      },
+      idempotencyKey ? { idempotencyKey } : undefined,
+    );
   }
 
   async sendSubscriptionExpiringEmail(data: {
@@ -1093,7 +1109,9 @@ Thank you for being part of 2XPredict.
       label: escapeHtml(item.label),
       value: escapeHtml(item.value),
     }));
-    const safeSubject = String(data.title).replace(/[\r\n]+/g, ' ').slice(0, 100);
+    const safeSubject = String(data.title)
+      .replace(/[\r\n]+/g, ' ')
+      .slice(0, 100);
 
     return this.resend.emails.send(
       {
@@ -1112,12 +1130,10 @@ ${paragraph('This message relates to activity on your 2xPredict account. Sign in
 `,
         }),
       },
-      { idempotencyKey } as any,
+      { idempotencyKey },
     );
   }
-
 }
-
 
 function escapeHtml(value: string): string {
   return String(value ?? '')
@@ -1134,4 +1150,3 @@ function safeLocalActionPath(value?: string | null): string | null {
   if (/[\\\r\n]/.test(path)) return null;
   return path.slice(0, 300);
 }
-
