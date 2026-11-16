@@ -28,7 +28,7 @@ interface SportsWorkerLastJob {
 
 interface LaneRuntime {
   type: SportsQueueJobType;
-  running: boolean;
+  activeJobs: number;
   wakeRequested: boolean;
   timer?: ReturnType<typeof setTimeout>;
   passes: number;
@@ -42,7 +42,14 @@ interface LaneRuntime {
   lastError?: string;
 }
 
-const LANE_CONCURRENCY = 1;
+const DEFAULT_LANE_CONCURRENCY = 1;
+const LIVE_SCOREBOARD_LANE_CONCURRENCY = 3;
+
+function getLaneConcurrency(type: SportsQueueJobType): number {
+  return type === SportsQueueJobType.LIVE_SCOREBOARD_REFRESH
+    ? LIVE_SCOREBOARD_LANE_CONCURRENCY
+    : DEFAULT_LANE_CONCURRENCY;
+}
 
 /**
  * These lanes have their own single-worker execution guard and do not wait for
@@ -64,9 +71,9 @@ const LEASE_RECOVERY_MS = 60_000;
 
 /**
  * Independent durable queue lane for every SportsQueueJobType.
- * Each lane claims and executes one job at a time. Most lanes use the shared
- * ten-permit process-wide limiter; live monitoring and short control gates
- * bypass it while retaining their own single-job lane concurrency.
+ * Live scoreboard refresh can process up to three jobs concurrently; every
+ * other lane remains single-job. Most lanes use the shared process-wide
+ * limiter; live monitoring and short control gates bypass that shared gate.
  */
 @Injectable()
 export class SportsQueueWorkerService
@@ -98,7 +105,7 @@ export class SportsQueueWorkerService
     for (const type of sportsOwnedTypes) {
       this.lanes.set(type, {
         type,
-        running: false,
+        activeJobs: 0,
         wakeRequested: false,
         passes: 0,
         failedPasses: 0,
@@ -141,8 +148,9 @@ export class SportsQueueWorkerService
       [...this.lanes.entries()].map(([type, lane]) => [
         type,
         {
-          running: lane.running,
-          concurrency: LANE_CONCURRENCY,
+          running: lane.activeJobs > 0,
+          activeJobs: lane.activeJobs,
+          concurrency: getLaneConcurrency(type),
           globalGate: GLOBAL_GATE_BYPASS_JOB_TYPES.has(type) ? 'BYPASS' : 'LIMITED',
           passes: lane.passes,
           failedPasses: lane.failedPasses,
@@ -161,10 +169,12 @@ export class SportsQueueWorkerService
       workerId: this.instanceId,
       initialized: this.initialized,
       stopped: this.stopped,
-      running: laneValues.some((lane) => lane.running),
+      running: laneValues.some((lane) => lane.activeJobs > 0),
       startedAt: this.startedAt,
       laneCount: this.lanes.size,
-      laneConcurrency: LANE_CONCURRENCY,
+      // Retain the legacy default while exposing the live lane's higher cap.
+      laneConcurrency: DEFAULT_LANE_CONCURRENCY,
+      maximumLaneConcurrency: LIVE_SCOREBOARD_LANE_CONCURRENCY,
       passCount: laneValues.reduce((sum, lane) => sum + lane.passes, 0),
       jobsClaimed: laneValues.reduce((sum, lane) => sum + lane.claimed, 0),
       jobsCompleted: laneValues.reduce((sum, lane) => sum + lane.completed, 0),
@@ -197,8 +207,13 @@ export class SportsQueueWorkerService
     if (this.stopped) return;
     const lane = this.lanes.get(type);
     if (!lane) return;
-    if (lane.running) {
+    if (lane.activeJobs > 0) {
       lane.wakeRequested = true;
+      // If capacity remains, start another claim without waiting for the
+      // currently executing job to finish.
+      if (lane.activeJobs < getLaneConcurrency(type)) {
+        this.scheduleLane(type, 0);
+      }
       return;
     }
     this.scheduleLane(type, 0);
@@ -207,7 +222,12 @@ export class SportsQueueWorkerService
   private scheduleLane(type: SportsQueueJobType, delayMs: number): void {
     if (this.stopped) return;
     const lane = this.lanes.get(type);
-    if (!lane || lane.running) return;
+    if (!lane) return;
+    if (lane.activeJobs >= getLaneConcurrency(type)) {
+      if (lane.timer) clearTimeout(lane.timer);
+      lane.timer = undefined;
+      return;
+    }
     if (lane.timer) clearTimeout(lane.timer);
     lane.timer = setTimeout(
       () => {
@@ -221,15 +241,22 @@ export class SportsQueueWorkerService
 
   private async pumpLane(type: SportsQueueJobType): Promise<void> {
     const lane = this.lanes.get(type);
-    if (!lane || lane.running || this.stopped) return;
+    if (
+      !lane ||
+      lane.activeJobs >= getLaneConcurrency(type) ||
+      this.stopped
+    ) return;
 
-    lane.running = true;
+    lane.activeJobs += 1;
     lane.passes += 1;
+
+    // Each pump claims one durable job. Additional live slots are filled only
+    // after a job is found, avoiding three empty database claims on idle polls.
     let processed = 0;
     let releasePermit: (() => void) | undefined;
 
     try {
-      // Bypass lanes remain serialized by lane.running. All other lanes obtain
+      // Bypass lanes remain outside the shared gate. All other lanes obtain
       // global capacity before claiming so they never hold a lease while waiting.
       if (!GLOBAL_GATE_BYPASS_JOB_TYPES.has(type)) {
         releasePermit = await this.backgroundWork.acquire(`sports:${type}`);
@@ -237,11 +264,14 @@ export class SportsQueueWorkerService
       if (this.stopped) return;
 
       lane.lastStartedAt = new Date();
-      const workerId = `${this.instanceId}:${type}:0`;
+      const workerId = `${this.instanceId}:${type}:${randomUUID()}`;
       try {
         const job = await this.queue.claimNext(workerId, LEASE_MS, type);
         if (job) {
           lane.claimed += 1;
+          if (lane.activeJobs < getLaneConcurrency(type)) {
+            this.scheduleLane(type, 0);
+          }
           processed = (await this.processClaimedJob(job, workerId)) ? 1 : 0;
         }
         lane.lastCompletedAt = new Date();
@@ -264,12 +294,16 @@ export class SportsQueueWorkerService
       }
     } finally {
       releasePermit?.();
-      lane.running = false;
+      lane.activeJobs = Math.max(0, lane.activeJobs - 1);
       const wakeRequested = lane.wakeRequested;
       lane.wakeRequested = false;
-      if (!this.stopped) {
-        // Event wakes may request an immediate check. Active lanes still yield
-        // for at least one second between passes, including gate-bypass lanes.
+      if (
+        !this.stopped &&
+        lane.activeJobs < getLaneConcurrency(type) &&
+        !lane.timer
+      ) {
+        // Preserve an already-scheduled immediate slot fill. Otherwise event
+        // wakes and productive passes get the active cadence; idle lanes back off.
         const delayMs =
           wakeRequested || processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
         this.scheduleLane(type, delayMs);
@@ -407,3 +441,4 @@ export class SportsQueueWorkerService
           .slice(0, 500);
   }
 }
+

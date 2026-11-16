@@ -39,7 +39,7 @@ export const SPORTS_COLLECTION_SCHEDULE = {
 
   liveScoreboard: {
     enabled: true,
-    intervalMs: 2 * MINUTE,
+    intervalMs: 1 * MINUTE,
     /** Frequent polling window after the first scheduled kickoff. */
     activeMonitoringWindowMs: 4 * HOUR,
     /** Continue slower final-status checks until ESPN confirms a terminal state. */
@@ -76,3 +76,4 @@ export type SportsCollectionScheduleKey =
   keyof typeof SPORTS_COLLECTION_SCHEDULE;
 
 export const SPORTS_COLLECTION_TIME = { MINUTE, HOUR, DAY } as const;
+

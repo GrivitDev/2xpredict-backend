@@ -80,4 +80,62 @@ describe('SportsQueueWorkerService global-gate routing', () => {
     );
     expect(releasePermit).toHaveBeenCalledTimes(1);
   });
+
+  it('allows up to three live scoreboard jobs at the same time', async () => {
+    const resolvers: Array<(job: any) => void> = [];
+    queue.claimNext.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const liveType = SportsQueueJobType.LIVE_SCOREBOARD_REFRESH;
+    const passes = [
+      (worker as any).pumpLane(liveType),
+      (worker as any).pumpLane(liveType),
+      (worker as any).pumpLane(liveType),
+      (worker as any).pumpLane(liveType),
+    ];
+
+    await Promise.resolve();
+
+    expect(queue.claimNext).toHaveBeenCalledTimes(3);
+    const workerIds = queue.claimNext.mock.calls.map((call) => call[0]);
+    expect(new Set(workerIds).size).toBe(3);
+
+    const liveStatus = (worker.getMonitorStatus() as any).lanes[liveType];
+    expect(liveStatus.activeJobs).toBe(3);
+    expect(liveStatus.concurrency).toBe(3);
+    expect(liveStatus.running).toBe(true);
+
+    resolvers.forEach((resolve) => resolve(null));
+    await Promise.all(passes);
+
+    const completedStatus = (worker.getMonitorStatus() as any).lanes[liveType];
+    expect(completedStatus.activeJobs).toBe(0);
+    expect(completedStatus.running).toBe(false);
+  });
+
+  it('keeps every non-live lane at concurrency one', async () => {
+    const type = SportsQueueJobType.MATCH_SUMMARY_COLLECTION;
+    const resolvers: Array<(job: any) => void> = [];
+    queue.claimNext.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const first = (worker as any).pumpLane(type);
+    const second = (worker as any).pumpLane(type);
+
+    await Promise.resolve();
+
+    expect(queue.claimNext).toHaveBeenCalledTimes(1);
+    expect((worker.getMonitorStatus() as any).lanes[type].concurrency).toBe(1);
+
+    resolvers[0](null);
+    await Promise.all([first, second]);
+  });
 });

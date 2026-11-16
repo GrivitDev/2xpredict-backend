@@ -17,4 +17,3 @@ export const SPORTS_PROVIDER_CONFIG = {
 } as const;
 
 export type SportsProviderConfig = typeof SPORTS_PROVIDER_CONFIG;
-

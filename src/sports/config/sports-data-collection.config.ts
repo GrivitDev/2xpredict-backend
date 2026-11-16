@@ -27,4 +27,3 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 } as const;
 
 export type SportsDataCollectionConfig = typeof SPORTS_DATA_COLLECTION_CONFIG;
-
