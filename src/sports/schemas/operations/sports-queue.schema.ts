@@ -81,6 +81,8 @@ export class SportsQueue implements Omit<
   'scope' | 'recurrence' | 'createdAt' | 'updatedAt'
 > {
   @Prop({ required: true, unique: true, trim: true }) jobKey!: string;
+  /** Stable identity for atomic enqueueIfMissing operations; absent on legacy jobs. */
+  @Prop({ type: String, trim: true }) dedupeKey?: string;
   @Prop({
     required: true,
     type: String,
@@ -164,7 +166,5 @@ SportsQueueSchema.index({
 SportsQueueSchema.index({ triggerEventId: 1, type: 1 });
 SportsQueueSchema.index({ status: 1, leaseExpiresAt: 1 });
 
-
-
-
-
+// Only new coalesced jobs carry dedupeKey; sparse keeps legacy records compatible.
+SportsQueueSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });

@@ -6,7 +6,7 @@ import { Injectable, OnModuleDestroy } from '@nestjs/common';
  * but still retain their own worker concurrency and provider-level limits.
  */
 export const BACKGROUND_WORK_LIMITS = {
-  maximumConcurrentJobs: 10,
+  maximumConcurrentJobs: 15,
   minimumLaneStartIntervalMs: 1_000,
   priorityAgingIntervalMs: 15_000,
   maximumPriorityAgingBoost: 80,
@@ -36,7 +36,7 @@ interface WaitingPermit {
  * access to gated capacity. Background maintenance is aged while waiting so
  * it continues to make progress instead of being permanently starved.
  *
- * - At most ten gated background operations hold a permit at once.
+ * - At most fifteen gated background operations hold a permit at once.
  * - A lane holds at most one permit at a time.
  * - Consecutive starts in one lane are at least one second apart.
  * - Eligible waiters are scheduled by priority, then FIFO; age increases

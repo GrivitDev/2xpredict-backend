@@ -123,9 +123,86 @@ export class SportsQueueService {
         ? scope[key]
         : { $exists: false };
     }
-    const existing = await this.queueModel.findOne(scopeFilter).select({ jobKey: 1 }).lean().exec();
-    if (existing) return { created: false, jobKey: String(existing.jobKey) };
-    return this.enqueue(request);
+    // Preserve compatibility with jobs created before dedupeKey was introduced.
+    // This lookup prevents deployment from re-enqueuing already completed work.
+    const legacyExisting = await this.queueModel
+      .findOne(scopeFilter)
+      .select({ jobKey: 1 })
+      .lean()
+      .exec();
+    if (legacyExisting) {
+      return { created: false, jobKey: String(legacyExisting.jobKey) };
+    }
+
+    // Stable identity deliberately excludes scheduledFor. Two concurrent
+    // producers therefore target the same unique key even if their clocks
+    // produce slightly different scheduled timestamps.
+    const identity = JSON.stringify({
+      type: request.type,
+      scope,
+      triggerEventId: request.triggerEventId ?? null,
+    });
+    const dedupeKey = this.jobKey(`enqueue-if-missing:${identity}`);
+    const scheduledFor = request.scheduledFor ?? new Date();
+
+    try {
+      const result = await this.queueModel.updateOne(
+        { dedupeKey },
+        {
+          $setOnInsert: {
+            dedupeKey,
+            jobKey: dedupeKey,
+            type: request.type,
+            scope,
+            priority: this.priority(request.priority),
+            status: SportsQueueJobStatus.PENDING,
+            lane: SportsQueueLane.NORMAL,
+            scheduledFor,
+            recurrence: request.recurrence,
+            attempts: 0,
+            maxAttempts: 20,
+            retryCount: 0,
+            triggerEventId: request.triggerEventId,
+          },
+        },
+        { upsert: true, setDefaultsOnInsert: true },
+      ).exec();
+
+      const created = result.upsertedCount === 1;
+      if (created) {
+        this.notifyWorker(request.type);
+        return { created: true, jobKey: dedupeKey };
+      }
+
+      const existing = await this.queueModel
+        .findOne({ dedupeKey })
+        .select({ jobKey: 1 })
+        .lean()
+        .exec();
+      return {
+        created: false,
+        jobKey: existing ? String(existing.jobKey) : dedupeKey,
+      };
+    } catch (error) {
+      // A simultaneous upsert can lose the unique-index race with E11000.
+      // Treat that as successful coalescing; propagate every other failure.
+      if (
+        !error ||
+        typeof error !== 'object' ||
+        !('code' in error) ||
+        Number((error as { code?: unknown }).code) !== 11000
+      ) {
+        throw error;
+      }
+
+      const existing = await this.queueModel
+        .findOne({ dedupeKey })
+        .select({ jobKey: 1 })
+        .lean()
+        .exec();
+      if (!existing) throw error;
+      return { created: false, jobKey: String(existing.jobKey) };
+    }
   }
 
   /**
@@ -514,7 +591,7 @@ export class SportsQueueService {
           retryCount,
           lastError,
         },
-        $unset: { ownerId: 1, heartbeatAt: 1, leaseExpiresAt: 1, startedAt: 1, nextRunAt: 1 },
+        $unset: { ownerId: 1, heartbeatAt: 1, leaseExpiresAt: 1, startedAt: 1 },
       },
     ).exec();
     return 'RETRY';
@@ -537,7 +614,7 @@ export class SportsQueueService {
         { jobKey, status: SportsQueueJobStatus.PROCESSING, leaseExpiresAt: { $lte: now } },
         {
           $set: { status: SportsQueueJobStatus.PENDING, scheduledFor: retryAt, nextAttemptAt: retryAt, retryCount, lane: SportsQueueLane.BACKGROUND_RETRY, lastError: 'Recovered after worker lease expiry.' },
-          $unset: { ownerId: 1, heartbeatAt: 1, leaseExpiresAt: 1, startedAt: 1, nextRunAt: 1 },
+          $unset: { ownerId: 1, heartbeatAt: 1, leaseExpiresAt: 1, startedAt: 1 },
         },
       ).exec();
       recovered += result.modifiedCount;
@@ -578,11 +655,3 @@ export class SportsQueueService {
       ]));
   }
 }
-
-
-
-
-
-
-
-

@@ -7,6 +7,7 @@ import type {
   TeamCatalogueResult,
 } from '../interfaces/provider-response.interface';
 import { getOddsApiSportKey } from '../config/odds-api-sport-key.map';
+import { SPORTS_COLLECTION_SCHEDULE } from '../config/sports-collection-schedule.config';
 import type {
   SportsCompetitionRecord,
   SportsFixtureRecord,
@@ -895,22 +896,66 @@ export class SportsDomainCollectionService {
     return true;
   }
 
-  async shouldContinueLiveScoreboard(
+  async getLiveScoreboardMonitoringState(
     competitionId: string,
     date: string,
-  ): Promise<boolean> {
+    expectedKickoffAt?: string,
+    now = Date.now(),
+  ): Promise<{ shouldContinue: boolean; intervalMs?: number; anchorKickoffAt?: string }> {
     const fixtures = await this.persistence.getFixturesForCompetitionDate(
       competitionId,
       date,
     );
-    if (!fixtures.length) return false;
+    if (!fixtures.length) return { shouldContinue: false };
+
+    // Only provider-confirmed terminal states end the monitoring chain. A
+    // stale SCHEDULED state after kickoff is deliberately not terminal: ESPN
+    // may still need to report a delayed, suspended, abandoned or completed match.
     const terminal = new Set([
       'COMPLETED',
       'POSTPONED',
       'CANCELLED',
       'ABANDONED',
     ]);
-    return fixtures.some((fixture) => !terminal.has(fixture.status.state));
+    const hasUnconfirmedFixture = fixtures.some(
+      (fixture) =>
+        !fixture.status.isFinal && !terminal.has(fixture.status.state),
+    );
+    if (!hasUnconfirmedFixture) return { shouldContinue: false };
+
+    const expectedKickoff = timestampOf(expectedKickoffAt);
+    const fixtureKickoffs = fixtures
+      .map((fixture) => timestampOf(fixture.kickoffAt))
+      .filter(Number.isFinite);
+    const fixtureAnchor = fixtureKickoffs.length
+      ? Math.min(...fixtureKickoffs)
+      : Number.NaN;
+    const dateAnchor = timestampOf(`${date}T00:00:00.000Z`);
+    const anchor = Number.isFinite(expectedKickoff)
+      ? expectedKickoff
+      : Number.isFinite(fixtureAnchor)
+        ? fixtureAnchor
+        : dateAnchor;
+
+    // A malformed scope must not silently retain the two-minute cadence.
+    // The calendar date is the final fallback anchor; if even that is invalid,
+    // continue only at the low verification cadence.
+    const elapsedMs = Number.isFinite(anchor)
+      ? Math.max(0, now - anchor)
+      : Number.POSITIVE_INFINITY;
+    const liveSchedule = SPORTS_COLLECTION_SCHEDULE.liveScoreboard;
+    const intervalMs =
+      elapsedMs >= liveSchedule.activeMonitoringWindowMs
+        ? liveSchedule.finalVerificationIntervalMs
+        : liveSchedule.intervalMs;
+
+    return {
+      shouldContinue: true,
+      intervalMs,
+      anchorKickoffAt: Number.isFinite(anchor)
+        ? new Date(anchor).toISOString()
+        : undefined,
+    };
   }
 
   async getSummaryBackfillPage(input: {

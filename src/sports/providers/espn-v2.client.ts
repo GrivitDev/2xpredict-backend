@@ -868,10 +868,10 @@ export class EspnV2Client {
   }
 
   /**
-   * Shared ESPN request-start scheduler. Live scoreboard requests have
-   * priority over normal collection work and have one reserved in-flight slot.
-   * Normal requests retain two slots. The provider-wide start interval and
-   * Retry-After cooldown still apply to every endpoint.
+   * Shared ESPN request-start scheduler. It permits up to the configured
+   * normal and reserved-live in-flight limits while enforcing one provider-wide
+   * request-start interval and Retry-After cooldown across all endpoints.
+   * Live scoreboard requests are selected first when a slot becomes available.
    */
   private waitForRequestSlot(label: string): Promise<void> {
     this.waitingRequests += 1;
@@ -902,7 +902,7 @@ export class EspnV2Client {
     }
     if (this.requestWaiters.length === 0) return;
 
-    // Prefer live requests, but do not let a full live slot block normal work.
+    // Prefer live requests, but do not let full live slots block normal work.
     const ordered = this.requestWaiters
       .map((request, index) => ({ request, index }))
       .sort((a, b) => Number(this.isLiveRequest(b.request.label)) - Number(this.isLiveRequest(a.request.label)) || a.index - b.index);
@@ -915,8 +915,8 @@ export class EspnV2Client {
     const delay = Math.max(0, dueAt - Date.now());
     this.requestSchedulerTimer = setTimeout(() => {
       this.requestSchedulerTimer = undefined;
-      // Re-evaluate at dispatch time: a live request may have arrived while
-      // this timer was waiting behind an ordinary request.
+      // Re-evaluate at dispatch time because a higher-priority live request
+      // may have arrived while the start-interval timer was pending.
       const candidates = this.requestWaiters
         .map((request, index) => ({ request, index }))
         .sort((a, b) => Number(this.isLiveRequest(b.request.label)) - Number(this.isLiveRequest(a.request.label)) || a.index - b.index);
@@ -1055,5 +1055,6 @@ export class EspnV2Client {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
+
 
 

@@ -230,6 +230,8 @@ export class SportsQueueJobProcessorService {
       if (!competition || competition.currentSeasonYear !== seasonYear) return;
     }
 
+    let successorRecurrence = job.recurrence;
+
     if (job.recurrence.repeatUntil === 'DATA_COMPLETE') {
       if (job.type === SportsQueueJobType.LIVE_SCOREBOARD_REFRESH) {
         const competitionId = this.required(
@@ -237,13 +239,23 @@ export class SportsQueueJobProcessorService {
           'competitionId',
         );
         const date = this.required(job.scope.calendarDate, 'calendarDate');
-        if (
-          !(await this.collection.shouldContinueLiveScoreboard(
-            competitionId,
-            date,
-          ))
-        )
-          return;
+        const monitoring = await this.collection.getLiveScoreboardMonitoringState(
+          competitionId,
+          date,
+          job.scope.expectedKickoffAt,
+        );
+        if (!monitoring.shouldContinue) return;
+
+        // Continue at two-minute cadence for the first four hours after the
+        // earliest known kickoff, then verify every thirty minutes until ESPN
+        // reports a terminal fixture state. Missing/invalid kickoff metadata
+        // is resolved by the collection service using persisted fixtures/date.
+        successorRecurrence = {
+          ...job.recurrence,
+          intervalMs:
+            monitoring.intervalMs ??
+            SPORTS_COLLECTION_SCHEDULE.liveScoreboard.finalVerificationIntervalMs,
+        };
       } else if (
         job.type === SportsQueueJobType.FIXTURE_SEASON_VALIDATION_GATE
       ) {
@@ -268,7 +280,7 @@ export class SportsQueueJobProcessorService {
     const scheduledFor = await this.queue.getOrCreateSuccessorAt(
       job.jobKey,
       workerId,
-      job.recurrence.intervalMs,
+      successorRecurrence.intervalMs,
     );
     // Bootstrap phase jobs are one-shot for the gate, but their successors
     // become ordinary scheduled discovery jobs and must not keep the phase open.
@@ -284,7 +296,7 @@ export class SportsQueueJobProcessorService {
       scope: successorScope,
       priority: job.priority,
       scheduledFor,
-      recurrence: job.recurrence,
+      recurrence: successorRecurrence,
       triggerEventId: job.triggerEventId,
     });
   }
@@ -2666,4 +2678,3 @@ export class SportsQueueJobProcessorService {
     return normalized;
   }
 }
-

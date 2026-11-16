@@ -37,7 +37,14 @@ export const SPORTS_COLLECTION_SCHEDULE = {
   matchOdds24Hours: { enabled: true, leadMs: 24 * HOUR },
   matchOdds18Hours: { enabled: true, leadMs: 18 * HOUR },
 
-  liveScoreboard: { enabled: true, intervalMs: 2 * MINUTE },
+  liveScoreboard: {
+    enabled: true,
+    intervalMs: 2 * MINUTE,
+    /** Frequent polling window after the first scheduled kickoff. */
+    activeMonitoringWindowMs: 4 * HOUR,
+    /** Continue slower final-status checks until ESPN confirms a terminal state. */
+    finalVerificationIntervalMs: 30 * MINUTE,
+  },
   playsAfterMatch: { enabled: true, delayMs: 2 * MINUTE },
 
   /** Recovers eligible recent completed fixtures that missed their highlight enqueue. */
@@ -69,4 +76,3 @@ export type SportsCollectionScheduleKey =
   keyof typeof SPORTS_COLLECTION_SCHEDULE;
 
 export const SPORTS_COLLECTION_TIME = { MINUTE, HOUR, DAY } as const;
-

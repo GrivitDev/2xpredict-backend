@@ -23,7 +23,7 @@ describe('SportsQueueWorkerService global-gate routing', () => {
       acquire: jest.fn().mockResolvedValue(releasePermit),
       getStatus: jest.fn().mockReturnValue({
         activeJobs: 0,
-        maximumConcurrentJobs: 10,
+        maximumConcurrentJobs: 15,
         waitingJobs: 0,
         activeLanes: [],
         waitingByPriority: { critical: 0, high: 0, normal: 0, low: 0 },

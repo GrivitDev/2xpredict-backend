@@ -7,12 +7,12 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
   ESPN: {
     enabled: true,
     rateLimit: {
-      // Keep provider traffic bounded on the small production instance.
-      // Normal and reserved live slots each allow one in-flight request, with
-      // at least one second between request starts.
-      minIntervalSeconds: 1,
-      normalConcurrency: 1,
-      liveConcurrency: 1,
+      // Bounded parallel transport: 15 ordinary ESPN requests plus 3
+      // reserved live-scoreboard requests may be in flight per backend process.
+      // A shared 200ms start interval caps aggregate starts at about 5/sec.
+      minIntervalSeconds: 0.2,
+      normalConcurrency: 15,
+      liveConcurrency: 3,
     },
   },
   YOUTUBE: {
@@ -27,3 +27,4 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 } as const;
 
 export type SportsDataCollectionConfig = typeof SPORTS_DATA_COLLECTION_CONFIG;
+
