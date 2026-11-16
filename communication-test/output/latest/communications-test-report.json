@@ -1,0 +1,34 @@
+{
+  "createdAt": "2026-11-16T13:58:14.045Z",
+  "mode": "LIVE_SEND",
+  "frontendUrl": "https://www.2xpredict.com",
+  "outputPath": "D:\\Dev-Ops\\2xpredict\\backend\\communication-test\\output\\latest",
+  "hasFailures": false,
+  "telegram": {
+    "destination": "-1004435302708",
+    "mode": "LIVE_SEND",
+    "results": [
+      {
+        "key": "daily-pick",
+        "label": "Daily Pick photo post",
+        "status": "SENT",
+        "messageId": 77,
+        "destination": "-1004435302708"
+      },
+      {
+        "key": "promotion",
+        "label": "Promotion text post",
+        "status": "SENT",
+        "messageId": 78,
+        "destination": "-1004435302708"
+      },
+      {
+        "key": "internal-ad",
+        "label": "Internal Ad photo post",
+        "status": "SENT",
+        "messageId": 79,
+        "destination": "-1004435302708"
+      }
+    ]
+  }
+}

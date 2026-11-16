@@ -19,6 +19,8 @@ export enum SportsQueueJobType {
   MATCH_SUMMARY_BACKFILL = 'MATCH_SUMMARY_BACKFILL',
   MATCH_PLAYS_COLLECTION = 'MATCH_PLAYS_COLLECTION',
   YOUTUBE_HIGHLIGHT = 'YOUTUBE_HIGHLIGHT',
+  /** Periodically recovers recent completed fixtures with missing/retryable highlights. */
+  YOUTUBE_HIGHLIGHT_RECONCILIATION = 'YOUTUBE_HIGHLIGHT_RECONCILIATION',
   SOCCER_NEWS_REFRESH = 'SOCCER_NEWS_REFRESH',
   /** Internal collection and projection jobs share this durable queue contract. */
   SOURCE_FACTS_CHANGED = 'SOURCE_FACTS_CHANGED',
@@ -143,4 +145,5 @@ export interface SportsQueueEnqueueRequest {
   recurrence?: SportsQueueRecurrence;
   triggerEventId?: string;
 }
+
 

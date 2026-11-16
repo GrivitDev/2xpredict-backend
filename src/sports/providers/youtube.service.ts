@@ -17,6 +17,7 @@ import {
 } from './youtube.interfaces';
 
 import { YOUTUBE_CONFIG } from '../config/youtube.config';
+import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 
 import {
   SportsProviderQuotaExceededError,
@@ -79,6 +80,9 @@ export class YoutubeService implements OnModuleInit {
         Accept: 'application/json',
       },
     });
+    this.logger.log(
+      `YouTube highlights activated (daily search cap=${SPORTS_DATA_COLLECTION_CONFIG.YOUTUBE.dailyRequestLimit}; per-search interval=${SPORTS_DATA_COLLECTION_CONFIG.YOUTUBE.rateLimit.minIntervalSeconds}s).`,
+    );
   }
 
   isEnabled(): boolean {
@@ -201,8 +205,8 @@ export class YoutubeService implements OnModuleInit {
 
     // Registry entries may be immutable channel IDs or official @handles.
     // Resolve handles through channels.list because search.list's channelId
-    // filter requires the immutable channel ID. The lookup also consumes the
-    // shared daily request allowance, keeping all YouTube HTTP calls below cap.
+    // filter requires the immutable channel ID. channels.list is tracked and
+    // rate-limited, but is excluded from the reserved search.list request count.
     const channelReference = channelId?.trim() || undefined;
     const resolvedChannelId = channelReference
       ? await this.resolveChannelId(channelReference)
@@ -296,7 +300,9 @@ export class YoutubeService implements OnModuleInit {
         forHandle: normalized,
         maxResults: 1,
       },
-      { countTowardProviderQuota: true, minimumIntervalSeconds: 1 },
+      // channels.list consumes YouTube quota units too, but it is not counted
+      // against this application's reserved search.list request budget.
+      { countTowardProviderQuota: false, minimumIntervalSeconds: 1 },
     );
     const channel = response.items?.[0];
     const channelId = channel?.id?.trim();
@@ -578,7 +584,7 @@ export class YoutubeService implements OnModuleInit {
     // Do not enforce a single title vocabulary. Broadly-used labels for actual
     // match footage, goals and recaps are accepted as well as "highlights".
     const highlightPattern =
-      /\b(highlights?|extended highlights?|goal highlights?|goals?|all goals|match recap|recap|match summary|best moments|match action|key moments|goal compilation)\b/;
+      /\b(highlights?|extended highlights?|full highlights?|game highlights?|goal highlights?|goals?|all goals|all the goals|match recap|post match recap|game recap|recap|match summary|best moments|match action|key moments|goal compilation|matchday highlights|highlights and goals|goals and highlights|full time highlights)\b/;
 
     // A highlight marker in the description alone is not enough to identify
     // the video itself as match highlights. Require the title to establish it.
@@ -710,6 +716,7 @@ export class YoutubeService implements OnModuleInit {
     this.logger.error(`YouTube API request failed: ${endpoint}`, error);
   }
 }
+
 
 
 

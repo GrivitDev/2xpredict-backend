@@ -1,6 +1,6 @@
 import { SettlementProcessorService } from './settlement-processor.service';
 
-const makeMatch = (state: 'COMPLETED' | 'LIVE' = 'COMPLETED') => ({
+const makeMatch = (state: 'COMPLETED' | 'LIVE' = 'COMPLETED', completedAt?: Date) => ({
   fixture: {
     id: 'fixture-1',
     espnEventId: 'espn-1',
@@ -8,6 +8,7 @@ const makeMatch = (state: 'COMPLETED' | 'LIVE' = 'COMPLETED') => ({
     seasonId: 'season-1',
     seasonYear: 2026,
     status: { state, isFinal: state === 'COMPLETED' },
+    ...(completedAt ? { completedAt } : {}),
     competitors: [],
   },
   competition: { id: 'competition-1', slug: 'eng.1', name: 'Premier League' },
@@ -49,9 +50,9 @@ const makeFacts = (timelineCoverageComplete: boolean) => ({
   sourceFingerprint: timelineCoverageComplete ? 'fresh-source' : 'old-source',
 });
 
-const createProcessor = (input?: { initialState?: 'COMPLETED' | 'LIVE' }) => {
-  const initialMatch = makeMatch(input?.initialState ?? 'COMPLETED');
-  const refreshedMatch = makeMatch('COMPLETED');
+const createProcessor = (input?: { initialState?: 'COMPLETED' | 'LIVE'; completedAt?: Date }) => {
+  const initialMatch = makeMatch(input?.initialState ?? 'COMPLETED', input?.completedAt);
+  const refreshedMatch = makeMatch('COMPLETED', input?.completedAt);
   const sportsRead = {
     getMatch: jest.fn()
       .mockResolvedValueOnce(initialMatch)
@@ -128,7 +129,9 @@ describe('SettlementProcessorService evidence recovery', () => {
 
     expect(sportsCollection.shouldCollectFixtureSummary).toHaveBeenCalledWith(
       'espn-1',
-      expect.any(Number),
+      0,
+      5 * 60_000,
+      undefined,
     );
     expect(sportsCollection.collectFixtureSummary).toHaveBeenCalledWith(
       'eng.1',
@@ -146,6 +149,39 @@ describe('SettlementProcessorService evidence recovery', () => {
     expect(betLabSettlementService.settleEvent).toHaveBeenCalledTimes(1);
   });
 
+
+  it('uses the fixture completion timestamp as the freshness boundary for full-time Summary evidence', async () => {
+    const completedAt = new Date('2026-11-11T10:55:00.000Z');
+    const { processor, sportsCollection } = createProcessor({ completedAt });
+
+    await processor.process(job);
+
+    expect(sportsCollection.shouldCollectFixtureSummary).toHaveBeenCalledWith(
+      'espn-1',
+      expect.any(Number),
+      5 * 60_000,
+      completedAt,
+    );
+  });
+
+  it('rejects otherwise recent team statistics collected before full time', () => {
+    const { processor } = createProcessor();
+    const completedAt = new Date(Date.now() - 5 * 60_000);
+    const facts = makeFacts(true) as any;
+    facts.homeStatisticsCollectedAt = new Date(completedAt.getTime() - 60_000);
+    facts.awayStatisticsCollectedAt = new Date(completedAt.getTime() - 30_000);
+
+    expect(
+      (processor as any).hasFreshTeamStatistics(facts, 60 * 60_000, completedAt),
+    ).toBe(false);
+
+    facts.homeStatisticsCollectedAt = new Date(completedAt.getTime() + 60_000);
+    facts.awayStatisticsCollectedAt = new Date(completedAt.getTime() + 90_000);
+
+    expect(
+      (processor as any).hasFreshTeamStatistics(facts, 60 * 60_000, completedAt),
+    ).toBe(true);
+  });
 
   it('re-normalizes a retained raw Summary locally when the fact revision is missing or outdated', async () => {
     const { processor, sportsRead, sportsCollection } = createProcessor();
@@ -184,4 +220,3 @@ describe('SettlementProcessorService evidence recovery', () => {
     expect(sportsRead.getMatch).toHaveBeenCalledTimes(1);
   });
 });
-

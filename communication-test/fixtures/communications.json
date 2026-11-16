@@ -1,0 +1,52 @@
+{
+  "recipient": {
+    "email": "grivitdev@gmail.com",
+    "fullName": "Grivit Communications Test"
+  },
+  "security": {
+    "otp": "482913",
+    "resetToken": "COMMUNICATION-TEST-ONLY-NOT-A-REAL-TOKEN"
+  },
+  "payment": {
+    "amount": 15000,
+    "currency": "NGN",
+    "paymentType": "VIP Subscription",
+    "reference": "2XP-COMM-TEST-20261116",
+    "rejectionReason": "This is a test rejection reason. No real payment was made or rejected."
+  },
+  "subscription": {
+    "plan": "vip",
+    "amount": 50000,
+    "currency": "NGN",
+    "activatedDate": "2026-11-16T10:00:00.000Z",
+    "expiryDate": "2026-12-16T23:59:00.000Z",
+    "expiringDate": "2026-11-19T23:59:00.000Z",
+    "daysRemaining": 3,
+    "expiredDate": "2026-11-12T23:59:00.000Z"
+  },
+  "notification": {
+    "title": "Your VIP account is ready",
+    "message": "This is a sample 2xPredict notification email. It verifies the shared email layout, action button, details card and banner.",
+    "actionUrl": "/profile#account-billing",
+    "details": [
+      { "label": "Account", "value": "Grivit Communications Test" },
+      { "label": "Plan", "value": "VIP" },
+      { "label": "Reference", "value": "2XP-COMM-TEST-20261116" },
+      { "label": "Environment", "value": "Local development test" }
+    ]
+  },
+  "telegram": {
+    "leagueName": "Premier League",
+    "homeTeamName": "Arsenal",
+    "awayTeamName": "Chelsea",
+    "fixtureDate": "Friday, 20 November 2026 · 18:00 WAT",
+    "marketName": "Match Result",
+    "selectionName": "Arsenal Win",
+    "odds": 1.85,
+    "confidence": 86,
+    "promotionTitle": "A new season of smarter predictions",
+    "promotionMessage": "Explore the 2xPredict membership options and discover the features available with each plan.",
+    "adTitle": "Explore 2xPredict VIP",
+    "adMessage": "Unlock VIP predictions, additional markets and enhanced match insights. This is a test advertisement only."
+  }
+}

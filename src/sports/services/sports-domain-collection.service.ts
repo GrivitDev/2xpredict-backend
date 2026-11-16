@@ -344,6 +344,7 @@ export class SportsDomainCollectionService {
   async isFixtureSummaryFallbackFresh(
     eventId: string,
     maxAgeMs = 24 * 60 * 60_000,
+    requiredAfter?: Date,
   ): Promise<boolean> {
     const state = await this.state.getState(
       'MATCH_SUMMARY_FALLBACK',
@@ -351,50 +352,79 @@ export class SportsDomainCollectionService {
       `fixture:${eventId}`,
     );
     if (state?.status !== 'SUCCEEDED' || !state.lastSuccessfulAt) return false;
-    const succeededAt = new Date(state.lastSuccessfulAt).getTime();
+
+    const succeededAt = timestampOf(state.lastSuccessfulAt);
+    const startedAt = timestampOf(state.lastStartedAt);
+    const requiredAfterAt = timestampOf(requiredAfter);
+    const collectionStartedAt = Number.isFinite(startedAt)
+      ? startedAt
+      : succeededAt;
+
     return (
       Number.isFinite(succeededAt) &&
-      Date.now() - succeededAt < Math.max(0, maxAgeMs)
+      Date.now() >= succeededAt &&
+      Date.now() - succeededAt < Math.max(0, maxAgeMs) &&
+      (!Number.isFinite(requiredAfterAt) || collectionStartedAt >= requiredAfterAt)
     );
   }
 
   /**
-   * Whether Settlement may safely request another Summary snapshot. A recent
-   * success is fresh for maxAgeMs; active or recently failed attempts observe
-   * a retry cooldown so partial settlement retries do not hammer ESPN.
+   * Whether another Summary snapshot is required. A recent success is fresh
+   * for maxAgeMs, but when requiredAfter is supplied the successful collection
+   * must also have started at or after that boundary (normally full time).
+   * Active or recently failed attempts retain their retry cooldown so
+   * settlement retries do not hammer ESPN.
    */
   async shouldCollectFixtureSummary(
     eventId: string,
     maxAgeMs = 20 * 60_000,
     retryCooldownMs = 5 * 60_000,
+    requiredAfter?: Date,
   ): Promise<boolean> {
     const storedSummary =
       await this.persistence.getMatchSummaryByEventId(eventId);
     const rawCollectedAt = timestampOf(storedSummary?.lastCollectedAt);
     const now = Date.now();
-    if (
+    const requiredAfterAt = timestampOf(requiredAfter);
+    const storedSummaryIsRecent =
       Number.isFinite(rawCollectedAt) &&
       now >= rawCollectedAt &&
-      now - rawCollectedAt < Math.max(0, maxAgeMs)
-    )
-      return false;
+      now - rawCollectedAt < Math.max(0, maxAgeMs);
+
+    // Preserve the original fast path for callers that do not care about the
+    // match lifecycle boundary (for example, generic recovery checks).
+    if (storedSummaryIsRecent && !Number.isFinite(requiredAfterAt)) return false;
 
     const state = await this.state.getState(
       'MATCH_SUMMARY_FALLBACK',
       'FIXTURE',
       `fixture:${eventId}`,
     );
-    if (!state) return true;
+    if (!state) {
+      // Legacy snapshots may not have a state-ledger row. Their collection time
+      // is the best available signal that the raw payload is post-match.
+      return !(
+        storedSummaryIsRecent &&
+        (!Number.isFinite(requiredAfterAt) || rawCollectedAt >= requiredAfterAt)
+      );
+    }
 
     const successfulAt = timestampOf(state.lastSuccessfulAt);
-    if (
+    const startedAt = timestampOf(state.lastStartedAt);
+    const collectionStartedAt = Number.isFinite(startedAt)
+      ? startedAt
+      : successfulAt;
+    const successfulAttemptIsAfterBoundary =
+      !Number.isFinite(requiredAfterAt) ||
+      collectionStartedAt >= requiredAfterAt;
+    const successfulStateIsRecent =
       state.status === 'SUCCEEDED' &&
       Number.isFinite(successfulAt) &&
       now >= successfulAt &&
-      now - successfulAt < Math.max(0, maxAgeMs)
-    ) {
-      return false;
-    }
+      now - successfulAt < Math.max(0, maxAgeMs) &&
+      successfulAttemptIsAfterBoundary;
+
+    if (successfulStateIsRecent) return false;
 
     if (state.status === 'PROCESSING' || state.status === 'FAILED') {
       const recentAttemptValue =

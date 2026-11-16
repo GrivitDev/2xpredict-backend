@@ -2,14 +2,14 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
 
 export type CustomerCareJobDocument = HydratedDocument<CustomerCareJob>;
-export type CustomerCareJobType = 'DAILY_PICKS' | 'PROMOTION' | 'INCIDENT_ALERT' | 'SUPPORT_NOTIFICATION';
+export type CustomerCareJobType = 'DAILY_PICKS' | 'PROMOTION' | 'INTERNAL_AD' | 'INCIDENT_ALERT' | 'SUPPORT_NOTIFICATION';
 
 @Schema({ timestamps: true, collection: 'customer_care_jobs' })
 export class CustomerCareJob {
   @Prop({ type: String, required: true, trim: true })
   jobKey!: string;
 
-  @Prop({ type: String, enum: ['DAILY_PICKS', 'PROMOTION', 'INCIDENT_ALERT', 'SUPPORT_NOTIFICATION'], required: true, index: true })
+  @Prop({ type: String, enum: ['DAILY_PICKS', 'PROMOTION', 'INTERNAL_AD', 'INCIDENT_ALERT', 'SUPPORT_NOTIFICATION'], required: true, index: true })
   type!: CustomerCareJobType;
 
   @Prop({ type: String, required: true, index: true })

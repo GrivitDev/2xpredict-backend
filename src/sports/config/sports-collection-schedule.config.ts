@@ -40,6 +40,9 @@ export const SPORTS_COLLECTION_SCHEDULE = {
   liveScoreboard: { enabled: true, intervalMs: 2 * MINUTE },
   playsAfterMatch: { enabled: true, delayMs: 2 * MINUTE },
 
+  /** Recovers eligible recent completed fixtures that missed their highlight enqueue. */
+  youtubeHighlights: { enabled: true, intervalMs: 15 * MINUTE, batchSize: 100 },
+
   /** ESPN News feeds: general soccer daily; league news around each fixture. */
   soccerNews: { enabled: true, intervalMs: DAY, initialDelayMs: 0 },
   leagueNewsPreMatch: { enabled: true, leadMs: 12 * HOUR },
@@ -66,3 +69,4 @@ export type SportsCollectionScheduleKey =
   keyof typeof SPORTS_COLLECTION_SCHEDULE;
 
 export const SPORTS_COLLECTION_TIME = { MINUTE, HOUR, DAY } as const;
+

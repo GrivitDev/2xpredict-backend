@@ -131,7 +131,7 @@ export class CustomerCareWorkerService implements OnModuleDestroy, OnModuleInit 
   }
 
   private async ensureDailyJobs(dateKey: string): Promise<void> {
-    for (const type of ['DAILY_PICKS', 'PROMOTION'] as const) {
+    for (const type of ['DAILY_PICKS', 'PROMOTION', 'INTERNAL_AD'] as const) {
       const jobKey = `${type}:${dateKey}`;
       await this.jobs
         .updateOne(
@@ -180,7 +180,7 @@ export class CustomerCareWorkerService implements OnModuleDestroy, OnModuleInit 
     return this.jobs
       .findOneAndUpdate(
         {
-          type: { $in: ['DAILY_PICKS', 'PROMOTION'] },
+          type: { $in: ['DAILY_PICKS', 'PROMOTION', 'INTERNAL_AD'] },
           attempts: { $lt: 4 },
           $or: [
             { status: 'PENDING', scheduledAt: { $lte: now } },
@@ -208,6 +208,8 @@ export class CustomerCareWorkerService implements OnModuleDestroy, OnModuleInit 
         result = await this.broadcasts.publishDailyPicks(job.dateKey);
       else if (job.type === 'PROMOTION')
         result = await this.broadcasts.publishDailyPromotions(job.dateKey);
+      else if (job.type === 'INTERNAL_AD')
+        result = await this.broadcasts.publishTelegramInternalAd(job.dateKey);
       else
         throw new Error(
           `Unsupported Customer Care job type: ${String(job.type)}`,

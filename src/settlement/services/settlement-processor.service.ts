@@ -551,9 +551,13 @@ export class SettlementProcessorService {
     let facts = this.factsService.extract(match, { timelineCoverageComplete });
     let sportsDataRefreshed = false;
     const statisticsFreshnessMs = SETTLEMENT_CONFIG.evidence.fullTimeStatisticsFreshnessMs;
+    const completedAtValue = fixture.completedAt?.getTime();
+    const completedAt = Number.isFinite(completedAtValue)
+      ? (fixture.completedAt as Date)
+      : undefined;
     const needsSummary =
       facts.scoreSource !== 'ESPN_SUMMARY' ||
-      !this.hasFreshTeamStatistics(facts, statisticsFreshnessMs) ||
+      !this.hasFreshTeamStatistics(facts, statisticsFreshnessMs, completedAt) ||
       Object.keys(facts.homeStats).length === 0 ||
       Object.keys(facts.awayStats).length === 0 ||
       facts.homeGoals === undefined ||
@@ -564,7 +568,9 @@ export class SettlementProcessorService {
       try {
         const shouldCollect = await this.sportsCollection.shouldCollectFixtureSummary(
           fixture.espnEventId,
-          statisticsFreshnessMs,
+          completedAt ? statisticsFreshnessMs : 0,
+          5 * 60_000,
+          completedAt,
         );
         if (shouldCollect) {
           await this.queue.assertProcessingLease(job);
@@ -628,12 +634,19 @@ export class SettlementProcessorService {
   private hasFreshTeamStatistics(
     facts: ReturnType<FootballMatchFactsService['extract']>,
     maximumAgeMs: number,
+    requiredAfter?: Date,
   ): boolean {
     const now = Date.now();
+    const completionBoundary = requiredAfter?.getTime();
     return [facts.homeStatisticsCollectedAt, facts.awayStatisticsCollectedAt].every((value) => {
       if (!(value instanceof Date) || !Number.isFinite(value.getTime())) return false;
-      const age = now - value.getTime();
-      return age >= -60_000 && age <= maximumAgeMs;
+      const collectedAt = value.getTime();
+      const age = now - collectedAt;
+      return (
+        age >= -60_000 &&
+        age <= maximumAgeMs &&
+        (!Number.isFinite(completionBoundary) || collectedAt >= (completionBoundary as number))
+      );
     });
   }
 
@@ -654,5 +667,3 @@ export class SettlementProcessorService {
     };
   }
 }
-
-

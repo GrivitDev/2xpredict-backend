@@ -43,6 +43,19 @@ interface LaneRuntime {
 }
 
 const LANE_CONCURRENCY = 1;
+
+/**
+ * These lanes have their own single-worker execution guard and do not wait for
+ * a shared global permit. This is limited to live monitoring and lightweight,
+ * sub-minute control gates. Historical backfills remain behind the global gate.
+ */
+const GLOBAL_GATE_BYPASS_JOB_TYPES: ReadonlySet<SportsQueueJobType> = new Set([
+  SportsQueueJobType.LIVE_SCOREBOARD_REFRESH,
+  SportsQueueJobType.BOOTSTRAP_PHASE_GATE,
+  SportsQueueJobType.SEASON_DISCOVERY_PHASE_GATE,
+  SportsQueueJobType.FIXTURE_SEASON_VALIDATION_GATE,
+]);
+
 const IDLE_POLL_MS = 10_000;
 const ACTIVE_POLL_MS = 1_000;
 const LEASE_MS = 10 * 60_000;
@@ -51,8 +64,9 @@ const LEASE_RECOVERY_MS = 60_000;
 
 /**
  * Independent durable queue lane for every SportsQueueJobType.
- * Each lane claims and executes one job at a time. The shared background-work
- * limiter caps all module workers at six active operations process-wide and prioritizes time-sensitive lanes.
+ * Each lane claims and executes one job at a time. Most lanes use the shared
+ * ten-permit process-wide limiter; live monitoring and short control gates
+ * bypass it while retaining their own single-job lane concurrency.
  */
 @Injectable()
 export class SportsQueueWorkerService
@@ -129,6 +143,7 @@ export class SportsQueueWorkerService
         {
           running: lane.running,
           concurrency: LANE_CONCURRENCY,
+          globalGate: GLOBAL_GATE_BYPASS_JOB_TYPES.has(type) ? 'BYPASS' : 'LIMITED',
           passes: lane.passes,
           failedPasses: lane.failedPasses,
           jobsClaimed: lane.claimed,
@@ -214,9 +229,11 @@ export class SportsQueueWorkerService
     let releasePermit: (() => void) | undefined;
 
     try {
-      // A permit is acquired before the durable claim, so waiting lanes do not
-      // hold processing leases while another module is using shared capacity.
-      releasePermit = await this.backgroundWork.acquire(`sports:${type}`);
+      // Bypass lanes remain serialized by lane.running. All other lanes obtain
+      // global capacity before claiming so they never hold a lease while waiting.
+      if (!GLOBAL_GATE_BYPASS_JOB_TYPES.has(type)) {
+        releasePermit = await this.backgroundWork.acquire(`sports:${type}`);
+      }
       if (this.stopped) return;
 
       lane.lastStartedAt = new Date();
@@ -251,8 +268,8 @@ export class SportsQueueWorkerService
       const wakeRequested = lane.wakeRequested;
       lane.wakeRequested = false;
       if (!this.stopped) {
-        // Event wakes may request an immediate check, but the limiter still
-        // enforces at least one second between starts in this lane.
+        // Event wakes may request an immediate check. Active lanes still yield
+        // for at least one second between passes, including gate-bypass lanes.
         const delayMs =
           wakeRequested || processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
         this.scheduleLane(type, delayMs);

@@ -2,17 +2,17 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
 
 export type CustomerCareBroadcastDocument = HydratedDocument<CustomerCareBroadcast>;
-export type CustomerCareBroadcastKind = 'DAILY_PICKS' | 'PROMOTION';
+export type CustomerCareBroadcastKind = 'DAILY_PICKS' | 'PROMOTION' | 'INTERNAL_AD';
 
 @Schema({ timestamps: true, collection: 'customer_care_broadcasts' })
 export class CustomerCareBroadcast {
-  @Prop({ type: String, enum: ['DAILY_PICKS', 'PROMOTION'], required: true, index: true })
+  @Prop({ type: String, enum: ['DAILY_PICKS', 'PROMOTION', 'INTERNAL_AD'], required: true, index: true })
   kind!: CustomerCareBroadcastKind;
 
   @Prop({ type: String, required: true, trim: true, index: true })
   dateKey!: string;
 
-  /** "daily" for picks; the existing promotion ID for a promotion broadcast. */
+  /** "daily" for scheduled broadcasts; internal ad and prediction IDs are stored in sourceReferences. */
   @Prop({ type: String, required: true, trim: true })
   sourceKey!: string;
 

@@ -8,6 +8,12 @@ import { ConfigService } from '@nestjs/config';
 import { Resend } from 'resend';
 
 import { emailLayout } from './templates/email-layout';
+import {
+  COMMUNICATION_BANNER_PATH,
+  NotificationRoutes,
+  buildFrontendUrl,
+  normalizeNotificationActionUrl,
+} from './notification-routes';
 
 import {
   sectionTitle,
@@ -18,12 +24,37 @@ import {
   infoCard,
   primaryButton,
   secondaryButton,
+  codePanel,
 } from './templates/email-components';
+import {
+  escapeHtml,
+  formatEmailDate,
+  safeEmailSubject,
+  safeHttpUrl,
+} from './templates/email-utils';
+
 @Injectable()
 export class EmailService {
   private resendClient?: { apiKey: string; client: Resend };
 
   constructor(private readonly config: ConfigService) {}
+
+  /** Build absolute links using the configured public frontend origin. */
+  private frontendPath(path: string): string {
+    return buildFrontendUrl(this.config.get<string>('FRONTEND_URL'), path);
+  }
+
+  /** Password-reset links must point to the configured public frontend origin. */
+  private passwordResetUrl(resetLink: string): string {
+    const safeUrl = safeHttpUrl(resetLink);
+    const frontendOrigin = new URL(this.frontendPath(NotificationRoutes.HOME)).origin;
+
+    if (!safeUrl || new URL(safeUrl).origin !== frontendOrigin) {
+      throw new InternalServerErrorException('Invalid password reset link.');
+    }
+
+    return safeUrl;
+  }
 
   /** Resolve Resend lazily so missing optional provider credentials never
    * prevent the Nest application from booting. */
@@ -42,261 +73,30 @@ export class EmailService {
 
   async sendOtpEmail(email: string, otp: string, idempotencyKey?: string) {
     try {
-      const response = await this.resend.emails.send(
+      return await this.resend.emails.send(
         {
           from: '2XPredict <register@2xpredict.com>',
           to: email,
           subject: 'Verify Your Email Address',
-          html: `
-<!DOCTYPE html>
-<html>
-
-<head>
-<meta charset="UTF-8">
-<title>Email Verification</title>
-</head>
-
-<body
-  style="
-    margin:0;
-    padding:0;
-    background:#f4f7fb;
-    font-family:Arial,Helvetica,sans-serif;
-  "
->
-
-<table
-  width="100%"
-  cellpadding="0"
-  cellspacing="0"
-  style="padding:40px 20px;"
->
-
-<tr>
-
-<td align="center">
-
-<table
-  width="600"
-  cellpadding="0"
-  cellspacing="0"
-  style="
-    background:#ffffff;
-    border-radius:18px;
-    overflow:hidden;
-    box-shadow:0 8px 30px rgba(0,0,0,.08);
-  "
->
-
-<!-- Banner -->
-
-<tr>
-
-<td>
-
-<img
-  src="https://www.2xpredict.com/banner.png"
-  alt="Football Predictions"
-  width="600"
-  style="
-    display:block;
-    width:100%;
-  "
-/>
-
-</td>
-
-</tr>
-
-<!-- Body -->
-
-<tr>
-
-<td style="padding:40px;">
-
-<h2
-  style="
-    margin-top:0;
-    color:#111827;
-  "
->
-
-Verify Your Email Address
-
-</h2>
-
-<p
-  style="
-    color:#4b5563;
-    line-height:1.8;
-    font-size:16px;
-  "
->
-
-Welcome to <strong>2XPredict</strong>!
-
-<br><br>
-
-To complete your registration, please use the verification code below.
-
-</p>
-
-<div
-  style="
-    background:#eff6ff;
-    border:2px dashed #2563eb;
-    border-radius:12px;
-    padding:25px;
-    text-align:center;
-    margin:35px 0;
-  "
->
-
-<p
-  style="
-    margin:0;
-    color:#6b7280;
-    font-size:14px;
-    text-transform:uppercase;
-    letter-spacing:2px;
-  "
->
-
-Verification Code
-
-</p>
-
-<div
-  style="
-    margin-top:15px;
-    font-size:42px;
-    font-weight:bold;
-    letter-spacing:10px;
-    color:#2563eb;
-  "
->
-
-${otp}
-
-</div>
-
-</div>
-
-<p
-  style="
-    color:#6b7280;
-    line-height:1.8;
-  "
->
-
-This verification code will expire in
-<strong>20 minutes</strong>.
-
-</p>
-
-<p
-  style="
-    color:#6b7280;
-    line-height:1.8;
-  "
->
-
-For your security, never share this code with anyone.
-
-</p>
-
-<hr
-  style="
-    border:none;
-    border-top:1px solid #e5e7eb;
-    margin:35px 0;
-  "
->
-
-<p
-  style="
-    color:#9ca3af;
-    font-size:14px;
-    line-height:1.8;
-  "
->
-
-If you didn't create an 2XPredict account,
-you can safely ignore this email.
-
-</p>
-
-</td>
-
-</tr>
-
-<!-- Footer -->
-
-<tr>
-
-<td
-  align="center"
-  style="
-    background:#f9fafb;
-    padding:25px;
-  "
->
-
-<p
-  style="
-    margin:0;
-    color:#6b7280;
-    font-size:13px;
-  "
->
-
-© ${new Date().getFullYear()} 2XPredict
-
-</p>
-
-<p
-  style="
-    margin-top:10px;
-  "
->
-
-<a
-  href="https://www.2xpredict.com"
-  style="
-    color:#2563eb;
-    text-decoration:none;
-  "
->
-
-www.2xpredict.com
-
-</a>
-
-</p>
-
-</td>
-
-</tr>
-
-</table>
-
-</td>
-
-</tr>
-
-</table>
-
-</body>
-
-</html>
+          html: emailLayout({
+            bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+            siteUrl: this.frontendPath(NotificationRoutes.HOME),
+            title: 'Verify Your Email Address',
+            preheader: 'Use the verification code to complete your 2xPredict registration.',
+            body: `
+${sectionTitle('Verify Your Email Address')}
+${paragraph('Welcome to <strong>2xPredict</strong>. To complete your registration, enter the verification code below.')}
+${codePanel('Verification Code', otp, 'This code expires in 20 minutes.')}
+${paragraph('For your security, never share this code with anyone.')}
+${warningBox('If you did not create a 2xPredict account, you can safely ignore this email.')}
 `,
+          }),
         },
         idempotencyKey ? { idempotencyKey } : undefined,
       );
-
-      return response;
     } catch (error) {
       if (error instanceof ServiceUnavailableException) throw error;
+      if (error instanceof InternalServerErrorException) throw error;
       // Avoid logging OTPs, email addresses or provider payloads.
       throw new InternalServerErrorException('Failed to send OTP email');
     }
@@ -307,265 +107,33 @@ www.2xpredict.com
     resetLink: string,
     idempotencyKey?: string,
   ) {
-    const safeResetLink = escapeHtml(resetLink);
+    const safeResetLink = this.passwordResetUrl(resetLink);
+
     return this.resend.emails.send(
       {
         from: '2XPredict <passwordreset@2xpredict.com>',
         to: email,
         subject: 'Reset Your Password',
-        html: `
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Reset Password</title>
-</head>
-
-<body style="
-  margin:0;
-  padding:0;
-  background:#f4f7fb;
-  font-family:Arial,Helvetica,sans-serif;
-">
-
-<table
-  width="100%"
-  cellpadding="0"
-  cellspacing="0"
-  style="padding:40px 20px;"
->
-
-<tr>
-
-<td align="center">
-
-<table
-  width="600"
-  cellpadding="0"
-  cellspacing="0"
-  style="
-    background:#ffffff;
-    border-radius:18px;
-    overflow:hidden;
-    box-shadow:0 8px 30px rgba(0,0,0,.08);
-  "
->
-
-
-<!-- Banner -->
-
-<tr>
-
-<td>
-
-<img
-  src="https://www.2xpredict.com/banner.png"
-  alt="Football"
-  width="600"
-  style="
-    display:block;
-    width:100%;
-  "
-/>
-
-</td>
-
-</tr>
-
-<!-- Content -->
-
-<tr>
-
-<td style="padding:40px;">
-
-<h2
-  style="
-    margin-top:0;
-    color:#111827;
-  "
->
-
-Reset Your Password
-
-</h2>
-
-<p
-  style="
-    color:#4b5563;
-    line-height:1.7;
-    font-size:16px;
-  "
->
-
-Hello,
-
-<br><br>
-
-We received a request to reset the password for your 2XPredict account.
-
-If this was you, simply click the button below.
-
-</p>
-
-<div
-  style="
-    text-align:center;
-    margin:40px 0;
-  "
->
-
-<a
-  href="${safeResetLink}"
-  style="
-    background:#2563eb;
-    color:#ffffff;
-    padding:16px 36px;
-    text-decoration:none;
-    border-radius:8px;
-    font-weight:bold;
-    font-size:16px;
-    display:inline-block;
-  "
->
-
-Reset Password
-
-</a>
-
-</div>
-
-<p
-  style="
-    color:#6b7280;
-    line-height:1.7;
-  "
->
-
-This password reset link will expire in
-<strong>30 minutes</strong>.
-
-</p>
-
-<p
-  style="
-    color:#6b7280;
-    line-height:1.7;
-  "
->
-
-If the button doesn't work, copy and paste this link into your browser:
-
-</p>
-
-<p
-  style="
-    word-break:break-word;
-  "
->
-
-<a
-  href="${safeResetLink}"
-  style="
-    color:#2563eb;
-  "
->
-
-${safeResetLink}
-
-</a>
-
-</p>
-
-<hr
-  style="
-    border:none;
-    border-top:1px solid #e5e7eb;
-    margin:35px 0;
-  "
->
-
-<p
-  style="
-    color:#9ca3af;
-    font-size:14px;
-    line-height:1.7;
-  "
->
-
-If you didn't request a password reset,
-you can safely ignore this email.
-Your password will remain unchanged.
-
-</p>
-
-</td>
-
-</tr>
-
-<!-- Footer -->
-
-<tr>
-
-<td
-  align="center"
-  style="
-    background:#f9fafb;
-    padding:25px;
-  "
->
-
-<p
-  style="
-    margin:0;
-    color:#6b7280;
-    font-size:13px;
-  "
->
-
-© ${new Date().getFullYear()} 2XPredict
-
-</p>
-
-<p
-  style="
-    margin:10px 0 0;
-  "
->
-
-<a
-  href="https://www.2xpredict.com"
-  style="
-    color:#2563eb;
-    text-decoration:none;
-  "
->
-
-www.2xpredict.com
-
-</a>
-
-</p>
-
-</td>
-
-</tr>
-
-</table>
-
-</td>
-
-</tr>
-
-</table>
-
-</body>
-
-</html>
+        html: emailLayout({
+          bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+          siteUrl: this.frontendPath(NotificationRoutes.HOME),
+          title: 'Reset Your Password',
+          preheader: 'Use the secure link to reset your 2xPredict password.',
+          body: `
+${sectionTitle('Reset Your Password')}
+${paragraph('We received a request to reset the password for your 2xPredict account. Select the button below to continue.')}
+${primaryButton('Reset Password', safeResetLink)}
+${warningBox('This password reset link expires in <strong>30 minutes</strong>. For your security, do not share it with anyone.')}
+${paragraph('If the button does not work, copy and paste this link into your browser:')}
+<p style="margin:0 0 20px;word-break:break-all;font-size:12px;line-height:1.7;"><a href="${escapeHtml(safeResetLink)}" style="color:#6b233b;">${escapeHtml(safeResetLink)}</a></p>
+${paragraph('If you did not request a password reset, you can safely ignore this email. Your password will remain unchanged.')}
 `,
+        }),
       },
       idempotencyKey ? { idempotencyKey } : undefined,
     );
   }
+
   async sendPaymentReceivedEmail(data: {
     email: string;
     amount: number;
@@ -573,9 +141,9 @@ www.2xpredict.com
     paymentType: string;
     reference: string;
   }) {
-    const homeUrl = 'https://www.2xpredict.com';
+    const homeUrl = this.frontendPath(NotificationRoutes.PROFILE_BILLING);
 
-    const aboutUrl = 'https://www.2xpredict.com/about';
+    const aboutUrl = this.frontendPath(NotificationRoutes.CUSTOMER_CARE);
 
     const symbol = data.currency === 'USD' ? '$' : '₦';
 
@@ -587,6 +155,8 @@ www.2xpredict.com
       subject: 'Payment Request Submitted — Awaiting Verification',
 
       html: emailLayout({
+        bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+        siteUrl: this.frontendPath(NotificationRoutes.HOME),
         title: 'Payment Submission Received',
 
         preheader:
@@ -630,9 +200,9 @@ ${infoCard('Payment Summary', [
   },
 ])}
 
-${primaryButton('🏠 Go to Home', homeUrl)}
+${primaryButton('View Payment & Subscription', homeUrl)}
 
-${secondaryButton('ℹ About 2XPredict', aboutUrl)}
+${secondaryButton('Contact Customer Care', aboutUrl)}
 
 ${paragraph(`
 Need help?
@@ -652,9 +222,9 @@ Our support team is always available if you have any questions regarding your pa
     activatedDate: Date;
     expiryDate: Date;
   }) {
-    const dashboardUrl = 'https://www.2xpredict.com/dashboard';
+    const dashboardUrl = this.frontendPath(NotificationRoutes.PROFILE);
 
-    const predictionsUrl = 'https://www.2xpredict.com/predictions';
+    const predictionsUrl = this.frontendPath(NotificationRoutes.PREDICTIONS);
 
     const symbol = data.currency === 'USD' ? '$' : '₦';
 
@@ -673,6 +243,8 @@ Our support team is always available if you have any questions regarding your pa
       subject: `${planName} Activated Successfully`,
 
       html: emailLayout({
+        bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+        siteUrl: this.frontendPath(NotificationRoutes.HOME),
         title: 'Subscription Activated',
 
         preheader: 'Your subscription has been activated successfully.',
@@ -709,19 +281,11 @@ ${infoCard('Subscription Summary', [
   },
   {
     label: 'Activated',
-    value: data.activatedDate.toLocaleDateString('en-NG', {
-      day: 'numeric',
-      month: 'long',
-      year: 'numeric',
-    }),
+    value: formatEmailDate(data.activatedDate),
   },
   {
     label: 'Expires',
-    value: data.expiryDate.toLocaleDateString('en-NG', {
-      day: 'numeric',
-      month: 'long',
-      year: 'numeric',
-    }),
+    value: formatEmailDate(data.expiryDate),
   },
 ])}
 
@@ -753,7 +317,7 @@ ${infoCard('Regular Benefits', [
 `
 }
 
-${primaryButton('📊 Go to Dashboard', dashboardUrl)}
+${primaryButton('View Profile', dashboardUrl)}
 
 ${secondaryButton('⚽ Browse Predictions', predictionsUrl)}
 
@@ -774,9 +338,9 @@ We wish you success with your football predictions!
     currency: string;
     reason?: string;
   }) {
-    const paymentUrl = 'https://www.2xpredict.com/payments';
+    const paymentUrl = this.frontendPath(NotificationRoutes.PROFILE_BILLING);
 
-    const supportUrl = 'https://www.2xpredict.com/about';
+    const supportUrl = this.frontendPath(NotificationRoutes.CUSTOMER_CARE);
 
     const symbol = data.currency === 'USD' ? '$' : '₦';
 
@@ -788,6 +352,8 @@ We wish you success with your football predictions!
       subject: 'Your Payment Could Not Be Verified',
 
       html: emailLayout({
+        bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+        siteUrl: this.frontendPath(NotificationRoutes.HOME),
         title: 'Payment Rejected',
 
         preheader: 'Your payment verification was unsuccessful.',
@@ -807,7 +373,7 @@ ${dangerBox(`
 Your payment request has been rejected.
 
 Reason:
-<strong>${data.reason || 'No reason was provided by the administrator.'}</strong>
+<strong>${escapeHtml(data.reason || 'No reason was provided by the administrator.')}</strong>
 `)}
 
 ${infoCard('Payment Details', [
@@ -833,7 +399,7 @@ If you believe this decision was made in error, please contact our support team 
 
 ${primaryButton('Submit Another Payment', paymentUrl)}
 
-${secondaryButton('About 2XPredict', supportUrl)}
+${secondaryButton('Contact Customer Care', supportUrl)}
 
 ${paragraph(`
 Thank you for your patience and understanding.
@@ -850,9 +416,9 @@ We appreciate your continued support of 2XPredict.
     idempotencyKey?: string,
   ) {
     const safeFullName = escapeHtml(data.fullName);
-    const predictionsUrl = 'https://www.2xpredict.com/predictions';
+    const predictionsUrl = this.frontendPath(NotificationRoutes.PREDICTIONS);
 
-    const betlabUrl = 'https://www.2xpredict.com/bet-lab';
+    const betlabUrl = this.frontendPath(NotificationRoutes.BET_LAB);
 
     return this.resend.emails.send(
       {
@@ -863,6 +429,8 @@ We appreciate your continued support of 2XPredict.
         subject: 'Welcome to 2XPredict 🎉',
 
         html: emailLayout({
+          bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+          siteUrl: this.frontendPath(NotificationRoutes.HOME),
           title: 'Welcome to 2XPredict',
 
           preheader: 'Your account has been verified successfully.',
@@ -935,18 +503,20 @@ We wish you success and hope you enjoy everything our platform has to offer.
     expiryDate: Date;
     daysRemaining: number;
   }) {
-    const renewalUrl = 'https://www.2xpredict.com/subscription';
+    const renewalUrl = this.frontendPath(NotificationRoutes.PROFILE_BILLING);
 
-    const dashboardUrl = 'https://www.2xpredict.com/dashboard';
+    const dashboardUrl = this.frontendPath(NotificationRoutes.PROFILE);
 
     return this.resend.emails.send({
       from: '2XPredict <subscriptions@2xpredict.com>',
 
       to: data.email,
 
-      subject: `Your ${data.plan.toUpperCase()} Subscription Expires Soon`,
+      subject: `Your ${safePlanLabel(data.plan)} Subscription Expires Soon`,
 
       html: emailLayout({
+        bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+        siteUrl: this.frontendPath(NotificationRoutes.HOME),
         title: 'Subscription Expiring Soon',
 
         preheader: 'Your subscription will expire soon.',
@@ -957,33 +527,29 @@ ${sectionTitle('Your Subscription is Almost Expiring ⏳')}
 ${paragraph(`
 Hello,
 
-Your <strong>${data.plan.toUpperCase()}</strong> subscription will expire soon.
+Your <strong>${safePlanLabel(data.plan)}</strong> subscription will expire soon.
 
 To continue enjoying uninterrupted access to premium football predictions and member benefits, please renew your subscription before it expires.
 `)}
 
 ${warningBox(`
-Your subscription expires in <strong>${data.daysRemaining} day${
-  data.daysRemaining === 1 ? '' : 's'
+Your subscription expires in <strong>${safeDaysRemaining(data.daysRemaining)} day${
+  safeDaysRemaining(data.daysRemaining) === 1 ? '' : 's'
 }</strong>.
 `)}
 
 ${infoCard('Subscription Details', [
   {
     label: 'Plan',
-    value: data.plan.toUpperCase(),
+    value: safePlanLabel(data.plan),
   },
   {
     label: 'Expires On',
-    value: data.expiryDate.toLocaleDateString('en-NG', {
-      day: 'numeric',
-      month: 'long',
-      year: 'numeric',
-    }),
+    value: formatEmailDate(data.expiryDate),
   },
   {
     label: 'Days Remaining',
-    value: `${data.daysRemaining}`,
+    value: `${safeDaysRemaining(data.daysRemaining)}`,
   },
 ])}
 
@@ -993,7 +559,7 @@ Renewing before your subscription expires ensures you continue enjoying uninterr
 
 ${primaryButton('Renew Subscription', renewalUrl)}
 
-${secondaryButton('Go to Dashboard', dashboardUrl)}
+${secondaryButton('View Profile', dashboardUrl)}
 
 ${paragraph(`
 Thank you for choosing 2XPredict.
@@ -1010,9 +576,9 @@ We appreciate your continued support.
     plan: 'regular' | 'vip' | 'premium';
     expiryDate: Date;
   }) {
-    const renewalUrl = 'https://www.2xpredict.com/subscription';
+    const renewalUrl = this.frontendPath(NotificationRoutes.PROFILE_BILLING);
 
-    const predictionsUrl = 'https://www.2xpredict.com/predictions';
+    const predictionsUrl = this.frontendPath(NotificationRoutes.PREDICTIONS);
 
     return this.resend.emails.send({
       from: '2XPredict <subscriptions@2xpredict.com>',
@@ -1022,6 +588,8 @@ We appreciate your continued support.
       subject: 'Your Subscription Has Expired',
 
       html: emailLayout({
+        bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+        siteUrl: this.frontendPath(NotificationRoutes.HOME),
         title: 'Subscription Expired',
 
         preheader: 'Your subscription has expired.',
@@ -1032,26 +600,19 @@ ${sectionTitle('Your Subscription Has Expired')}
 ${paragraph(`
 Hello,
 
-Your <strong>${data.plan.toUpperCase()}</strong> subscription has now expired.
+Your <strong>${safePlanLabel(data.plan)}</strong> subscription has now expired.
 
 Premium features are no longer available until your subscription is renewed.
 `)}
 
 ${dangerBox(`
-Your subscription expired on <strong>${data.expiryDate.toLocaleDateString(
-  'en-NG',
-  {
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric',
-  },
-)}</strong>.
+Your subscription expired on <strong>${formatEmailDate(data.expiryDate)}</strong>.
 `)}
 
 ${infoCard('Subscription Summary', [
   {
     label: 'Plan',
-    value: data.plan.toUpperCase(),
+    value: safePlanLabel(data.plan),
   },
   {
     label: 'Status',
@@ -1059,11 +620,7 @@ ${infoCard('Subscription Summary', [
   },
   {
     label: 'Expired On',
-    value: data.expiryDate.toLocaleDateString('en-NG', {
-      day: 'numeric',
-      month: 'long',
-      year: 'numeric',
-    }),
+    value: formatEmailDate(data.expiryDate),
   },
 ])}
 
@@ -1099,19 +656,17 @@ Thank you for being part of 2XPredict.
     },
     idempotencyKey: string,
   ) {
-    const title = escapeHtml(data.title);
-    const message = escapeHtml(data.message);
-    const actionPath = safeLocalActionPath(data.actionUrl);
+    const title = String(data.title ?? '').trim();
+    const message = escapeHtml(data.message ?? '');
+    const actionPath = normalizeNotificationActionUrl(safeLocalActionPath(data.actionUrl));
     const actionUrl = actionPath
-      ? `https://www.2xpredict.com${actionPath}`
+      ? this.frontendPath(actionPath)
       : null;
     const details = (data.details ?? []).slice(0, 8).map((item) => ({
-      label: escapeHtml(item.label),
-      value: escapeHtml(item.value),
+      label: String(item.label ?? ''),
+      value: String(item.value ?? ''),
     }));
-    const safeSubject = String(data.title)
-      .replace(/[\r\n]+/g, ' ')
-      .slice(0, 100);
+    const safeSubject = safeEmailSubject(data.title, '2xPredict notification');
 
     return this.resend.emails.send(
       {
@@ -1119,8 +674,10 @@ Thank you for being part of 2XPredict.
         to: data.email,
         subject: `2xPredict | ${safeSubject}`,
         html: emailLayout({
+          bannerUrl: this.frontendPath(COMMUNICATION_BANNER_PATH),
+          siteUrl: this.frontendPath(NotificationRoutes.HOME),
           title,
-          preheader: message.slice(0, 150),
+          preheader: String(data.message ?? '').slice(0, 150),
           body: `
 ${sectionTitle(title)}
 ${paragraph(message)}
@@ -1135,13 +692,19 @@ ${paragraph('This message relates to activity on your 2xPredict account. Sign in
   }
 }
 
-function escapeHtml(value: string): string {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+
+function safePlanLabel(plan: unknown): string {
+  switch (String(plan ?? '').toLowerCase()) {
+    case 'regular': return 'REGULAR';
+    case 'vip': return 'VIP';
+    case 'premium': return 'PREMIUM';
+    default: return 'MEMBERSHIP';
+  }
+}
+
+function safeDaysRemaining(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 0;
 }
 
 function safeLocalActionPath(value?: string | null): string | null {

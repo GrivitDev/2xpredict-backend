@@ -1,11 +1,12 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
 
 /**
- * Capacity is intentionally conservative for the 2-vCPU production instance.
- * Queue workers remain single-job-per-lane; this is the process-wide ceiling.
+ * Process-wide ceiling for background operations that participate in the
+ * shared gate. Independently protected priority lanes may bypass this gate,
+ * but still retain their own worker concurrency and provider-level limits.
  */
 export const BACKGROUND_WORK_LIMITS = {
-  maximumConcurrentJobs: 6,
+  maximumConcurrentJobs: 10,
   minimumLaneStartIntervalMs: 1_000,
   priorityAgingIntervalMs: 15_000,
   maximumPriorityAgingBoost: 80,
@@ -31,11 +32,11 @@ interface WaitingPermit {
 
 /**
  * Process-wide limiter shared by Sports, Odds, Predictions, Settlement and
- * Bet Lab. High-value live, pricing, prediction and settlement work gets first
- * access to capacity. Background maintenance is aged while waiting so it
- * continues to make progress instead of being permanently starved.
+ * Bet Lab. High-value pricing, prediction and settlement work gets first
+ * access to gated capacity. Background maintenance is aged while waiting so
+ * it continues to make progress instead of being permanently starved.
  *
- * - At most six background operations hold a permit at once.
+ * - At most ten gated background operations hold a permit at once.
  * - A lane holds at most one permit at a time.
  * - Consecutive starts in one lane are at least one second apart.
  * - Eligible waiters are scheduled by priority, then FIFO; age increases
@@ -207,7 +208,6 @@ export class BackgroundWorkLimiterService implements OnModuleDestroy {
     const normalized = lane.trim().toLowerCase();
 
     if (normalized === 'settlement:queue') return BACKGROUND_WORK_PRIORITY.CRITICAL;
-    if (normalized === 'sports:live_scoreboard_refresh') return BACKGROUND_WORK_PRIORITY.CRITICAL;
 
     if (
       normalized === 'settlement:startup-recovery' ||
@@ -222,7 +222,6 @@ export class BackgroundWorkLimiterService implements OnModuleDestroy {
     if (normalized === 'sports:fixture_daily_refresh') return 85;
     if (normalized === 'sports:fixture_daily_validation') return 82;
     if (normalized === 'sports:match_plays_collection') return 78;
-    if (normalized === 'sports:source-outbox') return 78;
     if (normalized === 'sports:source_facts_changed') return 78;
     if (normalized === 'settlement:target-reconciliation') return 72;
 
@@ -230,8 +229,6 @@ export class BackgroundWorkLimiterService implements OnModuleDestroy {
     if (normalized === 'predictions:queue-sync') return 60;
     if (normalized === 'sports:fixture_season_bootstrap') return 58;
     if (normalized === 'sports:bootstrap_start') return 55;
-    if (normalized === 'sports:bootstrap_phase_gate') return 52;
-    if (normalized === 'sports:season_discovery_phase_gate') return 50;
 
     if (normalized === 'predictions:product-pipeline') return 35;
     if (normalized === 'predictions:calibration') return 25;

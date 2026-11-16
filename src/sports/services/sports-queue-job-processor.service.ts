@@ -183,6 +183,12 @@ export class SportsQueueJobProcessorService {
         await this.youtubeHighlights.processAttempt(
           this.required(job.scope.fixtureId, 'fixtureId'),
           Math.max(1, Math.floor(Number(job.scope.youtubeAttempt ?? 1))),
+          job.jobKey,
+        );
+        return;
+      case SportsQueueJobType.YOUTUBE_HIGHLIGHT_RECONCILIATION:
+        await this.youtubeHighlights.reconcileRecentCompletedFixtures(
+          SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.batchSize,
         );
         return;
       case SportsQueueJobType.SOURCE_FACTS_CHANGED:
@@ -769,6 +775,19 @@ export class SportsQueueJobProcessorService {
       },
       triggerEventId: 'sports-recurring-retention-cleanup',
     });
+    if (SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.enabled) {
+      await this.queue.enqueueIfMissing({
+        type: SportsQueueJobType.YOUTUBE_HIGHLIGHT_RECONCILIATION,
+        scope: {},
+        priority: 42,
+        scheduledFor: new Date(Date.now() + SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.intervalMs),
+        recurrence: {
+          intervalMs: SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.intervalMs,
+          repeatUntil: 'NEVER',
+        },
+        triggerEventId: 'sports-recurring-youtube-highlight-reconciliation',
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1174,9 +1193,10 @@ export class SportsQueueJobProcessorService {
         return;
       const extendedScope = scope;
       if (extendedScope.milestone === 'AFTER_MATCH') {
-        const expectedCompletedAt = extendedScope.expectedCompletedAt
-          ? new Date(extendedScope.expectedCompletedAt).getTime()
-          : Number.NaN;
+        const hasExpectedCompletedAt = Boolean(extendedScope.expectedCompletedAt);
+        const expectedCompletedAt = hasExpectedCompletedAt
+          ? new Date(extendedScope.expectedCompletedAt as string).getTime()
+          : undefined;
         const actualCompletedAt = anchorFixture?.completedAt
           ? new Date(anchorFixture.completedAt).getTime()
           : Number.NaN;
@@ -1186,8 +1206,9 @@ export class SportsQueueJobProcessorService {
             anchorFixture.status.state === 'COMPLETED' ||
             anchorFixture.status.isFinal
           ) ||
-          !Number.isFinite(expectedCompletedAt) ||
-          actualCompletedAt !== expectedCompletedAt
+          (hasExpectedCompletedAt &&
+            (!Number.isFinite(expectedCompletedAt) ||
+              actualCompletedAt !== expectedCompletedAt))
         )
           return;
       }
@@ -1477,12 +1498,18 @@ export class SportsQueueJobProcessorService {
     const fixture = await this.collection.getFixture(fixtureId);
     if (!fixture) throw new Error(`Summary job references missing fixture ${fixtureId}.`);
     if (!(fixture.status.state === 'COMPLETED' || fixture.status.isFinal)) return;
+    const completionBoundary =
+      fixture.completedAt && Number.isFinite(fixture.completedAt.getTime())
+        ? fixture.completedAt
+        : undefined;
 
-    if (scope.expectedCompletedAt && fixture.completedAt) {
+    if (scope.expectedCompletedAt) {
       const expected = new Date(scope.expectedCompletedAt).getTime();
-      const actual = new Date(fixture.completedAt).getTime();
-      if (Number.isFinite(expected) && Number.isFinite(actual) && expected !== actual) {
-        this.logger.debug(`Skipping stale Summary job for ${fixtureId}; completion timestamp changed.`);
+      const actual = fixture.completedAt
+        ? new Date(fixture.completedAt).getTime()
+        : Number.NaN;
+      if (!Number.isFinite(expected) || actual !== expected) {
+        this.logger.debug(`Skipping stale Summary job for ${fixtureId}; completion timestamp changed or is no longer available.`);
         return;
       }
     }
@@ -1492,9 +1519,19 @@ export class SportsQueueJobProcessorService {
     const competition = await this.collection.getCompetition(fixture.competitionId);
     if (!competition?.slug) throw new Error(`Summary job references fixture ${fixtureId} without a competition slug.`);
 
-    // A backfill must not be suppressed by legacy success state created before
-    // raw Summary snapshots were persisted. The backfill run has its own queue identity.
-    if (!scope.summaryBackfillRunId && await this.collection.isFixtureSummaryFallbackFresh(eventId)) return;
+    // A pre-match Summary snapshot must never satisfy the post-match freshness
+    // gate. When ESPN did not provide completedAt, do not trust legacy freshness
+    // state because it cannot prove that the retained Summary was collected
+    // after full time. Historical backfills remain independent of this gate.
+    if (
+      !scope.summaryBackfillRunId &&
+      completionBoundary &&
+      (await this.collection.isFixtureSummaryFallbackFresh(
+        eventId,
+        24 * 60 * 60_000,
+        completionBoundary,
+      ))
+    ) return;
 
     const normalizedFixture = await this.collection.collectFixtureSummary(
       competition.slug,
@@ -1787,6 +1824,8 @@ export class SportsQueueJobProcessorService {
             const summaryFallbackFresh = fixture.espnEventId
               ? await this.collection.isFixtureSummaryFallbackFresh(
                   fixture.espnEventId,
+                  24 * 60 * 60_000,
+                  fixture.completedAt,
                 )
               : false;
             const missingTeamStatistics =
@@ -2303,17 +2342,24 @@ export class SportsQueueJobProcessorService {
           );
         }
 
-        const completedWithTimestamp = actionable.filter(
-          (item) =>
-            (item.status.state === 'COMPLETED' || item.status.isFinal) &&
-            Boolean(item.completedAt),
+        const completedFixtures = actionable.filter(
+          (item) => item.status.state === 'COMPLETED' || item.status.isFinal,
         );
         const completionBuckets = new Map<number, SportsFixtureRecord[]>();
         const bucketSize = 5 * SPORTS_COLLECTION_TIME.MINUTE;
-        for (const fixture of completedWithTimestamp) {
-          const completedAt = new Date(fixture.completedAt as Date).getTime();
-          if (!Number.isFinite(completedAt)) continue;
-          const bucket = Math.floor(completedAt / bucketSize);
+        const completionAnchor = (fixture: SportsFixtureRecord): number => {
+          const completedAt = fixture.completedAt?.getTime();
+          // Some ESPN competitions do not expose an actual completion time.
+          // The fixture is still final, so use kickoff as a stable fallback
+          // anchor and let the post-match refresh run as soon as it is due.
+          return Number.isFinite(completedAt)
+            ? (completedAt as number)
+            : fixture.kickoffAt.getTime();
+        };
+        for (const fixture of completedFixtures) {
+          const completionAt = completionAnchor(fixture);
+          if (!Number.isFinite(completionAt)) continue;
+          const bucket = Math.floor(completionAt / bucketSize);
           const bucketFixtures = completionBuckets.get(bucket) ?? [];
           bucketFixtures.push(fixture);
           completionBuckets.set(bucket, bucketFixtures);
@@ -2321,10 +2367,9 @@ export class SportsQueueJobProcessorService {
         for (const [bucket, bucketFixtures] of completionBuckets) {
           const anchorFixture = bucketFixtures[0];
           const latestCompletion = Math.max(
-            ...bucketFixtures.map((item) =>
-              new Date(item.completedAt as Date).getTime(),
-            ),
+            ...bucketFixtures.map((item) => completionAnchor(item)),
           );
+          const anchorCompletedAt = anchorFixture.completedAt?.getTime();
           const afterMatchScope: SportsQueueScope = {
             leagueId: group.competition.slug,
             competitionId: group.competition.id,
@@ -2332,9 +2377,9 @@ export class SportsQueueJobProcessorService {
             seasonYear: anchorFixture.seasonYear ?? scopeSeason.seasonYear,
             calendarDate: group.calendarDate,
             expectedKickoffAt: anchorFixture.kickoffAt.toISOString(),
-            expectedCompletedAt: new Date(
-              anchorFixture.completedAt as Date,
-            ).toISOString(),
+            ...(Number.isFinite(anchorCompletedAt)
+              ? { expectedCompletedAt: new Date(anchorCompletedAt as number).toISOString() }
+              : {}),
             ...(bootstrapContext ?? {}),
           };
           await this.enqueueMilestone(
@@ -2468,10 +2513,25 @@ export class SportsQueueJobProcessorService {
   ): Promise<void> {
     if (!(fixture.status.isFinal || fixture.status.state === 'COMPLETED')) return;
     if (!fixture.espnEventId) return;
-    if (!(await this.collection.shouldCollectFixtureSummary(fixture.espnEventId, 24 * 60 * 60_000))) return;
+    const completedAtValue = fixture.completedAt?.getTime();
+    const completedAt = Number.isFinite(completedAtValue)
+      ? (completedAtValue as number)
+      : undefined;
+    // A 24-hour cache window is valid only when the latest Summary request
+    // began after the known full-time boundary. Without completedAt, refresh
+    // once and rely on the durable queue's scope identity to prevent replay.
+    const summaryFreshnessWindow = completedAt === undefined
+      ? 0
+      : 24 * 60 * 60_000;
+    if (!(await this.collection.shouldCollectFixtureSummary(
+      fixture.espnEventId,
+      summaryFreshnessWindow,
+      5 * 60_000,
+      completedAt === undefined ? undefined : new Date(completedAt),
+    ))) return;
 
-    const completedAt = fixture.completedAt?.getTime() ?? fixture.kickoffAt.getTime();
-    const scheduledAt = completedAt + SPORTS_COLLECTION_SCHEDULE.summaryAfterMatch.delayMs;
+    const scheduledAt = (completedAt ?? fixture.kickoffAt.getTime()) +
+      SPORTS_COLLECTION_SCHEDULE.summaryAfterMatch.delayMs;
     await this.queue.enqueueIfMissing({
       type: SportsQueueJobType.MATCH_SUMMARY_COLLECTION,
       scope: {
@@ -2481,7 +2541,9 @@ export class SportsQueueJobProcessorService {
         seasonId: fixture.seasonId,
         seasonYear: fixture.seasonYear,
         leagueId: competition.slug,
-        ...(fixture.completedAt ? { expectedCompletedAt: new Date(fixture.completedAt).toISOString() } : {}),
+        ...(completedAt !== undefined
+          ? { expectedCompletedAt: new Date(completedAt).toISOString() }
+          : {}),
         summaryAttempt: 0,
       },
       priority: 96,

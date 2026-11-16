@@ -209,11 +209,13 @@ export class SportsQueueService {
     type: SportsQueueJobType,
     fixtureId: string,
     attempt: number,
+    excludeJobKey?: string,
   ): Promise<boolean> {
     const found = await this.queueModel.findOne({
       type,
       'scope.fixtureId': fixtureId,
       'scope.youtubeAttempt': attempt,
+      ...(excludeJobKey ? { jobKey: { $ne: excludeJobKey } } : {}),
       status: { $in: [SportsQueueJobStatus.PENDING, SportsQueueJobStatus.PROCESSING] },
     }).select({ _id: 1 }).lean().exec();
     return Boolean(found);
@@ -576,6 +578,7 @@ export class SportsQueueService {
       ]));
   }
 }
+
 
 
 

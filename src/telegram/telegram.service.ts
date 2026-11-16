@@ -8,6 +8,11 @@ export interface TelegramPublicBroadcastResult {
   deliveryUnknown?: boolean;
 }
 
+export interface TelegramInlineKeyboardButton {
+  text: string;
+  url: string;
+}
+
 type ErrorRecord = Record<string, unknown>;
 
 @Injectable()
@@ -49,6 +54,10 @@ export class TelegramService implements OnModuleInit {
     }
   }
 
+  /**
+   * Sends a standard HTML text broadcast. Promotion broadcasts continue to use
+   * this method so their existing delivery path is not changed by photo posts.
+   */
   async sendPublicChannelMessage(
     message: string,
   ): Promise<TelegramPublicBroadcastResult> {
@@ -90,7 +99,7 @@ export class TelegramService implements OnModuleInit {
 
     try {
       this.logger.log(
-        `Sending public Telegram broadcast (${body.length} characters).`,
+        `Sending public Telegram text broadcast (${body.length} characters).`,
       );
 
       const sent = await bot.telegram.sendMessage(this.channelId, body, {
@@ -101,7 +110,7 @@ export class TelegramService implements OnModuleInit {
       });
 
       this.logger.log(
-        `Telegram broadcast successfully accepted. Message ID: ${sent.message_id}.`,
+        `Telegram text broadcast successfully accepted. Message ID: ${sent.message_id}.`,
       );
 
       return {
@@ -110,30 +119,150 @@ export class TelegramService implements OnModuleInit {
         deliveryUnknown: false,
       };
     } catch (error) {
-      const statusCode = this.getStatusCode(error);
+      return this.handleDeliveryError(error, 'text');
+    }
+  }
 
-      // A transport failure or server-side failure may occur after
-      // Telegram has received the request. Never retry it blindly.
-      const deliveryUnknown =
-        statusCode === undefined ||
-        statusCode < 400 ||
-        statusCode >= 500 ||
-        statusCode === 408;
+  /**
+   * Sends a branded photo post using the publicly accessible /banner.png asset.
+   * Telegram fetches the image from the HTTPS URL; this method does not upload
+   * or create another image asset.
+   */
+  async sendPublicChannelPhoto(
+    photoUrl: string,
+    caption: string,
+    inlineKeyboard: TelegramInlineKeyboardButton[][] = [],
+  ): Promise<TelegramPublicBroadcastResult> {
+    const bot = this.bot;
+    const photo = String(photoUrl ?? '').trim();
+    const body = String(caption ?? '').trim();
 
+    if (!bot || !this.channelId) {
       this.logger.error(
-        [
-          'Public Telegram channel delivery failed.',
-          `HTTP/API status: ${statusCode ?? 'Unavailable'}.`,
-          `Delivery outcome: ${deliveryUnknown ? 'UNKNOWN' : 'REJECTED'}.`,
-          `Diagnostics: ${this.formatError(error)}`,
-        ].join(' '),
+        'Telegram photo broadcast rejected: bot token or channel ID is missing.',
+      );
+      return { success: false, deliveryUnknown: false };
+    }
+
+    if (!this.isPublicHttpsUrl(photo)) {
+      this.logger.error(
+        'Telegram photo broadcast rejected: the banner must be an absolute, public HTTPS URL.',
+      );
+      return { success: false, deliveryUnknown: false };
+    }
+
+    if (!body) {
+      this.logger.error(
+        'Telegram photo broadcast rejected: caption content is empty.',
+      );
+      return { success: false, deliveryUnknown: false };
+    }
+
+    // Telegram photo captions allow at most 1,024 characters after entity
+    // parsing. Validate before contacting Telegram rather than truncating HTML.
+    if (body.length > 1024) {
+      this.logger.error(
+        `Telegram photo broadcast rejected: caption contains ${body.length} characters; maximum is 1024.`,
+      );
+      return { success: false, deliveryUnknown: false };
+    }
+
+    const keyboardRows = this.normaliseInlineKeyboard(inlineKeyboard);
+
+    try {
+      this.logger.log(
+        `Sending public Telegram photo broadcast (caption: ${body.length} characters).`,
+      );
+
+      const sent = await bot.telegram.sendPhoto(this.channelId, photo, {
+        caption: body,
+        parse_mode: 'HTML',
+        ...(keyboardRows.length
+          ? { reply_markup: { inline_keyboard: keyboardRows } }
+          : {}),
+      });
+
+      this.logger.log(
+        `Telegram photo broadcast successfully accepted. Message ID: ${sent.message_id}.`,
       );
 
       return {
-        success: false,
-        deliveryUnknown,
+        success: true,
+        messageId: sent.message_id,
+        deliveryUnknown: false,
       };
+    } catch (error) {
+      return this.handleDeliveryError(error, 'photo');
     }
+  }
+
+  private normaliseInlineKeyboard(
+    rows: TelegramInlineKeyboardButton[][],
+  ): TelegramInlineKeyboardButton[][] {
+    if (!Array.isArray(rows)) return [];
+
+    return rows
+      .slice(0, 8)
+      .map((row) =>
+        (Array.isArray(row) ? row : [])
+          .slice(0, 8)
+          .filter(
+            (button) =>
+              Boolean(button) &&
+              typeof button.text === 'string' &&
+              button.text.trim().length > 0 &&
+              button.text.trim().length <= 64 &&
+              this.isPublicHttpsUrl(button.url),
+          )
+          .map((button) => ({
+            text: button.text.trim(),
+            url: button.url.trim(),
+          })),
+      )
+      .filter((row) => row.length > 0);
+  }
+
+  private isPublicHttpsUrl(value: string): boolean {
+    try {
+      const parsed = new URL(value);
+      return (
+        parsed.protocol === 'https:' &&
+        Boolean(parsed.hostname) &&
+        !parsed.username &&
+        !parsed.password
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private handleDeliveryError(
+    error: unknown,
+    deliveryType: 'text' | 'photo',
+  ): TelegramPublicBroadcastResult {
+    const statusCode = this.getStatusCode(error);
+
+    // A transport failure or server-side failure may occur after Telegram has
+    // received the request. Never retry it blindly.
+    const deliveryUnknown =
+      statusCode === undefined ||
+      statusCode < 400 ||
+      statusCode >= 500 ||
+      statusCode === 408;
+
+    this.logger.error(
+      [
+        `Public Telegram ${deliveryType} delivery failed.`,
+        `HTTP/API status: ${statusCode ?? 'Unavailable'}.`,
+        `Delivery outcome: ${deliveryUnknown ? 'UNKNOWN' : 'REJECTED'}.`,
+        `Diagnostics: ${this.formatError(error)}`,
+      ].join(' '),
+    );
+
+    return {
+      success: false,
+      deliveryUnknown,
+    };
   }
 
   private getStatusCode(error: unknown): number | undefined {

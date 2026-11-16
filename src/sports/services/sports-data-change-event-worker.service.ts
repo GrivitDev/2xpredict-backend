@@ -7,7 +7,6 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 
-import { BackgroundWorkLimiterService } from '../../common/background-work/background-work-limiter.service';
 import { SportsDataChangeEventProcessorService } from './sports-data-change-event-processor.service';
 import { SportsDataChangeEventService } from './sports-data-change-event.service';
 
@@ -30,14 +29,15 @@ export class SportsDataChangeEventWorkerService
   constructor(
     private readonly events: SportsDataChangeEventService,
     private readonly processor: SportsDataChangeEventProcessorService,
-    private readonly backgroundWork: BackgroundWorkLimiterService,
   ) {}
 
   onApplicationBootstrap(): void {
     this.stopped = false;
     this.events.setWakeHandler(() => this.wake());
     this.wake();
-    this.logger.log(`Sports source-data outbox worker started (${this.workerId}); batch=${OUTBOX_BATCH_SIZE}.`);
+    this.logger.log(
+      `Sports source-data outbox worker started (${this.workerId}); batch=${OUTBOX_BATCH_SIZE}; global-gate=bypass; sequential processing enabled.`,
+    );
   }
 
   onModuleDestroy(): void {
@@ -63,11 +63,11 @@ export class SportsDataChangeEventWorkerService
     if (this.running || this.stopped) return;
     this.running = true;
     let processed = 0;
-    let releasePermit: (() => void) | undefined;
 
     try {
-      releasePermit = await this.backgroundWork.acquire('sports:source-outbox');
-      if (this.stopped) return;
+      // The outbox has its own single-flight guard and sequential bounded drain.
+      // It must not wait behind the global gate because it hands source changes
+      // off to Settlement, Odds pricing and derived-data consumers.
       processed = await this.processor.drain(OUTBOX_BATCH_SIZE, this.workerId);
     } catch (error) {
       if (!this.stopped) {
@@ -77,7 +77,6 @@ export class SportsDataChangeEventWorkerService
         );
       }
     } finally {
-      releasePermit?.();
       this.running = false;
       const wasWokenDuringDrain = this.wakeRequested;
       this.wakeRequested = false;

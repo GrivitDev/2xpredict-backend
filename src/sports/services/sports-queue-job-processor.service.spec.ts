@@ -1,4 +1,6 @@
 import { SportsQueueJobProcessorService } from './sports-queue-job-processor.service';
+import { SportsQueueJobType } from '../interfaces/sports-queue.interface';
+import { SPORTS_COLLECTION_SCHEDULE } from '../config/sports-collection-schedule.config';
 
 const fixture = (id: string, competitionId: string, teamId: string, kickoffAt: Date, state = 'SCHEDULED') => ({
   id,
@@ -224,5 +226,236 @@ describe('SportsQueueJobProcessorService resilient global bootstrap gates', () =
     );
     expect(service.enqueuePhaseJobs).not.toHaveBeenCalled();
     expect(updateOne).not.toHaveBeenCalled();
+  });
+});
+
+describe('SportsQueueJobProcessorService post-match lifecycle', () => {
+  const competition = {
+    id: 'competition-1',
+    slug: 'eng.1',
+    name: 'Premier League',
+  } as any;
+
+  const completedFixture = (completedAt?: Date) => ({
+    ...fixture(
+      'fixture-1',
+      'competition-1',
+      'team-home',
+      new Date('2026-11-10T10:00:00.000Z'),
+      'COMPLETED',
+    ),
+    espnEventId: 'espn-1',
+    seasonId: 'season-1',
+    seasonYear: 2026,
+    ...(completedAt ? { completedAt } : {}),
+  }) as any;
+
+  it('anchors post-match Summary freshness to completedAt', async () => {
+    const completedAt = new Date('2026-11-10T11:52:00.000Z');
+    const match = completedFixture(completedAt);
+    const shouldCollectFixtureSummary = jest.fn().mockResolvedValue(true);
+    const enqueueIfMissing = jest.fn().mockResolvedValue({ created: true });
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = { shouldCollectFixtureSummary };
+    service.queue = { enqueueIfMissing };
+
+    await service.enqueueSummary(match, competition, 'scoreboard-refresh');
+
+    expect(shouldCollectFixtureSummary).toHaveBeenCalledWith(
+      'espn-1',
+      24 * 60 * 60_000,
+      5 * 60_000,
+      completedAt,
+    );
+    expect(enqueueIfMissing).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'MATCH_SUMMARY_COLLECTION',
+        scope: expect.objectContaining({
+          fixtureId: 'fixture-1',
+          expectedCompletedAt: completedAt.toISOString(),
+        }),
+      }),
+    );
+  });
+
+  it('forces one post-match Summary collection when completedAt is absent', async () => {
+    const match = completedFixture();
+    const shouldCollectFixtureSummary = jest.fn().mockResolvedValue(true);
+    const enqueueIfMissing = jest.fn().mockResolvedValue({ created: true });
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = { shouldCollectFixtureSummary };
+    service.queue = { enqueueIfMissing };
+
+    await service.enqueueSummary(match, competition, 'scoreboard-refresh');
+
+    expect(shouldCollectFixtureSummary).toHaveBeenCalledWith(
+      'espn-1',
+      0,
+      5 * 60_000,
+      undefined,
+    );
+    const request = enqueueIfMissing.mock.calls[0][0];
+    expect(request.scope).not.toHaveProperty('expectedCompletedAt');
+  });
+
+  it('schedules an after-match date refresh when a final fixture has no completedAt', async () => {
+    const match = completedFixture();
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = {
+      getCompetition: jest.fn().mockResolvedValue(competition),
+      getFixturesForCompetitionDate: jest.fn().mockResolvedValue([match]),
+    };
+    service.youtubeHighlights = {
+      ensureFirstAttempt: jest.fn().mockResolvedValue(undefined),
+    };
+    service.dateKey = jest.fn().mockReturnValue('2026-11-10');
+    service.enqueueSummary = jest.fn().mockResolvedValue(undefined);
+    service.enqueuePlays = jest.fn().mockResolvedValue(undefined);
+    service.enqueueLeagueNews = jest.fn().mockResolvedValue(undefined);
+    service.enqueueMilestone = jest.fn().mockResolvedValue(undefined);
+    service.logger = { warn: jest.fn(), debug: jest.fn(), log: jest.fn() };
+
+    await service.scheduleFixtureJobs([match], 'completed-fixture-refresh', true);
+
+    expect(service.enqueueMilestone).toHaveBeenCalledWith(
+      'FIXTURE_DAILY_REFRESH',
+      expect.objectContaining({
+        expectedKickoffAt: match.kickoffAt.toISOString(),
+      }),
+      'AFTER_MATCH',
+      match.kickoffAt.getTime() + 5 * 60_000,
+      85,
+      expect.stringContaining(':after-match:'),
+    );
+    const scope = service.enqueueMilestone.mock.calls[0][1];
+    expect(scope).not.toHaveProperty('expectedCompletedAt');
+  });
+
+  it('accepts a final after-match refresh without expectedCompletedAt', async () => {
+    const match = completedFixture();
+    const collectDailyFixtures = jest.fn().mockResolvedValue({
+      items: [match],
+      rejected: [],
+      receivedCount: 1,
+    });
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = {
+      getSeason: jest.fn().mockResolvedValue({ isCurrent: true }),
+      getFixturesForCompetitionDate: jest.fn().mockResolvedValue([match]),
+      collectDailyFixtures,
+    };
+    service.scheduleFixtureJobs = jest.fn().mockResolvedValue(undefined);
+
+    await service.processDailyScoreboard(
+      {
+        leagueId: 'eng.1',
+        competitionId: 'competition-1',
+        seasonId: 'season-1',
+        seasonYear: 2026,
+        calendarDate: '2026-11-10',
+        milestone: 'AFTER_MATCH',
+        expectedKickoffAt: match.kickoffAt.toISOString(),
+      },
+      false,
+    );
+
+    expect(collectDailyFixtures).toHaveBeenCalledTimes(1);
+    expect(service.scheduleFixtureJobs).toHaveBeenCalledWith(
+      [match],
+      'daily:2026-11-10',
+      true,
+      undefined,
+    );
+  });
+
+  it('rejects a stale after-match refresh when its expected completion time changed', async () => {
+    const match = completedFixture(new Date('2026-11-10T11:30:00.000Z'));
+    const collectDailyFixtures = jest.fn();
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = {
+      getSeason: jest.fn().mockResolvedValue({ isCurrent: true }),
+      getFixturesForCompetitionDate: jest.fn().mockResolvedValue([match]),
+      collectDailyFixtures,
+    };
+    service.scheduleFixtureJobs = jest.fn();
+
+    await service.processDailyScoreboard(
+      {
+        leagueId: 'eng.1',
+        competitionId: 'competition-1',
+        seasonId: 'season-1',
+        seasonYear: 2026,
+        calendarDate: '2026-11-10',
+        milestone: 'AFTER_MATCH',
+        expectedKickoffAt: match.kickoffAt.toISOString(),
+        expectedCompletedAt: '2026-11-10T11:00:00.000Z',
+      },
+      false,
+    );
+
+    expect(collectDailyFixtures).not.toHaveBeenCalled();
+    expect(service.scheduleFixtureJobs).not.toHaveBeenCalled();
+  });
+
+  it('does not skip a post-match Summary because of pre-match fallback freshness', async () => {
+    const completedAt = new Date('2026-11-10T11:52:00.000Z');
+    const match = completedFixture(completedAt);
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = {
+      getFixture: jest.fn().mockResolvedValue(match),
+      getCompetition: jest.fn().mockResolvedValue(competition),
+      isFixtureSummaryFallbackFresh: jest.fn().mockResolvedValue(false),
+      collectFixtureSummary: jest.fn().mockResolvedValue(match),
+    };
+    service.logger = { debug: jest.fn(), warn: jest.fn(), log: jest.fn() };
+
+    await service.processMatchSummary({ fixtureId: 'fixture-1' });
+
+    expect(service.collection.isFixtureSummaryFallbackFresh).toHaveBeenCalledWith(
+      'espn-1',
+      24 * 60 * 60_000,
+      completedAt,
+    );
+    expect(service.collection.collectFixtureSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not trust legacy Summary freshness when completedAt is unavailable', async () => {
+    const match = completedFixture();
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.collection = {
+      getFixture: jest.fn().mockResolvedValue(match),
+      getCompetition: jest.fn().mockResolvedValue(competition),
+      isFixtureSummaryFallbackFresh: jest.fn().mockResolvedValue(true),
+      collectFixtureSummary: jest.fn().mockResolvedValue(match),
+    };
+    service.logger = { debug: jest.fn(), warn: jest.fn(), log: jest.fn() };
+
+    await service.processMatchSummary({ fixtureId: 'fixture-1' });
+
+    expect(service.collection.isFixtureSummaryFallbackFresh).not.toHaveBeenCalled();
+    expect(service.collection.collectFixtureSummary).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+
+describe('SportsQueueJobProcessorService YouTube highlight reconciliation', () => {
+  it('dispatches the recurring reconciliation job to the YouTube collector', async () => {
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.youtubeHighlights = {
+      reconcileRecentCompletedFixtures: jest.fn().mockResolvedValue({
+        scanned: 2,
+        scheduled: 1,
+      }),
+    };
+
+    await service.process({
+      type: SportsQueueJobType.YOUTUBE_HIGHLIGHT_RECONCILIATION,
+      scope: {},
+    });
+
+    expect(
+      service.youtubeHighlights.reconcileRecentCompletedFixtures,
+    ).toHaveBeenCalledWith(SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.batchSize);
   });
 });

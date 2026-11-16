@@ -17,6 +17,17 @@ import {
 import { UserNotificationsService } from './user-notifications.service';
 import { UsersService } from '../../users/users.service';
 import { NotificationEmailDeliveryService } from '../email-delivery/email-delivery.service';
+import {
+  NotificationRoutes,
+  betLabTicketRoute,
+  customerCareConversationRoute,
+  promotionRoute,
+} from '../notification-routes';
+import {
+  normalizeNotificationCopy,
+  resolveNotificationPresentation,
+} from './notification-presentation';
+import type { NotificationPresentationInput } from './notification-presentation';
 
 const RETENTION_MONTHS = 18;
 const MAX_ATTEMPTS = 8;
@@ -44,6 +55,7 @@ export interface QueueNotificationInput {
   title: string;
   message: string;
   actionUrl?: string | null;
+  presentation?: NotificationPresentationInput | null;
   data?: Record<string, unknown>;
   /** Stable business event key, unique per recipient. */
   dedupeKey: string;
@@ -90,8 +102,7 @@ export class NotificationEventsService
   async enqueue(input: QueueNotificationInput): Promise<boolean> {
     const recipientId = String(input.recipientId ?? '').trim();
     const dedupeKey = String(input.dedupeKey ?? '').trim();
-    const title = String(input.title ?? '').trim();
-    const message = String(input.message ?? '').trim();
+    const { title, message } = normalizeNotificationCopy(input.title, input.message);
 
     if (
       !Types.ObjectId.isValid(recipientId) ||
@@ -111,6 +122,12 @@ export class NotificationEventsService
         title,
         message,
         actionUrl: input.actionUrl ?? null,
+        presentation: resolveNotificationPresentation(
+          input.type,
+          input.category,
+          input.actionUrl,
+          input.presentation,
+        ),
         data: input.data ?? {},
         dedupeKey,
         status: NotificationEventStatus.PENDING,
@@ -150,7 +167,7 @@ export class NotificationEventsService
       category: NotificationCategory.PAYMENTS,
       title: 'Payment Submitted',
       message: `Your ${paymentLabel} payment request has been submitted and is awaiting verification.`,
-      actionUrl: '/payments',
+      actionUrl: NotificationRoutes.PROFILE_BILLING,
       dedupeKey: `payment:${input.reference}:submitted`,
       data: {
         reference: input.reference,
@@ -184,7 +201,7 @@ export class NotificationEventsService
       category: NotificationCategory.PAYMENTS,
       title: 'Payment Confirmed',
       message: `Your ${formatAmount(input.amount, input.currency)} payment for ${paymentLabel} has been confirmed.`,
-      actionUrl: '/payments',
+      actionUrl: NotificationRoutes.PROFILE_BILLING,
       dedupeKey: `payment:${input.reference}:successful`,
       data: {
         reference: input.reference,
@@ -223,7 +240,7 @@ export class NotificationEventsService
         category: NotificationCategory.SUBSCRIPTIONS,
         title,
         message,
-        actionUrl: '/subscription',
+        actionUrl: NotificationRoutes.PROFILE_BILLING,
         dedupeKey: `payment:${input.reference}:subscription`,
         data: {
           reference: input.reference,
@@ -255,7 +272,7 @@ export class NotificationEventsService
       category: NotificationCategory.PAYMENTS,
       title: 'Payment Rejected',
       message: `Your ${paymentLabel} payment request could not be approved.${input.reason ? ` Reason: ${input.reason.slice(0, 500)}` : ''}`,
-      actionUrl: '/payments',
+      actionUrl: NotificationRoutes.PROFILE_BILLING,
       dedupeKey: `payment:${input.reference}:rejected`,
       data: {
         reference: input.reference,
@@ -280,7 +297,7 @@ export class NotificationEventsService
       category: NotificationCategory.REFERRALS,
       title: 'New Referral',
       message: `${displayName} joined 2xPredict using your referral link.`,
-      actionUrl: '/referrals',
+      actionUrl: NotificationRoutes.PROFILE_REFERRALS,
       dedupeKey: `referral:${input.referredUserId}:registered`,
       data: { referredUserId: input.referredUserId },
     });
@@ -298,7 +315,7 @@ export class NotificationEventsService
       category: NotificationCategory.REFERRALS,
       title: 'Referral Subscription Milestone',
       message: `A member you referred has activated a ${plan} subscription.`,
-      actionUrl: '/referrals',
+      actionUrl: NotificationRoutes.PROFILE_REFERRALS,
       dedupeKey: `referral:${input.referredUserId}:subscription:${input.plan}`,
       data: { referredUserId: input.referredUserId, plan: input.plan },
     });
@@ -324,7 +341,7 @@ export class NotificationEventsService
       message: isPoints
         ? `${Number(input.points ?? 0).toLocaleString()} bonus points have been added to your Bet Lab wallet.`
         : `You have received a ${String(input.plan ?? '').toUpperCase()} subscription bonus${input.durationDays ? ` for ${input.durationDays} days` : ''}.`,
-      actionUrl: isPoints ? '/bet-lab' : '/subscription',
+      actionUrl: isPoints ? NotificationRoutes.PROFILE_WALLET : NotificationRoutes.PROFILE_REWARDS,
       dedupeKey: `bonus:${input.grantId}:granted`,
       data: {
         grantId: input.grantId,
@@ -351,7 +368,7 @@ export class NotificationEventsService
       category: NotificationCategory.BONUSES,
       title: 'Subscription Bonus Expired',
       message: `Your ${input.plan.toUpperCase()} subscription bonus has expired. Check your current subscription to see which access remains available.`,
-      actionUrl: '/subscription',
+      actionUrl: NotificationRoutes.PROFILE_REWARDS,
       dedupeKey: `bonus:${input.grantId}:expired`,
       deliverAt: expiresAt,
       data: { grantId: input.grantId, plan: input.plan, expiresAt: expiresAt.toISOString() },
@@ -399,7 +416,7 @@ export class NotificationEventsService
       message: input.reason?.trim()
         ? `A bonus on your account has been revoked. Reason: ${input.reason.trim().slice(0, 500)}`
         : 'A bonus on your account has been revoked.',
-      actionUrl: '/account/bonuses',
+      actionUrl: NotificationRoutes.PROFILE_REWARDS,
       dedupeKey: `bonus:${input.grantId}:revoked`,
       data: { grantId: input.grantId },
     });
@@ -418,7 +435,7 @@ export class NotificationEventsService
       category: NotificationCategory.SUBSCRIPTIONS,
       title: 'Subscription Expiring Soon',
       message: `Your ${input.plan.toUpperCase()} subscription expires in ${input.daysRemaining} days. Renew to keep your access active.`,
-      actionUrl: '/subscription',
+      actionUrl: NotificationRoutes.PROFILE_BILLING,
       dedupeKey: `subscription:${input.subscriptionId}:expiring`,
       data: {
         subscriptionId: input.subscriptionId,
@@ -441,7 +458,7 @@ export class NotificationEventsService
       category: NotificationCategory.SUBSCRIPTIONS,
       title: 'Subscription Expired',
       message: `Your ${input.plan.toUpperCase()} subscription has expired. Renew to restore subscription access.`,
-      actionUrl: '/subscription',
+      actionUrl: NotificationRoutes.PROFILE_BILLING,
       dedupeKey: `subscription:${input.subscriptionId}:expired`,
       data: {
         subscriptionId: input.subscriptionId,
@@ -470,7 +487,7 @@ export class NotificationEventsService
       category: NotificationCategory.ACCOUNT,
       title: 'Email Verified',
       message: 'Your email address has been verified successfully. Your 2xPredict account is ready.',
-      actionUrl: '/account',
+      actionUrl: NotificationRoutes.PROFILE_PERSONAL,
       dedupeKey: `account:${input.userId}:email-verified`,
     });
   }
@@ -485,7 +502,7 @@ export class NotificationEventsService
       category: NotificationCategory.ACCOUNT,
       title: 'Account Email Updated',
       message: 'The email address associated with your 2xPredict account has been changed.',
-      actionUrl: '/account',
+      actionUrl: NotificationRoutes.PROFILE_PERSONAL,
       dedupeKey: `account:${input.userId}:email-changed:${createStableKey(input.email)}`,
     });
   }
@@ -502,7 +519,7 @@ export class NotificationEventsService
       category: NotificationCategory.ACCOUNT,
       title: input.title,
       message: input.message,
-      actionUrl: '/account',
+      actionUrl: NotificationRoutes.PROFILE_SECURITY,
       dedupeKey: `account:security:${input.userId}:${input.eventKey}`,
     });
   }
@@ -519,7 +536,7 @@ export class NotificationEventsService
       message: input.source === 'PASSWORD_RESET'
         ? 'Your account password was reset successfully. Other active sessions have been signed out.'
         : 'Your account password was changed successfully. Other active sessions have been signed out.',
-      actionUrl: '/account/security',
+      actionUrl: NotificationRoutes.PROFILE_SECURITY,
       dedupeKey: `account:${input.userId}:password:${input.source}:${Date.now()}`,
     });
   }
@@ -537,7 +554,7 @@ export class NotificationEventsService
       message: input.reason?.trim()
         ? `Your 2xPredict account has been suspended. Reason: ${input.reason.trim().slice(0, 350)}`
         : 'Your 2xPredict account has been suspended. Contact support if you need assistance.',
-      actionUrl: '/customer-care',
+      actionUrl: NotificationRoutes.CUSTOMER_CARE,
       dedupeKey: `account:${input.userId}:suspended:${input.bannedUntil?.toISOString() ?? 'indefinite'}:${Date.now()}`,
       data: input.bannedUntil ? { bannedUntil: input.bannedUntil.toISOString() } : {},
     });
@@ -550,7 +567,7 @@ export class NotificationEventsService
       category: NotificationCategory.ACCOUNT,
       title: 'Account Restored',
       message: 'Your 2xPredict account access has been restored.',
-      actionUrl: '/account',
+      actionUrl: NotificationRoutes.PROFILE_PERSONAL,
       dedupeKey: `account:${input.userId}:restored:${Date.now()}`,
     });
   }
@@ -572,7 +589,7 @@ export class NotificationEventsService
       category: NotificationCategory.BET_LAB,
       title: 'Bet Lab Ticket Placed',
       message: `Ticket #${input.ticketNumber} has been placed. Stake: ${formatPoints(input.stake)} points · Odds: ${Number(input.combinedOdds).toFixed(2)} · Potential return: ${formatPoints(input.potentialReturn)} points.`,
-      actionUrl: `/bet-lab/tickets/${encodeURIComponent(input.ticketId)}`,
+      actionUrl: betLabTicketRoute(input.ticketId),
       dedupeKey: `bet-lab:ticket:${input.ticketId}:placed`,
       data: {
         ticketId: input.ticketId,
@@ -627,7 +644,7 @@ export class NotificationEventsService
       category: NotificationCategory.BET_LAB,
       title,
       message,
-      actionUrl: `/bet-lab/tickets/${encodeURIComponent(input.ticketId)}`,
+      actionUrl: betLabTicketRoute(input.ticketId),
       dedupeKey: `bet-lab:ticket:${input.ticketId}:settled`,
       data: {
         ticketId: input.ticketId,
@@ -654,7 +671,7 @@ export class NotificationEventsService
       category: NotificationCategory.WALLET,
       title: 'Bet Lab Wallet Credited',
       message: `${formatPoints(input.amount)} virtual points were added to your Bet Lab wallet. ${input.description.slice(0, 180)}`,
-      actionUrl: '/bet-lab/wallet',
+      actionUrl: NotificationRoutes.PROFILE_WALLET,
       dedupeKey: `wallet:${input.transactionId}:credited`,
       data: {
         transactionId: input.transactionId,
@@ -679,7 +696,7 @@ export class NotificationEventsService
       category: NotificationCategory.WALLET,
       title: 'Bet Lab Wallet Debited',
       message: `${formatPoints(input.amount)} virtual points were used from your Bet Lab wallet. ${input.description.slice(0, 180)}`,
-      actionUrl: '/bet-lab/wallet',
+      actionUrl: NotificationRoutes.PROFILE_WALLET,
       dedupeKey: `wallet:${input.transactionId}:debited`,
       data: {
         transactionId: input.transactionId,
@@ -702,7 +719,7 @@ export class NotificationEventsService
       category: NotificationCategory.WALLET,
       title: 'Monthly Bet Lab Allowance Expired',
       message: `${formatPoints(input.amount)} unused monthly virtual points have expired because the allowance period ended. Your other wallet balances are unaffected.`,
-      actionUrl: '/bet-lab/wallet',
+      actionUrl: NotificationRoutes.PROFILE_WALLET,
       dedupeKey: `wallet:${input.transactionId}:allowance-expired`,
       data: {
         transactionId: input.transactionId,
@@ -725,7 +742,7 @@ export class NotificationEventsService
       category: NotificationCategory.PROMOTIONS,
       title: 'Promotion Joined',
       message: `You have successfully joined ${input.promoName.slice(0, 120)}. Check the promotion details and eligibility requirements.`,
-      actionUrl: '/promos',
+      actionUrl: promotionRoute(input.promoId),
       dedupeKey: `promotion:${input.promoId}:${input.userId}:joined`,
       data: {
         promoId: input.promoId,
@@ -758,7 +775,7 @@ export class NotificationEventsService
       category: NotificationCategory.PROMOTIONS,
       title: milestone ? 'Promotion Milestone Reached' : 'Promotion Reward Granted',
       message: `${input.promoName.slice(0, 100)}: ${details}`,
-      actionUrl: '/promos',
+      actionUrl: promotionRoute(input.promoId),
       dedupeKey: `promotion:${input.promoId}:${input.rewardId}:granted`,
       data: {
         promoId: input.promoId,
@@ -787,7 +804,7 @@ export class NotificationEventsService
       message: input.pointsReward && input.pointsReward > 0
         ? `${input.promoName.slice(0, 120)} was successfully applied. ${formatPoints(input.pointsReward)} reward points are included.`
         : `${input.promoName.slice(0, 120)} was successfully applied to your purchase.`,
-      actionUrl: '/promos',
+      actionUrl: promotionRoute(input.promoId),
       dedupeKey: `promotion:redemption:${input.reference}:completed`,
       data: { promoId: input.promoId, reference: input.reference, pointsReward: input.pointsReward ?? 0 },
     });
@@ -807,7 +824,7 @@ export class NotificationEventsService
       message: input.source === 'ADMIN'
         ? 'A member of the 2xPredict support team has replied to your conversation.'
         : 'You have received a new response from 2xPredict Customer Care.',
-      actionUrl: `/customer-care?conversationId=${encodeURIComponent(input.conversationId)}`,
+      actionUrl: customerCareConversationRoute(input.conversationId),
       dedupeKey: `support:reply:${input.messageId}`,
       data: { conversationId: input.conversationId, messageId: input.messageId, source: input.source },
     });
@@ -826,7 +843,7 @@ export class NotificationEventsService
       category: NotificationCategory.CUSTOMER_CARE,
       title: 'Support Request Updated',
       message: input.message,
-      actionUrl: `/customer-care?conversationId=${encodeURIComponent(input.conversationId)}`,
+      actionUrl: customerCareConversationRoute(input.conversationId),
       dedupeKey: `support:${input.conversationId}:updated:${input.eventKey}`,
       data: { conversationId: input.conversationId, status: input.status },
     });
@@ -842,7 +859,7 @@ export class NotificationEventsService
       category: NotificationCategory.CUSTOMER_CARE,
       title: 'Support Request Resolved',
       message: 'Your 2xPredict support conversation has been marked as resolved.',
-      actionUrl: `/customer-care?conversationId=${encodeURIComponent(input.conversationId)}`,
+      actionUrl: customerCareConversationRoute(input.conversationId),
       dedupeKey: `support:${input.conversationId}:resolved`,
       data: { conversationId: input.conversationId },
     });
@@ -866,7 +883,7 @@ export class NotificationEventsService
       message: isActive
         ? `Your ${input.plan.toUpperCase()} subscription is now active.`
         : `Your ${input.plan.toUpperCase()} subscription term is scheduled to begin on ${formatDate(input.startDate)}.`,
-      actionUrl: '/subscription',
+      actionUrl: NotificationRoutes.PROFILE_BILLING,
       dedupeKey: `subscription:${input.reference}:${isActive ? 'activated' : 'scheduled'}`,
       data: {
         plan: input.plan,
@@ -986,6 +1003,7 @@ export class NotificationEventsService
             title: event.title,
             message: event.message,
             actionUrl: event.actionUrl,
+            presentation: event.presentation,
             data: event.data,
             dedupeKey: event.dedupeKey,
           });
@@ -1121,4 +1139,3 @@ function formatPoints(value: number): string {
 function createStableKey(value: string): string {
   return createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex').slice(0, 20);
 }
-

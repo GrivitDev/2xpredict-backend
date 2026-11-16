@@ -2,6 +2,8 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument, Types } from 'mongoose';
 import { NotificationCategory } from '../enums/notification-category.enum';
 import { NotificationType } from '../enums/notification-type.enum';
+import { NotificationPresentationRecordSchema } from './notification-presentation.schema';
+import type { NotificationPresentationRecord } from './notification-presentation.schema';
 
 export type NotificationEventDocument = HydratedDocument<NotificationEvent>;
 
@@ -38,6 +40,9 @@ export class NotificationEvent {
 
   @Prop({ type: String, required: true, trim: true, maxlength: 1200 })
   message!: string;
+
+  @Prop({ type: NotificationPresentationRecordSchema })
+  presentation?: NotificationPresentationRecord;
 
   @Prop({ type: String, default: null, maxlength: 300 })
   actionUrl?: string | null;
@@ -97,4 +102,3 @@ NotificationEventSchema.index(
   { expiresAt: 1 },
   { expireAfterSeconds: 0, name: 'ttl_notification_events_18_months' },
 );
-

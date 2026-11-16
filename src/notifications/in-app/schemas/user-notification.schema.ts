@@ -2,6 +2,8 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument, Types } from 'mongoose';
 import { NotificationCategory } from '../enums/notification-category.enum';
 import { NotificationType } from '../enums/notification-type.enum';
+import { NotificationPresentationRecordSchema } from './notification-presentation.schema';
+import type { NotificationPresentationRecord } from './notification-presentation.schema';
 
 export type UserNotificationDocument = HydratedDocument<UserNotification>;
 
@@ -17,7 +19,12 @@ export class UserNotification {
   @Prop({ type: String, enum: NotificationType, required: true, index: true })
   type!: NotificationType;
 
-  @Prop({ type: String, enum: NotificationCategory, required: true, index: true })
+  @Prop({
+    type: String,
+    enum: NotificationCategory,
+    required: true,
+    index: true,
+  })
   category!: NotificationCategory;
 
   @Prop({ type: String, required: true, trim: true, maxlength: 120 })
@@ -25,6 +32,9 @@ export class UserNotification {
 
   @Prop({ type: String, required: true, trim: true, maxlength: 1200 })
   message!: string;
+
+  @Prop({ type: NotificationPresentationRecordSchema })
+  presentation?: NotificationPresentationRecord;
 
   @Prop({ type: Object, default: {} })
   data!: Record<string, unknown>;

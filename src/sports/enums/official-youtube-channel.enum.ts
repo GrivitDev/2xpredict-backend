@@ -177,8 +177,8 @@ export enum OfficialYoutubeChannel {
 }
 
 /**
- * Four broad football-video fallback channels. Search still validates both
- * teams, highlight-related title evidence, and the fixture publication window.
+ * Broad football-video fallback channels. The bounded search plan uses these
+ * after fixture-specific league and club channels, before the final broad query.
  */
 export const GENERAL_YOUTUBE_HIGHLIGHT_FALLBACKS: readonly OfficialYoutubeChannel[] =
   [
@@ -624,7 +624,7 @@ function getTeamChannel(teamName?: string): OfficialYoutubeChannel | undefined {
 
 /**
  * Returns the ordered, per-fixture search plan:
- * competition channel(s) → home/away club channel(s) → four fallbacks → broad search.
+ * league channel → one club channel → general football source(s) → broad search.
  * Duplicate channels are removed and the plan is capped by the configured request limit.
  */
 export function getYoutubeHighlightSearchPlan(
@@ -645,11 +645,19 @@ export function getYoutubeHighlightSearchPlan(
     YOUTUBE_CONFIG.searchWorkflow.maximumFallbackChannels,
   );
 
+  // Keep the search stages diverse. The previous concatenation could fill
+  // all three channel-restricted slots with the league + both clubs, meaning
+  // none of the general highlight publishers were ever searched for major
+  // competitions. Reserve one slot for a general football source before the
+  // final unrestricted search.
   const configuredChannels = [
-    ...competitionChannels,
-    ...teamChannels,
-    ...fallbacks,
-  ];
+    competitionChannels[0],
+    teamChannels[0],
+    fallbacks[0],
+    ...competitionChannels.slice(1),
+    ...teamChannels.slice(1),
+    ...fallbacks.slice(1),
+  ].filter((channel): channel is OfficialYoutubeChannel => Boolean(channel));
   const seen = new Set<OfficialYoutubeChannel>();
   const uniqueChannels = configuredChannels.filter((channel) => {
     if (seen.has(channel)) return false;
@@ -680,6 +688,7 @@ export function getYoutubeHighlightChannelIds(
     awayTeam,
   ).filter((channel): channel is OfficialYoutubeChannel => channel !== null);
 }
+
 
 
 

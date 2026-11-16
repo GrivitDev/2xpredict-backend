@@ -13,28 +13,28 @@ describe('BackgroundWorkLimiterService', () => {
     jest.useRealTimers();
   });
 
-  it('never grants more than six simultaneous permits', async () => {
+  it('never grants more than ten simultaneous permits', async () => {
     const releases = await Promise.all(
-      Array.from({ length: 6 }, (_, index) => limiter.acquire(`lane-${index}`)),
+      Array.from({ length: 10 }, (_, index) => limiter.acquire(`lane-${index}`)),
     );
 
-    let seventhGranted = false;
-    const seventh = limiter.acquire('lane-7').then((release) => {
-      seventhGranted = true;
+    let eleventhGranted = false;
+    const eleventh = limiter.acquire('lane-10').then((release) => {
+      eleventhGranted = true;
       return release;
     });
 
-    expect(limiter.getStatus().activeJobs).toBe(6);
-    expect(limiter.getStatus().maximumConcurrentJobs).toBe(6);
+    expect(limiter.getStatus().activeJobs).toBe(10);
+    expect(limiter.getStatus().maximumConcurrentJobs).toBe(10);
     expect(limiter.getStatus().waitingJobs).toBe(1);
-    expect(seventhGranted).toBe(false);
+    expect(eleventhGranted).toBe(false);
 
     releases[0]();
-    const releaseSeventh = await seventh;
-    expect(seventhGranted).toBe(true);
-    expect(limiter.getStatus().activeJobs).toBe(6);
+    const releaseEleventh = await eleventh;
+    expect(eleventhGranted).toBe(true);
+    expect(limiter.getStatus().activeJobs).toBe(10);
 
-    releaseSeventh();
+    releaseEleventh();
     for (const release of releases.slice(1)) release();
     expect(limiter.getStatus().activeJobs).toBe(0);
   });
@@ -68,7 +68,7 @@ describe('BackgroundWorkLimiterService', () => {
 
   it('grants critical settlement work before an older maintenance waiter', async () => {
     const occupied = await Promise.all(
-      Array.from({ length: 6 }, (_, index) => limiter.acquire(`occupied-${index}`)),
+      Array.from({ length: 10 }, (_, index) => limiter.acquire(`occupied-${index}`)),
     );
 
     let maintenanceGranted = false;
@@ -91,7 +91,7 @@ describe('BackgroundWorkLimiterService', () => {
 
   it('keeps critical work ahead even when maintenance has waited for a long time', async () => {
     const occupied = await Promise.all(
-      Array.from({ length: 6 }, (_, index) => limiter.acquire(`occupied-${index}`)),
+      Array.from({ length: 10 }, (_, index) => limiter.acquire(`occupied-${index}`)),
     );
 
     let maintenanceGranted = false;
@@ -114,7 +114,7 @@ describe('BackgroundWorkLimiterService', () => {
 
   it('ages normal work so it can overtake newer normal-priority work', async () => {
     const occupied = await Promise.all(
-      Array.from({ length: 6 }, (_, index) => limiter.acquire(`occupied-${index}`)),
+      Array.from({ length: 10 }, (_, index) => limiter.acquire(`occupied-${index}`)),
     );
 
     let agedGranted = false;
@@ -138,7 +138,7 @@ describe('BackgroundWorkLimiterService', () => {
 
   it('reports waiting work by priority class', async () => {
     const occupied = await Promise.all(
-      Array.from({ length: 6 }, (_, index) => limiter.acquire(`occupied-${index}`)),
+      Array.from({ length: 10 }, (_, index) => limiter.acquire(`occupied-${index}`)),
     );
     const waiters = [
       limiter.acquire('settlement:queue'),

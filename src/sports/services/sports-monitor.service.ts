@@ -10,6 +10,8 @@ import { Model } from 'mongoose';
 
 import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
 import { EspnV2Client } from '../providers/espn-v2.client';
+import { YoutubeService } from '../providers/youtube.service';
+import { SPORTS_DATA_COLLECTION_CONFIG } from '../config/sports-data-collection.config';
 import { SportsDataChangeEvent } from '../schemas/operations/sports-data-change-event.schema';
 import { SportsBootstrapState } from '../schemas/operations/sports-bootstrap-state.schema';
 import { SportsCollectionState } from '../schemas/operations/sports-collection-state.schema';
@@ -28,6 +30,8 @@ import { SportsCompetition } from '../schemas/domain/competition.schema';
 import { SportsFixture } from '../schemas/domain/fixture.schema';
 import { SportsMatchOddsSnapshot } from '../schemas/domain/match-odds-snapshot.schema';
 import { SportsMatchTimelineEvent } from '../schemas/domain/match-timeline-event.schema';
+import { SportsYoutubeHighlight } from '../schemas/domain/youtube-highlight.schema';
+import { SportsProviderRateLimit } from '../schemas/sports-provider-rate-limit.schema';
 import { SportsSeason } from '../schemas/domain/season.schema';
 import { SportsQueueService } from './sports-queue.service';
 import { SportsQueueWorkerService } from './sports-queue-worker.service';
@@ -124,6 +128,10 @@ export class SportsMonitorService
     private readonly timelineModel: Model<any>,
     @InjectModel(SportsMatchOddsSnapshot.name)
     private readonly oddsSnapshotModel: Model<any>,
+    @InjectModel(SportsYoutubeHighlight.name)
+    private readonly youtubeHighlightModel: Model<any>,
+    @InjectModel(SportsProviderRateLimit.name)
+    private readonly providerRateLimitModel: Model<any>,
     @InjectModel(SportsCalculatedStandings.name)
     private readonly standingsModel: Model<any>,
     @InjectModel(SportsTeamForm.name)
@@ -141,6 +149,7 @@ export class SportsMonitorService
     @InjectModel(SportsPlayerEventTotals.name)
     private readonly playerEventTotalsModel: Model<any>,
     private readonly espn: EspnV2Client,
+    private readonly youtube: YoutubeService,
     private readonly queue: SportsQueueService,
     private readonly worker: SportsQueueWorkerService,
     private readonly systemMonitor: SystemMonitorService,
@@ -302,6 +311,11 @@ export class SportsMonitorService
       expiredOutboxLeases,
       failedOutboxEvents,
       oldestPendingOutboxEvent,
+      youtubeHighlightStatusRows,
+      recentYoutubeFound,
+      staleYoutubeSearches,
+      latestYoutubeHighlight,
+      youtubeQuotaState,
     ] = await Promise.all([
       this.bootstrapModel.findOne({ key: 'espn-soccer-v2' }).lean().exec(),
       this.queueModel
@@ -513,6 +527,34 @@ export class SportsMonitorService
         })
         .lean()
         .exec(),
+      this.youtubeHighlightModel
+        .aggregate([
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+        ])
+        .exec() as Promise<CountRow[]>,
+      this.youtubeHighlightModel
+        .countDocuments({ status: 'FOUND', publishedAt: { $gte: cutoff24h } })
+        .exec(),
+      this.youtubeHighlightModel
+        .countDocuments({
+          status: 'SEARCHING',
+          $or: [
+            { searchedAt: { $exists: false } },
+            { searchedAt: { $lte: new Date(now.getTime() - 12 * MINUTE) } },
+          ],
+        })
+        .exec(),
+      this.youtubeHighlightModel
+        .findOne({ status: 'FOUND' })
+        .sort({ publishedAt: -1, updatedAt: -1 })
+        .select({ fixtureId: 1, videoId: 1, title: 1, channelTitle: 1, publishedAt: 1, updatedAt: 1 })
+        .lean()
+        .exec(),
+      this.providerRateLimitModel
+        .findOne({ provider: 'youtube', endpoint: '__provider_quota__' })
+        .select({ dailyPeriod: 1, dailyRequests: 1, quotaBlockedUntil: 1 })
+        .lean()
+        .exec(),
     ]);
 
     const bootstrapPhaseProgress =
@@ -578,6 +620,20 @@ export class SportsMonitorService
     const queueCounts = this.toCountMap(queueStatusRows);
     const collectionCounts = this.toCountMap(collectionStatusRows);
     const outboxCounts = this.toCountMap(outboxStatusRows);
+    const youtubeHighlightCounts = this.toCountMap(youtubeHighlightStatusRows);
+    const youtubeDailyPeriod = this.getLagosDailyPeriod(now);
+    const youtubeDailyRequests =
+      youtubeQuotaState?.dailyPeriod === youtubeDailyPeriod
+        ? Number(youtubeQuotaState.dailyRequests ?? 0)
+        : 0;
+    const youtubeDailyLimit = SPORTS_DATA_COLLECTION_CONFIG.YOUTUBE.dailyRequestLimit;
+    const youtubeDailyRemaining = Math.max(0, youtubeDailyLimit - youtubeDailyRequests);
+    const youtubeQuotaBlockedUntil = this.toDate(youtubeQuotaState?.quotaBlockedUntil);
+    const youtubeQuotaBlocked = Boolean(
+      youtubeQuotaBlockedUntil && youtubeQuotaBlockedUntil.getTime() > now.getTime(),
+    ) || youtubeDailyRemaining <= 0;
+    const youtubeEnabled = this.youtube.isEnabled();
+    const youtubeStaleSearchingCount = Number(staleYoutubeSearches ?? 0);
     const dueJobTypes = Object.fromEntries(
       overdueQueueJobsByType.map((item) => [
         String(item._id),
@@ -682,6 +738,34 @@ export class SportsMonitorService
     const workerLastPassCompletedAt = this.toDate(worker.lastPassCompletedAt);
 
     const alerts: SportsMonitorAlert[] = [];
+
+    if (!youtubeEnabled)
+      alerts.push({
+        code: 'YOUTUBE_HIGHLIGHTS_DISABLED',
+        severity: 'WARNING',
+        message:
+          'YouTube Highlights is disabled because YOUTUBE_DATA_API_KEY is missing from the running backend environment.',
+      });
+    else if (youtubeQuotaBlocked)
+      alerts.push({
+        code: 'YOUTUBE_SEARCH_QUOTA_EXHAUSTED',
+        severity: 'WARNING',
+        message:
+          'YouTube highlight searches are paused until the configured quota period resets.',
+        details: {
+          dailySearchRequests: youtubeDailyRequests,
+          dailySearchLimit: youtubeDailyLimit,
+          quotaBlockedUntil: youtubeQuotaBlockedUntil?.toISOString(),
+        },
+      });
+    if (youtubeEnabled && youtubeStaleSearchingCount > 0)
+      alerts.push({
+        code: 'YOUTUBE_HIGHLIGHT_SEARCHES_STALE',
+        severity: 'WARNING',
+        message:
+          'YouTube highlight records have remained in SEARCHING for more than twelve minutes; reconciliation should recover them.',
+        count: youtubeStaleSearchingCount,
+      });
 
     const monitorStartupAgeMs = this.startedAt
       ? now.getTime() - this.startedAt.getTime()
@@ -1028,6 +1112,33 @@ export class SportsMonitorService
               : providerHasRequests
                 ? 'HEALTHY'
                 : 'UNKNOWN',
+        },
+        youtube: {
+          enabled: youtubeEnabled,
+          health: !youtubeEnabled
+            ? 'DISABLED'
+            : youtubeQuotaBlocked
+              ? 'QUOTA_EXHAUSTED'
+              : youtubeStaleSearchingCount > 0
+                ? 'DEGRADED'
+                : 'ACTIVE',
+          dailySearchLimit: youtubeDailyLimit,
+          dailySearchRequests: youtubeDailyRequests,
+          dailySearchRemaining: youtubeDailyRemaining,
+          quotaBlockedUntil: youtubeQuotaBlockedUntil?.toISOString(),
+          highlightRecordsByStatus: youtubeHighlightCounts,
+          highlightsFoundLast24Hours: Number(recentYoutubeFound),
+          staleSearchingRecords: Number(staleYoutubeSearches),
+          latestFound: latestYoutubeHighlight
+            ? {
+                fixtureId: latestYoutubeHighlight.fixtureId,
+                videoId: latestYoutubeHighlight.videoId,
+                title: latestYoutubeHighlight.title,
+                channelTitle: latestYoutubeHighlight.channelTitle,
+                publishedAt: this.toDate(latestYoutubeHighlight.publishedAt)?.toISOString(),
+                updatedAt: this.toDate(latestYoutubeHighlight.updatedAt)?.toISOString(),
+              }
+            : null,
         },
       },
       worker,
@@ -1720,6 +1831,17 @@ export class SportsMonitorService
     }
   }
 
+  private getLagosDailyPeriod(date: Date): string {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Africa/Lagos',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const values = new Map(parts.map((part) => [part.type, part.value]));
+    return `${values.get('year')}-${values.get('month')}-${values.get('day')}`;
+  }
+
   private toCountMap(rows: CountRow[]): Record<string, number> {
     return Object.fromEntries(
       rows.map((row) => [String(row._id ?? 'UNKNOWN'), Number(row.count ?? 0)]),
@@ -1767,4 +1889,5 @@ export class SportsMonitorService
           .slice(0, 500);
   }
 }
+
 

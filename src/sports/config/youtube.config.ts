@@ -25,13 +25,12 @@ export const YOUTUBE_CONFIG = {
   ] as const,
 
   /**
-   * Four total requests per fixture: an initial search, then retries beginning
-   * at one hour. The fourth search is unrestricted by channel; the first three
-   * follow the competition/club/fallback channel priority order.
+   * Four bounded searches per fixture, spread across the post-match window.
+   * The final search is unrestricted by channel.
    */
   searchWorkflow: {
     maximumRequestsPerFixture: 4,
-    attemptOffsetsMinutes: [10, 70, 130, 190] as const,
+    attemptOffsetsMinutes: [10, 60, 240, 720] as const,
     maximumFallbackChannels: 4,
   },
 
@@ -39,3 +38,4 @@ export const YOUTUBE_CONFIG = {
 } as const;
 
 export type YoutubeConfig = typeof YOUTUBE_CONFIG;
+

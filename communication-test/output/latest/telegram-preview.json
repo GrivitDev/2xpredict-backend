@@ -1,0 +1,45 @@
+{
+  "note": "Preview only; no Telegram API request was made.",
+  "cases": [
+    {
+      "key": "daily-pick",
+      "label": "Daily Pick photo post",
+      "type": "photo",
+      "photoUrl": "https://www.2xpredict.com/banner.png",
+      "caption": "🧪 <b>COMMUNICATION TEST — NOT A LIVE TIP</b>\n⚽ <b>2XPREDICT</b>\n<b>DAILY PICK</b>\n━━━━━━━━━━━━━━━━━━\n🏆 Premier League\n<b>Arsenal vs Chelsea</b>\n🕒 Friday, 20 November 2026 · 18:00 WAT\n• Match Result: <b>Arsenal Win</b> · <b>1.85</b>\n📊 Confidence: <b>86%</b>\n\n<i>Preview message only. This is synthetic test data, not a real prediction or betting recommendation.</i>",
+      "keyboard": [
+        [
+          {
+            "text": "⚽ View Prediction",
+            "url": "https://www.2xpredict.com/predictions?communication-test=1"
+          },
+          {
+            "text": "🌐 Explore 2xPredict",
+            "url": "https://www.2xpredict.com/?communication-test=1"
+          }
+        ]
+      ]
+    },
+    {
+      "key": "promotion",
+      "label": "Promotion text post",
+      "type": "text",
+      "message": "🧪 <b>COMMUNICATION TEST — NOT A LIVE PROMOTION</b>\n🎁 <b>2XPREDICT</b>\n<b>A new season of smarter predictions</b>\n━━━━━━━━━━━━━━━━━━\nExplore the 2xPredict membership options and discover the features available with each plan.\n\n📣 <a href=\"https://www.2xpredict.com/promos?communication-test=1\">View promotions</a>\n🌐 <a href=\"https://www.2xpredict.com/?communication-test=1\">Visit 2xPredict</a>\n<i>Administrative test message. No offer or promo code is being activated.</i>"
+    },
+    {
+      "key": "internal-ad",
+      "label": "Internal Ad photo post",
+      "type": "photo",
+      "photoUrl": "https://www.2xpredict.com/banner.png",
+      "caption": "🧪 <b>COMMUNICATION TEST — INTERNAL AD PREVIEW</b>\n📣 <b>2XPREDICT</b>\n<b>Explore 2xPredict VIP</b>\n━━━━━━━━━━━━━━━━━━\nUnlock VIP predictions, additional markets and enhanced match insights. This is a test advertisement only.\n\n<i>Test advertisement only. No active campaign or paid offer is being announced.</i>",
+      "keyboard": [
+        [
+          {
+            "text": "Explore VIP Plans",
+            "url": "https://www.2xpredict.com/pricing?communication-test=1"
+          }
+        ]
+      ]
+    }
+  ]
+}

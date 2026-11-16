@@ -212,6 +212,19 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
       },
       triggerEventId: 'sports-recurring-retention-cleanup',
     });
+    if (SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.enabled) {
+      await this.queue.enqueueIfMissing({
+        type: SportsQueueJobType.YOUTUBE_HIGHLIGHT_RECONCILIATION,
+        scope: {},
+        priority: 42,
+        scheduledFor: new Date(Date.now() + SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.intervalMs),
+        recurrence: {
+          intervalMs: SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.intervalMs,
+          repeatUntil: 'NEVER',
+        },
+        triggerEventId: 'sports-recurring-youtube-highlight-reconciliation',
+      });
+    }
   }
 
   /**
@@ -262,6 +275,7 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
     });
   }
 }
+
 
 
 

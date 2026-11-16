@@ -5,6 +5,8 @@ import { Model } from 'mongoose';
 import { CuratedPredictionService } from '../../predictions-engine/services/curated-prediction.service';
 import { PromosService } from '../../promos/promos.service';
 import { TelegramService } from '../../telegram/telegram.service';
+import type { TelegramInlineKeyboardButton } from '../../telegram/telegram.service';
+import { InternalAdsService } from '../../internal-ads/internal-ads.service';
 import { SupportActionAudit } from '../schemas/support-action-audit.schema';
 import { CustomerCareBroadcast } from '../schemas/customer-care-broadcast.schema';
 import { GroqAssistantService, CreativeCopy } from './groq-assistant.service';
@@ -16,10 +18,12 @@ export class DailyBroadcastService {
   private readonly predictionsUrl: string;
   private readonly promotionsUrl: string;
   private readonly maxOddsAgeHours: number;
+  private readonly bannerUrl: string;
 
   constructor(
     private readonly curatedPredictions: CuratedPredictionService,
     private readonly promos: PromosService,
+    private readonly internalAds: InternalAdsService,
     private readonly telegram: TelegramService,
     private readonly groq: GroqAssistantService,
     private readonly config: ConfigService,
@@ -37,6 +41,12 @@ export class DailyBroadcastService {
     this.promotionsUrl =
       this.config.get<string>('CUSTOMER_CARE_PROMOTIONS_URL') ||
       `${this.frontendUrl}/promos`;
+    // Telegram requires an absolute, publicly fetchable HTTPS image URL. The
+    // single approved communication image is frontend /banner.png.
+    this.bannerUrl = safeTelegramHref(
+      `${this.frontendUrl}/banner.png`,
+      this.frontendUrl,
+    );
     const oddsAge = Number(
       this.config.get<string>('CUSTOMER_CARE_MAX_ODDS_AGE_HOURS') ?? 12,
     );
@@ -119,7 +129,7 @@ export class DailyBroadcastService {
           Number(b.confidence || 0) - Number(a.confidence || 0),
       );
       const picks = eligible
-        .slice(0, 3)
+        .slice(0, 1)
         .map((item: any) =>
           normalizePick(item, this.predictionsUrl, this.maxOddsAgeHours),
         );
@@ -144,16 +154,13 @@ export class DailyBroadcastService {
         return { skipped: true, reason: broadcast.skipReason };
       }
 
-      const recent = await this.recentExamples('DAILY_PICKS', dateKey);
-      const copy = await this.generateUniqueCopy(
-        'DAILY_PICKS',
-        dateKey,
-        { picks },
-        recent,
-      );
-      const content = renderPicksMessage(copy, picks, this.frontendUrl);
+      // Daily-pick broadcasts use a compact, deterministic message. The
+      // prediction candidates are already curated and ranked by Pick Center;
+      // a separate AI copy call adds latency without adding verified facts.
+      // Promotion broadcasts continue using the existing creative-copy flow.
+      const content = renderPicksMessage(picks);
       broadcast.content = content;
-      broadcast.styleTag = copy.styleTag;
+      broadcast.styleTag = 'daily-single-pick-photo-v1';
       broadcast.sourceReferences = picks
         .map((pick) => pick.predictionCode)
         .filter(Boolean);
@@ -162,8 +169,17 @@ export class DailyBroadcastService {
 
       broadcast.status = 'SENDING';
       await broadcast.save();
-      const delivery = await this.telegram.sendPublicChannelMessage(
+      const predictionUrl = safeTelegramHref(picks[0].url, this.frontendUrl);
+      const homeUrl = safeTelegramHref(this.frontendUrl, this.frontendUrl);
+      const delivery = await this.telegram.sendPublicChannelPhoto(
+        this.bannerUrl,
         broadcast.content,
+        [
+          [
+            { text: '⚽ View Prediction', url: predictionUrl },
+            { text: '🌐 Explore 2xPredict', url: homeUrl },
+          ],
+        ],
       );
       if (!delivery.success && delivery.deliveryUnknown) {
         broadcast.status = 'FAILED';
@@ -197,7 +213,7 @@ export class DailyBroadcastService {
       await this.writeAudit(
         'daily_picks_broadcast',
         'SUCCEEDED',
-        `Published ${picks.length} curated picks to the public Telegram channel.`,
+        `Published ${picks.length} curated pick to the public Telegram channel.`,
         { dateKey, sourceReferences: broadcast.sourceReferences },
       ).catch((error) =>
         this.logger.warn(
@@ -208,7 +224,7 @@ export class DailyBroadcastService {
         sent: true,
         broadcastId: String(broadcast._id),
         count: picks.length,
-        styleTag: copy.styleTag,
+        styleTag: 'daily-single-pick-photo-v1',
         telegramMessageId: delivery.messageId,
       };
     } catch (error) {
@@ -457,6 +473,227 @@ export class DailyBroadcastService {
     }
   }
 
+  /**
+   * Publishes one active Telegram-placed Internal Ad per Lagos calendar day.
+   * Delivery state is persisted in the existing durable broadcast collection;
+   * ambiguous Telegram outcomes require administrator review before retry.
+   */
+  async publishTelegramInternalAd(
+    dateKey: string,
+  ): Promise<Record<string, unknown>> {
+    const existing = await this.broadcasts
+      .findOne({ kind: 'INTERNAL_AD', dateKey, sourceKey: 'daily' })
+      .exec();
+
+    if (existing?.status === 'SENT' || existing?.status === 'SKIPPED') {
+      return {
+        skipped: true,
+        reason: `ALREADY_${existing.status}`,
+        broadcastId: String(existing._id),
+      };
+    }
+    if (existing?.manualReviewRequired) {
+      return {
+        skipped: true,
+        requiresAdminReview: true,
+        reason: 'DELIVERY_OUTCOME_REQUIRES_ADMIN_CONFIRMATION',
+        broadcastId: String(existing._id),
+      };
+    }
+    if (existing?.status === 'SENDING') {
+      const ageMs = Date.now() - toDate((existing as any).updatedAt).getTime();
+      if (Number.isFinite(ageMs) && ageMs > 5 * 60_000) {
+        existing.status = 'FAILED';
+        existing.manualReviewRequired = true;
+        existing.lastError =
+          'An earlier internal-ad send was interrupted after Telegram delivery began. Check the public channel before retrying.';
+        await existing.save();
+        return {
+          skipped: true,
+          requiresAdminReview: true,
+          reason: 'STALE_SEND_STATE',
+          broadcastId: String(existing._id),
+        };
+      }
+      return {
+        deferred: true,
+        reason: 'SEND_ALREADY_IN_PROGRESS',
+        broadcastId: String(existing._id),
+      };
+    }
+
+    const broadcast =
+      existing ??
+      (await this.broadcasts.create({
+        kind: 'INTERNAL_AD',
+        dateKey,
+        sourceKey: 'daily',
+        status: 'GENERATING',
+        attempts: 0,
+      }));
+    const attempt = Number(broadcast.attempts || 0) + 1;
+    broadcast.attempts = attempt;
+    broadcast.status = 'GENERATING';
+    broadcast.manualReviewRequired = false;
+    broadcast.lastError = '';
+    broadcast.skipReason = '';
+    await broadcast.save();
+
+    let telegramAccepted = false;
+    try {
+      const rawAds = await this.internalAds.getActiveTelegramAds();
+      const ads = (Array.isArray(rawAds) ? rawAds : [])
+        .map((value: any) => toPlain(value))
+        .filter((ad: any) =>
+          ad &&
+          ad.isActive === true &&
+          Array.isArray(ad.placements) &&
+          ad.placements.includes('TELEGRAM'),
+        )
+        .sort((a: any, b: any) => {
+          const lastSentA = toDate(a.lastTelegramSentAt).getTime();
+          const lastSentB = toDate(b.lastTelegramSentAt).getTime();
+          const safeLastSentA = Number.isFinite(lastSentA) ? lastSentA : 0;
+          const safeLastSentB = Number.isFinite(lastSentB) ? lastSentB : 0;
+          if (safeLastSentA !== safeLastSentB) return safeLastSentA - safeLastSentB;
+          const priority = (value: unknown) =>
+            value === 'high' ? 3 : value === 'medium' ? 2 : 1;
+          return (
+            priority(b.displayLevel) - priority(a.displayLevel) ||
+            Number(b.sortOrder || 0) - Number(a.sortOrder || 0) ||
+            toDate(a.createdAt).getTime() - toDate(b.createdAt).getTime()
+          );
+        });
+
+      const ad = ads[0];
+      if (!ad) {
+        if (attempt < 4) {
+          broadcast.status = 'GENERATING';
+          broadcast.skipReason =
+            'No active Telegram-placed internal advertisement is available yet; a bounded readiness retry is scheduled.';
+          await broadcast.save();
+          return {
+            deferred: true,
+            retryAfterMs: 30 * 60_000,
+            reason: 'NO_ACTIVE_TELEGRAM_INTERNAL_AD',
+            broadcastId: String(broadcast._id),
+          };
+        }
+        broadcast.status = 'SKIPPED';
+        broadcast.skipReason =
+          'No active Telegram-placed internal advertisement was available after bounded readiness checks.';
+        await broadcast.save();
+        return { skipped: true, reason: broadcast.skipReason };
+      }
+
+      const rendered = renderTelegramInternalAd(ad, this.frontendUrl);
+      broadcast.content = rendered.caption;
+      broadcast.styleTag = 'internal-ad-photo-v1';
+      broadcast.sourceReferences = [String(ad._id)];
+      broadcast.status = 'READY';
+      await broadcast.save();
+
+      broadcast.status = 'SENDING';
+      await broadcast.save();
+      const delivery = await this.telegram.sendPublicChannelPhoto(
+        this.bannerUrl,
+        broadcast.content,
+        rendered.inlineKeyboard,
+      );
+
+      if (!delivery.success && delivery.deliveryUnknown) {
+        broadcast.status = 'FAILED';
+        broadcast.manualReviewRequired = true;
+        broadcast.lastError =
+          'Telegram internal-ad delivery outcome is unknown. Check the public channel before retrying.';
+        await broadcast.save();
+        await this.writeAudit(
+          'telegram_internal_ad_broadcast',
+          'FAILED',
+          broadcast.lastError,
+          { dateKey, attempt, internalAdId: String(ad._id) },
+        ).catch(() => undefined);
+        return {
+          sent: false,
+          requiresAdminReview: true,
+          broadcastId: String(broadcast._id),
+        };
+      }
+      if (!delivery.success) {
+        throw new Error(
+          'Telegram internal-ad photo delivery was rejected. Check TELEGRAM_INFO_GROUP_ID and bot channel permissions.',
+        );
+      }
+
+      telegramAccepted = true;
+      const sentAt = new Date();
+      await this.internalAds.recordTelegramDelivery(
+        String(ad._id),
+        sentAt,
+        delivery.messageId,
+      );
+      broadcast.status = 'SENT';
+      broadcast.manualReviewRequired = false;
+      broadcast.sentAt = sentAt;
+      broadcast.telegramMessageId = delivery.messageId;
+      broadcast.lastError = '';
+      await broadcast.save();
+
+      await this.writeAudit(
+        'telegram_internal_ad_broadcast',
+        'SUCCEEDED',
+        `Published internal advertisement "${safeText(ad.title, 120)}" to the public Telegram channel.`,
+        {
+          dateKey,
+          internalAdId: String(ad._id),
+          telegramMessageId: delivery.messageId,
+        },
+      ).catch((error) =>
+        this.logger.warn(
+          `Internal-ad broadcast audit failed: ${safeError(error)}`,
+        ),
+      );
+
+      return {
+        sent: true,
+        broadcastId: String(broadcast._id),
+        internalAdId: String(ad._id),
+        styleTag: 'internal-ad-photo-v1',
+        telegramMessageId: delivery.messageId,
+      };
+    } catch (error) {
+      if (telegramAccepted) {
+        broadcast.status = 'FAILED';
+        broadcast.manualReviewRequired = true;
+        broadcast.lastError =
+          'Telegram accepted the internal-ad post, but final delivery state could not be confirmed in MongoDB. Check the public channel before retrying.';
+        await broadcast.save().catch(() => undefined);
+        await this.writeAudit(
+          'telegram_internal_ad_broadcast',
+          'FAILED',
+          broadcast.lastError,
+          { dateKey, attempt, sourceReferences: broadcast.sourceReferences },
+        ).catch(() => undefined);
+        return {
+          sent: false,
+          requiresAdminReview: true,
+          broadcastId: String(broadcast._id),
+        };
+      }
+
+      broadcast.status = 'FAILED';
+      broadcast.lastError = safeError(error);
+      await broadcast.save();
+      await this.writeAudit(
+        'telegram_internal_ad_broadcast',
+        'FAILED',
+        broadcast.lastError,
+        { dateKey, attempt, sourceReferences: broadcast.sourceReferences },
+      ).catch(() => undefined);
+      throw error;
+    }
+  }
+
   private async generateUniqueCopy(
     kind: 'DAILY_PICKS' | 'PROMOTION',
     dateKey: string,
@@ -538,6 +775,9 @@ export class DailyBroadcastService {
 interface NormalizedPick {
   predictionCode: string;
   title: string;
+  leagueName?: string;
+  homeTeamName?: string;
+  awayTeamName?: string;
   fixtureDate: string;
   selections: Array<{
     marketName: string;
@@ -617,9 +857,38 @@ function normalizePick(
       };
     });
   const code = safeText(item.predictionCode || item.eventId || '', 100);
+  const firstSelection = Array.isArray(item.selections) ? item.selections[0] : {};
+  const fixture = item.fixture && typeof item.fixture === 'object' ? item.fixture : {};
+  const homeTeamName = safeText(
+    item.homeTeamName ||
+      firstSelection?.homeTeamName ||
+      fixture.homeTeamName ||
+      fixture.homeTeam?.name ||
+      '',
+    80,
+  );
+  const awayTeamName = safeText(
+    item.awayTeamName ||
+      firstSelection?.awayTeamName ||
+      fixture.awayTeamName ||
+      fixture.awayTeam?.name ||
+      '',
+    80,
+  );
+  const leagueName = safeText(
+    item.leagueName ||
+      firstSelection?.leagueName ||
+      fixture.leagueName ||
+      fixture.competitionName ||
+      '',
+    100,
+  );
   return {
     predictionCode: code,
     title: safeText(item.title || 'Curated match prediction', 150),
+    ...(leagueName ? { leagueName } : {}),
+    ...(homeTeamName ? { homeTeamName } : {}),
+    ...(awayTeamName ? { awayTeamName } : {}),
     fixtureDate: formatLagosDateTime(item.fixtureDateFrom),
     selections,
     confidence: Math.max(0, Math.min(98, Number(item.confidence) || 0)),
@@ -721,53 +990,46 @@ function formatPromoRequirement(value: string): string {
   return labels[value] ?? safeText(value.replace(/_/g, ' '), 100);
 }
 
-function renderPicksMessage(
-  copy: CreativeCopy,
-  picks: NormalizedPick[],
-  frontendUrl: string,
-): string {
-  const safeHeadline = escapeTelegramHtml(copy.headline.toUpperCase());
-  const safeIntro = escapeTelegramHtml(copy.intro);
-  const safeClosing = escapeTelegramHtml(copy.closing);
-  const homeUrl = safeTelegramHref(frontendUrl);
-  const header = [
-    '⚽ <b>2XPREDICT</b>',
-    `<b>${safeHeadline}</b>`,
-    '━━━━━━━━━━━━━━━━━━',
-    safeIntro,
-    '',
-  ].join('\n');
-  const footer = [
-    '',
-    '━━━━━━━━━━━━━━━━━━',
-    safeClosing,
-    '',
-    `🌐 <a href="${escapeTelegramHtml(homeUrl)}">Explore 2xPredict</a>`,
-    '<i>Predictions are estimates, not guarantees. Review the live market details and make responsible decisions.</i>',
-  ].join('\n');
+function renderPicksMessage(picks: NormalizedPick[]): string {
+  const pick = picks[0];
+  if (!pick) return '';
 
-  const blocks: string[] = [];
-  for (const [index, pick] of picks.entries()) {
-    const selections = pick.selections.slice(0, 8).map((selection) => {
-      const odds = selection.odds && Number.isFinite(selection.odds)
-        ? ` · <b>${selection.odds.toFixed(2)}</b>${selection.oddsSource ? ` <i>(${escapeTelegramHtml(selection.oddsSource)})</i>` : ''}`
+  const matchTitle =
+    pick.homeTeamName && pick.awayTeamName
+      ? `${pick.homeTeamName} vs ${pick.awayTeamName}`
+      : pick.title;
+  const selectionLines = pick.selections.slice(0, 3).map((selection) => {
+    const odds =
+      typeof selection.odds === 'number' && Number.isFinite(selection.odds)
+        ? ` · <b>${selection.odds.toFixed(2)}</b>`
         : '';
-      return `  • ${escapeTelegramHtml(selection.marketName)}: <b>${escapeTelegramHtml(selection.selectionName)}</b>${odds}`;
-    });
-    const link = safeTelegramHref(pick.url, frontendUrl);
-    const block = [
-      `<b>${index + 1}. ${escapeTelegramHtml(pick.title)}</b>`,
-      `🕒 ${escapeTelegramHtml(pick.fixtureDate)}`,
-      ...selections,
-      `🔎 <a href="${escapeTelegramHtml(link)}">View match &amp; markets</a>`,
-    ].join('\n');
-    const candidate = `${header}${blocks.length ? '\n\n' : ''}${[...blocks, block].join('\n\n')}${footer}`;
-    if (candidate.length > 3900) break;
-    blocks.push(block);
-  }
+    return `• ${escapeTelegramHtml(selection.marketName)}: <b>${escapeTelegramHtml(selection.selectionName)}</b>${odds}`;
+  });
 
-  const message = `${header}${blocks.join('\n\n')}${footer}`;
-  return message.length <= 4096 ? message : `${header}${footer}`;
+  const lines = [
+    '⚽ <b>2XPREDICT</b>',
+    '<b>DAILY PICK</b>',
+    '━━━━━━━━━━━━━━━━━━',
+    ...(pick.leagueName
+      ? [`🏆 ${escapeTelegramHtml(pick.leagueName)}`]
+      : []),
+    `<b>${escapeTelegramHtml(safeText(matchTitle, 150))}</b>`,
+    `🕒 ${escapeTelegramHtml(safeText(pick.fixtureDate, 80))}`,
+    ...selectionLines,
+    `📊 Confidence: <b>${Math.round(pick.confidence)}%</b>`,
+    '',
+    '<i>Predictions are estimates, not guarantees. Review current markets before making a decision.</i>',
+  ];
+
+  // Build complete lines only. This avoids cutting an HTML entity or tag while
+  // respecting Telegram's 1,024-character photo-caption limit.
+  const captionLines: string[] = [];
+  for (const line of lines) {
+    const candidate = [...captionLines, line].join('\n');
+    if (candidate.length > 1024) break;
+    captionLines.push(line);
+  }
+  return captionLines.join('\n');
 }
 
 function renderPromotionsMessage(
@@ -845,6 +1107,87 @@ function renderPromotionsMessage(
 
   const message = `${header}${blocks.join('\n\n')}${footer}`;
   return message.length <= 4096 ? message : `${header}${footer}`;
+}
+
+function renderTelegramInternalAd(
+  ad: Record<string, any>,
+  frontendUrl: string,
+): { caption: string; inlineKeyboard: TelegramInlineKeyboardButton[][] } {
+  const title = safeText(ad.title, 120) || 'Featured announcement';
+  const subtitle = safeText(ad.subtitle, 160);
+  const message = safeText(ad.message, 500);
+  const description = Array.isArray(ad.description)
+    ? ad.description.map((item: unknown) => safeText(item, 180)).filter(Boolean).slice(0, 2)
+    : [];
+  const instructions = Array.isArray(ad.instructions)
+    ? ad.instructions.map((item: unknown) => safeText(item, 150)).filter(Boolean).slice(0, 2)
+    : [];
+
+  const lines = [
+    '📢 <b>2XPREDICT | FEATURED</b>',
+    `<b>${escapeTelegramHtml(title)}</b>`,
+    ...(subtitle ? [escapeTelegramHtml(subtitle)] : []),
+    ...(message ? ['', escapeTelegramHtml(message)] : []),
+    ...(description.length ? ['', ...description.map((item) => `• ${escapeTelegramHtml(item)}`)] : []),
+    ...(instructions.length ? ['', '<b>How to get started</b>', ...instructions.map((item) => `• ${escapeTelegramHtml(item)}`)] : []),
+    '',
+    '<i>Visit 2xPredict to explore more. Terms and eligibility may apply.</i>',
+  ];
+
+  const captionLines: string[] = [];
+  for (const line of lines) {
+    const candidate = [...captionLines, line].join('\n');
+    if (candidate.length > 1024) break;
+    captionLines.push(line);
+  }
+  const caption = captionLines.join('\n').trim();
+
+  const actions = Array.isArray(ad.actions) ? ad.actions : [];
+  const buttons: TelegramInlineKeyboardButton[] = actions
+    .slice(0, 2)
+    .map((action: any) => ({
+      text: safeText(action?.label, 64),
+      url: safeTelegramAdHref(action?.url, frontendUrl),
+    }))
+    .filter((button: TelegramInlineKeyboardButton) => Boolean(button.text));
+
+  if (!buttons.length) {
+    buttons.push({
+      text: '🌐 Explore 2xPredict',
+      url: safeTelegramAdHref('/promos', frontendUrl),
+    });
+  }
+
+  return { caption, inlineKeyboard: [buttons] };
+}
+
+function safeTelegramAdHref(value: unknown, frontendUrl: string): string {
+  const fallback = 'https://www.2xpredict.com/';
+  try {
+    const base = new URL(frontendUrl);
+    const parsed = new URL(String(value ?? '').trim() || '/', base);
+    const hostname = parsed.hostname.toLowerCase();
+    const isLocalHost =
+      hostname === 'localhost' ||
+      hostname.endsWith('.localhost') ||
+      hostname.endsWith('.local') ||
+      /^127\./.test(hostname) ||
+      /^10\./.test(hostname) ||
+      /^192\.168\./.test(hostname) ||
+      /^169\.254\./.test(hostname);
+    if (
+      parsed.protocol !== 'https:' ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password ||
+      isLocalHost
+    ) {
+      return new URL('/', base).toString();
+    }
+    return parsed.toString();
+  } catch {
+    return fallback;
+  }
 }
 
 function escapeTelegramHtml(value: unknown): string {
@@ -1052,4 +1395,3 @@ function safeError(error: unknown): string {
     .replace(/[\u0000-\u001F\u007F]/g, ' ')
     .slice(0, 1000);
 }
-

@@ -175,7 +175,7 @@ export class CustomerCareAdminController {
     broadcast.lastError = '';
     await broadcast.save();
 
-    const type = broadcast.kind === 'DAILY_PICKS' ? 'DAILY_PICKS' : 'PROMOTION';
+    const type = broadcast.kind;
     const jobKey = `${type}:${broadcast.dateKey}`;
     const now = new Date();
     await this.jobs.updateOne(
@@ -198,8 +198,8 @@ export class CustomerCareAdminController {
     const job = await this.jobs.findById(id).exec();
     if (!job) throw new NotFoundException('Customer Care job was not found.');
     if (job.status !== 'FAILED') throw new BadRequestException('Only failed jobs can be manually retried.');
-    if (job.type === 'DAILY_PICKS' || job.type === 'PROMOTION') {
-      const kind = job.type === 'DAILY_PICKS' ? 'DAILY_PICKS' : 'PROMOTION';
+    if (job.type === 'DAILY_PICKS' || job.type === 'PROMOTION' || job.type === 'INTERNAL_AD') {
+      const kind = job.type;
       const broadcast = await this.broadcasts.findOne({ kind, dateKey: job.dateKey, sourceKey: 'daily' }).lean().exec();
       if (broadcast?.manualReviewRequired) {
         throw new BadRequestException('This broadcast has an uncertain Telegram delivery result. Use the broadcast retry endpoint after checking the public channel.');

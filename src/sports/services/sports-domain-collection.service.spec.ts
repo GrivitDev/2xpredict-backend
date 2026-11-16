@@ -71,6 +71,94 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
     ).resolves.toBe(true);
   });
 
+  it('does not treat a pre-completion Summary snapshot as fresh for post-match collection', async () => {
+    const completedAt = new Date(now.getTime() - 15 * 60_000);
+    persistence.getMatchSummaryByEventId.mockResolvedValue({
+      lastCollectedAt: new Date(now.getTime() - 10 * 60_000),
+    });
+    state.getState.mockResolvedValue({
+      status: 'SUCCEEDED',
+      lastStartedAt: new Date(now.getTime() - 20 * 60_000),
+      lastSuccessfulAt: new Date(now.getTime() - 10 * 60_000),
+    });
+
+    await expect(
+      service.shouldCollectFixtureSummary(
+        'espn-1',
+        24 * 60 * 60_000,
+        5 * 60_000,
+        completedAt,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it('treats a Summary collection started after completion as fresh', async () => {
+    const completedAt = new Date(now.getTime() - 15 * 60_000);
+    persistence.getMatchSummaryByEventId.mockResolvedValue({
+      lastCollectedAt: new Date(now.getTime() - 10 * 60_000),
+    });
+    state.getState.mockResolvedValue({
+      status: 'SUCCEEDED',
+      lastStartedAt: new Date(now.getTime() - 12 * 60_000),
+      lastSuccessfulAt: new Date(now.getTime() - 10 * 60_000),
+    });
+
+    await expect(
+      service.shouldCollectFixtureSummary(
+        'espn-1',
+        24 * 60 * 60_000,
+        5 * 60_000,
+        completedAt,
+      ),
+    ).resolves.toBe(false);
+  });
+
+  it('treats a successful fallback as fresh only when its request started after full time', async () => {
+    const completedAt = new Date(now.getTime() - 15 * 60_000);
+    state.getState.mockResolvedValue({
+      status: 'SUCCEEDED',
+      lastStartedAt: new Date(now.getTime() - 20 * 60_000),
+      lastSuccessfulAt: new Date(now.getTime() - 10 * 60_000),
+    });
+
+    await expect(
+      service.isFixtureSummaryFallbackFresh(
+        'espn-1',
+        24 * 60 * 60_000,
+        completedAt,
+      ),
+    ).resolves.toBe(false);
+
+    state.getState.mockResolvedValue({
+      status: 'SUCCEEDED',
+      lastStartedAt: new Date(now.getTime() - 12 * 60_000),
+      lastSuccessfulAt: new Date(now.getTime() - 10 * 60_000),
+    });
+
+    await expect(
+      service.isFixtureSummaryFallbackFresh(
+        'espn-1',
+        24 * 60 * 60_000,
+        completedAt,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it('allows a forced post-match Summary refresh when ESPN omits completedAt', async () => {
+    persistence.getMatchSummaryByEventId.mockResolvedValue({
+      lastCollectedAt: new Date(now.getTime() - 1_000),
+    });
+    state.getState.mockResolvedValue({
+      status: 'SUCCEEDED',
+      lastStartedAt: new Date(now.getTime() - 2_000),
+      lastSuccessfulAt: new Date(now.getTime() - 1_000),
+    });
+
+    await expect(
+      service.shouldCollectFixtureSummary('espn-1', 0),
+    ).resolves.toBe(true);
+  });
+
   it('respects the cooldown for an active or recently failed Summary request', async () => {
     state.getState
       .mockResolvedValueOnce({

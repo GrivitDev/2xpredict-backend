@@ -29,7 +29,7 @@ import { UploadsModule } from '../uploads/uploads.module';
   providers: [
     adminRealtimeRegistrationProvider(
       'internal-ads',
-      'Internal promotional content management and placement delivery.',
+      'Internal promotional content management and website/Telegram placement delivery.',
     ),
     InternalAdsService,
     JwtAuthGuard,

@@ -15,6 +15,12 @@ import { NotificationCategory } from './enums/notification-category.enum';
 import { NotificationType } from './enums/notification-type.enum';
 import { NotificationQueryDto } from './dto/notification-query.dto';
 import { UserNotificationsGateway } from './user-notifications.gateway';
+import { normalizeNotificationActionUrl } from '../notification-routes';
+import {
+  normalizeNotificationCopy,
+  resolveNotificationPresentation,
+} from './notification-presentation';
+import type { NotificationPresentationInput } from './notification-presentation';
 
 export interface CreateUserNotificationInput {
   recipientId: string;
@@ -23,6 +29,7 @@ export interface CreateUserNotificationInput {
   title: string;
   message: string;
   actionUrl?: string | null;
+  presentation?: NotificationPresentationInput | null;
   data?: Record<string, unknown>;
   /** Stable business-event identifier. Required for idempotent retries. */
   dedupeKey: string;
@@ -65,8 +72,7 @@ export class UserNotificationsService implements OnModuleInit {
       throw new BadRequestException('Invalid notification recipient.');
     }
 
-    const title = String(input.title ?? '').trim();
-    const message = String(input.message ?? '').trim();
+    const { title, message } = normalizeNotificationCopy(input.title, input.message);
     const dedupeKey = String(input.dedupeKey ?? '').trim();
     if (!title || title.length > 120) {
       throw new BadRequestException('Notification title must be 1–120 characters.');
@@ -85,13 +91,20 @@ export class UserNotificationsService implements OnModuleInit {
     if (existing) return this.present(existing);
 
     const now = new Date();
+    const actionUrl = this.validateActionUrl(input.actionUrl);
     const notification = new this.notificationModel({
       recipientId,
       type: input.type,
       category: input.category,
       title,
       message,
-      actionUrl: this.validateActionUrl(input.actionUrl),
+      actionUrl,
+      presentation: resolveNotificationPresentation(
+        input.type,
+        input.category,
+        actionUrl,
+        input.presentation,
+      ),
       data: this.sanitizeData(input.data ?? {}),
       dedupeKey,
       readAt: null,
@@ -233,7 +246,7 @@ export class UserNotificationsService implements OnModuleInit {
     if (!path.startsWith('/') || path.startsWith('//') || path.length > 300) {
       throw new BadRequestException('Notification action URL must be a local path.');
     }
-    return path;
+    return normalizeNotificationActionUrl(path);
   }
 
   private sanitizeData(value: Record<string, unknown>): Record<string, unknown> {
@@ -269,6 +282,7 @@ export class UserNotificationsService implements OnModuleInit {
 
   private present(value: any): Record<string, unknown> {
     const item = typeof value?.toObject === 'function' ? value.toObject() : value;
+    const actionUrl = normalizeNotificationActionUrl(item.actionUrl);
     return {
       id: String(item._id),
       type: item.type,
@@ -276,7 +290,13 @@ export class UserNotificationsService implements OnModuleInit {
       title: item.title,
       message: item.message,
       data: item.data ?? {},
-      actionUrl: item.actionUrl ?? null,
+      actionUrl,
+      presentation: resolveNotificationPresentation(
+        item.type,
+        item.category,
+        actionUrl,
+        item.presentation,
+      ),
       readAt: item.readAt ?? null,
       createdAt: item.createdAt,
       expiresAt: item.expiresAt,
