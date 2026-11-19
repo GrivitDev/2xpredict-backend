@@ -28,3 +28,4 @@ describe('YouTube highlight channel search plans', () => {
     expect(new Set(plan.filter(Boolean)).size).toBe(plan.filter(Boolean).length);
   });
 });
+

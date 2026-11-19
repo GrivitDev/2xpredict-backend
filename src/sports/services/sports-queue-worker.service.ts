@@ -5,9 +5,12 @@ import {
   Logger,
   OnApplicationBootstrap,
   OnModuleDestroy,
+  Optional,
 } from '@nestjs/common';
 
 import { SportsQueueJobType } from '../interfaces/sports-queue.interface';
+import { YOUTUBE_LEAGUE_PRIORITY } from '../config/youtube.config';
+import { SportsProviderRateLimitService } from './sports-provider-rate-limit.service';
 import { SportsQueueJobProcessorService } from './sports-queue-job-processor.service';
 import { SportsQueueService } from './sports-queue.service';
 import { SportsCollectionStateService } from './sports-collection-state.service';
@@ -40,6 +43,8 @@ interface LaneRuntime {
   lastStartedAt?: Date;
   lastCompletedAt?: Date;
   lastError?: string;
+  pausedUntil?: Date;
+  quotaPausePeriod?: 'daily' | 'monthly';
 }
 
 const DEFAULT_LANE_CONCURRENCY = 1;
@@ -96,6 +101,8 @@ export class SportsQueueWorkerService
     private readonly jobProcessor: SportsQueueJobProcessorService,
     private readonly collectionStates: SportsCollectionStateService,
     private readonly backgroundWork: BackgroundWorkLimiterService,
+    @Optional()
+    private readonly providerRateLimits?: SportsProviderRateLimitService,
   ) {
     const sportsOwnedTypes = Object.values(SportsQueueJobType).filter(
       (type) =>
@@ -117,7 +124,7 @@ export class SportsQueueWorkerService
     }
   }
 
-  onApplicationBootstrap(): void {
+  async onApplicationBootstrap(): Promise<void> {
     this.stopped = false;
     this.initialized = true;
     this.startedAt = new Date();
@@ -125,6 +132,27 @@ export class SportsQueueWorkerService
       if (type) this.wakeLane(type);
       else for (const laneType of this.lanes.keys()) this.wakeLane(laneType);
     });
+
+    // Upgrade pre-existing pending YouTube jobs before any worker can claim
+    // them. Only PENDING YOUTUBE_HIGHLIGHT jobs are updated by the queue helper.
+    try {
+      const updated =
+        typeof this.queue.reprioritizePendingYoutubeHighlightJobs === 'function'
+          ? await this.queue.reprioritizePendingYoutubeHighlightJobs(
+              YOUTUBE_LEAGUE_PRIORITY,
+            )
+          : 0;
+      if (updated > 0) {
+        this.logger.log(
+          `Applied tiered YouTube league priority to ${updated} pending highlight job(s).`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Could not refresh pending YouTube highlight priorities during startup: ${this.errorMessage(error)}`,
+      );
+    }
+
     for (const type of this.lanes.keys()) this.scheduleLane(type, 0);
     void this.recoverLeases();
     this.scheduleLeaseRecovery();
@@ -161,6 +189,8 @@ export class SportsQueueWorkerService
           lastPassStartedAt: lane.lastStartedAt,
           lastPassCompletedAt: lane.lastCompletedAt,
           lastError: lane.lastError,
+          pausedUntil: lane.pausedUntil,
+          quotaPausePeriod: lane.quotaPausePeriod,
         },
       ]),
     );
@@ -207,6 +237,14 @@ export class SportsQueueWorkerService
     if (this.stopped) return;
     const lane = this.lanes.get(type);
     if (!lane) return;
+    if (
+      type === SportsQueueJobType.YOUTUBE_HIGHLIGHT &&
+      lane.pausedUntil &&
+      lane.pausedUntil.getTime() > Date.now()
+    ) {
+      // Event-driven queue wakes must not break a quota pause.
+      return;
+    }
     if (lane.activeJobs > 0) {
       lane.wakeRequested = true;
       // If capacity remains, start another claim without waiting for the
@@ -256,6 +294,44 @@ export class SportsQueueWorkerService
     let releasePermit: (() => void) | undefined;
 
     try {
+      // Quota exhaustion pauses the whole YouTube lane before another job is
+      // claimed. Pending jobs remain untouched and therefore retain tier order.
+      if (
+        type === SportsQueueJobType.YOUTUBE_HIGHLIGHT &&
+        this.providerRateLimits
+      ) {
+        if (lane.pausedUntil && lane.pausedUntil.getTime() > Date.now()) {
+          this.scheduleLane(type, lane.pausedUntil.getTime() - Date.now());
+          return;
+        }
+        lane.pausedUntil = undefined;
+        lane.quotaPausePeriod = undefined;
+
+        const [dailyRemaining, monthlyRemaining] = await Promise.all([
+          this.providerRateLimits.getRemainingDailyRequests('youtube'),
+          this.providerRateLimits.getRemainingMonthlyRequests('youtube'),
+        ]);
+        const exhaustedPeriod =
+          dailyRemaining !== null && dailyRemaining <= 0
+            ? 'daily'
+            : monthlyRemaining !== null && monthlyRemaining <= 0
+              ? 'monthly'
+              : undefined;
+
+        if (exhaustedPeriod) {
+          const resumeAt = this.providerRateLimits.getQuotaResumeAt(
+            'youtube',
+            exhaustedPeriod,
+          );
+          lane.pausedUntil = resumeAt;
+          lane.quotaPausePeriod = exhaustedPeriod;
+          lane.lastError = `YouTube ${exhaustedPeriod} quota exhausted; lane paused until ${resumeAt.toISOString()}.`;
+          this.logger.warn(lane.lastError);
+          this.scheduleLane(type, Math.max(1_000, resumeAt.getTime() - Date.now()));
+          return;
+        }
+      }
+
       // Bypass lanes remain outside the shared gate. All other lanes obtain
       // global capacity before claiming so they never hold a lease while waiting.
       if (!GLOBAL_GATE_BYPASS_JOB_TYPES.has(type)) {
@@ -441,4 +517,5 @@ export class SportsQueueWorkerService
           .slice(0, 500);
   }
 }
+
 

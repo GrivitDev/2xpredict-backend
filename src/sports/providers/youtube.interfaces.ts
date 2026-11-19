@@ -2,7 +2,6 @@ export interface YouTubeSearchOptions {
   query: string;
   channelId?: string;
   publishedAfter?: string;
-  publishedBefore?: string;
   maxResults?: number;
   order?: 'date' | 'relevance';
 }
@@ -58,6 +57,7 @@ export interface YouTubeSearchResponse {
     resultsPerPage?: number;
   };
 }
+
 
 
 

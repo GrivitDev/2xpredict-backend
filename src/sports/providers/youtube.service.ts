@@ -37,12 +37,6 @@ export class YoutubeService implements OnModuleInit {
 
   private readonly baseUrl = YOUTUBE_CONFIG.apiBaseUrl;
 
-  /**
-   * A YouTube highlight is only relevant from the match kickoff
-   * until 24 hours after the match.
-   */
-  private readonly highlightWindowHours = YOUTUBE_CONFIG.highlightWindowHours;
-
   private http!: AxiosInstance;
 
   private apiKey = '';
@@ -133,14 +127,11 @@ export class YoutubeService implements OnModuleInit {
       params.publishedAfter = options.publishedAfter;
     }
 
-    if (options.publishedBefore) {
-      params.publishedBefore = options.publishedBefore;
-    }
-
     if (YOUTUBE_CONFIG.requireEmbeddable) {
+      // Embeddability matters because highlights are displayed inside 2xPredict.
+      // videoSyndicated is intentionally omitted: it excludes otherwise valid
+      // embeddable videos that YouTube does not classify as syndicated.
       params.videoEmbeddable = 'true';
-
-      params.videoSyndicated = 'true';
     }
 
     return this.request<YouTubeSearchResponse>('/search', 'search', params);
@@ -151,19 +142,13 @@ export class YoutubeService implements OnModuleInit {
   // ============================================================
 
   /**
-   * Searches YouTube specifically for the finished fixture.
+   * Searches for match highlights without assuming the publisher puts both
+   * club names in the video title. Player-focused titles are common; fixture
+   * identity is therefore checked against the title and description together.
    *
-   * Rules:
-   *
-   * 1. Search using both team names only; do not require the query to contain
-   *    the word "highlights".
-   * 2. Restrict early requests to configured channels; the final attempt is broad.
-   * 3. Search only from kickoff through 24 hours after kickoff.
-   * 4. Independently validate every returned video's publication date.
-   * 5. Normalize team names and allow recognised common team-name variants.
-   * 6. Accept common highlight/recap/goal terminology without requiring one
-   *    exact title format; reject obvious non-highlight content.
-   * 7. Select the best valid candidate.
+   * Publication time is a hard safety boundary: a video published before
+   * kickoff is never accepted. There is deliberately no post-kickoff expiry,
+   * because quota-paused queue jobs must remain eligible on later days.
    *
    * No videos.list request is made.
    */
@@ -182,31 +167,14 @@ export class YoutubeService implements OnModuleInit {
     if (!(matchDate instanceof Date) || Number.isNaN(matchDate.getTime())) {
       throw new BadRequestException('A valid match date is required');
     }
-
-    const now = new Date();
-    if (matchDate.getTime() > now.getTime()) {
+    if (matchDate.getTime() > Date.now()) {
       this.logger.warn(
-        `Skipping YouTube highlight search because match date is in the future: ${matchDate.toISOString()}`,
+        `Skipping YouTube highlight search because match kickoff is in the future: ${matchDate.toISOString()}`,
       );
       return null;
     }
-
-    const windowEnd = new Date(
-      matchDate.getTime() + this.highlightWindowHours * 60 * 60 * 1000,
-    );
-    if (now.getTime() > windowEnd.getTime()) {
-      this.logger.debug(
-        `Skipping YouTube highlight search because the 24-hour window has expired for ${normalizedHome} vs ${normalizedAway}`,
-      );
-      return null;
-    }
-
-    const searchEnd = windowEnd.getTime() < now.getTime() ? windowEnd : now;
 
     // Registry entries may be immutable channel IDs or official @handles.
-    // Resolve handles through channels.list because search.list's channelId
-    // filter requires the immutable channel ID. channels.list is tracked and
-    // rate-limited, but is excluded from the reserved search.list request count.
     const channelReference = channelId?.trim() || undefined;
     const resolvedChannelId = channelReference
       ? await this.resolveChannelId(channelReference)
@@ -218,22 +186,13 @@ export class YoutubeService implements OnModuleInit {
       return null;
     }
 
-    // Search only the fixture's two teams. Requiring "highlights" in the
-    // query makes YouTube miss videos titled "Goals", "Match Recap", or
-    // other reasonable variations. The queue still controls which channel
-    // is searched for each attempt.
-    const query = `${normalizedHome} ${normalizedAway}`;
-
-    // One queue job performs exactly one API search. The final stage intentionally
-    // omits the channel filter; retries are persisted by SportsQueueWorkerService.
+    // Keep the query broad. Requiring a literal "highlights" term here can
+    // suppress player-centred uploads whose descriptions identify the fixture.
     const searchResponse = await this.searchVideos({
-      query,
-      // The query is intentionally broader now that "highlights" is not
-      // required. Return more candidates so validation can choose a suitable one.
-      maxResults: 10,
-      order: 'date',
+      query: `${normalizedHome} ${normalizedAway}`,
+      maxResults: YOUTUBE_CONFIG.searchWorkflow.maxResultsPerSearch,
+      order: 'relevance',
       publishedAfter: matchDate.toISOString(),
-      publishedBefore: searchEnd.toISOString(),
       channelId: resolvedChannelId,
     });
 
@@ -266,7 +225,6 @@ export class YoutubeService implements OnModuleInit {
             normalizedHome,
             normalizedAway,
             matchDate,
-            windowEnd,
           ),
       );
 
@@ -327,64 +285,36 @@ export class YoutubeService implements OnModuleInit {
     homeTeam: string,
     awayTeam: string,
     matchDate: Date,
-    windowEnd: Date,
   ): boolean {
-    if (!video.publishedAt) {
-      return false;
-    }
+    if (!video.publishedAt) return false;
 
     const publishedAt = new Date(video.publishedAt);
-
-    if (Number.isNaN(publishedAt.getTime())) {
-      return false;
-    }
-
-    /*
-     * Absolute publication window.
-     *
-     * The result must have been published:
-     *
-     *     >= match kickoff
-     *     <= match kickoff + 24h
-     */
+    const now = Date.now();
     if (
+      Number.isNaN(publishedAt.getTime()) ||
       publishedAt.getTime() < matchDate.getTime() ||
-      publishedAt.getTime() > windowEnd.getTime() ||
-      publishedAt.getTime() > Date.now()
+      publishedAt.getTime() > now
     ) {
+      // The kickoff boundary is strict. Earlier uploads can never qualify.
       return false;
     }
 
     const title = this.normalize(video.title);
-    const searchText = this.normalize(
-      `${video.title} ${video.description ?? ''}`,
-    );
+    const description = this.normalize(video.description ?? '');
+    const searchableText = `${title} ${description}`.trim();
+    if (!title || !searchableText) return false;
 
-    if (!title || !searchText) {
+    // The fixture may be identified in the description while the title uses
+    // the names of scorers or other key players. Both teams must still be
+    // established somewhere in the video metadata to avoid generic/fake hits.
+    if (
+      !this.teamAppearsInText(searchableText, homeTeam) ||
+      !this.teamAppearsInText(searchableText, awayTeam)
+    ) {
       return false;
     }
 
-    // Keep the fixture identity check, but normalize accents, punctuation,
-    // spacing and common short forms before comparing the names.
-    // Both team identities must appear in the TITLE. Description-only matches
-    // are too weak and were a source of unrelated videos being accepted.
-    if (!this.teamAppearsInText(title, homeTeam)) {
-      return false;
-    }
-
-    if (!this.teamAppearsInText(title, awayTeam)) {
-      return false;
-    }
-
-    // Do not require the literal word "highlight(s)". Legitimate publishers
-    // also use terms such as "goals", "match recap", or "best moments".
-    // At the same time, avoid selecting interviews, previews, livestreams,
-    // reactions, podcasts, game-play videos and press conferences.
-    if (!this.isHighlightLike(title, searchText, video.channelTitle)) {
-      return false;
-    }
-
-    return true;
+    return this.isHighlightLike(title, description, video.channelTitle);
   }
 
   // ============================================================
@@ -396,71 +326,33 @@ export class YoutubeService implements OnModuleInit {
     homeTeam: string,
     awayTeam: string,
   ): YouTubeVideoResult | null {
-    if (!videos.length) {
-      return null;
-    }
+    if (!videos.length) return null;
 
     const scored = videos.map((video) => {
       const title = this.normalize(video.title);
-
+      const description = this.normalize(video.description ?? '');
+      const channel = this.normalize(video.channelTitle ?? '');
       let score = 0;
 
-      /*
-       * Full team-name presence gets stronger weighting than
-       * partial token matches.
-       */
-      if (title.includes(this.normalize(homeTeam))) {
-        score += 8;
-      } else if (this.teamAppearsInText(title, homeTeam)) {
-        score += 6;
-      }
-
-      if (title.includes(this.normalize(awayTeam))) {
-        score += 8;
-      } else if (this.teamAppearsInText(title, awayTeam)) {
-        score += 6;
-      }
-
-      if (title.includes('highlights')) {
-        score += 3;
-      } else if (title.includes('highlight')) {
-        score += 2;
-      } else if (title.includes('goals') || title.includes('match recap')) {
-        score += 2;
-      }
-
-      const channelTitle = this.normalize(video.channelTitle ?? '');
-      if (
-        /\b(official|league|sports|football|soccer|dazn|bein|uefa|fifa)\b/.test(
-          channelTitle,
-        )
-      ) {
-        score += 1;
-      }
+      // Give the strongest weight to fixture identity in the title, but do not
+      // reject a player-focused title when the description identifies the match.
+      score += this.teamAppearsInText(title, homeTeam) ? 10 : 4;
+      score += this.teamAppearsInText(title, awayTeam) ? 10 : 4;
+      if (this.hasHighlightMarker(title)) score += 6;
+      else if (this.hasHighlightMarker(description)) score += 3;
+      if (this.isRecognizedFootballPublisher(channel)) score += 2;
+      if (/\b(extended|full|official|all goals|matchday)\b/.test(title)) score += 1;
 
       const publishedTime = video.publishedAt
         ? new Date(video.publishedAt).getTime()
         : 0;
-
-      return {
-        video,
-        score,
-        publishedTime,
-      };
+      return { video, score, publishedTime };
     });
 
-    /*
-     * Match relevance comes first. Publication time is only a tie-breaker
-     * between candidates that already look equally relevant to this fixture.
-     */
-    scored.sort((a, b) => {
-      if (b.score !== a.score) {
-        return b.score - a.score;
-      }
-
-      return b.publishedTime - a.publishedTime;
-    });
-
+    // Relevance comes first. Publication recency is only a tie-breaker.
+    scored.sort((a, b) =>
+      b.score - a.score || b.publishedTime - a.publishedTime,
+    );
     return scored[0]?.video ?? null;
   }
 
@@ -560,35 +452,52 @@ export class YoutubeService implements OnModuleInit {
 
   private isHighlightLike(
     title: string,
-    searchText: string,
+    description: string,
     channelTitle?: string,
   ): boolean {
     const titleText = this.normalize(title);
-    const fullText = this.normalize(searchText);
-
-    // These formats are not match highlights, even if both club names appear.
-    const nonHighlightPattern =
-      /\b(interviews?|press conference|preview|predictions?|reaction|watchalong|watch along|podcasts?|livestream|live stream|full match live|commentary only|analysis|tactics|efootball|pes gameplay|gameplay|gaming|virtual football|virtual soccer|lego|cartoon|animated|animation|fc 2[0-9]|fifa 2[0-9]|fifa ultimate team)\b/;
+    const descriptionText = this.normalize(description);
     const channelText = this.normalize(channelTitle ?? '');
-    const metadataText = `${titleText} ${fullText} ${channelText}`;
 
+    // Explicitly reject formats that are commonly returned for team searches.
+    const nonHighlightPattern =
+      /\b(interviews?|press conference|preview|predictions?|reaction|watchalong|watch along|podcasts?|livestream|live stream|full match live|commentary only|tactical analysis|analysis|tactics|efootball|pes gameplay|gameplay|gaming|virtual football|virtual soccer|lego|cartoon|animated|animation|fifa 2[0-9]|fc 2[0-9]|ultimate team)\b/;
+    if (nonHighlightPattern.test(titleText)) return false;
+
+    // Game-play/animation exclusions apply to the wider metadata too.
     if (
-      nonHighlightPattern.test(titleText) ||
-      /\b(lego|cartoon|animated|animation|virtual football|virtual soccer|gameplay|gaming|efootball|pes gameplay)\b/.test(
-        metadataText,
+      /\b(lego|cartoon|animated|animation|virtual football|virtual soccer|gameplay|gaming|efootball|pes gameplay|fifa ultimate team)\b/.test(
+        `${titleText} ${descriptionText}`,
       )
     ) {
       return false;
     }
 
-    // Do not enforce a single title vocabulary. Broadly-used labels for actual
-    // match footage, goals and recaps are accepted as well as "highlights".
-    const highlightPattern =
-      /\b(highlights?|extended highlights?|full highlights?|game highlights?|goal highlights?|goals?|all goals|all the goals|match recap|post match recap|game recap|recap|match summary|best moments|match action|key moments|goal compilation|matchday highlights|highlights and goals|goals and highlights|full time highlights)\b/;
+    if (this.hasHighlightMarker(titleText)) return true;
 
-    // A highlight marker in the description alone is not enough to identify
-    // the video itself as match highlights. Require the title to establish it.
-    return highlightPattern.test(titleText);
+    // Allow a player-centred title only when the video description itself
+    // carries highlight language and the title describes match action, or the
+    // uploader is a recognisable football broadcaster/competition channel.
+    const playerOrMatchActionPattern =
+      /\b(goals?|brace|hat trick|hat-trick|penalt(?:y|ies)|assists?|saves?|masterclass|performance|moments?|vs|versus|match action)\b/;
+    return (
+      this.hasHighlightMarker(descriptionText) &&
+      (playerOrMatchActionPattern.test(titleText) ||
+        this.isRecognizedFootballPublisher(channelText))
+    );
+  }
+
+  private hasHighlightMarker(value: string): boolean {
+    const text = this.normalize(value);
+    const highlightPattern =
+      /\b(highlights?|extended highlights?|full highlights?|game highlights?|goal highlights?|goals?|all goals|all the goals|match recap|post match recap|game recap|recap|match summary|best moments|match action|key moments|goal compilation|matchday highlights|highlights and goals|goals and highlights|full time highlights|player highlights|best saves|top saves)\b/;
+    return highlightPattern.test(text);
+  }
+
+  private isRecognizedFootballPublisher(channelTitle: string): boolean {
+    return /\b(official|league|football|soccer|sports|sport|dazn|bein|espn|fifa|uefa|premier|sky|fox|tnt|sporty|sportytv|supersport)\b/.test(
+      this.normalize(channelTitle),
+    );
   }
 
   // ============================================================
@@ -716,6 +625,7 @@ export class YoutubeService implements OnModuleInit {
     this.logger.error(`YouTube API request failed: ${endpoint}`, error);
   }
 }
+
 
 
 

@@ -56,6 +56,48 @@ export class SportsQueueService {
     this.wakeHandler?.(type);
   }
 
+  /**
+   * Refreshes only pending YouTube highlight jobs to the current league tiers.
+   * Processing and terminal jobs are intentionally untouched. This also
+   * upgrades jobs created before tiered priority was introduced.
+   */
+  async reprioritizePendingYoutubeHighlightJobs(
+    priorityByLeague: Readonly<Record<string, number>>,
+  ): Promise<number> {
+    const entries = Object.entries(priorityByLeague).filter(
+      ([leagueId, priority]) => Boolean(leagueId) && Number.isFinite(priority),
+    );
+    if (!entries.length) return 0;
+
+    const branches = entries.map(([leagueId, priority]) => ({
+      case: { $eq: ['$scope.leagueId', leagueId] },
+      then: this.priority(priority),
+    }));
+    const result = await this.queueModel.updateMany(
+      {
+        type: SportsQueueJobType.YOUTUBE_HIGHLIGHT,
+        status: SportsQueueJobStatus.PENDING,
+        'scope.leagueId': { $in: entries.map(([leagueId]) => leagueId) },
+      },
+      [
+        {
+          $set: {
+            priority: {
+              $switch: {
+                branches,
+                default: '$priority',
+              },
+            },
+          },
+        },
+      ],
+    ).exec();
+
+    const modified = Number(result.modifiedCount ?? 0);
+    if (modified > 0) this.notifyWorker(SportsQueueJobType.YOUTUBE_HIGHLIGHT);
+    return modified;
+  }
+
   async enqueue(request: SportsQueueEnqueueRequest): Promise<{ created: boolean; jobKey: string }> {
     const scheduledFor = request.scheduledFor ?? new Date();
     const normalizedScope = this.sortObject((request.scope ?? {}) as Record<string, unknown>);
@@ -655,3 +697,4 @@ export class SportsQueueService {
       ]));
   }
 }
+

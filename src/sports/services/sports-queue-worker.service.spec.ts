@@ -117,6 +117,34 @@ describe('SportsQueueWorkerService global-gate routing', () => {
     expect(completedStatus.running).toBe(false);
   });
 
+
+  it('pauses only the YouTube lane when its daily quota is exhausted', async () => {
+    const resumeAt = new Date(Date.now() + 60_000);
+    (worker as any).providerRateLimits = {
+      getRemainingDailyRequests: jest.fn().mockResolvedValue(0),
+      getRemainingMonthlyRequests: jest.fn().mockResolvedValue(null),
+      getQuotaResumeAt: jest.fn().mockReturnValue(resumeAt),
+    };
+
+    await (worker as any).pumpLane(SportsQueueJobType.YOUTUBE_HIGHLIGHT);
+
+    expect(queue.claimNext).not.toHaveBeenCalled();
+    expect((worker.getMonitorStatus() as any).lanes[SportsQueueJobType.YOUTUBE_HIGHLIGHT]).toEqual(
+      expect.objectContaining({
+        pausedUntil: resumeAt,
+        quotaPausePeriod: 'daily',
+      }),
+    );
+
+    // The quota gate must not pause an unrelated sports worker lane.
+    await (worker as any).pumpLane(SportsQueueJobType.MATCH_SUMMARY_COLLECTION);
+    expect(queue.claimNext).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Number),
+      SportsQueueJobType.MATCH_SUMMARY_COLLECTION,
+    );
+  });
+
   it('keeps every non-live lane at concurrency one', async () => {
     const type = SportsQueueJobType.MATCH_SUMMARY_COLLECTION;
     const resolvers: Array<(job: any) => void> = [];
@@ -139,3 +167,4 @@ describe('SportsQueueWorkerService global-gate routing', () => {
     await Promise.all([first, second]);
   });
 });
+

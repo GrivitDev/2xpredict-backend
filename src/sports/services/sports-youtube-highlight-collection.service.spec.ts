@@ -192,3 +192,69 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
     );
   });
 });
+
+describe('SportsYoutubeHighlightCollectionService ranked scheduling', () => {
+  afterEach(() => jest.useRealTimers());
+
+  it('keeps an old completed fixture eligible and applies its league priority', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-11-19T10:00:00.000Z'));
+    const enqueue = jest.fn().mockResolvedValue({ created: true, jobKey: 'youtube-job' });
+    const updateOne = jest.fn(() => ({ exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }) }));
+    const service = Object.create(
+      SportsYoutubeHighlightCollectionService.prototype,
+    ) as any;
+    service.queue = {
+      hasActiveFixtureJob: jest.fn().mockResolvedValue(false),
+      enqueue,
+    };
+    service.highlightModel = { updateOne };
+
+    const fixture = {
+      id: 'fixture-old',
+      competitionId: 'competition-1',
+      seasonId: 'season-1',
+      seasonYear: 2026,
+      kickoffAt: new Date('2026-11-16T08:00:00.000Z'),
+      completedAt: new Date('2026-11-16T10:00:00.000Z'),
+    };
+
+    await expect(service.enqueueAttempt(fixture, 'eng.1', 1)).resolves.toBe(true);
+
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: SportsQueueJobType.YOUTUBE_HIGHLIGHT,
+        priority: 40,
+        scope: expect.objectContaining({
+          fixtureId: 'fixture-old',
+          leagueId: 'eng.1',
+        }),
+      }),
+    );
+  });
+
+  it('assigns lower-ranked leagues a lower queue priority', async () => {
+    const enqueue = jest.fn().mockResolvedValue({ created: true, jobKey: 'youtube-job' });
+    const updateOne = jest.fn(() => ({ exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }) }));
+    const service = Object.create(
+      SportsYoutubeHighlightCollectionService.prototype,
+    ) as any;
+    service.queue = {
+      hasActiveFixtureJob: jest.fn().mockResolvedValue(false),
+      enqueue,
+    };
+    service.highlightModel = { updateOne };
+
+    const fixture = {
+      id: 'fixture-rank-four',
+      competitionId: 'competition-4',
+      kickoffAt: new Date('2026-11-18T08:00:00.000Z'),
+      completedAt: new Date('2026-11-18T10:00:00.000Z'),
+    };
+
+    await service.enqueueAttempt(fixture, 'gre.1', 1);
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ priority: 10 }),
+    );
+  });
+});
+

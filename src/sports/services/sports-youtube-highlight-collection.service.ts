@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
-import { YOUTUBE_CONFIG } from '../config/youtube.config';
+import { getYoutubeLeaguePriority, YOUTUBE_CONFIG } from '../config/youtube.config';
 import { getYoutubeHighlightSearchPlan } from '../enums/official-youtube-channel.enum';
 import { SportsQueueJobType } from '../interfaces/sports-queue.interface';
 import { SportsFixtureRecord } from '../interfaces/sports-domain.interface';
@@ -19,7 +19,7 @@ const SUPPORTED_YOUTUBE_COMPETITIONS = new Set<string>(
   YOUTUBE_CONFIG.supportedCompetitionSlugs.map((value) => value.toLowerCase()),
 );
 const HIGHLIGHT_RECONCILIATION_LOOKBACK_MS =
-  YOUTUBE_CONFIG.highlightWindowHours * 60 * 60_000;
+  YOUTUBE_CONFIG.reconciliationLookbackDays * 24 * 60 * 60_000;
 const SEARCHING_RECOVERY_GRACE_MS = 12 * 60_000;
 
 export type SportsYoutubeOutcome =
@@ -51,8 +51,8 @@ export class SportsYoutubeHighlightCollectionService {
   /**
    * Periodic safety net for completed fixtures whose original post-match
    * follow-up was missed, quarantined, or completed before highlight collection
-   * was enabled. The kickoff window bounds the scan; joins exclude unsupported
-   * competitions and terminal highlight records.
+   * was enabled. A 30-day lookback is a recovery boundary, not a publication
+   * expiry; queued jobs can still resume after longer quota pauses.
    */
   async reconcileRecentCompletedFixtures(
     limit = 100,
@@ -191,13 +191,9 @@ export class SportsYoutubeHighlightCollectionService {
     if (!this.isCompleted(fixture) || !this.youtube.isEnabled()) return false;
 
     const kickoffAt = new Date(fixture.kickoffAt).getTime();
-    const highlightWindowEnd =
-      kickoffAt + YOUTUBE_CONFIG.highlightWindowHours * 60 * 60_000;
-    if (
-      !Number.isFinite(kickoffAt) ||
-      Date.now() < kickoffAt ||
-      Date.now() > highlightWindowEnd
-    ) return false;
+    // Do not expire completed fixtures after 24 hours. Quota-paused work must
+    // remain eligible when the YouTube lane resumes on a later quota day.
+    if (!Number.isFinite(kickoffAt) || Date.now() < kickoffAt) return false;
 
     const competition = await this.competitionModel.findOne({ id: fixture.competitionId }).lean().exec();
     const competitionSlug = String(competition?.slug ?? fixture.competitionId).toLowerCase();
@@ -293,9 +289,8 @@ export class SportsYoutubeHighlightCollectionService {
     if (!homeName || !awayName) throw new Error(`Fixture ${fixture.id} is missing normalized team names for YouTube search`);
 
     const kickoff = new Date(fixture.kickoffAt);
-    const expiry = kickoff.getTime() + YOUTUBE_CONFIG.highlightWindowHours * 60 * 60_000;
-    if (Number.isNaN(kickoff.getTime()) || Date.now() < kickoff.getTime() || Date.now() > expiry) {
-      await this.markTerminal(fixture, homeName, awayName, 'YouTube highlight search window has expired or the match is not yet due.');
+    if (Number.isNaN(kickoff.getTime()) || Date.now() < kickoff.getTime()) {
+      await this.markTerminal(fixture, homeName, awayName, 'YouTube highlight search is not valid before match kickoff.');
       return 'SKIPPED';
     }
 
@@ -427,21 +422,8 @@ export class SportsYoutubeHighlightCollectionService {
     const retryAt = period === 'monthly'
       ? this.getNextUtcMonthStart()
       : this.getNextLagosMidnight();
-    const expiry = new Date(
-      new Date(fixture.kickoffAt).getTime() +
-      YOUTUBE_CONFIG.highlightWindowHours * 60 * 60_000,
-    );
-
-    if (retryAt.getTime() >= expiry.getTime()) {
-      await this.markTerminal(
-        fixture,
-        homeName,
-        awayName,
-        `${reason} The 24-hour highlight window will expire before quota is available again.`,
-      );
-      return;
-    }
-
+    // Keep the current stage pending for the next quota period. There is no
+    // post-kickoff publication expiry, so an overnight pause cannot terminalise it.
     await this.highlightModel.updateOne(
       { fixtureId: fixture.id, status: { $nin: ['FOUND', 'FAILED'] } },
       { $set: { status: 'RETRY', error: reason, nextRetryAt: retryAt } },
@@ -483,14 +465,12 @@ export class SportsYoutubeHighlightCollectionService {
     const completionReference = fixture.completedAt
       ? new Date(fixture.completedAt)
       : new Date(kickoff.getTime() + 2 * 60 * 60_000);
-    const expiry = new Date(kickoff.getTime() + YOUTUBE_CONFIG.highlightWindowHours * 60 * 60_000);
     const target = new Date(completionReference.getTime() + offsets[attempt - 1] * 60_000);
     const now = Date.now();
     // Round overdue enqueue times to a stable minute so concurrent lifecycle
     // passes produce the same durable job identity instead of duplicate jobs.
     const immediateDueAt = new Date(Math.floor(now / 60_000) * 60_000);
     const scheduledFor = scheduledForOverride ?? (target.getTime() > now ? target : immediateDueAt);
-    if (Date.now() > expiry.getTime() || scheduledFor.getTime() > expiry.getTime()) return false;
     if (await this.queue.hasActiveFixtureJob(
       SportsQueueJobType.YOUTUBE_HIGHLIGHT,
       fixture.id,
@@ -507,7 +487,7 @@ export class SportsYoutubeHighlightCollectionService {
         seasonYear: fixture.seasonYear,
         youtubeAttempt: attempt,
       },
-      priority: 18,
+      priority: getYoutubeLeaguePriority(competitionSlug),
       scheduledFor,
       triggerEventId: `youtube-highlight:${fixture.id}:attempt:${attempt}`,
     });
@@ -599,3 +579,4 @@ export class SportsYoutubeHighlightCollectionService {
     return error instanceof Error ? error.message.replace(/[\r\n]+/g, ' ').slice(0, 220) : String(error).slice(0, 220);
   }
 }
+

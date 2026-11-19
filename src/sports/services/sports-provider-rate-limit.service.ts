@@ -611,6 +611,16 @@ export class SportsProviderRateLimitService {
   // REMAINING DAILY
   // ============================================================
 
+  /** Returns the provider quota period boundary used to resume a paused lane. */
+  getQuotaResumeAt(
+    _provider: SportsProvider,
+    period: 'daily' | 'monthly',
+    from = new Date(),
+  ): Date {
+    if (period === 'daily') return this.getNextLagosMidnight(from);
+    return new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + 1, 1));
+  }
+
   async getRemainingDailyRequests(
     provider: SportsProvider,
   ): Promise<number | null> {
@@ -1104,6 +1114,7 @@ export class SportsProviderRateLimitService {
     });
   }
 }
+
 
 
 
