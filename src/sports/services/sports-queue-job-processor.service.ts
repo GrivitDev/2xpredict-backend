@@ -250,10 +250,10 @@ export class SportsQueueJobProcessorService {
         );
         if (!monitoring.shouldContinue) return;
 
-        // Continue at two-minute cadence for the first four hours after the
-        // earliest known kickoff, then verify every thirty minutes until ESPN
-        // reports a terminal fixture state. Missing/invalid kickoff metadata
-        // is resolved by the collection service using persisted fixtures/date.
+        // Use the configured fast cadence for the first four hours, then
+        // verify every thirty minutes through the first two days and every six
+        // hours thereafter. Completed fixtures with missing scores also remain
+        // eligible for low-frequency verification.
         successorRecurrence = {
           ...job.recurrence,
           intervalMs:
@@ -2518,11 +2518,23 @@ export class SportsQueueJobProcessorService {
         }
       }
 
-      if (
-        actionable.some(
-          (item) => item.status.state !== 'COMPLETED' && !item.status.isFinal,
-        )
-      ) {
+      const requiresStatusVerification = actionable.some((item) => {
+        const completed =
+          item.status.state === 'COMPLETED' || item.status.isFinal;
+        if (!completed) return true;
+        return !(
+          Array.isArray(item.competitors) &&
+          item.competitors.length === 2 &&
+          item.competitors.every(
+            (competitor) =>
+              competitor.score !== null &&
+              competitor.score !== undefined &&
+              Number.isFinite(Number(competitor.score)),
+          )
+        );
+      });
+
+      if (requiresStatusVerification) {
         await this.scheduleLiveScoreboard(
           group.competition,
           actionable[0],

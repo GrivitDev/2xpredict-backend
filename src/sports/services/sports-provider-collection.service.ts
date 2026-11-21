@@ -184,9 +184,26 @@ export class SportsProviderCollectionService {
   async collectLiveScoreboard(
     leagueId: string,
     context: Omit<FixtureNormalizationContext, 'leagueId' | 'collectedAt'>,
+    date?: string,
   ): Promise<FixtureCollectionResult> {
-    // Live monitoring always calls the unfiltered Site /scoreboard route. The
-    // date remains only a local queue/continuation scope, not a provider filter.
+    // The durable live-monitoring job is competition/date scoped. Use that
+    // date in the ESPN request as well; the unfiltered live endpoint does not
+    // reliably return fixtures from previous calendar dates.
+    if (date !== undefined) {
+      const normalizedDate = date.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) {
+        throw new Error(`Invalid live scoreboard date: ${date}`);
+      }
+      const response = await this.espn.getDateScopedLiveScoreboard(leagueId, normalizedDate);
+      return this.normalizeScoreboard(
+        response,
+        leagueId,
+        context,
+        `/scoreboard?dates=${normalizedDate.replace(/-/g, '')}`,
+      );
+    }
+
+    // Backward compatibility for any legacy caller that has no date scope.
     const response = await this.espn.getLiveScoreboard(leagueId);
     return this.normalizeScoreboard(response, leagueId, context, '/scoreboard');
   }

@@ -231,6 +231,19 @@ export class EspnV2Client {
     );
   }
 
+  /** Date-scoped scoreboard request that retains the reserved live lane. */
+  getDateScopedLiveScoreboard(
+    leagueId: string,
+    date: string,
+  ): Promise<ProviderJsonObject> {
+    const league = this.requiredPathId(leagueId, 'leagueId');
+    return this.get(
+      `${this.siteBaseUrl}/${league}/scoreboard`,
+      'live-scoreboard',
+      { dates: this.toCompactDate(date) },
+    );
+  }
+
   getMonthlyScoreboard(
     leagueId: string,
     month: string,
@@ -1055,6 +1068,7 @@ export class EspnV2Client {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
+
 
 
 

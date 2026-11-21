@@ -31,6 +31,11 @@ const timestampOf = (value: unknown): number => {
   return Number.NaN;
 };
 
+const HOUR = 60 * 60_000;
+const STALE_FIXTURE_RECOVERY_AFTER_MS = 4 * HOUR;
+const SUMMARY_RECOVERY_COOLDOWN_MS = 6 * HOUR;
+const MAX_SUMMARY_RECOVERIES_PER_PASS = 2;
+
 /**
  * Coordinates provider collection, normalization, persistence and freshness state.
  * Scheduling is owned by the durable queue processor, not this service.
@@ -427,7 +432,8 @@ export class SportsDomainCollectionService {
 
     if (successfulStateIsRecent) return false;
 
-    if (state.status === 'PROCESSING' || state.status === 'FAILED') {
+    // NO_DATA is a completed attempt too; it must not be retried on every monitor pass.
+    if (['PROCESSING', 'FAILED', 'NO_DATA'].includes(String(state.status))) {
       const recentAttemptValue =
         state.status === 'PROCESSING'
           ? (state.lastStartedAt ?? state.updatedAt)
@@ -545,48 +551,216 @@ export class SportsDomainCollectionService {
     scope: { competitionId: string; seasonId?: string; seasonYear?: number },
     date?: string,
   ): Promise<FixtureCollectionResult> {
-    const endpoint = '/scoreboard';
+    const normalizedDate = date?.trim();
+    const endpoint = normalizedDate
+      ? `/scoreboard?dates=${normalizedDate.replace(/-/g, '')}`
+      : '/scoreboard';
     const input = this.stateInput(
       'LIVE_SCOREBOARD',
       'COMPETITION',
-      `${scope.competitionId}:${date ?? 'CURRENT'}`,
+      `${scope.competitionId}:${normalizedDate ?? 'CURRENT'}`,
       endpoint,
       2 * 60_000,
     );
     await this.state.markStarted(input);
     try {
-      const result = await this.provider.collectLiveScoreboard(leagueId, scope);
-      const recovered: SportsFixtureRecord[] = [];
-      const unresolved: string[] = [];
-      let retryableFallbackError: unknown;
+      if (
+        normalizedDate &&
+        !/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)
+      ) {
+        throw new Error(`Invalid live scoreboard date: ${normalizedDate}`);
+      }
+
+      // Read the already-known fixtures for this date once. The same rows are
+      // used to detect old matches that ESPN omitted or returned without a
+      // final score; normal, complete scoreboard responses need no Summary
+      // fallback requests.
+      const knownFixtures = normalizedDate
+        ? await this.persistence.getFixturesForCompetitionDate(
+            scope.competitionId,
+            normalizedDate,
+          )
+        : [];
+
+      const result = await this.provider.collectLiveScoreboard(
+        leagueId,
+        scope,
+        normalizedDate,
+      );
+
+      // Persist the date-scoped scoreboard once. Summary fallback persists its
+      // own recovered fixture, so including those rows in a second bulk write
+      // would duplicate database work for the same match.
+      const saved = await this.persistence.saveFixtures(result.items);
+      result.previousStates = saved.previousStates;
+
+      const candidates = new Map<
+        string,
+        { eventId: string; fixture?: SportsFixtureRecord; reason: string }
+      >();
+
+      // A malformed scoreboard event can still be recovered from its ESPN
+      // Summary. Keep these ahead of general stale-fixture recovery.
       for (const rejected of result.rejected) {
-        if (!rejected.eventId) {
-          unresolved.push(`unknown-event:${rejected.reason}`);
+        const eventId = String(rejected.eventId ?? '').trim();
+        if (!eventId) {
+          this.logger.warn(
+            `Live scoreboard ${leagueId}/${normalizedDate ?? 'CURRENT'} rejected an event without an ESPN event ID: ${rejected.reason}`,
+          );
           continue;
         }
+        const knownFixture = knownFixtures.find(
+          (fixture) => fixture.espnEventId === eventId,
+        );
+        candidates.set(eventId, {
+          eventId,
+          fixture: knownFixture,
+          reason: 'scoreboard event could not be normalized',
+        });
+      }
+
+      if (normalizedDate && knownFixtures.length) {
+        const incomingById = new Map(
+          result.items.map((fixture) => [fixture.id, fixture] as const),
+        );
+        const returnedEventIds = new Set(
+          result.items.map((fixture) => fixture.espnEventId),
+        );
+        const staleBefore = Date.now() - STALE_FIXTURE_RECOVERY_AFTER_MS;
+        const staleFixtures = [...knownFixtures].sort(
+          (left, right) =>
+            timestampOf(left.kickoffAt) - timestampOf(right.kickoffAt),
+        );
+
+        for (const storedFixture of staleFixtures) {
+          const fixture =
+            incomingById.get(storedFixture.id) ?? storedFixture;
+          const kickoffAt = timestampOf(fixture.kickoffAt);
+          if (!Number.isFinite(kickoffAt) || kickoffAt > staleBefore) continue;
+
+          const state = String(fixture.status?.state ?? 'UNKNOWN');
+          if (['POSTPONED', 'CANCELLED', 'ABANDONED'].includes(state)) continue;
+
+          const isCompleted =
+            fixture.status?.isFinal === true || state === 'COMPLETED';
+          const hasFinalScores =
+            Array.isArray(fixture.competitors) &&
+            fixture.competitors.length === 2 &&
+            fixture.competitors.every(
+              (competitor) =>
+                competitor.score !== null &&
+                competitor.score !== undefined &&
+                Number.isFinite(Number(competitor.score)),
+            );
+          const isMissingFromScoreboard = !returnedEventIds.has(
+            fixture.espnEventId,
+          );
+          const isStillNonTerminal = !isCompleted;
+          const isCompletedWithoutScores = isCompleted && !hasFinalScores;
+
+          if (!isStillNonTerminal && !isCompletedWithoutScores) continue;
+          if (!fixture.espnEventId) continue;
+
+          const reason = isCompletedWithoutScores
+            ? 'completed fixture has an incomplete final score'
+            : isMissingFromScoreboard
+              ? 'old fixture was omitted from its date-specific scoreboard'
+              : 'fixture still has a non-terminal status long after kickoff';
+
+          if (!candidates.has(fixture.espnEventId)) {
+            candidates.set(fixture.espnEventId, {
+              eventId: fixture.espnEventId,
+              fixture,
+              reason,
+            });
+          }
+        }
+      }
+
+      const recovered: SportsFixtureRecord[] = [];
+      const candidateList = [...candidates.values()];
+      // Rotate the small recovery sample every six-hour recovery window.
+      // A fixture whose Summary cooldown is active therefore cannot occupy
+      // the recovery slots forever and starve other stale fixtures.
+      const rotation = candidateList.length
+        ? (
+            Math.floor(Date.now() / SUMMARY_RECOVERY_COOLDOWN_MS) *
+            MAX_SUMMARY_RECOVERIES_PER_PASS
+          ) % candidateList.length
+        : 0;
+      const selectedCandidates = candidateList.length
+        ? candidateList
+            .slice(rotation)
+            .concat(candidateList.slice(0, rotation))
+            .slice(0, MAX_SUMMARY_RECOVERIES_PER_PASS)
+        : [];
+
+      for (const candidate of selectedCandidates) {
+        const kickoffAt = candidate.fixture
+          ? timestampOf(candidate.fixture.kickoffAt)
+          : Number.NaN;
+        const completedAt = candidate.fixture?.completedAt
+          ? timestampOf(candidate.fixture.completedAt)
+          : Number.NaN;
+        const requiredAfter = Number.isFinite(completedAt)
+          ? new Date(completedAt)
+          : Number.isFinite(kickoffAt)
+            ? new Date(kickoffAt + 2 * HOUR)
+            : undefined;
+
+        // A Summary request is permitted only when no recent post-match
+        // snapshot/attempt exists. NO_DATA and FAILED attempts also observe
+        // the cooldown, so suspended/omitted fixtures cannot cause a request
+        // every time the recurring scoreboard monitor runs.
+        const shouldCollect = await this.shouldCollectFixtureSummary(
+          candidate.eventId,
+          SUMMARY_RECOVERY_COOLDOWN_MS,
+          SUMMARY_RECOVERY_COOLDOWN_MS,
+          requiredAfter,
+        );
+        if (!shouldCollect) continue;
+
+        const summaryScope = candidate.fixture
+          ? {
+              ...scope,
+              seasonId: candidate.fixture.seasonId ?? scope.seasonId,
+              seasonYear: candidate.fixture.seasonYear ?? scope.seasonYear,
+            }
+          : scope;
         try {
           const summaryFixture = await this.collectFixtureSummary(
             leagueId,
-            rejected.eventId,
-            scope,
+            candidate.eventId,
+            summaryScope,
           );
-          if (summaryFixture) recovered.push(summaryFixture);
-          else unresolved.push(rejected.eventId);
+          if (summaryFixture) {
+            recovered.push(summaryFixture);
+          } else {
+            this.logger.warn(
+              `Summary recovery for ${candidate.eventId} did not produce a normalized fixture (${candidate.reason}).`,
+            );
+          }
         } catch (error) {
-          unresolved.push(rejected.eventId);
-          if (this.isRetryableProviderError(error))
-            retryableFallbackError ??= error;
+          // The date-specific scoreboard itself succeeded. Do not fail and
+          // repeat that entire request because an optional Summary fallback
+          // failed; the six-hour cooldown and next monitoring pass handle it.
+          this.logger.warn(
+            `Summary recovery failed for ${candidate.eventId} (${candidate.reason}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
       }
-      if (unresolved.length) {
-        if (retryableFallbackError) throw retryableFallbackError;
-        throw new Error(
-          `Live scoreboard ${leagueId} has ${unresolved.length} event(s) that could not be recovered from Summary.`,
-        );
+
+      // Summary collection persists its fixture immediately. Include recovered
+      // fixtures in this result as well so downstream scheduling sees their
+      // newly confirmed state without another database scan.
+      const mergedItems = new Map<string, SportsFixtureRecord>();
+      for (const fixture of [...result.items, ...recovered]) {
+        mergedItems.set(fixture.id, fixture);
       }
-      if (recovered.length) result.items.push(...recovered);
-      const saved = await this.persistence.saveFixtures(result.items);
-      result.previousStates = saved.previousStates;
+      result.items = [...mergedItems.values()];
+
       await this.state.markSucceeded(input, undefined, result.endpoint);
       return result;
     } catch (error) {
@@ -921,19 +1095,34 @@ export class SportsDomainCollectionService {
     );
     if (!fixtures.length) return { shouldContinue: false };
 
-    // Only provider-confirmed terminal states end the monitoring chain. A
-    // stale SCHEDULED state after kickoff is deliberately not terminal: ESPN
-    // may still need to report a delayed, suspended, abandoned or completed match.
-    const terminal = new Set([
-      'COMPLETED',
+    // Only provider-confirmed terminal states with the required result data
+    // end the monitoring chain. A stale SCHEDULED/LIVE state after kickoff is
+    // not terminal, and a COMPLETED fixture without both scores still needs
+    // low-frequency verification.
+    const terminalWithoutScore = new Set([
       'POSTPONED',
       'CANCELLED',
       'ABANDONED',
     ]);
-    const hasUnconfirmedFixture = fixtures.some(
-      (fixture) =>
-        !fixture.status.isFinal && !terminal.has(fixture.status.state),
-    );
+    const hasUnconfirmedFixture = fixtures.some((fixture) => {
+      const state = String(fixture.status?.state ?? 'UNKNOWN');
+      if (terminalWithoutScore.has(state)) return false;
+
+      const completed =
+        fixture.status?.isFinal === true || state === 'COMPLETED';
+      if (!completed) return true;
+
+      return !(
+        Array.isArray(fixture.competitors) &&
+        fixture.competitors.length === 2 &&
+        fixture.competitors.every(
+          (competitor) =>
+            competitor.score !== null &&
+            competitor.score !== undefined &&
+            Number.isFinite(Number(competitor.score)),
+        )
+      );
+    });
     if (!hasUnconfirmedFixture) return { shouldContinue: false };
 
     const expectedKickoff = timestampOf(expectedKickoffAt);
@@ -958,9 +1147,11 @@ export class SportsDomainCollectionService {
       : Number.POSITIVE_INFINITY;
     const liveSchedule = SPORTS_COLLECTION_SCHEDULE.liveScoreboard;
     const intervalMs =
-      elapsedMs >= liveSchedule.activeMonitoringWindowMs
-        ? liveSchedule.finalVerificationIntervalMs
-        : liveSchedule.intervalMs;
+      elapsedMs >= liveSchedule.historicalVerificationAfterMs
+        ? liveSchedule.historicalVerificationIntervalMs
+        : elapsedMs >= liveSchedule.activeMonitoringWindowMs
+          ? liveSchedule.finalVerificationIntervalMs
+          : liveSchedule.intervalMs;
 
     return {
       shouldContinue: true,

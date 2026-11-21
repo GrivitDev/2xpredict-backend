@@ -1597,20 +1597,72 @@ export class SportsPersistenceService {
     const newTerminal = ['COMPLETED', 'CANCELLED', 'ABANDONED'].includes(
       newState,
     );
-    const staleRegression = terminal && !newTerminal;
+    const previousKickoffAt =
+      previous.kickoffAt?.getTime() ?? Number.NaN;
+    const incomingKickoffAt = incoming.kickoffAt.getTime();
+    const previouslyStarted =
+      ['LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES', 'COMPLETED'].includes(oldState);
+    const regressedToNotStarted =
+      previouslyStarted &&
+      ['SCHEDULED', 'UNKNOWN'].includes(newState) &&
+      Number.isFinite(previousKickoffAt) &&
+      previousKickoffAt === incomingKickoffAt;
+    const staleRegression =
+      (terminal && !newTerminal) || regressedToNotStarted;
+    const shouldPreserveKnownScores =
+      staleRegression ||
+      [
+        'LIVE',
+        'HALFTIME',
+        'EXTRA_TIME',
+        'PENALTIES',
+        'COMPLETED',
+        'POSTPONED',
+        'CANCELLED',
+        'ABANDONED',
+      ].includes(newState);
+
+    let safeIncoming = incoming;
+    if (shouldPreserveKnownScores) {
+      const previousByTeam = new Map(
+        (previous.competitors ?? []).map((competitor) => [
+          competitor.teamId,
+          competitor,
+        ] as const),
+      );
+      const competitors = incoming.competitors.map((competitor) => {
+        const previousCompetitor = previousByTeam.get(competitor.teamId);
+        const incomingHasScore =
+          competitor.score !== null && competitor.score !== undefined;
+        if (
+          incomingHasScore ||
+          !previousCompetitor ||
+          previousCompetitor.score === null ||
+          previousCompetitor.score === undefined
+        ) {
+          return competitor;
+        }
+        return {
+          ...competitor,
+          score: previousCompetitor.score,
+          winner: competitor.winner ?? previousCompetitor.winner,
+        };
+      });
+      safeIncoming = {
+        ...incoming,
+        competitors: competitors as typeof incoming.competitors,
+        periodScores:
+          incoming.periodScores?.length
+            ? incoming.periodScores
+            : (previous.periodScores ?? incoming.periodScores),
+      };
+    }
+
     if (staleRegression) {
       return {
-        ...incoming,
+        ...safeIncoming,
         status: previous.status ?? incoming.status,
         completedAt: previous.completedAt ?? incoming.completedAt,
-        competitors: incoming.competitors?.every(
-          (item) => item.score === null || item.score === undefined,
-        )
-          ? (previous.competitors ?? incoming.competitors)
-          : incoming.competitors,
-        periodScores: incoming.periodScores?.length
-          ? incoming.periodScores
-          : (previous.periodScores ?? incoming.periodScores),
       };
     }
 
@@ -1620,18 +1672,18 @@ export class SportsPersistenceService {
     if (
       newState === 'COMPLETED' &&
       oldState !== 'COMPLETED' &&
-      !incoming.completedAt
+      !safeIncoming.completedAt
     ) {
-      return { ...incoming, completedAt: new Date() };
+      return { ...safeIncoming, completedAt: new Date() };
     }
     if (
       newState === 'COMPLETED' &&
       previous.completedAt &&
-      !incoming.completedAt
+      !safeIncoming.completedAt
     ) {
-      return { ...incoming, completedAt: new Date(previous.completedAt) };
+      return { ...safeIncoming, completedAt: new Date(previous.completedAt) };
     }
-    return incoming;
+    return safeIncoming;
   }
 
   private fixtureSourceFingerprint(fixture: SportsFixtureRecord): string {

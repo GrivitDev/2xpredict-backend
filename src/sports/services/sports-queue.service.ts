@@ -91,6 +91,7 @@ export class SportsQueueService {
           },
         },
       ],
+      { updatePipeline: true },
     ).exec();
 
     const modified = Number(result.modifiedCount ?? 0);
@@ -697,5 +698,3 @@ export class SportsQueueService {
       ]));
   }
 }
-
-

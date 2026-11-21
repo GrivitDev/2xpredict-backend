@@ -105,3 +105,92 @@ describe('SportsPersistenceService completed-fixture pagination', () => {
     expect(query.select).toHaveBeenCalledWith('-_id');
   });
 });
+
+
+describe('SportsPersistenceService fixture score regression protection', () => {
+  const service = Object.create(SportsPersistenceService.prototype) as any;
+
+  it('preserves an already-known final score when ESPN omits scores on a later final refresh', () => {
+    const completedAt = new Date('2026-11-18T20:00:00.000Z');
+    const previous = {
+      status: { state: 'COMPLETED', isFinal: true },
+      completedAt,
+      competitors: [
+        { teamId: 'home-1', homeAway: 'HOME', score: 2, winner: true },
+        { teamId: 'away-1', homeAway: 'AWAY', score: 1, winner: false },
+      ],
+      periodScores: [
+        { teamId: 'home-1', period: 1, score: 1 },
+        { teamId: 'away-1', period: 1, score: 0 },
+        { teamId: 'home-1', period: 2, score: 1 },
+        { teamId: 'away-1', period: 2, score: 1 },
+      ],
+    };
+    const incoming = {
+      status: { state: 'COMPLETED', isFinal: true },
+      competitors: [
+        { teamId: 'home-1', homeAway: 'HOME', score: null },
+        { teamId: 'away-1', homeAway: 'AWAY', score: null },
+      ],
+      periodScores: [],
+    };
+
+    const result = service.preventFixtureRegression(incoming, previous);
+
+    expect(result.competitors.map((item: any) => item.score)).toEqual([2, 1]);
+    expect(result.periodScores).toEqual(previous.periodScores);
+    expect(result.completedAt).toEqual(completedAt);
+  });
+
+  it('preserves only the missing team score while accepting a corrected score from ESPN', () => {
+    const previous = {
+      status: { state: 'COMPLETED', isFinal: true },
+      competitors: [
+        { teamId: 'home-1', homeAway: 'HOME', score: 2, winner: true },
+        { teamId: 'away-1', homeAway: 'AWAY', score: 1, winner: false },
+      ],
+      periodScores: [],
+    };
+    const incoming = {
+      status: { state: 'COMPLETED', isFinal: true },
+      competitors: [
+        { teamId: 'home-1', homeAway: 'HOME', score: 3, winner: true },
+        { teamId: 'away-1', homeAway: 'AWAY', score: null },
+      ],
+      periodScores: [],
+    };
+
+    const result = service.preventFixtureRegression(incoming, previous);
+
+    expect(result.competitors.map((item: any) => item.score)).toEqual([3, 1]);
+  });
+
+  it('does not regress a previously live fixture to SCHEDULED when its kickoff is unchanged', () => {
+    const kickoffAt = new Date('2026-11-18T18:00:00.000Z');
+    const previous = {
+      kickoffAt,
+      status: { state: 'LIVE', isFinal: false },
+      competitors: [
+        { teamId: 'home-1', homeAway: 'HOME', score: 1 },
+        { teamId: 'away-1', homeAway: 'AWAY', score: 0 },
+      ],
+      periodScores: [],
+    };
+    const incoming = {
+      kickoffAt: new Date(kickoffAt.getTime()),
+      status: { state: 'SCHEDULED', isFinal: false },
+      competitors: [
+        { teamId: 'home-1', homeAway: 'HOME', score: null },
+        { teamId: 'away-1', homeAway: 'AWAY', score: null },
+      ],
+      periodScores: [],
+    };
+
+    const result = service.preventFixtureRegression(incoming, previous);
+
+    expect(result.status).toEqual(previous.status);
+    expect(result.competitors.map((item: any) => item.score)).toEqual([1, 0]);
+  });
+
+});
+

@@ -193,6 +193,111 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
   });
 });
 
+
+describe('SportsYoutubeHighlightCollectionService incomplete fixture team data', () => {
+  const query = (value: unknown) => ({
+    lean: jest.fn().mockReturnThis(),
+    exec: jest.fn().mockResolvedValue(value),
+  });
+
+  const completedFixture = {
+    id: 'fixture-missing-team-name',
+    espnEventId: 'espn-fixture-missing-team-name',
+    competitionId: 'competition-1',
+    kickoffAt: new Date('2026-11-16T08:00:00.000Z'),
+    completedAt: new Date('2026-11-16T10:00:00.000Z'),
+    status: { state: 'COMPLETED', isFinal: true },
+    competitors: [
+      { teamId: 'home-1', homeAway: 'HOME' },
+      { teamId: 'away-1', homeAway: 'AWAY' },
+    ],
+  };
+
+  it('records a terminal skip when normalized team names are unavailable instead of retrying the queue job', async () => {
+    const updateOne = jest.fn(() => ({
+      exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }),
+    }));
+    const findHighlight = jest.fn();
+    const service = Object.create(
+      SportsYoutubeHighlightCollectionService.prototype,
+    ) as any;
+
+    service.youtube = {
+      isEnabled: jest.fn().mockReturnValue(true),
+      findHighlight,
+    };
+    service.fixtureModel = {
+      findOne: jest.fn(() => query(completedFixture)),
+    };
+    service.competitionModel = {
+      findOne: jest.fn(() => query({ slug: 'eng.1' })),
+    };
+    service.teamModel = {
+      findOne: jest
+        .fn()
+        .mockImplementationOnce(() => query(null))
+        .mockImplementationOnce(() => query({ displayName: '   ', name: 'Chelsea' })),
+    };
+    service.highlightModel = { updateOne };
+    service.logger = { warn: jest.fn() };
+
+    await expect(service.processAttempt('fixture-missing-team-name', 1)).resolves.toBe('SKIPPED');
+
+    expect(updateOne).toHaveBeenCalledWith(
+      { fixtureId: 'fixture-missing-team-name' },
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          homeTeam: 'Unknown home team (home-1)',
+          awayTeam: 'Chelsea',
+          status: 'FAILED',
+          error: expect.stringContaining('normalized name data is unavailable'),
+          nextRetryAt: null,
+        }),
+        $setOnInsert: { retryCount: 0 },
+      }),
+      { upsert: true, setDefaultsOnInsert: true },
+    );
+    expect(findHighlight).not.toHaveBeenCalled();
+    expect(service.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Skipping YouTube highlight for fixture fixture-missing-team-name'),
+    );
+  });
+
+  it('records a terminal skip when either home or away competitor is missing', async () => {
+    const fixture = {
+      ...completedFixture,
+      competitors: [{ teamId: 'home-1', homeAway: 'HOME' }],
+    };
+    const updateOne = jest.fn(() => ({
+      exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }),
+    }));
+    const service = Object.create(
+      SportsYoutubeHighlightCollectionService.prototype,
+    ) as any;
+
+    service.youtube = { isEnabled: jest.fn().mockReturnValue(true) };
+    service.fixtureModel = { findOne: jest.fn(() => query(fixture)) };
+    service.competitionModel = {
+      findOne: jest.fn(() => query({ slug: 'eng.1' })),
+    };
+    service.highlightModel = { updateOne };
+    service.logger = { warn: jest.fn() };
+
+    await expect(service.processAttempt('fixture-missing-team-name', 1)).resolves.toBe('SKIPPED');
+
+    expect(updateOne).toHaveBeenCalledWith(
+      { fixtureId: 'fixture-missing-team-name' },
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: 'FAILED',
+          error: expect.stringContaining('does not contain both home and away competitors'),
+        }),
+      }),
+      { upsert: true, setDefaultsOnInsert: true },
+    );
+  });
+});
+
 describe('SportsYoutubeHighlightCollectionService ranked scheduling', () => {
   afterEach(() => jest.useRealTimers());
 
@@ -257,4 +362,3 @@ describe('SportsYoutubeHighlightCollectionService ranked scheduling', () => {
     );
   });
 });
-

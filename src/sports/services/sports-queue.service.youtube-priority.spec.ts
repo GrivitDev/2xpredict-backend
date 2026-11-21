@@ -35,6 +35,7 @@ describe('SportsQueueService YouTube highlight priority migration', () => {
           },
         },
       ],
+      { updatePipeline: true },
     );
   });
 });

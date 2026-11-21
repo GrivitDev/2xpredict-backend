@@ -51,8 +51,11 @@ export const SPORTS_COLLECTION_SCHEDULE = {
     intervalMs: 1 * MINUTE,
     /** Frequent polling window after the first scheduled kickoff. */
     activeMonitoringWindowMs: 4 * HOUR,
-    /** Continue slower final-status checks until ESPN confirms a terminal state. */
+    /** Medium-frequency final-status checks for the first two days. */
     finalVerificationIntervalMs: 30 * MINUTE,
+    /** Old unresolved dates stay recoverable without generating frequent requests. */
+    historicalVerificationAfterMs: 48 * HOUR,
+    historicalVerificationIntervalMs: 6 * HOUR,
   },
   playsAfterMatch: { enabled: true, delayMs: 2 * MINUTE },
 

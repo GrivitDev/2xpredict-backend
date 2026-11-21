@@ -277,16 +277,66 @@ export class SportsYoutubeHighlightCollectionService {
     const competitionSlug = String(competition?.slug ?? fixture.competitionId).toLowerCase();
     if (!SUPPORTED_YOUTUBE_COMPETITIONS.has(competitionSlug)) return 'SKIPPED';
 
-    const home = fixture.competitors.find((item) => item.homeAway === 'HOME');
-    const away = fixture.competitors.find((item) => item.homeAway === 'AWAY');
-    if (!home || !away) throw new Error(`Fixture ${fixture.id} is missing its home/away teams`);
+    const competitors = Array.isArray(fixture.competitors)
+      ? fixture.competitors
+      : [];
+    const home = competitors.find((item) => item.homeAway === 'HOME');
+    const away = competitors.find((item) => item.homeAway === 'AWAY');
+
+    if (!home || !away) {
+      const reason =
+        'YouTube highlight skipped because the normalized fixture does not contain both home and away competitors.';
+      await this.markTerminal(
+        fixture,
+        this.missingTeamLabel('home'),
+        this.missingTeamLabel('away'),
+        reason,
+      );
+      this.logger.warn(`Skipping YouTube highlight for fixture ${fixture.id}: ${reason}`);
+      return 'SKIPPED';
+    }
+
+    const homeTeamId = String(home.teamId ?? '').trim();
+    const awayTeamId = String(away.teamId ?? '').trim();
+    if (!homeTeamId || !awayTeamId) {
+      const missingReferences = [
+        !homeTeamId ? 'home team ID' : undefined,
+        !awayTeamId ? 'away team ID' : undefined,
+      ].filter((value): value is string => Boolean(value));
+      const reason =
+        `YouTube highlight skipped because the fixture is missing its ${missingReferences.join(' and ')}.`;
+      await this.markTerminal(
+        fixture,
+        this.missingTeamLabel('home', homeTeamId),
+        this.missingTeamLabel('away', awayTeamId),
+        reason,
+      );
+      this.logger.warn(`Skipping YouTube highlight for fixture ${fixture.id}: ${reason}`);
+      return 'SKIPPED';
+    }
+
     const [homeTeam, awayTeam] = await Promise.all([
-      this.teamModel.findOne({ id: home.teamId }).lean().exec(),
-      this.teamModel.findOne({ id: away.teamId }).lean().exec(),
+      this.teamModel.findOne({ id: homeTeamId }).lean().exec(),
+      this.teamModel.findOne({ id: awayTeamId }).lean().exec(),
     ]);
-    const homeName = String(homeTeam?.displayName ?? homeTeam?.name ?? '').trim();
-    const awayName = String(awayTeam?.displayName ?? awayTeam?.name ?? '').trim();
-    if (!homeName || !awayName) throw new Error(`Fixture ${fixture.id} is missing normalized team names for YouTube search`);
+    const homeName = this.normalizedTeamName(homeTeam);
+    const awayName = this.normalizedTeamName(awayTeam);
+    if (!homeName || !awayName) {
+      const missingNames = [
+        !homeName ? `home team ${homeTeamId}` : undefined,
+        !awayName ? `away team ${awayTeamId}` : undefined,
+      ].filter((value): value is string => Boolean(value));
+      const reason =
+        `YouTube highlight skipped because normalized name data is unavailable for ${missingNames.join(' and ')}.`;
+      await this.markTerminal(
+        fixture,
+        homeName || this.missingTeamLabel('home', homeTeamId),
+        awayName || this.missingTeamLabel('away', awayTeamId),
+        reason,
+      );
+      this.logger.warn(`Skipping YouTube highlight for fixture ${fixture.id}: ${reason}`);
+      return 'SKIPPED';
+    }
 
     const kickoff = new Date(fixture.kickoffAt);
     if (Number.isNaN(kickoff.getTime()) || Date.now() < kickoff.getTime()) {
@@ -543,6 +593,19 @@ export class SportsYoutubeHighlightCollectionService {
     ).exec();
   }
 
+  private normalizedTeamName(team: any): string {
+    const displayName = String(team?.displayName ?? '').trim();
+    if (displayName) return displayName;
+    return String(team?.name ?? '').trim();
+  }
+
+  private missingTeamLabel(side: 'home' | 'away', teamId?: string): string {
+    const normalizedId = String(teamId ?? '').trim();
+    return normalizedId
+      ? `Unknown ${side} team (${normalizedId})`
+      : `Unknown ${side} team`;
+  }
+
   private getNextLagosMidnight(from = new Date()): Date {
     const parts = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Africa/Lagos',
@@ -579,4 +642,3 @@ export class SportsYoutubeHighlightCollectionService {
     return error instanceof Error ? error.message.replace(/[\r\n]+/g, ' ').slice(0, 220) : String(error).slice(0, 220);
   }
 }
-

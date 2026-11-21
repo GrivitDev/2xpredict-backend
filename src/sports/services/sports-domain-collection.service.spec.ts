@@ -253,4 +253,37 @@ describe('SportsDomainCollectionService settlement evidence gates', () => {
       service.shouldCollectMatchPlays('fixture-1'),
     ).resolves.toBe(false);
   });
+
+  it('suppresses repeated Summary recovery after a NO_DATA result until its cooldown expires', async () => {
+    state.getState.mockResolvedValue({
+      status: 'NO_DATA',
+      updatedAt: new Date(now.getTime() - 10 * 60_000),
+    });
+
+    await expect(
+      service.shouldCollectFixtureSummary(
+        'espn-1',
+        6 * 60 * 60_000,
+        6 * 60 * 60_000,
+        new Date(now.getTime() - 8 * 60 * 60_000),
+      ),
+    ).resolves.toBe(false);
+  });
+
+  it('allows Summary recovery again after the NO_DATA cooldown expires', async () => {
+    state.getState.mockResolvedValue({
+      status: 'NO_DATA',
+      updatedAt: new Date(now.getTime() - 7 * 60 * 60_000),
+    });
+
+    await expect(
+      service.shouldCollectFixtureSummary(
+        'espn-1',
+        6 * 60 * 60_000,
+        6 * 60 * 60_000,
+        new Date(now.getTime() - 8 * 60 * 60_000),
+      ),
+    ).resolves.toBe(true);
+  });
+
 });

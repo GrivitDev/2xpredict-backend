@@ -3,6 +3,10 @@ import { SportsDomainCollectionService } from './sports-domain-collection.servic
 const makeFixture = (state: string, kickoffAt: Date, isFinal = false) => ({
   status: { state, isFinal },
   kickoffAt,
+  competitors:
+    state === 'COMPLETED' || isFinal
+      ? [{ score: 1 }, { score: 0 }]
+      : [{ score: null }, { score: null }],
 });
 
 describe('SportsDomainCollectionService live scoreboard lifecycle', () => {
@@ -65,6 +69,40 @@ describe('SportsDomainCollectionService live scoreboard lifecycle', () => {
     await expect(service.getLiveScoreboardMonitoringState(
       'competition-1', '2026-11-15', undefined, kickoff + 5 * 60 * 60_000,
     )).resolves.toMatchObject({ shouldContinue: true, intervalMs: 30 * 60_000 });
+  });
+
+
+
+  it('continues six-hour verification when ESPN says COMPLETED but omits one or both final scores', async () => {
+    const kickoff = Date.parse('2026-11-15T10:00:00.000Z');
+    const completedWithoutScores = {
+      ...makeFixture('COMPLETED', new Date(kickoff), true),
+      competitors: [{ score: null }, { score: null }],
+    };
+    const service = makeService([completedWithoutScores]);
+    await expect(service.getLiveScoreboardMonitoringState(
+      'competition-1',
+      '2026-11-15',
+      new Date(kickoff).toISOString(),
+      kickoff + 72 * 60 * 60_000,
+    )).resolves.toMatchObject({
+      shouldContinue: true,
+      intervalMs: 6 * 60 * 60_000,
+    });
+  });
+
+  it('switches unresolved fixtures to six-hour verification after forty-eight hours', async () => {
+    const kickoff = Date.parse('2026-11-15T10:00:00.000Z');
+    const service = makeService([makeFixture('LIVE', new Date(kickoff))]);
+    await expect(service.getLiveScoreboardMonitoringState(
+      'competition-1',
+      '2026-11-15',
+      new Date(kickoff).toISOString(),
+      kickoff + 72 * 60 * 60_000,
+    )).resolves.toMatchObject({
+      shouldContinue: true,
+      intervalMs: 6 * 60 * 60_000,
+    });
   });
 });
 
