@@ -137,6 +137,43 @@ export class UsersService {
       .exec();
   }
 
+  /** Authentication lookup for a verified Google identity. */
+  async findByGoogleIdForAuth(googleId: string) {
+    return this.userModel
+      .findOne({ googleId, isDeleted: false })
+      .select('+googleId +authVersion +loginFailedAttempts +loginLockedUntil -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
+  }
+
+  /** Finds an email account and includes its hidden Google identity if linked. */
+  async findByEmailForGoogleAuth(email: string) {
+    return this.userModel
+      .findOne({ email: email.trim().toLowerCase(), isDeleted: false })
+      .select('+googleId +authVersion +loginFailedAttempts +loginLockedUntil -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
+  }
+
+  /** Links a verified Google identity to an already-verified local account. */
+  async linkGoogleIdentity(userId: string, email: string, googleId: string) {
+    return this.userModel
+      .findOneAndUpdate(
+        {
+          _id: userId,
+          email: email.trim().toLowerCase(),
+          isDeleted: false,
+          $or: [
+            { googleId: { $exists: false } },
+            { googleId: null },
+            { googleId },
+          ],
+        },
+        { $set: { googleId } },
+        { returnDocument: 'after', runValidators: true },
+      )
+      .select('+googleId +authVersion +loginFailedAttempts +loginLockedUntil -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
+  }
+
   async findByEmailForPasswordReset(email: string) {
     return this.userModel
       .findOne({
@@ -254,10 +291,44 @@ export class UsersService {
     ).exec();
   }
 
+  async claimVerificationOnboarding(userId: string) {
+    const now = new Date();
+    const leaseUntil = new Date(now.getTime() + 5 * 60 * 1000);
+
+    return this.userModel
+      .findOneAndUpdate(
+        {
+          _id: userId,
+          isDeleted: false,
+          isVerified: true,
+          verificationOnboardingPending: true,
+          $or: [
+            { verificationOnboardingLockedUntil: { $exists: false } },
+            { verificationOnboardingLockedUntil: null },
+            { verificationOnboardingLockedUntil: { $lte: now } },
+          ],
+        },
+        { $set: { verificationOnboardingLockedUntil: leaseUntil } },
+        { returnDocument: 'after' },
+      )
+      .select('+verificationOnboardingPending +verificationOnboardingLockedUntil -passwordResetToken -passwordResetExpires -passwordResetAttempts -passwordResetLockedUntil -passwordResetRequestedAt')
+      .exec();
+  }
+
+  async releaseVerificationOnboarding(userId: string) {
+    return this.userModel.updateOne(
+      { _id: userId, isDeleted: false, verificationOnboardingPending: true },
+      { $unset: { verificationOnboardingLockedUntil: 1 } },
+    ).exec();
+  }
+
   async completeVerificationOnboarding(userId: string) {
     return this.userModel.updateOne(
       { _id: userId, isDeleted: false, verificationOnboardingPending: true },
-      { $set: { verificationOnboardingPending: false } },
+      {
+        $set: { verificationOnboardingPending: false },
+        $unset: { verificationOnboardingLockedUntil: 1 },
+      },
     ).exec();
   }
 
@@ -305,7 +376,7 @@ export class UsersService {
       ...userData,
       email: userData.email?.trim().toLowerCase(),
       username: userData.username?.trim().toLowerCase(),
-      status: UserStatus.PENDING,
+      status: userData.status ?? UserStatus.PENDING,
     });
 
     return user.save();
@@ -459,6 +530,36 @@ export class UsersService {
           },
         },
       ] as any,
+      { returnDocument: 'after', updatePipeline: true },
+    ).exec();
+  }
+
+  async updateGoogleLoginInfo(
+    userId: string,
+    expectedAuthVersion: number,
+    googleId: string,
+  ) {
+    const versionConditions =
+      expectedAuthVersion === 0
+        ? [{ authVersion: 0 }, { authVersion: { $exists: false } }]
+        : [{ authVersion: expectedAuthVersion }];
+
+    return this.userModel.findOneAndUpdate(
+      {
+        _id: userId,
+        isDeleted: false,
+        googleId,
+        $and: [{ $or: versionConditions }],
+      },
+      {
+        $set: {
+          lastLoginAt: new Date(),
+          loginFailedAttempts: 0,
+          authVersion: expectedAuthVersion,
+        },
+        $unset: { loginLockedUntil: 1 },
+        $inc: { loginCount: 1 },
+      },
       { returnDocument: 'after' },
     ).exec();
   }
@@ -526,7 +627,7 @@ export class UsersService {
           },
         },
       ] as any,
-      { returnDocument: 'after' },
+      { returnDocument: 'after', updatePipeline: true },
     ).exec();
   }
 
@@ -661,3 +762,4 @@ export class UsersService {
     );
   }
 }
+

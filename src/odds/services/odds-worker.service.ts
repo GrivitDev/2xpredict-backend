@@ -15,7 +15,7 @@ import type { ClaimedSportsQueueJob } from '../../sports/services/sports-queue.s
 import { ODDS_CONFIG } from '../config/odds.config';
 import { OddsService } from './odds.service';
 
-const QUEUE_POLL_MS = 1_000;
+const QUEUE_POLL_MS = 3_000;
 const QUEUE_LEASE_MS = 10 * 60_000;
 const QUEUE_HEARTBEAT_MS = 60_000;
 
@@ -40,6 +40,9 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private startedAt?: Date;
 
   private inventorySweepStartedAt?: Date;
+  /** Fixed window boundaries are retained until the current keyset sweep completes. */
+  private inventoryWindowFrom?: Date;
+  private inventoryWindowTo?: Date;
   private inventorySweepPages = 0;
   private inventorySweepFixtures = 0;
   private inventorySweepSucceeded = 0;
@@ -102,7 +105,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
 
     this.adminGateway.setModuleOperationalStatus(
       'odds', 'STARTING',
-      'Grivit is backfilling all retained Sports fixtures and consuming source-change pricing jobs.',
+      `Grivit is pricing upcoming Sports fixtures within the next ${ODDS_CONFIG.pricingLookaheadHours / 24} days and consuming eligible source-change jobs.`,
     );
 
     void this.runSafely();
@@ -192,7 +195,8 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       configuredIntervalMs: ODDS_CONFIG.workerIntervalMs,
       configuredBatchSize: ODDS_CONFIG.workerBatchSize,
       configuredConcurrency: ODDS_CONFIG.workerConcurrency,
-      configuredScanScope: 'ALL_RETAINED_FIXTURES',
+      configuredLookaheadHours: ODDS_CONFIG.pricingLookaheadHours,
+      configuredScanScope: 'UPCOMING_NEXT_7_DAYS',
       configuredCleanupIntervalMs: ODDS_CONFIG.cleanupIntervalMs,
       configuredRetentionGraceMonths: ODDS_CONFIG.seasonRetentionGraceMonths,
       queueWorkerId: this.workerId,
@@ -223,6 +227,10 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private beginInventorySweep(at: Date): void {
     if (this.inventorySweepStartedAt) return;
     this.inventorySweepStartedAt = at;
+    this.inventoryWindowFrom = new Date(at);
+    this.inventoryWindowTo = new Date(
+      at.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+    );
     this.lastInventorySweepStartedAt = at;
     this.inventorySweepPages = 0;
     this.inventorySweepFixtures = 0;
@@ -249,13 +257,15 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       this.lastSuccessfulInventorySweepAt = at;
     }
     this.inventorySweepStartedAt = undefined;
+    this.inventoryWindowFrom = undefined;
+    this.inventoryWindowTo = undefined;
     this.inventorySweepPages = 0;
     this.inventorySweepFixtures = 0;
     this.inventorySweepSucceeded = 0;
     this.inventorySweepFailed = 0;
   }
 
-  /** One page per pass; repeated passes cover every retained fixture. */
+  /** One page per pass; repeated passes cover upcoming fixtures within the seven-day window. */
   private async runSafely(): Promise<void> {
     if (this.stopping || !ODDS_CONFIG.enabled || this.busy) return;
     this.busy = true;
@@ -268,9 +278,18 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       releasePermit = await this.backgroundWork.acquire('odds:inventory');
       if (this.stopping) return;
 
+      // A stable window prevents a moving `now` boundary from changing the
+      // keyset result set while a multi-page inventory sweep is in progress.
+      const windowFrom = this.inventoryWindowFrom ?? new Date(startedAt);
+      const windowTo = this.inventoryWindowTo ?? new Date(
+        windowFrom.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+      );
       let result = await this.sportsRead.getFixtures({
+        from: windowFrom,
+        to: windowTo,
         limit: ODDS_CONFIG.workerBatchSize,
         cursor: this.cursor,
+        sortOrder: 'ASC',
       });
       if (!result.items.length && this.cursor) {
         // An empty page after a cursor means the previous cursor-based sweep
@@ -278,7 +297,16 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         this.completeInventorySweep(new Date());
         this.cursor = undefined;
         this.beginInventorySweep(new Date());
-        result = await this.sportsRead.getFixtures({ limit: ODDS_CONFIG.workerBatchSize });
+        const restartedWindowFrom = this.inventoryWindowFrom ?? new Date();
+        const restartedWindowTo = this.inventoryWindowTo ?? new Date(
+          restartedWindowFrom.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+        );
+        result = await this.sportsRead.getFixtures({
+          from: restartedWindowFrom,
+          to: restartedWindowTo,
+          limit: ODDS_CONFIG.workerBatchSize,
+          sortOrder: 'ASC',
+        });
       }
 
       const fixtures = result.items;
@@ -294,27 +322,32 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         }
         const batch = fixtures.slice(offset, offset + ODDS_CONFIG.workerConcurrency);
         const outcomes = await Promise.all(batch.map(async (fixture) => {
+          // A long page may span several minutes. Recheck each kickoff just
+          // before pricing so a fixture that has since started is not repriced.
+          if (!this.isWithinPricingWindow(fixture)) {
+            return { fixture, success: false, skipped: true };
+          }
           try {
             await this.oddsService.refreshFixture(fixture.id);
-            return { fixture, success: true };
+            return { fixture, success: true, skipped: false };
           } catch (error) {
             this.logger.warn(`Grivit pricing failed for fixture ${fixture.id}: ${this.errorMessage(error)}`);
-            return { fixture, success: false };
+            return { fixture, success: false, skipped: false };
           }
         }));
         const succeeded = outcomes.filter((item) => item.success);
         successfullyRefreshedFixtures.push(...succeeded.map((item) => item.fixture));
         refreshed += succeeded.length;
-        failed += outcomes.length - succeeded.length;
+        failed += outcomes.filter((item) => !item.success && !item.skipped).length;
       }
 
       // Do not advance the keyset cursor for an interrupted page. The page is
       // safely revisited after restart instead of being counted as completed.
       if (interrupted || this.stopping) return;
 
-      // This also covers the initial all-fixture Odds backfill. A prediction
+      // This also covers the initial upcoming-fixture Odds backfill. A prediction
       // trigger is coalesced by the latest persisted Grivit price timestamp, so
-      // an unchanged full scan cannot create duplicate work every cycle.
+      // an unchanged rolling scan cannot create duplicate work every cycle.
       const predictionTriggers = await this.enqueuePredictionRecalculations(successfullyRefreshedFixtures);
       if (predictionTriggers > 0) {
         this.logger.log(`Grivit refresh released ${predictionTriggers} prediction recalculation trigger(s).`);
@@ -341,14 +374,14 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
 
       this.adminGateway.setModuleOperationalStatus(
         'odds', failed ? 'DEGRADED' : 'READY',
-        `Grivit pricing batch processed ${fixtures.length} fixtures (${refreshed} successful, ${failed} failed). Upcoming, live and completed fixtures are included.`,
+        `Grivit pricing batch processed ${fixtures.length} fixtures (${refreshed} successful, ${failed} failed) within the configured upcoming-fixture horizon.`,
       );
       this.adminGateway.publishModuleEvent('odds', 'odds:cycle-completed', {
         fixtureCount: fixtures.length,
         refreshed,
         failed,
         nextPageAvailable: Boolean(result.nextCursor),
-        scanScope: 'ALL_RETAINED_FIXTURES',
+        scanScope: 'UPCOMING_NEXT_7_DAYS',
         inventorySweep: this.getMonitorStatus().inventorySweep,
         bookmaker: 'Grivit',
         externalApiCalls: 0,
@@ -420,6 +453,19 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     try {
       const fixtureId = String(job.scope.fixtureId ?? '').trim();
       if (!fixtureId) throw new Error('Odds pricing queue job is missing fixtureId.');
+      const fixture = await this.sportsRead.getFixture(fixtureId);
+      if (!fixture || !this.isWithinPricingWindow(fixture)) {
+        const completed = await this.queue.markCompleted(job.jobKey, workerId);
+        if (completed) {
+          this.queueJobsCompleted += 1;
+          this.logger.debug(
+            `Skipped out-of-window Grivit pricing job for ${fixtureId}; the rolling inventory sweep will pick it up if it enters the seven-day horizon.`,
+          );
+        } else {
+          this.logger.warn(`Odds queue job ${job.jobKey} lost its processing lease before skip completion.`);
+        }
+        return;
+      }
       await this.oddsService.refreshFixture(fixtureId);
       await this.enqueuePredictionRecalculationForFixture(fixtureId);
       const completed = await this.queue.markCompleted(job.jobKey, workerId);
@@ -519,13 +565,25 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   }
 
   private isUpcomingPredictionFixture(fixture: SportsFixtureRecord): boolean {
-    const kickoffAt = this.toDate(fixture.kickoffAt);
-    if (!kickoffAt || kickoffAt.getTime() <= Date.now()) return false;
+    if (!this.isWithinPricingWindow(fixture)) return false;
     const state = String(fixture.status?.state ?? 'UNKNOWN').toUpperCase();
     return ![
       'LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES',
       'COMPLETED', 'POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED',
     ].includes(state) && fixture.status?.isFinal !== true;
+  }
+
+  /** Date eligibility is separate from prediction eligibility so cancelled
+   * fixtures in-window still pass through OddsService and lose stale quotes. */
+  private isWithinPricingWindow(fixture: SportsFixtureRecord): boolean {
+    const kickoffAt = this.toDate(fixture.kickoffAt);
+    const now = Date.now();
+    const horizonEnd = now + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000;
+    return Boolean(
+      kickoffAt &&
+      kickoffAt.getTime() > now &&
+      kickoffAt.getTime() <= horizonEnd,
+    );
   }
 
   private toDate(value: unknown): Date | null {
@@ -582,5 +640,6 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 
 

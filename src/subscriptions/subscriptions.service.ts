@@ -453,29 +453,58 @@ export class SubscriptionsService {
       expiresAt: { $gt: now },
     };
 
-    // At most three indexed existence lookups. Avoid loading every active
-    // bonus for an account just to determine its effective subscription tier.
-    for (const plan of ['premium', 'vip', 'regular'] as const) {
-      const grant = await this.bonusGrantModel
-        .findOne({ ...commonFilter, plan })
-        .sort({ expiresAt: -1 })
-        .select({ plan: 1, startsAt: 1, expiresAt: 1 })
-        .lean()
-        .exec();
-      if (grant?.plan && grant.expiresAt) {
-        // Bonus subscription entitlements are recorded immediately, including
-        // for unverified accounts, but they cannot become effective until the
-        // account verifies its current email address.
-        const user = await this.usersService.findById(userId);
-        if (!user?.isVerified) return null;
-        return {
-          plan: grant.plan,
-          startsAt: new Date(grant.startsAt),
-          expiresAt: new Date(grant.expiresAt),
-        };
-      }
-    }
-    return null;
+    // Resolve the same tier precedence and latest-expiry rule in one database
+    // round trip. The initial sort lets each plan group retain its latest grant;
+    // the priority sort then preserves premium > vip > regular.
+    const [grant] = await this.bonusGrantModel
+      .aggregate([
+        {
+          $match: {
+            ...commonFilter,
+            plan: { $in: ['premium', 'vip', 'regular'] },
+          },
+        },
+        { $sort: { expiresAt: -1 } },
+        {
+          $group: {
+            _id: '$plan',
+            grant: { $first: '$$ROOT' },
+          },
+        },
+        {
+          $addFields: {
+            __planPriority: {
+              $switch: {
+                branches: [
+                  { case: { $eq: ['$_id', 'premium'] }, then: 3 },
+                  { case: { $eq: ['$_id', 'vip'] }, then: 2 },
+                  { case: { $eq: ['$_id', 'regular'] }, then: 1 },
+                ],
+                default: 0,
+              },
+            },
+          },
+        },
+        { $sort: { __planPriority: -1 } },
+        { $limit: 1 },
+        { $replaceRoot: { newRoot: '$grant' } },
+        { $project: { _id: 0, plan: 1, startsAt: 1, expiresAt: 1 } },
+      ])
+      .exec();
+
+    if (!grant?.plan || !grant.expiresAt || !grant.startsAt) return null;
+
+    // Bonus subscription entitlements are recorded immediately, including for
+    // unverified accounts, but they cannot become effective until the account
+    // verifies its current email address.
+    const user = await this.usersService.findById(userId);
+    if (!user?.isVerified) return null;
+
+    return {
+      plan: grant.plan,
+      startsAt: new Date(grant.startsAt),
+      expiresAt: new Date(grant.expiresAt),
+    };
   }
 
   private readonly planRank: Record<PlanType, number> = {

@@ -60,7 +60,7 @@ export class OddsMonitorService
   private readonly logger = new Logger(OddsMonitorService.name);
   private readonly monitorIntervalMs = this.readPositiveInteger(
     process.env.ODDS_MONITOR_INTERVAL_MS,
-    60_000,
+    3 * MINUTE,
   );
   private readonly cacheTtlMs = 15_000;
   private stopped = false;
@@ -1207,3 +1207,4 @@ export class OddsMonitorService
     return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
   }
 }
+

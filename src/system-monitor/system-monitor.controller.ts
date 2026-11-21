@@ -5,6 +5,7 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { SystemMonitorService } from './system-monitor.service';
 import { SystemMonitorStorageService } from './system-monitor-storage.service';
 import { SystemMonitorDatabaseTrackerService } from './system-monitor-database-tracker.service';
+import { SystemMonitorPerformanceService } from './system-monitor-performance.service';
 
 @Controller('admin/system-monitor')
 @Roles('admin')
@@ -14,6 +15,7 @@ export class SystemMonitorController {
     private readonly systemMonitorService: SystemMonitorService,
     private readonly storageService: SystemMonitorStorageService,
     private readonly databaseTracker: SystemMonitorDatabaseTrackerService,
+    private readonly performanceMonitor: SystemMonitorPerformanceService,
   ) {}
 
   @Get() async getDashboard(): Promise<unknown> {
@@ -59,6 +61,8 @@ export class SystemMonitorController {
   @Get('storage') getStorage(): unknown { return this.storageService.getStorageStats(); }
   @Get('storage/history') getStorageHistory(@Query('limit') limit?: string): unknown { return this.storageService.getStorageHistory(limit ? Number(limit) : undefined); }
   @Get('database') getDatabaseHealth(): unknown { return this.storageService.getDatabaseHealth(); }
+  @Get('database/pool') getDatabasePoolMetrics(): unknown { return this.databaseTracker.getPoolMetrics(); }
+  @Get('performance/database-pool') getDatabaseConnectionPoolPerformance(): unknown { return this.databaseTracker.getConnectionPoolMetrics(); }
   @Get('database/collections/:name') getCollection(@Param('name') name: string): unknown { return this.storageService.getCollectionDetail(name); }
   @Get('database/operations') getDatabaseOperations(@Query('limit') limit?: string, @Query('status') status?: string): unknown {
     return this.databaseTracker.getOperations({ limit: limit ? Number(limit) : undefined, status });
@@ -66,6 +70,22 @@ export class SystemMonitorController {
   @Get('database/collections/:name/operations') getCollectionOperations(@Param('name') name: string, @Query('limit') limit?: string): unknown {
     return this.databaseTracker.getOperations({ collection: name, limit: limit ? Number(limit) : undefined });
   }
+
+  @Get('performance/requests')
+  getRequestPerformance(@Query('limit') limit?: string): unknown {
+    return this.performanceMonitor.getRequestMetrics(
+      limit ? Number(limit) : undefined,
+    );
+  }
+
+  @Get('performance/database')
+  getDatabasePerformance(
+    @Query('limit') limit?: string,
+    @Query('collection') collection?: string,
+  ): unknown {
+    return this.databaseTracker.getLatencyMetrics({
+      limit: limit ? Number(limit) : undefined,
+      collection,
+    });
+  }
 }
-
-

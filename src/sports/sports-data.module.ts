@@ -50,6 +50,8 @@ import {
   SportsTeamStatisticsAggregateSchema,
   SportsPlayerEventTotals,
   SportsPlayerEventTotalsSchema,
+  SportsOfficialStandings,
+  SportsOfficialStandingsSchema,
 } from './schemas';
 import {
   SportsBootstrapState,
@@ -116,6 +118,7 @@ import {
       },
       { name: SportsMatchSummary.name, schema: SportsMatchSummarySchema },
       { name: SportsMatchFacts.name, schema: SportsMatchFactsSchema },
+      { name: SportsOfficialStandings.name, schema: SportsOfficialStandingsSchema },
       { name: SportsCollectionState.name, schema: SportsCollectionStateSchema },
       { name: SportsDataChangeEvent.name, schema: SportsDataChangeEventSchema },
       { name: SportsEntityRevision.name, schema: SportsEntityRevisionSchema },
@@ -204,3 +207,4 @@ import {
   ],
 })
 export class SportsDataModule {}
+

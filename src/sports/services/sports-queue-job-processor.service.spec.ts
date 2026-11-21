@@ -459,3 +459,26 @@ describe('SportsQueueJobProcessorService YouTube highlight reconciliation', () =
     ).toHaveBeenCalledWith(SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.batchSize);
   });
 });
+
+
+
+describe('SportsQueueJobProcessorService Grivit pricing horizon', () => {
+  it('bounds cross-competition fixture reads to the seven-day pricing horizon', async () => {
+    const now = new Date('2026-11-11T11:00:00.000Z');
+    const sportsRead = {
+      getFixtures: jest.fn().mockResolvedValue({ items: [], nextCursor: undefined }),
+    };
+    const service = Object.create(SportsQueueJobProcessorService.prototype) as any;
+    service.sportsRead = sportsRead;
+
+    await service.getUpcomingCrossCompetitionFixtures(['team-a'], 'league-1', now);
+
+    expect(sportsRead.getFixtures).toHaveBeenCalledWith(expect.objectContaining({
+      teamId: 'team-a',
+      from: now,
+      to: new Date(now.getTime() + 7 * 24 * 60 * 60_000),
+      sortOrder: 'ASC',
+      retainedOnly: true,
+    }));
+  });
+});

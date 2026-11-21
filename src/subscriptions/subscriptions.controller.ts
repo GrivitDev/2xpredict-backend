@@ -47,12 +47,14 @@ export class SubscriptionsController {
   @UseGuards(JwtAuthGuard)
   @Get('status')
   async getStatus(@GetUser() user: { _id: string }) {
-    const subscription = await this.service.getActiveSubscription(user._id);
-    const plan = await this.service.getUserPlan(user._id);
+    // getUserPlan() resolves the same effective entitlement again. Resolve it
+    // once and reuse its paid subscription and effective plan in this response.
+    const entitlement = await this.service.getEffectiveEntitlement(user._id);
+    const plan = entitlement.plan;
 
     return {
       plan,
-      subscription,
+      subscription: entitlement.subscription,
       entitlements: getSubscriptionEntitlements(plan),
     };
   }

@@ -3,6 +3,11 @@ import { NestFactory } from '@nestjs/core';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { realtimeCorsOptions } from './realtime/realtime-cors';
+import {
+  createHttpCompressionMiddleware,
+  isHttpCompressionEnabled,
+} from './system-monitor/http-compression';
+import { httpDeliveryByteCounterMiddleware } from './system-monitor/http-delivery-byte-counter.middleware';
 
 const DEFAULT_FRONTEND_URL = 'https://www.2xpredict.com';
 
@@ -52,6 +57,17 @@ async function bootstrap() {
   normalizeFrontendUrl(logger);
 
   const app = await NestFactory.create(AppModule, { rawBody: true });
+
+  // Count response bytes before compression wraps ServerResponse.write/end.
+  // This records emitted bytes only; response bodies are never retained.
+  app.use(httpDeliveryByteCounterMiddleware);
+
+  if (isHttpCompressionEnabled(process.env.HTTP_COMPRESSION_ENABLED)) {
+    app.use(createHttpCompressionMiddleware());
+    logger.log('HTTP response compression enabled (1 KB threshold, level 4).');
+  } else {
+    logger.log('HTTP response compression is disabled by configuration.');
+  }
 
   // Configure trusted reverse proxies.
   const trustProxyHopsValue = process.env.TRUST_PROXY_HOPS;

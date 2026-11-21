@@ -32,7 +32,7 @@ export class SportsCalculatedStandings {
 }
 export type SportsCalculatedStandingsDocument = HydratedDocument<SportsCalculatedStandings>;
 export const SportsCalculatedStandingsSchema = SchemaFactory.createForClass(SportsCalculatedStandings);
-SportsCalculatedStandingsSchema.index({ competitionId: 1, seasonId: 1, position: 1 }, { unique: true });
+SportsCalculatedStandingsSchema.index({ competitionId: 1, seasonId: 1, position: 1 });
 
 @Schema({ timestamps: true, collection: 'sports_team_form', versionKey: false })
 export class SportsTeamForm {
@@ -229,3 +229,4 @@ export class SportsPlayerEventTotals {
 export type SportsPlayerEventTotalsDocument = HydratedDocument<SportsPlayerEventTotals>;
 export const SportsPlayerEventTotalsSchema = SchemaFactory.createForClass(SportsPlayerEventTotals);
 SportsPlayerEventTotalsSchema.index({ competitionId: 1, seasonId: 1, playerId: 1 }, { unique: true });
+

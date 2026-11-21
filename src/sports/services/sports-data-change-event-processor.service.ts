@@ -10,6 +10,7 @@ import { SportsFixture } from '../schemas/domain/fixture.schema';
 import { SportsSeason } from '../schemas/domain/season.schema';
 import { SportsQueueJobType } from '../interfaces/sports-queue.interface';
 import { SportsQueueService } from './sports-queue.service';
+import { ODDS_CONFIG } from '../../odds/config/odds.config';
 
 type FixtureIdRow = { id: string };
 
@@ -130,8 +131,9 @@ export class SportsDataChangeEventProcessorService {
       await this.enqueueAffectedSeasonProjections(fixtureIds, event.eventId);
     }
 
-    // Grivit is repriced for every affected fixture. Its worker will then
-    // publish a prediction trigger only if the resulting prices pass readiness.
+    // Grivit repricing is restricted to affected upcoming fixtures inside its
+    // configured horizon. The worker publishes prediction triggers only when
+    // the resulting prices also pass readiness.
     await this.enqueueAffectedOddsPricing(event, fixtureIds);
   }
 
@@ -183,10 +185,11 @@ export class SportsDataChangeEventProcessorService {
       }
       query = {
         'competitors.teamId': { $in: teamIds },
-        kickoffAt: { $gte: new Date() },
-        'status.state': {
-          $nin: ['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'],
+        kickoffAt: {
+          $gt: new Date(),
+          $lte: new Date(Date.now() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000),
         },
+        'status.state': { $nin: ['COMPLETED'] },
       };
     } else if (event.entity === 'MATCH_ODDS') {
       const targetIds = this.unique([
@@ -211,10 +214,11 @@ export class SportsDataChangeEventProcessorService {
       if (!scopes.length) return;
       query = {
         $or: scopes,
-        kickoffAt: { $gte: new Date() },
-        'status.state': {
-          $nin: ['COMPLETED', 'POSTPONED', 'CANCELLED', 'ABANDONED'],
+        kickoffAt: {
+          $gt: new Date(),
+          $lte: new Date(Date.now() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000),
         },
+        'status.state': { $nin: ['COMPLETED'] },
       };
     }
 
@@ -244,7 +248,9 @@ export class SportsDataChangeEventProcessorService {
       if (!page.length) break;
       const ids = page.map((row) => String(row.id));
       scanned += ids.length;
-      await this.enqueueOddsPricingForIds(ids, event);
+      await this.enqueueOddsPricingForIds(ids, event, {
+        alreadyWithinPricingWindow: true,
+      });
       cursor = ids[ids.length - 1];
       if (page.length < this.fixturePageSize) break;
     }
@@ -259,8 +265,32 @@ export class SportsDataChangeEventProcessorService {
   private async enqueueOddsPricingForIds(
     fixtureIds: string[],
     event: SportsDataChangedEvent,
+    options: { alreadyWithinPricingWindow?: boolean } = {},
   ): Promise<void> {
-    const ids = this.unique(fixtureIds);
+    const requestedIds = this.unique(fixtureIds);
+    if (!requestedIds.length) return;
+
+    let ids = requestedIds;
+    if (!options.alreadyWithinPricingWindow) {
+      const now = new Date();
+      const horizonEnd = new Date(
+        now.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+      );
+      const eligibleRows = (await this.fixtureModel
+        .find({
+          $or: [
+            { id: { $in: requestedIds } },
+            { espnEventId: { $in: requestedIds } },
+          ],
+          kickoffAt: { $gt: now, $lte: horizonEnd },
+        })
+        .select('id')
+        .lean()
+        .exec()) as FixtureIdRow[];
+      ids = this.unique(eligibleRows.map((row) => String(row.id)));
+    }
+
+    if (!ids.length) return;
     for (
       let offset = 0;
       offset < ids.length;
@@ -369,3 +399,4 @@ export class SportsDataChangeEventProcessorService {
     ];
   }
 }
+

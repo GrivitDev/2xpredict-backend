@@ -3,8 +3,10 @@ export const ODDS_CONFIG = {
   enabled: true,
   /** Admin/monitor readiness sample only; never limits the pricing scan. */
   predictionCoverageWindowHours: 72,
-  /** Full catalogue scan; this is not limited to a pre-match lookahead. */
-  workerIntervalMs: 60_000,
+  /** Grivit prices are calculated only for fixtures kicking off within this horizon. */
+  pricingLookaheadHours: 7 * 24,
+  /** Event-driven pricing is primary; inventory reconciliation is a two-minute recovery/backfill safety net. */
+  workerIntervalMs: 2 * 60_000,
   workerBatchSize: 100,
   workerConcurrency: 1,
   /** Maximum age of an external bookmaker reference, never a Grivit price. */
@@ -49,6 +51,7 @@ export function isOddsQuoteFresh(value: unknown, now = Date.now()): boolean {
   return age >= -ODDS_CONFIG.futureTimestampToleranceMs &&
     age <= ODDS_CONFIG.maximumQuoteAgeHours * 3_600_000;
 }
+
 
 
 

@@ -9,11 +9,11 @@ export const SETTLEMENT_CONFIG = {
     /** Cooldown before revisiting a completed snapshot; new source fingerprints bypass it. */
     completedTargetRecoveryIntervalMs: 15 * 60_000,
     /** Safety-critical lease renewal prevents a slow but active job from being reclaimed. */
-    leaseHeartbeatIntervalMs: 60_000,
+    leaseHeartbeatIntervalMs: 30_000,
     /** Re-scan unresolved Prediction/Bet Lab targets to recover missed enqueue handoffs. */
     targetReconciliationIntervalMs: 5 * 60_000,
     /** A worker claim is considered abandoned after this lease expires. */
-    processingLeaseMinutes: 5,
+    processingLeaseMinutes: 10,
     maximumAttempts: 5,
     initialRetryDelayMs: 30_000,
     maximumRetryDelayMs: 30 * 60_000,

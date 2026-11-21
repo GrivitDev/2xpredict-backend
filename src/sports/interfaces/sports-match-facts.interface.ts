@@ -100,6 +100,70 @@ export interface SportsMatchSummaryEvent {
   sourceCoverage: 'PARTIAL';
 }
 
+
+/** A provider statistic retained without flattening away its display semantics. */
+export interface SportsOfficialStandingsStatistic {
+  name?: string;
+  displayName?: string;
+  shortDisplayName?: string;
+  abbreviation?: string;
+  type?: string;
+  value: number | null;
+  displayValue?: string;
+  summary?: string;
+  description?: string;
+}
+
+export interface SportsOfficialStandingsEntry {
+  /** Internal Sports team identity, consistently derived from the ESPN team id. */
+  teamId: string;
+  espnTeamId: string;
+  teamName: string;
+  abbreviation?: string;
+  logoUrl?: string;
+  link?: string;
+  /** ESPN rank when provided; otherwise the provider's row order. */
+  position: number;
+  stats: SportsOfficialStandingsStatistic[];
+}
+
+export interface SportsOfficialStandingsGroup {
+  id: string;
+  name?: string;
+  abbreviation?: string;
+  header?: string;
+  href?: string;
+  entries: SportsOfficialStandingsEntry[];
+}
+
+/** Normalized competition-season standings extracted from an ESPN Summary. */
+export interface SportsOfficialStandingsSnapshot {
+  id: string;
+  competitionId: string;
+  seasonId: string;
+  provider: 'ESPN';
+  endpoint: string;
+  sourcePayloadHash: string;
+  sourceRevision: number;
+  sourceCollectedAt: Date;
+  header?: string;
+  groups: SportsOfficialStandingsGroup[];
+  entryCount: number;
+  /** False if a group/entry was missing required team identity or malformed. */
+  isComplete: boolean;
+  diagnostics: string[];
+}
+
+export interface SportsOfficialStandingsNormalizationInput {
+  competitionId: string;
+  seasonId: string;
+  endpoint: string;
+  sourcePayloadHash: string;
+  sourceRevision: number;
+  sourceCollectedAt: Date;
+  rawPayload: Record<string, unknown>;
+}
+
 export interface SportsMatchFactsWrite {
   fixtureId: string;
   espnEventId: string;
@@ -141,3 +205,4 @@ export interface SportsMatchFactsNormalizationInput {
   rawPayload: Record<string, unknown>;
   fixture?: SportsFixtureRecord | null;
 }
+

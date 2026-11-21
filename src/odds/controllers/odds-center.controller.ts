@@ -66,22 +66,30 @@ export class OddsCenterController {
     } while (cursor && fixtures.length < MAX_FIXTURES);
 
     const eventIds = fixtures.map((fixture) => fixture.id);
-    const [prices, competitions, teams] = await Promise.all([
-      this.oddsService.getPricesForFixtures(eventIds),
-      Promise.all(
-        [...new Set(fixtures.map((fixture) => fixture.competitionId))].map(
-          (id) => this.sportsRead.getCompetition(id),
+    const competitionIds = [
+      ...new Set(
+        fixtures
+          .map((fixture) => String(fixture.competitionId ?? '').trim())
+          .filter(Boolean),
+      ),
+    ];
+    const teamIds = [
+      ...new Set(
+        fixtures.flatMap((fixture) =>
+          fixture.competitors
+            .map((item: any) => String(item.teamId ?? '').trim())
+            .filter(Boolean),
         ),
       ),
-      Promise.all(
-        [
-          ...new Set(
-            fixtures.flatMap((fixture) =>
-              fixture.competitors.map((item: any) => item.teamId),
-            ),
-          ),
-        ].map((id) => this.sportsRead.getTeam(id)),
-      ),
+    ];
+
+    // Use Sports' bounded batch readers instead of issuing one database read
+    // per competition and team. These methods preserve the identifier
+    // matching of getCompetition() and getTeam().
+    const [prices, competitions, teams] = await Promise.all([
+      this.oddsService.getPricesForFixtures(eventIds),
+      this.sportsRead.getCompetitionsByIdentifiers(competitionIds),
+      this.sportsRead.getTeamsByIdentifiers(teamIds),
     ]);
     const competitionById = new Map(
       competitions.filter(Boolean).map((item: any) => [item.id, item]),

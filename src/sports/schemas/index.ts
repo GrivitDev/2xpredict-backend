@@ -17,3 +17,6 @@ export * from './sports-provider-rate-limit.schema';
 
 export * from './domain/match-summary.schema';
 export * from './domain/match-facts.schema';
+
+
+export * from './derived/official-standings.schema';

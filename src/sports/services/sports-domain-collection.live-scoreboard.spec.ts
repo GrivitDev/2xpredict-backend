@@ -14,12 +14,12 @@ describe('SportsDomainCollectionService live scoreboard lifecycle', () => {
     return service;
   };
 
-  it('keeps two-minute polling during the first four hours after kickoff', async () => {
+  it('keeps one-minute polling during the first four hours after kickoff', async () => {
     const kickoff = Date.parse('2026-11-16T10:00:00.000Z');
     const service = makeService([makeFixture('SCHEDULED', new Date(kickoff))]);
     await expect(service.getLiveScoreboardMonitoringState(
       'competition-1', '2026-11-16', new Date(kickoff).toISOString(), kickoff + 3 * 60 * 60_000,
-    )).resolves.toMatchObject({ shouldContinue: true, intervalMs: 2 * 60_000 });
+    )).resolves.toMatchObject({ shouldContinue: true, intervalMs: 60_000 });
   });
 
   it('switches stale scheduled fixtures to thirty-minute verification after four hours', async () => {
@@ -67,3 +67,4 @@ describe('SportsDomainCollectionService live scoreboard lifecycle', () => {
     )).resolves.toMatchObject({ shouldContinue: true, intervalMs: 30 * 60_000 });
   });
 });
+

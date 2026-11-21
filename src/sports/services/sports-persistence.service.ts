@@ -5,7 +5,10 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import type { ClientSession } from 'mongoose';
 
-import type { SportsMatchFactsWrite } from '../interfaces/sports-match-facts.interface';
+import type {
+  SportsMatchFactsWrite,
+  SportsOfficialStandingsSnapshot,
+} from '../interfaces/sports-match-facts.interface';
 import type { SportsFixtureReadResult } from '../interfaces/sports-read.interface';
 
 import type {
@@ -28,6 +31,7 @@ import {
   SportsQueue,
   SportsCollectionState,
   SportsYoutubeHighlight,
+  SportsOfficialStandings,
 } from '../schemas';
 import { SportsDataChangeEventService } from './sports-data-change-event.service';
 
@@ -48,6 +52,8 @@ export class SportsPersistenceService {
     private readonly matchSummaryModel: Model<any>,
     @InjectModel(SportsMatchFacts.name)
     private readonly matchFactsModel: Model<any>,
+    @InjectModel(SportsOfficialStandings.name)
+    private readonly officialStandingsModel: Model<any>,
     @InjectModel(SportsCollectionState.name)
     private readonly collectionStateModel: Model<any>,
     @InjectModel(SportsYoutubeHighlight.name)
@@ -522,7 +528,7 @@ export class SportsPersistenceService {
     > = {};
 
     try {
-      // Retry transient MongoDB WriteConflict errors against a fresh snapshot.
+      // Retry transient transaction conflicts and the revision-ledger upsert race.
       // The complete read/fingerprint/outbox decision is rerun on each attempt.
       await this.withWriteConflictRetry(session, async () => {
         settlementSourceChanges.clear();
@@ -1016,6 +1022,162 @@ export class SportsPersistenceService {
       .exec();
   }
 
+  /**
+   * Persist a complete official standings snapshot without allowing an older
+   * or malformed Summary response to replace the last good table.
+   *
+   * sourceRevision is retained for diagnostics only because ESPN Summary
+   * revisions belong to individual fixtures and are not comparable across a
+   * competition's matches. Freshness is therefore ordered by collection time.
+   */
+  async saveOfficialStandings(
+    snapshot: SportsOfficialStandingsSnapshot,
+  ): Promise<{ saved: boolean; reason: 'SAVED' | 'INCOMPLETE' | 'STALE' | 'UNCHANGED' | 'AMBIGUOUS_TIMESTAMP' }> {
+    const competitionId = String(snapshot.competitionId ?? '').trim();
+    const seasonId = String(snapshot.seasonId ?? '').trim();
+    const sourceCollectedAt = new Date(snapshot.sourceCollectedAt);
+    const attemptedAt = new Date();
+    const actualEntryCount = (snapshot.groups ?? []).reduce(
+      (total, group) => total + (Array.isArray(group.entries) ? group.entries.length : 0),
+      0,
+    );
+    const structurallyComplete =
+      Boolean(competitionId && seasonId) &&
+      snapshot.provider === 'ESPN' &&
+      snapshot.isComplete === true &&
+      snapshot.entryCount > 0 &&
+      actualEntryCount === snapshot.entryCount &&
+      Array.isArray(snapshot.groups) &&
+      snapshot.groups.length > 0 &&
+      snapshot.groups.every((group) => Array.isArray(group.entries) && group.entries.length > 0) &&
+      Number.isFinite(sourceCollectedAt.getTime());
+
+    const makeAttempt = (
+      status: string,
+      reason?: string,
+    ): Record<string, unknown> => ({
+      status,
+      reason,
+      attemptedAt,
+      endpoint: snapshot.endpoint,
+      sourcePayloadHash: snapshot.sourcePayloadHash,
+      sourceCollectedAt: Number.isFinite(sourceCollectedAt.getTime())
+        ? sourceCollectedAt
+        : undefined,
+      sourceRevision: snapshot.sourceRevision,
+      entryCount: actualEntryCount,
+      isComplete: structurallyComplete,
+      diagnostics: snapshot.diagnostics ?? [],
+    });
+
+    const upsertDefaults = {
+      id: snapshot.id,
+      competitionId,
+      seasonId,
+      provider: 'ESPN',
+      status: 'MISSING',
+      groups: [],
+      entryCount: 0,
+      isComplete: false,
+      diagnostics: [],
+    };
+
+    if (!structurallyComplete) {
+      await this.officialStandingsModel.updateOne(
+        { competitionId, seasonId },
+        {
+          $set: { lastAttempt: makeAttempt('INCOMPLETE', 'Snapshot failed structural completeness checks.') },
+          $setOnInsert: upsertDefaults,
+        },
+        { upsert: true, runValidators: true },
+      ).exec();
+      return { saved: false, reason: 'INCOMPLETE' };
+    }
+
+    const validSnapshotFields = {
+      provider: 'ESPN',
+      status: 'AVAILABLE',
+      endpoint: snapshot.endpoint,
+      sourcePayloadHash: snapshot.sourcePayloadHash,
+      sourceRevision: snapshot.sourceRevision,
+      sourceCollectedAt,
+      lastSuccessfulAt: attemptedAt,
+      header: snapshot.header,
+      groups: snapshot.groups,
+      entryCount: actualEntryCount,
+      isComplete: true,
+      diagnostics: snapshot.diagnostics ?? [],
+      lastAttempt: makeAttempt('SAVED'),
+    };
+
+    let writeAccepted = false;
+    try {
+      const result = await this.officialStandingsModel.updateOne(
+        {
+          competitionId,
+          seasonId,
+          $or: [
+            { sourceCollectedAt: { $lt: sourceCollectedAt } },
+            { sourceCollectedAt: { $exists: false } },
+            { sourceCollectedAt: null },
+          ],
+        },
+        {
+          $set: validSnapshotFields,
+          $setOnInsert: {
+            id: snapshot.id,
+            competitionId,
+            seasonId,
+          },
+        },
+        { upsert: true, runValidators: true },
+      ).exec();
+      writeAccepted = Number(result?.matchedCount ?? 0) > 0
+        || Number(result?.upsertedCount ?? 0) > 0;
+    } catch (error) {
+      // A stale upsert can hit the unique competition-season index because
+      // the existing newer document does not match the conditional filter.
+      if (Number((error as { code?: unknown })?.code) !== 11000) throw error;
+    }
+
+    if (writeAccepted) return { saved: true, reason: 'SAVED' };
+
+    const current = await this.officialStandingsModel
+      .findOne({ competitionId, seasonId })
+      .select({ sourceCollectedAt: 1, sourcePayloadHash: 1 })
+      .lean()
+      .exec() as { sourceCollectedAt?: Date | string; sourcePayloadHash?: string } | null;
+    const currentTimestamp = current?.sourceCollectedAt
+      ? new Date(current.sourceCollectedAt).getTime()
+      : Number.NaN;
+    const incomingTimestamp = sourceCollectedAt.getTime();
+    const reason = Number.isFinite(currentTimestamp) && currentTimestamp > incomingTimestamp
+      ? 'STALE' as const
+      : Number.isFinite(currentTimestamp) && currentTimestamp === incomingTimestamp
+        ? current?.sourcePayloadHash === snapshot.sourcePayloadHash
+          ? 'UNCHANGED' as const
+          : 'AMBIGUOUS_TIMESTAMP' as const
+        : 'STALE' as const;
+
+    await this.officialStandingsModel.updateOne(
+      { competitionId, seasonId },
+      { $set: { lastAttempt: makeAttempt(reason, 'Snapshot was not newer than the stored official standings.') } },
+    ).exec();
+
+    return { saved: false, reason };
+  }
+
+  async getOfficialStandings(
+    competitionId: string,
+    seasonId: string,
+  ): Promise<unknown | null> {
+    return this.officialStandingsModel
+      .findOne({ competitionId, seasonId, status: 'AVAILABLE', isComplete: true })
+      .select('-_id -__v')
+      .lean()
+      .exec();
+  }
+
   async saveOddsSnapshot(item: SportsMatchOddsSnapshotRecord): Promise<void> {
     const normalized = this.stripUndefined(item);
     delete normalized.rawPayload;
@@ -1149,6 +1311,7 @@ export class SportsPersistenceService {
    */
   async getSummaryBackfillPage(input: {
     competitionId: string;
+    seasonId?: string;
     cursorKickoffAt?: string;
     cursorFixtureId?: string;
     limit: number;
@@ -1172,6 +1335,8 @@ export class SportsPersistenceService {
         ],
       },
     ];
+
+    if (input.seasonId) and.push({ seasonId: input.seasonId });
 
     if (input.cursorKickoffAt && input.cursorFixtureId) {
       const cursorDate = new Date(input.cursorKickoffAt);
@@ -1588,16 +1753,29 @@ export class SportsPersistenceService {
       code?: number;
       codeName?: string;
       errorLabels?: string[];
+      keyPattern?: Record<string, number>;
       hasErrorLabel?: (label: string) => boolean;
     };
     const labels = Array.isArray(value.errorLabels) ? value.errorLabels : [];
     const transientTransaction = labels.includes('TransientTransactionError') ||
       value.hasErrorLabel?.('TransientTransactionError') === true;
+
+    // Two live scoreboard transactions can concurrently initialize the same
+    // source-revision ledger row. The unique { entity, entityId } index makes
+    // one insert lose with E11000; retry the complete fixture/outbox transaction
+    // so it can read the winner's committed ledger row and allocate a revision.
+    // Do not retry unrelated duplicate-key errors.
+    const revisionLedgerInitializationRace =
+      value.code === 11000 &&
+      value.keyPattern?.entity === 1 &&
+      value.keyPattern?.entityId === 1;
+
     return value.code === 112 ||
       value.code === 251 ||
       value.codeName === 'WriteConflict' ||
       value.codeName === 'NoSuchTransaction' ||
-      transientTransaction;
+      transientTransaction ||
+      revisionLedgerInitializationRace;
   }
 
   private stripUndefined<T extends Record<string, any>>(value: T): T {
@@ -1606,3 +1784,4 @@ export class SportsPersistenceService {
     ) as T;
   }
 }
+

@@ -16,6 +16,13 @@ import { AnalyticsOperationsService } from './analytics-operations.service';
 
 type CountResult = { count: number };
 
+type PublicPredictionStatsFacet = {
+  marketsPredicted: CountResult[];
+  marketWinCounts: CountResult[];
+  matchesPredictedCounts: CountResult[];
+  settledMatchCounts: CountResult[];
+};
+
 export interface PublicAnalyticsStats {
   registeredUsers: number;
   subscribers: number;
@@ -102,14 +109,16 @@ export class AnalyticsService {
       selections: { $elemMatch: { isFinalSelection: true } },
     };
 
+    // The homepage needs four different prediction counters, but all four use
+    // the same initial status/final-selection boundary. Run their independent
+    // calculations as facets of one collection read instead of issuing four
+    // concurrent scans against MarketPrediction. Each facet preserves the
+    // original count/grouping semantics.
     const [
       registeredUsers,
       subscriberCounts,
-      marketsPredicted,
-      marketWinCounts,
-      matchesPredictedCounts,
+      predictionStatsRows,
       activeCompetitionCount,
-      settledMatchCounts,
     ] = await Promise.all([
       this.userModel.countDocuments({
         isDeleted: { $ne: true },
@@ -128,71 +137,83 @@ export class AnalyticsService {
         { $group: { _id: '$userId' } },
         { $count: 'count' },
       ]).exec(),
-      this.marketPredictionModel.countDocuments(predictedMarketsMatch).exec(),
-      this.marketPredictionModel.aggregate<CountResult>([
+      this.marketPredictionModel.aggregate<PublicPredictionStatsFacet>([
+        { $match: predictedMarketsMatch },
         {
-          $match: {
-            status: { $in: PREDICTED_MARKET_STATUSES },
-            selections: {
-              $elemMatch: {
-                isFinalSelection: true,
-                actualOutcome: 'WON',
+          $facet: {
+            marketsPredicted: [{ $count: 'count' }],
+            marketWinCounts: [
+              {
+                $match: {
+                  selections: {
+                    $elemMatch: {
+                      isFinalSelection: true,
+                      actualOutcome: 'WON',
+                    },
+                  },
+                },
               },
-            },
-          },
-        },
-        { $unwind: '$selections' },
-        {
-          $match: {
-            'selections.isFinalSelection': true,
-            'selections.actualOutcome': 'WON',
-          },
-        },
-        { $count: 'count' },
-      ]).exec(),
-      this.marketPredictionModel.aggregate<CountResult>([
-        { $match: predictedMarketsMatch },
-        { $group: { _id: '$eventId' } },
-        { $count: 'count' },
-      ]).exec(),
-      this.sportsRead.countCompetitions({ activeOnly: true }),
-      this.marketPredictionModel.aggregate<CountResult>([
-        { $match: predictedMarketsMatch },
-        { $unwind: '$selections' },
-        { $match: { 'selections.isFinalSelection': true } },
-        {
-          $group: {
-            _id: '$eventId',
-            totalSelections: { $sum: 1 },
-            settledSelections: {
-              $sum: {
-                $cond: [
-                  {
-                    $in: [
-                      { $ifNull: ['$selections.actualOutcome', 'PENDING'] },
-                      PERSISTED_SETTLEMENT_OUTCOMES,
+              { $unwind: '$selections' },
+              {
+                $match: {
+                  'selections.isFinalSelection': true,
+                  'selections.actualOutcome': 'WON',
+                },
+              },
+              { $count: 'count' },
+            ],
+            matchesPredictedCounts: [
+              { $group: { _id: '$eventId' } },
+              { $count: 'count' },
+            ],
+            settledMatchCounts: [
+              { $unwind: '$selections' },
+              { $match: { 'selections.isFinalSelection': true } },
+              {
+                $group: {
+                  _id: '$eventId',
+                  totalSelections: { $sum: 1 },
+                  settledSelections: {
+                    $sum: {
+                      $cond: [
+                        {
+                          $in: [
+                            { $ifNull: ['$selections.actualOutcome', 'PENDING'] },
+                            PERSISTED_SETTLEMENT_OUTCOMES,
+                          ],
+                        },
+                        1,
+                        0,
+                      ],
+                    },
+                  },
+                },
+              },
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $gt: ['$totalSelections', 0] },
+                      { $eq: ['$totalSelections', '$settledSelections'] },
                     ],
                   },
-                  1,
-                  0,
-                ],
+                },
               },
-            },
+              { $count: 'count' },
+            ],
           },
         },
-        {
-          $match: {
-            $expr: {
-              $and: [
-                { $gt: ['$totalSelections', 0] },
-                { $eq: ['$totalSelections', '$settledSelections'] },
-              ],
-            },
-          },
-        },
-        { $count: 'count' },
       ]).exec(),
+      this.sportsRead.countCompetitions({ activeOnly: true }),
     ]);
+
+    const predictionStats = predictionStatsRows[0];
+    const marketsPredicted = predictionStats?.marketsPredicted?.[0]?.count ?? 0;
+    const marketsWon = predictionStats?.marketWinCounts?.[0]?.count ?? 0;
+    const matchesPredicted =
+      predictionStats?.matchesPredictedCounts?.[0]?.count ?? 0;
+    const settledMatches =
+      predictionStats?.settledMatchCounts?.[0]?.count ?? 0;
 
     return {
       registeredUsers,
@@ -202,10 +223,10 @@ export class AnalyticsService {
       pricingEnabledMarkets: marketCatalog.filter(
         (market) => market.pricingEnabled !== false,
       ).length,
-      marketsWon: marketWinCounts[0]?.count ?? 0,
-      matchesPredicted: matchesPredictedCounts[0]?.count ?? 0,
+      marketsWon,
+      matchesPredicted,
       activeLeagues: activeCompetitionCount,
-      settledMatches: settledMatchCounts[0]?.count ?? 0,
+      settledMatches,
       updatedAt: new Date().toISOString(),
     };
   }
@@ -238,3 +259,4 @@ export class AnalyticsService {
     };
   }
 }
+

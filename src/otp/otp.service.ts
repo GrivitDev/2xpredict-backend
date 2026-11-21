@@ -323,6 +323,27 @@ export class OtpService implements OnModuleInit {
     ).exec();
   }
 
+  /**
+   * Completes the existing first-verification welcome/referral/promo workflow.
+   * Used by OTP, verified email changes and Google sign-in. A short database
+   * lease prevents concurrent verification paths from running these effects
+   * at the same time.
+   */
+  async completeFirstVerificationOnboarding(userId: string) {
+    const user = await this.usersService.claimVerificationOnboarding(userId);
+    if (!user) return false;
+
+    try {
+      await this.completeFirstVerification(user, user.pendingPromoCode);
+      await this.usersService.clearPendingPromoCode(userId);
+      await this.usersService.completeVerificationOnboarding(userId);
+      return true;
+    } catch (error) {
+      await this.usersService.releaseVerificationOnboarding(userId);
+      throw error;
+    }
+  }
+
   async verifyOtp(verifyOtpDto: VerifyOtpDto) {
     const normalizedEmail = verifyOtpDto.email.trim().toLowerCase();
     const pendingUser = await this.usersService.findByEmail(normalizedEmail);
@@ -342,9 +363,7 @@ export class OtpService implements OnModuleInit {
       }
 
       if (user.verificationOnboardingPending) {
-        await this.completeFirstVerification(user, pendingUser.pendingPromoCode);
-        await this.usersService.clearPendingPromoCode(String(user._id));
-        await this.usersService.completeVerificationOnboarding(String(user._id));
+        await this.completeFirstVerificationOnboarding(String(user._id));
       }
       await this.completeOtp(otp);
 
@@ -477,7 +496,6 @@ export class OtpService implements OnModuleInit {
 
       const needsFirstVerification =
         !currentUser.isVerified || currentUser.verificationOnboardingPending;
-      const pendingPromoCode = currentUser.pendingPromoCode;
       let updatedUser: Awaited<ReturnType<UsersService['changeEmailAndVerify']>>;
       try {
         updatedUser = await this.usersService.changeEmailAndVerify(
@@ -494,9 +512,7 @@ export class OtpService implements OnModuleInit {
       if (!updatedUser) throw new NotFoundException('Account could not be updated.');
 
       if (needsFirstVerification) {
-        await this.completeFirstVerification(updatedUser, pendingPromoCode);
-        await this.usersService.clearPendingPromoCode(userId);
-        await this.usersService.completeVerificationOnboarding(userId);
+        await this.completeFirstVerificationOnboarding(userId);
       }
 
       await this.completeOtp(otp);

@@ -10,7 +10,7 @@ import {
   SportsQueueScope,
 } from '../interfaces/sports-queue.interface';
 import { SportsBootstrapState } from '../schemas/operations/sports-bootstrap-state.schema';
-import { SportsSeason } from '../schemas';
+import { SportsCompetition, SportsSeason } from '../schemas';
 import { SportsQueueService } from './sports-queue.service';
 
 @Injectable()
@@ -24,6 +24,8 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
     private readonly bootstrapModel: Model<SportsBootstrapState>,
     @InjectModel(SportsSeason.name)
     private readonly seasonModel: Model<any>,
+    @InjectModel(SportsCompetition.name)
+    private readonly competitionModel: Model<any>,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -162,6 +164,7 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
 
   private async ensureRecurringDiscovery(): Promise<void> {
     await this.ensureHistoricalDerivedBaseline();
+    await this.ensureOfficialStandingsBackfill();
     const bootstrap = (await this.bootstrapModel
       .findOne({ key: this.stateKey })
       .select({ runId: 1 })
@@ -228,6 +231,50 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
   }
 
   /**
+   * One-time, idempotent, local-only backfill of official standings from
+   * already-retained Summary payloads. No ESPN requests are scheduled here.
+   */
+  private async ensureOfficialStandingsBackfill(): Promise<void> {
+    if (!SPORTS_COLLECTION_SCHEDULE.officialStandingsBackfill.enabled) return;
+
+    const competitions = (await this.competitionModel
+      .find({
+        isActive: true,
+        currentSeasonId: { $exists: true, $nin: [null, ''] },
+      })
+      .sort({ slug: 1, id: 1 })
+      .select({ id: 1, currentSeasonId: 1 })
+      .lean()
+      .exec()) as Array<{ id?: string; currentSeasonId?: string }>;
+
+    const runId = 'STAGE1E_OFFICIAL_STANDINGS_V1';
+    const baseTime = Date.now();
+    let queued = 0;
+    for (const competition of competitions) {
+      const competitionId = String(competition.id ?? '').trim();
+      const seasonId = String(competition.currentSeasonId ?? '').trim();
+      if (!competitionId || !seasonId) continue;
+
+      const result = await this.queue.enqueueIfMissing({
+        type: SportsQueueJobType.OFFICIAL_STANDINGS_BACKFILL,
+        scope: { competitionId, seasonId, backfillRunId: runId },
+        priority: SPORTS_COLLECTION_SCHEDULE.officialStandingsBackfill.priority,
+        scheduledFor: new Date(
+          baseTime + queued * SPORTS_COLLECTION_SCHEDULE.officialStandingsBackfill.startSpacingMs,
+        ),
+        triggerEventId: `official-standings-backfill:${runId}:${competitionId}:${seasonId}:start`,
+      });
+      if (result.created) queued += 1;
+    }
+
+    if (queued) {
+      this.logger.log(
+        `Official standings local backfill queued for ${queued} active competition-season(s).`,
+      );
+    }
+  }
+
+  /**
    * One-time idempotent Stage 4 migration for deployments whose original
    * Sports bootstrap was completed before historical derived projections were
    * retained. A stable scope key prevents this baseline from replaying on every
@@ -275,6 +322,7 @@ export class SportsQueueBootstrapService implements OnApplicationBootstrap {
     });
   }
 }
+
 
 
 

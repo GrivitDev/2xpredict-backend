@@ -2,14 +2,16 @@ export const PREDICTION_ENGINE_CONFIG = {
   enabled: true,
   modelVersion: '2XP-FOOTBALL-3.1.0',
   queue: {
-    /** Periodic full-inventory reconciliation; Stage 2 adds direct Sports/Odds event enqueueing. */
+    /** Periodic reconciliation only considers fixtures inside this rolling window. */
+    forwardWindowHours: 7 * 24,
+    /** Periodic reconciliation is a bounded recovery path; source events remain the primary trigger. */
     syncIntervalMs: 10 * 60_000,
     /** Ten-second polling avoids rapid queue checks while preserving responsiveness. */
     workerIntervalMs: 10_000,
     /** One active calculation at a time; the shared limiter also caps all modules globally. */
     workerConcurrency: 1,
-    /** Temporary safety-net refresh; Stage 2 will make source-change events the primary trigger. */
-    completedRefreshIntervalMs: 12 * 60 * 60 * 1000,
+    /** Source-change events are primary; retain a 72-hour recovery refresh for missed or silent updates. */
+    completedRefreshIntervalMs: 72 * 60 * 60 * 1000,
     /** Retry exhausted jobs after a cooldown, even if source timestamps did not change. */
     failedRecoveryIntervalMs: 30 * 60 * 1000,
     maxAttempts: 4,
@@ -174,4 +176,5 @@ export const PREDICTION_ENGINE_CONFIG = {
 } as const;
 
 export type PredictionEngineConfig = typeof PREDICTION_ENGINE_CONFIG;
+
 

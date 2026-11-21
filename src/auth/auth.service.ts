@@ -11,11 +11,13 @@ import { Connection } from 'mongoose';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'node:crypto';
+import { OAuth2Client } from 'google-auth-library';
 
 import { UsersService } from '../users/users.service';
 import { UserSessionService } from '../user-session/user-session.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { GoogleAuthDto } from './dto/google-auth.dto';
 import { RequestEmailChangeDto } from './dto/request-email-change.dto';
 import { OtpService } from '../otp/otp.service';
 import { NotificationEmailDeliveryService } from '../notifications/email-delivery/email-delivery.service';
@@ -34,6 +36,7 @@ const PASSWORD_RESET_RESPONSE =
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly googleClient = new OAuth2Client();
 
   constructor(
     private readonly usersService: UsersService,
@@ -210,6 +213,270 @@ export class AuthService {
         isVerified: user.isVerified,
       },
     };
+  }
+
+  async googleAuth(dto: GoogleAuthDto, ip?: string, userAgent?: string) {
+    const clientId = this.configService.getOrThrow<string>('GOOGLE_CLIENT_ID');
+    let googlePayload: {
+      sub?: string;
+      email?: string;
+      email_verified?: boolean;
+      name?: string;
+    } | undefined;
+
+    try {
+      const ticket = await this.googleClient.verifyIdToken({
+        idToken: dto.idToken,
+        audience: clientId,
+      });
+      googlePayload = ticket.getPayload();
+    } catch {
+      throw new UnauthorizedException('Google sign-in could not be verified. Please try again.');
+    }
+
+    const googleId = googlePayload?.sub;
+    const email = typeof googlePayload?.email === 'string'
+      ? googlePayload.email.trim().toLowerCase()
+      : '';
+    const emailVerified = googlePayload?.email_verified === true;
+
+    if (!googleId || !email || !emailVerified) {
+      throw new UnauthorizedException('Google did not provide a verified email address for this account.');
+    }
+
+    let user = await this.usersService.findByGoogleIdForAuth(googleId);
+
+    if (!user) {
+      const existingEmailUser = await this.usersService.findByEmailForGoogleAuth(email);
+
+      if (existingEmailUser) {
+        if (!existingEmailUser.isVerified) {
+          throw new ConflictException(
+            'An account with this email already exists. Verify that account first, then sign in with Google.',
+          );
+        }
+
+        if (existingEmailUser.googleId && existingEmailUser.googleId !== googleId) {
+          throw new ConflictException(
+            'This account is already linked to a different Google account.',
+          );
+        }
+
+        user = await this.usersService.linkGoogleIdentity(
+          String(existingEmailUser._id),
+          email,
+          googleId,
+        );
+
+        if (!user) {
+          const concurrentGoogleUser =
+            await this.usersService.findByGoogleIdForAuth(googleId);
+          if (!concurrentGoogleUser) {
+            throw new ConflictException(
+              'This account could not be linked to Google. Please try signing in again.',
+            );
+          }
+          user = concurrentGoogleUser;
+        }
+      } else {
+        user = await this.createGoogleAccount({
+          googleId,
+          email,
+          fullName: googlePayload?.name,
+          ip,
+          referralCode: dto.referralCode,
+          promoCode: dto.promoCode,
+        });
+      }
+    }
+
+    const now = new Date();
+    if (user.isDeleted || user.status === UserStatus.DELETED) {
+      throw new UnauthorizedException('Account has been deleted.');
+    }
+    if (user.status !== UserStatus.ACTIVE) {
+      throw new UnauthorizedException('Account is not active.');
+    }
+    if (user.bannedUntil && user.bannedUntil > now) {
+      throw new UnauthorizedException('Account is temporarily banned.');
+    }
+    if (user.loginLockedUntil && user.loginLockedUntil > now) {
+      throw new UnauthorizedException('Account sign-in is temporarily locked. Please try again later.');
+    }
+
+    // Google has already verified the email. Complete the same referral,
+    // campaign and welcome onboarding used by the OTP verification workflow.
+    try {
+      const onboardingCompleted = await this.otpService.completeFirstVerificationOnboarding(String(user._id));
+      if (onboardingCompleted) {
+        try {
+          await this.notificationEvents.accountEmailVerified({ userId: String(user._id) });
+        } catch (notificationError) {
+          const message = notificationError instanceof Error ? notificationError.message : String(notificationError);
+          this.logger.warn(`Google account onboarding completed, but its verification notification could not be queued: ${message}`);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Google sign-in succeeded in identity verification, but account onboarding remains pending: ${message}`);
+    }
+
+    const authVersion = Number(user.authVersion ?? 0);
+    const loginUpdate = await this.usersService.updateGoogleLoginInfo(
+      String(user._id),
+      authVersion,
+      googleId,
+    );
+    if (!loginUpdate) {
+      throw new UnauthorizedException('Google sign-in could not establish a valid account session. Please try again.');
+    }
+
+    await this.userSessionService.cleanupUserSessions(String(user._id));
+    const session = await this.userSessionService.createSession({
+      userId: user._id,
+      userAgent: userAgent || 'unknown',
+      ipAddress: ip || 'unknown',
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+
+    const token = this.jwtService.sign({
+      userId: String(user._id),
+      fullName: user.fullName,
+      username: user.username,
+      email: user.email,
+      role: user.role,
+      country: user.country,
+      countryCode: user.countryCode,
+      currency: user.currency,
+      sessionId: String(session._id),
+      authVersion,
+    });
+
+    return {
+      message: 'Google sign-in successful',
+      token,
+      user: {
+        id: String(user._id),
+        fullName: user.fullName,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        country: user.country,
+        countryCode: user.countryCode,
+        currency: user.currency,
+        isVerified: user.isVerified,
+      },
+    };
+  }
+
+  private async createGoogleAccount(input: {
+    googleId: string;
+    email: string;
+    fullName?: string;
+    ip?: string;
+    referralCode?: string;
+    promoCode?: string;
+  }) {
+    let referredBy: string | undefined;
+
+    if (input.referralCode) {
+      const normalizedReferralCode = input.referralCode.trim().toLowerCase();
+      const referrer = await this.usersService.findByUsername(normalizedReferralCode);
+      if (!referrer) throw new BadRequestException('Invalid referral code.');
+      referredBy = String(referrer._id);
+    }
+
+    const promoCode = input.promoCode?.trim();
+    if (promoCode) {
+      const promo = await this.promosService.findActivePromoByCode(promoCode);
+      if (!promo) throw new BadRequestException('Invalid or expired promo code.');
+    }
+
+    const location = await this.geoLocationService.lookup(input.ip || '');
+    const country = location?.country || '';
+    const countryCode = location?.countryCode || '';
+    const currency = countryCode === 'NG' ? 'NGN' : 'USD';
+
+    const emailName = input.email.split('@')[0] || 'member';
+    const normalizedName = input.fullName?.trim().slice(0, 100);
+    const fullName = normalizedName && normalizedName.length >= 2
+      ? normalizedName
+      : (emailName.length >= 2 ? emailName.slice(0, 100) : `User ${emailName}`);
+
+    // Google registrations still use the existing required password-hash
+    // schema. This random value is never returned or used as a user password;
+    // users can set a real password later through the password-reset flow.
+    const generatedPassword = crypto.randomBytes(48).toString('hex');
+    const password = await bcrypt.hash(generatedPassword, BCRYPT_ROUNDS);
+
+    let lastDuplicateError: unknown;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const username = await this.generateGoogleUsername(input.email);
+      try {
+        return await this.usersService.create({
+          fullName,
+          username,
+          phoneNumber: '',
+          email: input.email,
+          password,
+          googleId: input.googleId,
+          country,
+          countryCode,
+          currency,
+          status: UserStatus.ACTIVE,
+          isVerified: true,
+          verificationOnboardingPending: true,
+          referredBy,
+          pendingPromoCode: promoCode,
+        });
+      } catch (error) {
+        if (!this.isDuplicateKeyError(error)) throw error;
+        lastDuplicateError = error;
+
+        // Concurrent first sign-ins can create the same identity. Reuse the
+        // winning account rather than reporting a false registration failure.
+        const concurrentUser = await this.usersService.findByGoogleIdForAuth(input.googleId);
+        if (concurrentUser) return concurrentUser;
+
+        const sameEmailUser = await this.usersService.findByEmailForGoogleAuth(input.email);
+        if (sameEmailUser) {
+          if (sameEmailUser.googleId === input.googleId) return sameEmailUser;
+          if (sameEmailUser.googleId) {
+            throw new ConflictException('This email address is already linked to another Google account.');
+          }
+          if (!sameEmailUser.isVerified) {
+            throw new ConflictException(
+              'An account with this email already exists. Verify that account first, then sign in with Google.',
+            );
+          }
+          const linkedUser = await this.usersService.linkGoogleIdentity(
+            String(sameEmailUser._id),
+            input.email,
+            input.googleId,
+          );
+          if (linkedUser) return linkedUser;
+        }
+      }
+    }
+
+    if (lastDuplicateError) {
+      throw new ConflictException('A unique username could not be created for this Google account. Please try again.');
+    }
+    throw new ConflictException('Google account registration could not be completed. Please try again.');
+  }
+
+  private async generateGoogleUsername(email: string): Promise<string> {
+    const localPart = email.split('@')[0] || 'member';
+    let base = localPart.toLowerCase().replace(/[^a-z0-9_]/g, '');
+    if (base.length < 3) base = `user${base}`;
+    base = (base || 'member').slice(0, 16);
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const candidate = `${base}_${crypto.randomInt(100000, 1000000)}`;
+      if (!(await this.usersService.findByUsername(candidate))) return candidate;
+    }
+
+    throw new ConflictException('A username could not be generated for this Google account. Please try again.');
   }
 
   async requestEmailChange(userId: string, dto: RequestEmailChangeDto) {

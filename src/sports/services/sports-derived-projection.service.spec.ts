@@ -4,7 +4,7 @@ import type { SportsMatchFactsRecord } from '../interfaces/sports-match-facts.in
 
 describe('SportsDerivedProjectionService — historical projections', () => {
   const createService = (models: Record<string, unknown>[] = []) => {
-    const dependencies = (models.length ? models : Array.from({ length: 13 }, () => ({}))) as unknown as ConstructorParameters<typeof SportsDerivedProjectionService>;
+    const dependencies = (models.length ? models : Array.from({ length: 14 }, () => ({}))) as unknown as ConstructorParameters<typeof SportsDerivedProjectionService>;
     return new SportsDerivedProjectionService(...dependencies);
   };
 
@@ -100,6 +100,95 @@ describe('SportsDerivedProjectionService — historical projections', () => {
     const match = (service as any).toCompletedMatch(fixture, facts);
     expect(match.homeGoals).toBe(0);
     expect(match.awayGoals).toBe(3);
+  });
+
+  it('includes known season teams that have not completed a fixture yet', () => {
+    const service = createService();
+    const fixture = completedFixture('fixture-standings', 0, 'season-current');
+    const match = {
+      fixture,
+      home: fixture.competitors[0],
+      away: fixture.competitors[1],
+      homeGoals: 2,
+      awayGoals: 0,
+    };
+
+    const rows = (service as any).calculateStandings(
+      [match],
+      new Date('2026-11-19T00:00:00.000Z'),
+      'competition-1',
+      'season-current',
+      new Set(['team:alpha', 'team:beta', 'team:unplayed']),
+    );
+    const unplayed = rows.find((row: any) => row.teamId === 'team:unplayed');
+
+    expect(rows).toHaveLength(3);
+    expect(unplayed).toMatchObject({
+      teamId: 'team:unplayed',
+      sourceFixtureCount: 0,
+      metrics: {
+        played: 0,
+        won: 0,
+        drawn: 0,
+        lost: 0,
+        goalsFor: 0,
+        goalsAgainst: 0,
+        points: 0,
+      },
+    });
+  });
+
+  it('preserves a team record when a recalculation sees fewer completed results', async () => {
+    const previousMetrics = {
+      teamId: 'team:alpha',
+      played: 3,
+      won: 3,
+      drawn: 0,
+      lost: 0,
+      goalsFor: 7,
+      goalsAgainst: 1,
+      goalDifference: 6,
+      points: 9,
+    };
+    const query: any = {};
+    query.select = jest.fn(() => query);
+    query.lean = jest.fn(() => query);
+    query.exec = jest.fn().mockResolvedValue([{
+      id: 'standings:competition-1:season-current:team:alpha',
+      competitionId: 'competition-1',
+      seasonId: 'season-current',
+      teamId: 'team:alpha',
+      position: 1,
+      calculatedAt: new Date('2026-11-18T00:00:00.000Z'),
+      sourceFixtureCount: 3,
+      metrics: previousMetrics,
+    }]);
+    const standingsModel = { find: jest.fn(() => query) };
+    const models = Array.from({ length: 14 }, () => ({}));
+    models[5] = standingsModel;
+    const service = createService(models);
+    const fixture = completedFixture('fixture-partial-standings', 0, 'season-current');
+    const match = {
+      fixture,
+      home: fixture.competitors[0],
+      away: fixture.competitors[1],
+      homeGoals: 1,
+      awayGoals: 0,
+    };
+
+    const rows = await (service as any).calculateSafeStandings(
+      [match],
+      new Date('2026-11-19T00:00:00.000Z'),
+      'competition-1',
+      'season-current',
+      new Set(['team:alpha', 'team:beta', 'team:unplayed']),
+    );
+    const alpha = rows.find((row: any) => row.teamId === 'team:alpha');
+    const unplayed = rows.find((row: any) => row.teamId === 'team:unplayed');
+
+    expect(alpha.sourceFixtureCount).toBe(3);
+    expect(alpha.metrics).toEqual(previousMetrics);
+    expect(unplayed.metrics.played).toBe(0);
   });
 
   it('reads normalized team statistics when fixture statistics are absent', () => {
@@ -235,7 +324,7 @@ describe('SportsDerivedProjectionService — historical projections', () => {
   });
 
   it('does not delete previous-season projections when compatibility pruning is called', async () => {
-    const models = Array.from({ length: 13 }, () => ({
+    const models = Array.from({ length: 14 }, () => ({
       deleteMany: jest.fn().mockReturnValue({ exec: jest.fn().mockResolvedValue({ deletedCount: 0 }) }),
     }));
     const service = createService(models);
@@ -269,7 +358,7 @@ describe('SportsDerivedProjectionService — historical projections', () => {
     factsQuery.lean = jest.fn(() => factsQuery);
     factsQuery.exec = jest.fn().mockResolvedValue([]);
     const matchFactsModel = { find: jest.fn(() => factsQuery) };
-    const models = Array.from({ length: 13 }, () => ({}));
+    const models = Array.from({ length: 14 }, () => ({}));
     models[0] = fixtureModel;
     models[2] = matchFactsModel;
     const service = createService(models);
@@ -345,3 +434,4 @@ describe('SportsDerivedProjectionService — historical projections', () => {
   });
 
 });
+

@@ -96,7 +96,7 @@ export class SportsMonitorService
   private readonly logger = new Logger(SportsMonitorService.name);
   private readonly monitorIntervalMs = this.readPositiveInteger(
     process.env.SPORTS_MONITOR_INTERVAL_MS,
-    60_000,
+    3 * MINUTE,
   );
   private readonly cacheTtlMs = 15_000;
   private stopped = false;
@@ -1889,5 +1889,6 @@ export class SportsMonitorService
           .slice(0, 500);
   }
 }
+
 
 

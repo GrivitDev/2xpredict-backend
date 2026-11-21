@@ -32,6 +32,15 @@ export const SPORTS_COLLECTION_SCHEDULE = {
     priority: 25,
   },
 
+  /** Re-process retained Summary payloads locally to recover official standings. */
+  officialStandingsBackfill: {
+    enabled: true,
+    pageSize: 20,
+    startSpacingMs: 2_000,
+    nextPageDelayMs: 10_000,
+    priority: 18,
+  },
+
   /** Match odds are checked at three fixed pre-match checkpoints only. */
   matchOdds48Hours: { enabled: true, leadMs: 48 * HOUR },
   matchOdds24Hours: { enabled: true, leadMs: 24 * HOUR },
@@ -76,4 +85,5 @@ export type SportsCollectionScheduleKey =
   keyof typeof SPORTS_COLLECTION_SCHEDULE;
 
 export const SPORTS_COLLECTION_TIME = { MINUTE, HOUR, DAY } as const;
+
 

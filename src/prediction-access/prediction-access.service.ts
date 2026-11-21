@@ -119,6 +119,11 @@ export class PredictionAccessService {
         allocationBasis:
           'DISTINCT_LEAGUES_WITH_ACTIVE_PREDICTIONS_PER_LAGOS_DATE',
         mode: 'DAILY_ACTIVE_LEAGUE_ALLOCATION',
+        predictionVisibility:
+          plan === PredictionAccessPlan.VIP ||
+          plan === PredictionAccessPlan.PREMIUM
+            ? 'FULL'
+            : 'LIMITED',
         marketAccess: this.getMarketAccessSummary(plan),
       },
       curatedPredictionCenter: {
@@ -127,21 +132,25 @@ export class PredictionAccessService {
         leagueAccessPercentage:
           PREDICTION_ACCESS_CONFIG.curatedLeagueVisibility[plan],
         mode:
-          PREDICTION_ACCESS_CONFIG.curatedLeagueVisibility[plan] === 0
-            ? 'LOCKED_ACTIVE_PREDICTIONS_COUNTS_ONLY'
+          PREDICTION_ACCESS_CONFIG.curatedLeagueVisibility[plan] >= 100
+            ? 'FULL_DAILY_LEAGUE_ACCESS'
             : 'DAILY_ACTIVE_LEAGUE_ALLOCATION',
+        marketAccess: this.getCuratedMarketAccessSummary(plan),
       },
       slipProducts:
         plan === PredictionAccessPlan.PREMIUM
           ? ['ODDS_10', 'ODDS_25', 'ODDS_50']
-          : [],
+          : plan === PredictionAccessPlan.VIP
+            ? ['ODDS_10']
+            : [],
       sureOdds:
         plan === PredictionAccessPlan.REGULAR
-          ? ['SURE_2']
-          : plan === PredictionAccessPlan.VIP ||
-              plan === PredictionAccessPlan.PREMIUM
-            ? ['SURE_2', 'SURE_5', 'SURE_7']
-            : [],
+          ? ['SURE_2', 'SURE_7']
+          : plan === PredictionAccessPlan.VIP
+            ? ['SURE_2', 'SURE_7']
+            : plan === PredictionAccessPlan.PREMIUM
+              ? ['SURE_2', 'SURE_5', 'SURE_7']
+              : [],
       marketAccess: this.getMarketAccessSummary(plan),
     });
 
@@ -229,14 +238,13 @@ export class PredictionAccessService {
       },
       leagueSummary,
       accessPlan: plan,
-      marketAccess: this.getMarketAccessSummary(plan),
+      marketAccess: this.getCuratedMarketAccessSummary(plan),
       leagueAccess: this.getDailyLeagueAccessSummary(curatedAllocation),
-      ...(plan === PredictionAccessPlan.ANONYMOUS ||
-      plan === PredictionAccessPlan.FREE
+      ...(PREDICTION_ACCESS_CONFIG.curatedLeagueVisibility[plan] < 100
         ? {
-            activePredictionsLocked: true,
+            activePredictionsPartiallyLocked: true,
             message:
-              'Published curated predictions are listed with counts. A qualifying subscription is required to view their selections.',
+              'Some active Curated Predictions are available on this plan. Remaining leagues are represented with locked prediction counts.',
           }
         : {}),
     };
@@ -292,7 +300,7 @@ export class PredictionAccessService {
     return {
       ...visiblePrediction,
       accessPlan: plan,
-      marketAccess: this.getMarketAccessSummary(plan),
+      marketAccess: this.getCuratedMarketAccessSummary(plan),
     };
   }
 
@@ -328,14 +336,13 @@ export class PredictionAccessService {
             input.includePast === true,
           )
         : queryRecords;
-    const [allPicks, allocationPicks] = await Promise.all([
-      this.enrichPickCenterRecords(queryRecords),
-      allocationRecords === queryRecords
-        ? Promise.resolve(queryRecords)
-        : this.enrichPickCenterRecords(allocationRecords),
-    ]);
+    // Enrichment is required only for records returned to the client. The
+    // allocation denominator consumes the raw Pick Center fields
+    // (leagueId, fixtureDate and selectedMarkets) and does not need Sports
+    // presentation metadata or a second MarketPrediction lookup.
+    const allPicks = await this.enrichPickCenterRecords(queryRecords);
     const leagueAllocation = this.buildPickCenterLeagueAccessAllocation(
-      allocationPicks,
+      allocationRecords,
       plan,
     );
     const picks = allPicks.filter((pick: any) =>
@@ -345,9 +352,36 @@ export class PredictionAccessService {
         leagueAllocation,
       ),
     );
-    const allowedEventIds = [
-      ...new Set(picks.map((pick: any) => String(pick.eventId))),
-    ];
+
+    // Resolve the market entitlement once per fixture. The same approved
+    // selection references are used both to narrow the database query and to
+    // filter the returned market selections, avoiding repeated policy work.
+    const picksByEvent = new Map<string, any>();
+    const approvedSelectionsByEvent = new Map<string, Set<string>>();
+    const approvedMarketPredictionIds = new Set<string>();
+
+    for (const pick of picks) {
+      const eventId = String(pick.eventId ?? '');
+      if (!eventId) continue;
+      picksByEvent.set(eventId, pick);
+
+      const visibleRankedMarkets = this.filterPickCenter(pick, plan)
+        .selectedMarkets as any[];
+      const approvedSelections = new Set<string>();
+
+      for (const entry of visibleRankedMarkets) {
+        const marketPredictionId = String(entry.marketPredictionId ?? '');
+        const selectionKey = String(entry.selectionKey ?? '');
+        if (!marketPredictionId || !selectionKey) continue;
+
+        approvedSelections.add(`${marketPredictionId}::${selectionKey}`);
+        approvedMarketPredictionIds.add(marketPredictionId);
+      }
+
+      approvedSelectionsByEvent.set(eventId, approvedSelections);
+    }
+
+    const allowedEventIds = [...picksByEvent.keys()];
 
     if (!allowedEventIds.length) {
       return {
@@ -363,6 +397,15 @@ export class PredictionAccessService {
       eventId: { $in: allowedEventIds },
       status: PredictionStatus.CALCULATED,
     };
+
+    // When no specific market was requested, every visible market prediction
+    // must be referenced by an entitlement-approved Pick Center selection.
+    // Querying only those document IDs replaces the former broad read of up to
+    // 100,000 market documents. Keep the marketKey path broad enough to retain
+    // the existing requestedMarketLocked response behaviour.
+    if (!input.marketKey?.trim()) {
+      marketQuery._id = { $in: [...approvedMarketPredictionIds] };
+    }
     if (input.eventId?.trim()) marketQuery.eventId = input.eventId.trim();
     if (input.leagueId?.trim())
       marketQuery.leagueId = input.leagueId.trim().toLowerCase();
@@ -381,16 +424,6 @@ export class PredictionAccessService {
           marketAccess,
           leagueAccess: this.getDailyLeagueAccessSummary(leagueAllocation),
           requestedMarketUnavailable: true,
-        };
-      }
-      if (!this.canAccessActiveMarket(plan, requestedMarketKey)) {
-        return {
-          items: [],
-          pagination: { ...pageInfo, total: 0, pages: 0 },
-          accessPlan: plan,
-          marketAccess,
-          leagueAccess: this.getDailyLeagueAccessSummary(leagueAllocation),
-          requestedMarketLocked: true,
         };
       }
       marketQuery.marketKey = requestedMarketKey;
@@ -447,9 +480,6 @@ export class PredictionAccessService {
       .limit(100000)
       .lean()
       .exec();
-    const picksByEvent = new Map(
-      picks.map((pick: any) => [String(pick.eventId), pick]),
-    );
     const visible = rawMarkets
       .map((market) =>
         this.filterActiveMarket(
@@ -457,6 +487,8 @@ export class PredictionAccessService {
           picksByEvent.get(String(market.eventId)),
           plan,
           input,
+          approvedSelectionsByEvent.get(String(market.eventId)) ??
+            new Set<string>(),
         ),
       )
       .filter((market): market is Record<string, any> => Boolean(market));
@@ -474,6 +506,9 @@ export class PredictionAccessService {
       accessPlan: plan,
       marketAccess,
       leagueAccess: this.getDailyLeagueAccessSummary(leagueAllocation),
+      ...(input.marketKey?.trim() && rawMarkets.length > 0 && visible.length === 0
+        ? { requestedMarketLocked: true }
+        : {}),
     };
   }
 
@@ -1567,7 +1602,7 @@ export class PredictionAccessService {
     const predictionDocs = marketPredictionIds.length
       ? ((await this.marketPredictionModel
           .find({ _id: { $in: marketPredictionIds } })
-          .select('_id selections')
+          .select('_id selections.key selections.actualOutcome')
           .lean()
           .exec()) as any[])
       : [];
@@ -1699,14 +1734,11 @@ export class PredictionAccessService {
     ];
     if (!uniqueEventIds.length) return result;
 
-    // Fetch only normalized fixture, team, and competition records. Avoid
-    // getMatch() here because its richer statistics/lineup/timeline projection
-    // is unnecessary for the list presentation and can create avoidable load.
-    const fixtures = await this.mapConcurrent(uniqueEventIds, 12, (eventId) =>
-      this.sportsRead.getFixture(eventId),
-    );
-    const validFixtures = fixtures.filter(
-      (fixture): fixture is NonNullable<typeof fixture> => Boolean(fixture),
+    // Fetch normalized fixture, team, and competition records in bounded
+    // batch queries. Avoid getMatch() here because its richer
+    // statistics/lineup/timeline projection is unnecessary for list cards.
+    const validFixtures = await this.sportsRead.getFixturesByIdentifiers(
+      uniqueEventIds,
     );
     if (!validFixtures.length) return result;
 
@@ -1727,9 +1759,7 @@ export class PredictionAccessService {
       ),
     ];
     const [teamRecords, competitionMap] = await Promise.all([
-      this.mapConcurrent(teamIds, 12, (teamId) =>
-        this.sportsRead.getTeam(teamId),
-      ),
+      this.sportsRead.getTeamsByIdentifiers(teamIds),
       this.getSportsCompetitionMap(competitionIds),
     ]);
     const teamMap = new Map<string, any>();
@@ -1781,39 +1811,14 @@ export class PredictionAccessService {
     return result;
   }
 
-  private async mapConcurrent<T, R>(
-    values: T[],
-    concurrency: number,
-    worker: (value: T, index: number) => Promise<R>,
-  ): Promise<R[]> {
-    if (!values.length) return [];
-    const results = new Array<R>(values.length);
-    let nextIndex = 0;
-    const workerCount = Math.max(
-      1,
-      Math.min(values.length, Math.floor(concurrency) || 1),
-    );
-    await Promise.all(
-      Array.from({ length: workerCount }, async () => {
-        while (true) {
-          const index = nextIndex;
-          nextIndex += 1;
-          if (index >= values.length) return;
-          results[index] = await worker(values[index], index);
-        }
-      }),
-    );
-    return results;
-  }
-
   private async getSportsCompetitionMap(
     competitionIds: string[],
   ): Promise<Map<string, any>> {
     const uniqueIds = [
       ...new Set(competitionIds.map((id) => String(id).trim()).filter(Boolean)),
     ];
-    const records = await this.mapConcurrent(uniqueIds, 12, (id) =>
-      this.sportsRead.getCompetition(id),
+    const records = await this.sportsRead.getCompetitionsByIdentifiers(
+      uniqueIds,
     );
     const result = new Map<string, any>();
     for (const competition of records) {
@@ -1964,20 +1969,9 @@ export class PredictionAccessService {
     pick: any,
     plan: PredictionAccessPlan,
     input: PredictionReadFilters,
+    approvedSelections: ReadonlySet<string>,
   ): Record<string, any> | null {
     if (!pick || !Array.isArray(market.selections)) return null;
-    if (
-      !this.canAccessActiveMarket(plan, String(market.marketKey ?? '').trim())
-    )
-      return null;
-    const visibleRankedMarkets = this.filterPickCenter(pick, plan)
-      .selectedMarkets as any[];
-    const approved = new Set(
-      visibleRankedMarkets.map(
-        (entry: any) =>
-          `${String(entry.marketPredictionId)}::${String(entry.selectionKey)}`,
-      ),
-    );
     const selections = market.selections.filter((selection: any) => {
       if (selection.status !== PredictionStatus.CALCULATED) return false;
       if (selection.actualOutcome) return false;
@@ -2006,7 +2000,9 @@ export class PredictionAccessService {
         confidence < Number(input.minimumConfidence)
       )
         return false;
-      return approved.has(`${String(market._id)}::${String(selection.key)}`);
+      return approvedSelections.has(
+        `${String(market._id)}::${String(selection.key)}`,
+      );
     });
     if (!selections.length) return null;
     return {
@@ -2078,14 +2074,11 @@ export class PredictionAccessService {
     const allSelectedMarkets = this.oneSelectionPerMarket(
       Array.isArray(pick.selectedMarkets) ? pick.selectedMarkets : [],
     );
-    const selectedMarkets = allSelectedMarkets.filter((selection: any) =>
-      this.canAccessActiveMarket(
-        plan,
-        String(selection?.marketKey ?? selection?.marketCode ?? '')
-          .trim()
-          .toUpperCase(),
-      ),
-    );
+    const marketLimit = PREDICTION_ACCESS_CONFIG.marketVisibility[plan].limit;
+    const selectedMarkets =
+      marketLimit === null
+        ? allSelectedMarkets
+        : allSelectedMarkets.slice(0, marketLimit);
     const marketAccess = this.getMarketAccessSummary(plan);
     return {
       ...pick,
@@ -2100,13 +2093,18 @@ export class PredictionAccessService {
         plan,
         ...marketAccess,
         visiblePickCenterMarketCount: selectedMarkets.length,
+        predictionVisibility:
+          plan === PredictionAccessPlan.VIP ||
+          plan === PredictionAccessPlan.PREMIUM
+            ? 'FULL'
+            : 'LIMITED',
         leagueAccessPercentage: PREDICTION_ACCESS_CONFIG.leagueVisibility[plan],
         mode: 'DAILY_LEAGUE_AND_MARKET_ENTITLEMENTS',
       },
     };
   }
 
-  private canAccessActiveMarket(
+  private canAccessCuratedMarket(
     plan: PredictionAccessPlan,
     marketKey: string,
   ): boolean {
@@ -2114,7 +2112,7 @@ export class PredictionAccessService {
       .trim()
       .toUpperCase();
     if (!key) return false;
-    const tier = PREDICTION_ACCESS_CONFIG.marketVisibility[plan];
+    const tier = PREDICTION_ACCESS_CONFIG.curatedMarketVisibility[plan];
     const visibleMarketKeys: readonly string[] = tier.marketKeys;
     const visibleFamilies = new Set(tier.families);
     const family = PREDICTION_MARKET_FAMILY_BY_KEY.get(key);
@@ -2127,6 +2125,44 @@ export class PredictionAccessService {
     plan: PredictionAccessPlan,
   ): Record<string, unknown> {
     const tier = PREDICTION_ACCESS_CONFIG.marketVisibility[plan];
+    const enabledCount = PREDICTION_ACCESS_CONFIG.enabledMarketCount;
+    const visibleCount =
+      tier.limit === null
+        ? enabledCount
+        : Math.min(tier.limit, enabledCount);
+    const visibleFamilies = [
+      ...new Set(PREDICTION_MARKET_FAMILY_BY_KEY.values()),
+    ];
+    return {
+      mode:
+        tier.limit === null
+          ? 'ALL_PRICING_ENABLED_MARKETS'
+          : 'TOP_RANKED_MARKET_GROUPS_PER_FIXTURE',
+      marketLimit: tier.limit,
+      visibleMarketTypeCount: visibleCount,
+      totalPricingEnabledMarketTypes: enabledCount,
+      lockedMarketTypeCount: Math.max(0, enabledCount - visibleCount),
+      marketSelectionDiversity: {
+        level: tier.diversity,
+        strategy: 'HIGHEST_RANKED_DISTINCT_MARKET_GROUPS_PER_FIXTURE',
+        visibleFamilies,
+        visibleFamilyCount: visibleFamilies.length,
+        lockedFamilies: [],
+        lockedFamilyCount: 0,
+        totalMarketFamilies: PREDICTION_ACCESS_CONFIG.enabledMarketFamilyCount,
+      },
+      // The catalogue keys are candidates; the actual visible set is computed
+      // separately for every fixture from its ranked Pick Center selections.
+      visibleMarketKeys: [...ENABLED_PREDICTION_MARKET_KEYS],
+      marketKeysAreFixtureSpecific: true,
+      settledOutcomesPublic: true,
+    };
+  }
+
+  private getCuratedMarketAccessSummary(
+    plan: PredictionAccessPlan,
+  ): Record<string, unknown> {
+    const tier = PREDICTION_ACCESS_CONFIG.curatedMarketVisibility[plan];
     const visibleKeys = [...tier.marketKeys];
     const visibleFamilies = [...tier.families];
     const enabledFamilies = new Set(
@@ -2292,8 +2328,41 @@ export class PredictionAccessService {
       predictionId?: string;
     } = {},
   ): Promise<any[]> {
+    const query: Record<string, any> = {
+      status: { $in: ['PUBLISHED', 'SETTLED'] },
+    };
+
+    // Push an optional date window into MongoDB before loading curated
+    // snapshots. Keep both supported date locations in the query so legacy
+    // records without fixtureDateFrom remain discoverable through their
+    // selection-level fixtureDate. The existing in-memory filter remains the
+    // final authority for exact date and selection-level semantics.
+    if (input.from || input.to) {
+      const range: Record<string, Date> = {};
+      if (input.from) {
+        const from = this.parseLagosDate(input.from, false);
+        if (Number.isNaN(from.getTime())) {
+          throw new BadRequestException(`Invalid from date "${input.from}".`);
+        }
+        range.$gte = from;
+      }
+      if (input.to) {
+        const toIsDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(input.to);
+        const to = this.parseLagosDate(input.to, toIsDateOnly);
+        if (Number.isNaN(to.getTime())) {
+          throw new BadRequestException(`Invalid to date "${input.to}".`);
+        }
+        if (toIsDateOnly) range.$lt = to;
+        else range.$lte = to;
+      }
+      query.$or = [
+        { fixtureDateFrom: range },
+        { 'selections.fixtureDate': range },
+      ];
+    }
+
     const records = (await this.curatedPredictionModel
-      .find({ status: { $in: ['PUBLISHED', 'SETTLED'] } })
+      .find(query)
       .sort({ fixtureDateFrom: 1, createdAt: -1 })
       .lean()
       .exec()) as any[];
@@ -2365,7 +2434,7 @@ export class PredictionAccessService {
         allowed: true,
         plan,
         mode: 'PARTIAL_CURATED_LEAGUE_AND_MARKET_ACCESS',
-        ...this.getMarketAccessSummary(plan),
+        ...this.getCuratedMarketAccessSummary(plan),
         visibleSelectionCount: visibleSelections.length,
       },
     };
@@ -2384,7 +2453,7 @@ export class PredictionAccessService {
     allocation: DailyLeagueAccessAllocation,
   ): boolean {
     const marketKey = String(selection?.marketKey ?? '').trim();
-    if (!this.canAccessActiveMarket(plan, marketKey)) return false;
+    if (!this.canAccessCuratedMarket(plan, marketKey)) return false;
     const leagueId = String(
       selection?.leagueId ?? selection?.competitionId ?? record?.leagueId ?? '',
     )
@@ -2562,6 +2631,7 @@ export class PredictionAccessService {
   ): PredictionAccessPlan | null {
     switch (plan) {
       case PredictionAccessPlan.ANONYMOUS:
+        return PredictionAccessPlan.FREE;
       case PredictionAccessPlan.FREE:
         return PredictionAccessPlan.REGULAR;
       case PredictionAccessPlan.REGULAR:
@@ -3043,4 +3113,7 @@ export class PredictionAccessService {
     return new Date(timestamp).toISOString().slice(0, 10);
   }
 }
+
+
+
 

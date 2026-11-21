@@ -168,3 +168,4 @@ SportsQueueSchema.index({ status: 1, leaseExpiresAt: 1 });
 
 // Only new coalesced jobs carry dedupeKey; sparse keeps legacy records compatible.
 SportsQueueSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
+

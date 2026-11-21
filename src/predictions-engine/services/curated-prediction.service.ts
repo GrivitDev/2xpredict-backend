@@ -435,6 +435,14 @@ export class CuratedPredictionService {
           'selectedMarkets.0': { $exists: true },
           fixtureDate: { $gt: now, $lte: new Date(horizon) },
         })
+        .select({
+          eventId: 1,
+          fixtureDate: 1,
+          live: 1,
+          completed: 1,
+          status: 1,
+          selectedMarkets: 1,
+        })
         .lean()
         .exec()) as unknown as PickCenterSource | null;
       if (!currentPick || currentPick.completed === true || currentPick.live === true || isFinishedPick(currentPick)) {
@@ -593,6 +601,23 @@ export class CuratedPredictionService {
         'selectedMarkets.0': { $exists: true },
         live: { $ne: true },
         fixtureDate: { $gt: now, $lte: horizon },
+      })
+      // The curated builder consumes only these Pick Center snapshot fields.
+      // selectedMarkets remains complete because every eligible market and its
+      // odds provenance are required by the existing publication rules.
+      .select({
+        eventId: 1,
+        leagueId: 1,
+        leagueName: 1,
+        fixtureDate: 1,
+        retentionExpiresAt: 1,
+        homeTeamName: 1,
+        awayTeamName: 1,
+        modelVersion: 1,
+        live: 1,
+        completed: 1,
+        status: 1,
+        selectedMarkets: 1,
       })
       .sort({ fixtureDate: 1 })
       .lean()
@@ -805,6 +830,30 @@ export class CuratedPredictionService {
       candidatesByEvent.set(eventId, candidates);
     }
 
+    // Fetch existing curated snapshots in one indexed query rather than one
+    // findOne round-trip for every fixture. The eventId field is unique in the
+    // curated schema, so the map preserves the original findOne semantics.
+    const candidateEventIds = [...candidatesByEvent.keys()];
+    const existingRows = candidateEventIds.length
+      ? ((await this.curatedPredictionModel
+          .find({ eventId: { $in: candidateEventIds } })
+          .select({
+            _id: 1,
+            eventId: 1,
+            predictionCode: 1,
+            generatedDateKey: 1,
+            status: 1,
+            settlementStatus: 1,
+            selections: 1,
+            diagnostics: 1,
+          })
+          .lean()
+          .exec()) as Array<Record<string, any>>)
+      : [];
+    const existingByEvent = new Map(
+      existingRows.map((item) => [String(item.eventId ?? ''), item]),
+    );
+
     const results: Array<Record<string, unknown>> = [];
     const publishableEventIds = new Set<string>();
     let created = 0;
@@ -824,9 +873,7 @@ export class CuratedPredictionService {
     };
 
     for (const [eventId, candidates] of candidatesByEvent) {
-      const existing = await this.curatedPredictionModel
-        .findOne({ eventId })
-        .exec();
+      const existing = existingByEvent.get(eventId) ?? null;
       const existingStatus = String(existing?.status ?? '').toUpperCase();
       const existingSettlementStatus = String(
         existing?.settlementStatus ?? 'PENDING',
@@ -1118,4 +1165,5 @@ export class CuratedPredictionService {
     };
   }
 }
+
 

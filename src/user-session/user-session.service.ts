@@ -25,13 +25,9 @@ export class UserSessionService {
 
     const session = await this.sessionModel.create({
       ...data,
-
       location,
-
       device: data.userAgent ? parseDevice(data.userAgent) : 'Unknown Device',
-
       lastActiveAt: new Date(),
-
       isActive: true,
     });
 
@@ -110,24 +106,77 @@ export class UserSessionService {
       { $set: { lastActiveAt: now } },
     ).exec();
   }
+
   // =====================================
   // ADMIN SUMMARY
   // =====================================
+  /**
+   * Builds the admin profile session summary in one database round trip.
+   *
+   * The latest-session list remains the same latest 10 records. To preserve the
+   * existing currentSession behaviour, the active candidate is still selected
+   * from the latest 100 records, just as getUserSessions() did previously.
+   * Counts are calculated over the complete per-user record set.
+   */
   async getSessionSummary(userId: string) {
     const userObjectId = new Types.ObjectId(userId);
     const now = new Date();
-    const [sessions, totalSessions, activeSessions] = await Promise.all([
-      this.getUserSessions(userId),
-      this.sessionModel.countDocuments({ userId: userObjectId }).exec(),
-      this.sessionModel.countDocuments({ userId: userObjectId, isActive: true, expiresAt: { $gt: now } }).exec(),
-    ]);
-    const currentSession = sessions.find((session) => session.isActive && session.expiresAt > now) ?? null;
+
+    const [summary] = await this.sessionModel
+      .aggregate([
+        { $match: { userId: userObjectId } },
+        { $sort: { lastActiveAt: -1 } },
+        {
+          $facet: {
+            latestSessions: [{ $limit: 10 }],
+            currentSession: [
+              { $limit: 100 },
+              {
+                $match: {
+                  isActive: true,
+                  expiresAt: { $gt: now },
+                },
+              },
+              { $limit: 1 },
+            ],
+            totalSessions: [{ $count: 'count' }],
+            activeSessions: [
+              {
+                $match: {
+                  isActive: true,
+                  expiresAt: { $gt: now },
+                },
+              },
+              { $count: 'count' },
+            ],
+          },
+        },
+      ])
+      .exec();
+
+    const latestSessions = Array.isArray(summary?.latestSessions)
+      ? summary.latestSessions
+      : [];
+    const currentSessionRecord = Array.isArray(summary?.currentSession)
+      ? summary.currentSession[0] ?? null
+      : null;
+    const totalSessions = Number(summary?.totalSessions?.[0]?.count ?? 0);
+    const activeSessions = Number(summary?.activeSessions?.[0]?.count ?? 0);
+
+    const withComputedState = (session: Record<string, any>) => ({
+      ...session,
+      isActive: Boolean(session.isActive && session.expiresAt > now),
+      expired: session.expiresAt <= now,
+    });
+
     return {
-      latestSessions: sessions.slice(0, 10),
+      latestSessions: latestSessions.map(withComputedState),
       totalSessions,
       activeSessions,
-      lastLogin: sessions.length ? sessions[0].lastActiveAt : null,
-      currentSession,
+      lastLogin: latestSessions.length ? latestSessions[0].lastActiveAt : null,
+      currentSession: currentSessionRecord
+        ? withComputedState(currentSessionRecord)
+        : null,
     };
   }
 
@@ -143,9 +192,7 @@ export class UserSessionService {
 
     return sessions.map((session) => ({
       ...session.toObject(),
-
       isActive: session.isActive && session.expiresAt > now,
-
       expired: session.expiresAt <= now,
     }));
   }

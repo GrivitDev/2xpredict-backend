@@ -14,6 +14,7 @@ import {
   SportsCompetitionScoringTotals,
   SportsHeadToHead,
   SportsPlayerEventTotals,
+  SportsOfficialStandings,
   SportsTeamForm,
   SportsTeamHomeAwayRecord,
   SportsTeamScoringRecord,
@@ -65,6 +66,7 @@ export class SportsDerivedProjectionService {
     @InjectModel(SportsCompetitionScoringTotals.name) private readonly competitionScoringModel: Model<any>,
     @InjectModel(SportsTeamStatisticsAggregate.name) private readonly statisticsModel: Model<any>,
     @InjectModel(SportsPlayerEventTotals.name) private readonly playerEventsModel: Model<any>,
+    @InjectModel(SportsOfficialStandings.name) private readonly officialStandingsModel: Model<any>,
   ) {}
 
   async recalculateSeason(competitionId: string, seasonId: string): Promise<{
@@ -147,12 +149,19 @@ export class SportsDerivedProjectionService {
     const h2h = historical.headToHead;
 
     if (!matches.length) {
+      // A missing or temporarily incomplete result set is not evidence that a
+      // previously published standings table is invalid. Preserve existing
+      // rows and seed zero-played entries only for teams not already represented.
+      const standings = await this.calculateSafeStandings(
+        [], calculatedAt, competitionId, seasonId, teamIds,
+      );
+      if (standings.length) await this.upsertRows(this.standingsModel, standings);
+
       await this.runTasksWithConcurrency([
         () => this.upsertRows(this.formModel, forms),
         () => this.upsertRows(this.h2hModel, h2h),
       ], DERIVED_PROJECTION_WRITE_CONCURRENCY);
       await this.runTasksWithConcurrency([
-        () => this.prune(this.standingsModel, { competitionId, seasonId }, []),
         () => this.prune(this.formModel, { competitionId, seasonId }, forms),
         () => this.prune(this.homeAwayModel, { competitionId, seasonId }, []),
         () => this.prune(this.scoringModel, { competitionId, seasonId }, []),
@@ -202,7 +211,9 @@ export class SportsDerivedProjectionService {
       }
     }
 
-    const standings = this.calculateStandings(matches, calculatedAt);
+    const standings = await this.calculateSafeStandings(
+      matches, calculatedAt, competitionId, seasonId, teamIds,
+    );
     const homeAway = this.calculateHomeAway(matches, calculatedAt);
     const scoring = this.calculateTeamScoring(matches, timelineByFixture, timelineCoverageFixtureIds, calculatedAt);
     const competitionScoring = this.calculateCompetitionScoring(matches, timelineByFixture, timelineCoverageFixtureIds, calculatedAt);
@@ -221,7 +232,9 @@ export class SportsDerivedProjectionService {
     ], DERIVED_PROJECTION_WRITE_CONCURRENCY);
 
     await this.runTasksWithConcurrency([
-      () => this.prune(this.standingsModel, { competitionId, seasonId }, standings),
+      // Standings are intentionally not pruned from a potentially incomplete
+      // fixture inventory. The official ESPN standings pipeline will reconcile
+      // competition membership in the next substage.
       () => this.prune(this.formModel, { competitionId, seasonId }, forms),
       () => this.prune(this.homeAwayModel, { competitionId, seasonId }, homeAway),
       () => this.prune(this.scoringModel, { competitionId, seasonId }, scoring),
@@ -252,8 +265,180 @@ export class SportsDerivedProjectionService {
     this.logger.debug('Previous-season derived projections are retained; no pruning was performed.');
   }
 
+  /**
+   * Return complete official ESPN standings when available, retaining the
+   * legacy array/row contract. Group metadata is attached to every row so
+   * callers can render separate tables without changing the response shape.
+   * Calculated standings remain the fallback for missing or invalid snapshots.
+   */
   async getStandings(competitionId: string, seasonId: string): Promise<unknown[]> {
-    return this.standingsModel.find({ competitionId, seasonId }).sort({ position: 1 }).select('-_id -__v').lean().exec();
+    const official = await this.officialStandingsModel
+      .findOne({
+        competitionId,
+        seasonId,
+        provider: 'ESPN',
+        status: 'AVAILABLE',
+        isComplete: true,
+        entryCount: { $gt: 0 },
+      })
+      .select('provider status isComplete entryCount groups header sourceCollectedAt lastSuccessfulAt')
+      .lean()
+      .exec() as Record<string, any> | null;
+
+    const officialRows = this.toOfficialStandingsRows(official, competitionId, seasonId);
+    if (officialRows.length) return officialRows;
+
+    return this.standingsModel
+      .find({ competitionId, seasonId })
+      .sort({ position: 1 })
+      .select('-_id -__v')
+      .lean()
+      .exec();
+  }
+
+  private toOfficialStandingsRows(
+    snapshot: Record<string, any> | null,
+    competitionId: string,
+    seasonId: string,
+  ): Record<string, any>[] {
+    if (
+      !snapshot ||
+      snapshot.provider !== 'ESPN' ||
+      snapshot.status !== 'AVAILABLE' ||
+      snapshot.isComplete !== true ||
+      !Array.isArray(snapshot.groups) ||
+      snapshot.groups.length === 0
+    ) return [];
+
+    const actualEntryCount = snapshot.groups.reduce(
+      (total: number, group: Record<string, any>) =>
+        total + (Array.isArray(group?.entries) ? group.entries.length : 0),
+      0,
+    );
+    if (
+      actualEntryCount === 0 ||
+      actualEntryCount !== Number(snapshot.entryCount ?? -1) ||
+      snapshot.groups.some((group: Record<string, any>) =>
+        !Array.isArray(group?.entries) || group.entries.length === 0,
+      )
+    ) return [];
+
+    const collectedAt = this.standingsDate(
+      snapshot.sourceCollectedAt ?? snapshot.lastSuccessfulAt,
+    );
+    if (!collectedAt) return [];
+
+    const rows: Record<string, any>[] = [];
+    for (const [groupIndex, groupValue] of snapshot.groups.entries()) {
+      const group = groupValue as Record<string, any>;
+      const entries = group.entries as Array<Record<string, any>>;
+      for (const [entryIndex, entry] of entries.entries()) {
+        const teamId = String(entry?.teamId ?? '').trim();
+        if (!teamId) return [];
+
+        const stats = Array.isArray(entry.stats) ? entry.stats as Array<Record<string, any>> : [];
+        const statValue = (...aliases: string[]): number | undefined => {
+          const aliasSet = new Set(aliases.map((alias) => this.standingsKey(alias)));
+          for (const stat of stats) {
+            const keys = [stat.name, stat.type, stat.abbreviation, stat.shortDisplayName]
+              .map((key) => this.standingsKey(key))
+              .filter(Boolean);
+            if (!keys.some((key) => aliasSet.has(key))) continue;
+            const value = this.standingsNumber(stat.value ?? stat.displayValue);
+            if (value !== undefined) return value;
+          }
+          return undefined;
+        };
+
+        const played = statValue('gamesPlayed', 'played', 'gp') ?? 0;
+        const won = statValue('wins', 'win', 'won', 'w') ?? 0;
+        const drawn = statValue('ties', 'draws', 'drawn', 'd') ?? 0;
+        const lost = statValue('losses', 'loss', 'lost', 'l') ?? 0;
+        const goalsFor = statValue('goalsFor', 'goalsScored', 'totalGoalsScored', 'totalGoals', 'gf');
+        const goalsAgainst = statValue('goalsAgainst', 'goalsConceded', 'totalGoalsAgainst', 'ga');
+        const goalDifference = statValue('pointDifferential', 'goalDifference', 'goalDiff', 'gd')
+          ?? (goalsFor !== undefined && goalsAgainst !== undefined
+            ? goalsFor - goalsAgainst
+            : null);
+        const points = statValue('points', 'pts') ?? 0;
+        const position = statValue('rank', 'position', 'standing')
+          ?? this.standingsNumber(entry.position)
+          ?? entryIndex + 1;
+        const groupId = String(group.id ?? `group-${groupIndex + 1}`);
+        const groupName = String(group.name ?? group.header ?? group.abbreviation ?? `Group ${groupIndex + 1}`);
+
+        // Preserve every ESPN statistic under providerStats while exposing the
+        // familiar numeric fields consumed by existing API and prediction code.
+        const providerStats = stats.map((stat) => ({ ...stat }));
+        rows.push({
+          id: `official-standings:${competitionId}:${seasonId}:${groupId}:${teamId}`,
+          competitionId,
+          seasonId,
+          teamId,
+          position,
+          calculatedAt: collectedAt,
+          computedAt: collectedAt,
+          sourceCollectedAt: collectedAt,
+          source: 'ESPN_OFFICIAL',
+          provider: 'ESPN',
+          header: snapshot.header,
+          groupId,
+          groupName,
+          groupAbbreviation: group.abbreviation,
+          groupHeader: group.header,
+          groupHref: group.href,
+          teamName: entry.teamName,
+          abbreviation: entry.abbreviation,
+          logoUrl: entry.logoUrl,
+          link: entry.link,
+          sourceFixtureCount: played,
+          played,
+          won,
+          drawn,
+          lost,
+          goalsFor: goalsFor ?? null,
+          goalsAgainst: goalsAgainst ?? null,
+          goalDifference,
+          points,
+          providerStats,
+          metrics: {
+            played,
+            won,
+            drawn,
+            lost,
+            goalsFor: goalsFor ?? null,
+            goalsAgainst: goalsAgainst ?? null,
+            goalDifference,
+            points,
+            pointsPerMatch: played > 0 ? points / played : 0,
+            winRate: played > 0 ? (won / played) * 100 : 0,
+            drawRate: played > 0 ? (drawn / played) * 100 : 0,
+            lossRate: played > 0 ? (lost / played) * 100 : 0,
+            providerStats,
+            source: 'ESPN_OFFICIAL',
+          },
+        });
+      }
+    }
+    return rows;
+  }
+
+  private standingsKey(value: unknown): string {
+    return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  private standingsNumber(value: unknown): number | undefined {
+    if (value === null || value === undefined || value === '') return undefined;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+    const match = String(value).trim().match(/[+-]?\d+(?:\.\d+)?/);
+    if (!match) return undefined;
+    const parsed = Number(match[0]);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  private standingsDate(value: unknown): Date | null {
+    const parsed = value instanceof Date ? value : new Date(value as string | number);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
   }
 
   async getTeamFormsForTeam(teamId: string, competitionId?: string): Promise<unknown[]> {
@@ -316,7 +501,78 @@ export class SportsDerivedProjectionService {
     return { fixture, home, away, homeGoals: Number(homeGoals), awayGoals: Number(awayGoals) };
   }
 
-  private calculateStandings(matches: Match[], calculatedAt: Date): any[] {
+  private async calculateSafeStandings(
+    matches: Match[],
+    calculatedAt: Date,
+    competitionId: string,
+    seasonId: string,
+    knownTeamIds: Set<string>,
+  ): Promise<any[]> {
+    const existingRows = await this.standingsModel
+      .find({ competitionId, seasonId })
+      .select('id teamId position calculatedAt sourceFixtureCount metrics')
+      .lean()
+      .exec() as Array<{
+        id?: string;
+        teamId?: string;
+        position?: number;
+        calculatedAt?: Date;
+        sourceFixtureCount?: number;
+        metrics?: Record<string, unknown>;
+      }>;
+
+    const existingByTeam = new Map(
+      existingRows
+        .filter((row) => Boolean(row.teamId))
+        .map((row) => [String(row.teamId), row]),
+    );
+    const allTeamIds = new Set<string>([
+      ...knownTeamIds,
+      ...existingByTeam.keys(),
+      ...matches.flatMap((match) => [match.home.teamId, match.away.teamId]),
+    ]);
+    const rows = this.calculateStandings(
+      matches, calculatedAt, competitionId, seasonId, allTeamIds,
+    );
+
+    // Never downgrade a team's previously collected record merely because a
+    // recalculation currently sees fewer completed results for that team.
+    for (const row of rows) {
+      const previous = existingByTeam.get(row.teamId);
+      if (!previous) continue;
+      const previousPlayed = Math.max(
+        Number(previous.sourceFixtureCount ?? 0),
+        Number(previous.metrics?.played ?? 0),
+      );
+      if (Number(row.sourceFixtureCount ?? 0) >= previousPlayed) continue;
+
+      row.metrics = previous.metrics ?? row.metrics;
+      row.sourceFixtureCount = previousPlayed;
+      row.calculatedAt = previous.calculatedAt ?? row.calculatedAt;
+    }
+
+    const metric = (row: any, key: string): number => {
+      const value = key === 'goalDifference' && row.metrics?.[key] === undefined
+        ? Number(row.metrics?.goalsFor ?? 0) - Number(row.metrics?.goalsAgainst ?? 0)
+        : Number(row.metrics?.[key] ?? 0);
+      return Number.isFinite(value) ? value : 0;
+    };
+    rows.sort((a, b) =>
+      metric(b, 'points') - metric(a, 'points')
+      || (metric(b, 'goalDifference') - metric(a, 'goalDifference'))
+      || (metric(b, 'goalsFor') - metric(a, 'goalsFor'))
+      || String(a.teamId).localeCompare(String(b.teamId)),
+    );
+    return rows.map((row, index) => ({ ...row, position: index + 1 }));
+  }
+
+  private calculateStandings(
+    matches: Match[],
+    calculatedAt: Date,
+    competitionId: string,
+    seasonId: string,
+    teamIds: Set<string>,
+  ): any[] {
     const table = new Map<string, TeamTally>();
     const ensure = (teamId: string): TeamTally => {
       let row = table.get(teamId);
@@ -326,6 +582,10 @@ export class SportsDerivedProjectionService {
       }
       return row;
     };
+    // Include every known participant from the season fixture inventory,
+    // including teams that have not completed a match yet.
+    for (const teamId of teamIds) ensure(teamId);
+
     for (const match of matches) {
       const home = ensure(match.home.teamId);
       const away = ensure(match.away.teamId);
@@ -340,9 +600,9 @@ export class SportsDerivedProjectionService {
       b.points - a.points || (b.goalsFor - b.goalsAgainst) - (a.goalsFor - a.goalsAgainst) || b.goalsFor - a.goalsFor || a.teamId.localeCompare(b.teamId),
     );
     return ranked.map((row, index) => ({
-      id: `standings:${matches[0].fixture.competitionId}:${matches[0].fixture.seasonId}:${row.teamId}`,
-      competitionId: matches[0].fixture.competitionId,
-      seasonId: matches[0].fixture.seasonId,
+      id: `standings:${competitionId}:${seasonId}:${row.teamId}`,
+      competitionId,
+      seasonId,
       teamId: row.teamId,
       position: index + 1,
       calculatedAt,
@@ -1523,3 +1783,4 @@ export class SportsDerivedProjectionService {
     await model.deleteMany({ ...scope, id: { $nin: ids } }).exec();
   }
 }
+

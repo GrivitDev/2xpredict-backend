@@ -264,6 +264,48 @@ export class PickCenterService {
 
     const loadedMarketDocuments = (await this.marketPredictionModel
       .find({ eventId, modelVersion, completed: { $ne: true }, live: { $ne: true } })
+      // Pick Center only needs the canonical fixture identity and the final
+      // selection/odds fields below. Avoid loading diagnostics, source arrays,
+      // settlement evidence/history and other market-engine payload fields.
+      .select({
+        eventId: 1,
+        leagueId: 1,
+        fixtureDate: 1,
+        homeTeamName: 1,
+        awayTeamName: 1,
+        marketKey: 1,
+        marketName: 1,
+        marketAbbreviation: 1,
+        modelVersion: 1,
+        fixtureSourceRevision: 1,
+        live: 1,
+        completed: 1,
+        dataQuality: 1,
+        'selections.key': 1,
+        'selections.fullName': 1,
+        'selections.abbreviation': 1,
+        'selections.line': 1,
+        'selections.subjectId': 1,
+        'selections.subjectName': 1,
+        'selections.status': 1,
+        'selections.actualOutcome': 1,
+        'selections.probability': 1,
+        'selections.confidence': 1,
+        'selections.evidenceConfidence': 1,
+        'selections.fairOdds': 1,
+        'selections.decimalOdds': 1,
+        'selections.oddsUpdatedAt': 1,
+        'selections.dataQuality': 1,
+        'selections.priceType': 1,
+        'selections.oddsBasis': 1,
+        'selections.oddsCalculationMethod': 1,
+        'selections.oddsProvider': 1,
+        'selections.bookmaker': 1,
+        'selections.settlementProfile': 1,
+        'selections.recommendationEligible': 1,
+        'selections.oddsPredictionReady': 1,
+        'selections.isFinalSelection': 1,
+      })
       .lean()
       .exec()) as unknown as MarketDocumentLike[];
     const currentFixtureSourceRevision =
@@ -717,6 +759,7 @@ export class PickCenterService {
     return 5;
   }
 }
+
 
 
 

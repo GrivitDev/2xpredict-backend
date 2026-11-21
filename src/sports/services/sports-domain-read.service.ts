@@ -76,7 +76,7 @@ export class SportsDomainReadService {
       .find(this.competitionFilter(query))
       .sort({ name: 1, id: 1 })
       .limit(limit)
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return rows as SportsCompetitionRecord[];
@@ -87,10 +87,34 @@ export class SportsDomainReadService {
   ): Promise<SportsCompetitionRecord | null> {
     const row = await this.competitionModel
       .findOne({ $or: [{ id: competitionId }, { slug: competitionId }] })
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return (row as SportsCompetitionRecord | null) ?? null;
+  }
+
+  /** Batch equivalent of getCompetition(), preserving its identifier matching. */
+  async getCompetitionsByIdentifiers(
+    competitionIds: string[],
+  ): Promise<SportsCompetitionRecord[]> {
+    const identifiers = [
+      ...new Set(
+        competitionIds.map((id) => String(id).trim()).filter(Boolean),
+      ),
+    ];
+    if (!identifiers.length) return [];
+
+    const rows = await this.competitionModel
+      .find({
+        $or: [
+          { id: { $in: identifiers } },
+          { slug: { $in: identifiers } },
+        ],
+      })
+      .select('-_id -rawPayload')
+      .lean()
+      .exec();
+    return rows as SportsCompetitionRecord[];
   }
 
   async getSeasons(competitionId?: string): Promise<SportsSeasonRecord[]> {
@@ -98,7 +122,7 @@ export class SportsDomainReadService {
     const rows = await this.seasonModel
       .find(filter)
       .sort({ competitionId: 1, year: -1 })
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return rows as SportsSeasonRecord[];
@@ -107,7 +131,7 @@ export class SportsDomainReadService {
   async getSeason(seasonId: string): Promise<SportsSeasonRecord | null> {
     const row = await this.seasonModel
       .findOne({ id: seasonId })
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return (row as SportsSeasonRecord | null) ?? null;
@@ -130,7 +154,7 @@ export class SportsDomainReadService {
       .find(filter)
       .sort({ name: 1, id: 1 })
       .limit(Math.max(1, Math.min(query.limit ?? 250, 1_000)))
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return rows as SportsTeamRecord[];
@@ -139,19 +163,61 @@ export class SportsDomainReadService {
   async getTeam(teamId: string): Promise<SportsTeamRecord | null> {
     const row = await this.teamModel
       .findOne({ $or: [{ id: teamId }, { espnId: teamId }] })
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return (row as SportsTeamRecord | null) ?? null;
   }
 
+  /** Batch equivalent of getTeam(), including canonical and ESPN identifiers. */
+  async getTeamsByIdentifiers(teamIds: string[]): Promise<SportsTeamRecord[]> {
+    const identifiers = [
+      ...new Set(teamIds.map((id) => String(id).trim()).filter(Boolean)),
+    ];
+    if (!identifiers.length) return [];
+
+    const rows = await this.teamModel
+      .find({
+        $or: [
+          { id: { $in: identifiers } },
+          { espnId: { $in: identifiers } },
+        ],
+      })
+      .select('-_id -rawPayload')
+      .lean()
+      .exec();
+    return rows as SportsTeamRecord[];
+  }
+
   async getFixture(fixtureId: string): Promise<SportsFixtureRecord | null> {
     const row = await this.fixtureModel
       .findOne({ $or: [{ id: fixtureId }, { espnEventId: fixtureId }] })
-      .select('-_id')
+      .select('-_id -rawPayload -competitors.rawPayload')
       .lean()
       .exec();
     return (row as SportsFixtureRecord | null) ?? null;
+  }
+
+  /** Batch equivalent of getFixture(), matching both supported fixture IDs. */
+  async getFixturesByIdentifiers(
+    fixtureIds: string[],
+  ): Promise<SportsFixtureRecord[]> {
+    const identifiers = [
+      ...new Set(fixtureIds.map((id) => String(id).trim()).filter(Boolean)),
+    ];
+    if (!identifiers.length) return [];
+
+    const rows = await this.fixtureModel
+      .find({
+        $or: [
+          { id: { $in: identifiers } },
+          { espnEventId: { $in: identifiers } },
+        ],
+      })
+      .select('-_id -rawPayload -competitors.rawPayload')
+      .lean()
+      .exec();
+    return rows as SportsFixtureRecord[];
   }
 
   async countFixtures(query: SportsFixtureQuery = {}): Promise<number> {
@@ -225,7 +291,7 @@ export class SportsDomainReadService {
       .find(filter)
       .sort({ kickoffAt: sortDirection, id: sortDirection })
       .limit(limit + 1)
-      .select('-_id')
+      .select('-_id -rawPayload -competitors.rawPayload')
       .lean()
       .exec();
     const hasMore = rows.length > limit;
@@ -248,17 +314,27 @@ export class SportsDomainReadService {
   async getFixtureContexts(
     fixtureIds: string[],
   ): Promise<SportsFixtureContextReadModel[]> {
-    if (!fixtureIds.length) return [];
-    const fixtures = (await this.fixtureModel
-      .find({
-        $or: [
-          { id: { $in: fixtureIds } },
-          { espnEventId: { $in: fixtureIds } },
-        ],
-      })
-      .select('-_id')
-      .lean()
-      .exec()) as SportsFixtureRecord[];
+    const identifiers = [
+      ...new Set(fixtureIds.map((id) => String(id).trim()).filter(Boolean)),
+    ];
+    if (!identifiers.length) return [];
+
+    // Reuse the same bounded identifier lookup used by other Sports readers.
+    // This keeps canonical-ID and ESPN-ID matching in one place.
+    const fixtures = await this.getFixturesByIdentifiers(identifiers);
+    return this.buildFixtureContexts(fixtures);
+  }
+
+  /**
+   * Assemble read contexts from fixtures that are already in memory.
+   * Keeping this separate avoids re-reading a fixture when a caller has just
+   * loaded it (notably getMatch()).
+   */
+  private async buildFixtureContexts(
+    fixtures: SportsFixtureRecord[],
+  ): Promise<SportsFixtureContextReadModel[]> {
+    if (!fixtures.length) return [];
+
     const competitionIds = [
       ...new Set(fixtures.map((item) => item.competitionId)),
     ];
@@ -277,26 +353,32 @@ export class SportsDomainReadService {
       ),
     ];
 
-    // A match context normally contains one competition, season and two
-    // teams. Load reference collections in two bounded waves instead of
-    // issuing all three reads at once.
-    const [competitions, seasons] = await Promise.all([
-      this.competitionModel
-        .find({ id: { $in: competitionIds } })
-        .select('-_id')
-        .lean()
-        .exec(),
-      this.seasonModel
-        .find({ id: { $in: seasonIds } })
-        .select('-_id')
-        .lean()
-        .exec(),
+    // These reference reads are independent. Run them in one bounded wave so
+    // match detail latency is not extended by an avoidable second DB round trip.
+    // Skip empty identifier sets rather than issuing guaranteed-empty queries.
+    const [competitions, seasons, teams] = await Promise.all([
+      competitionIds.length
+        ? this.competitionModel
+            .find({ id: { $in: competitionIds } })
+            .select('-_id -rawPayload')
+            .lean()
+            .exec()
+        : Promise.resolve([]),
+      seasonIds.length
+        ? this.seasonModel
+            .find({ id: { $in: seasonIds } })
+            .select('-_id -rawPayload')
+            .lean()
+            .exec()
+        : Promise.resolve([]),
+      teamIds.length
+        ? this.teamModel
+            .find({ id: { $in: teamIds } })
+            .select('-_id -rawPayload')
+            .lean()
+            .exec()
+        : Promise.resolve([]),
     ]);
-    const teams = await this.teamModel
-      .find({ id: { $in: teamIds } })
-      .select('-_id')
-      .lean()
-      .exec();
     const competitionMap = new Map<string, SportsCompetitionRecord>(
       competitions.map((item: any) => [String(item.id), item]),
     );
@@ -329,24 +411,30 @@ export class SportsDomainReadService {
   async getMatch(fixtureId: string): Promise<SportsMatchReadModel | null> {
     const fixture = await this.getFixture(fixtureId);
     if (!fixture) return null;
-    const [context] = await this.getFixtureContexts([fixture.id]);
+
+    // All detail sections are independent once the canonical fixture is known.
+    // Build the context from that already-loaded fixture instead of querying
+    // sports_fixtures a second time through getFixtureContexts().
+    const [contextRows, timeline, latestOdds, matchFacts, matchSummary] =
+      await Promise.all([
+        this.buildFixtureContexts([fixture]),
+        this.getMatchTimeline(fixture.id),
+        this.getMatchOdds(fixture.id),
+        this.matchFactsModel
+          .findOne({ fixtureId: fixture.id })
+          .select('-_id -__v')
+          .lean()
+          .exec(),
+        this.matchSummaryModel
+          .findOne({ fixtureId: fixture.id })
+          .select({ _id: 0, __v: 0, rawPayload: 0 })
+          .lean()
+          .exec(),
+      ]);
+
+    const context = contextRows[0];
     if (!context) return null;
-    const [timeline, latestOdds] = await Promise.all([
-      this.getMatchTimeline(fixture.id),
-      this.getMatchOdds(fixture.id),
-    ]);
-    const [matchFacts, matchSummary] = await Promise.all([
-      this.matchFactsModel
-        .findOne({ fixtureId: fixture.id })
-        .select('-_id -__v')
-        .lean()
-        .exec(),
-      this.matchSummaryModel
-        .findOne({ fixtureId: fixture.id })
-        .select({ _id: 0, __v: 0, rawPayload: 0 })
-        .lean()
-        .exec(),
-    ]);
+
     return {
       ...context,
       timeline,
@@ -367,12 +455,15 @@ export class SportsDomainReadService {
     const team = await this.getTeam(teamId);
     if (!team) return null;
 
-    const fixturesPage = await this.getFixtures({
-      teamId: team.id,
-      state: 'COMPLETED',
-      retainedOnly: true,
-      limit: Math.max(5, Math.min(100, Math.floor(limit) || 40)),
-    });
+    const [fixturesPage, projectionValues] = await Promise.all([
+      this.getFixtures({
+        teamId: team.id,
+        state: 'COMPLETED',
+        retainedOnly: true,
+        limit: Math.max(5, Math.min(100, Math.floor(limit) || 40)),
+      }),
+      this.derived.getTeamFormsForTeam(team.id, competitionId),
+    ]);
     const recentFixtures = fixturesPage.items
       .filter(
         (fixture) =>
@@ -388,9 +479,7 @@ export class SportsDomainReadService {
     // Read all retained season projections once. A requested current season may
     // not have a completed fixture yet, so the latest prior-season rolling form
     // is a valid fallback until the current season projection is recalculated.
-    const projectionRows = (
-      await this.derived.getTeamFormsForTeam(team.id, competitionId)
-    )
+    const projectionRows = projectionValues
       .map((value) => this.asRecord(value))
       .filter((record): record is Record<string, any> => Boolean(record));
     const targetScopes = new Map<
@@ -848,7 +937,7 @@ export class SportsDomainReadService {
     const rows = await this.timelineModel
       .find({ fixtureId })
       .sort({ sequence: 1, id: 1 })
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return rows as SportsMatchTimelineEventRecord[];
@@ -860,7 +949,7 @@ export class SportsDomainReadService {
     const row = await this.oddsModel
       .findOne({ fixtureId })
       .sort({ collectedAt: -1 })
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return (row as SportsMatchOddsSnapshotRecord | null) ?? null;
@@ -874,7 +963,7 @@ export class SportsDomainReadService {
       .find({ fixtureId })
       .sort({ collectedAt: -1 })
       .limit(Math.max(1, Math.min(requestedLimit, 100)))
-      .select('-_id')
+      .select('-_id -rawPayload')
       .lean()
       .exec();
     return rows as SportsMatchOddsSnapshotRecord[];
@@ -919,3 +1008,4 @@ export class SportsDomainReadService {
     }
   }
 }
+

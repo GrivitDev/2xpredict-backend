@@ -9,6 +9,11 @@ import type {
   SportsMatchFactsWrite,
   SportsMatchResultFacts,
   SportsMatchSummaryEvent,
+  SportsOfficialStandingsNormalizationInput,
+  SportsOfficialStandingsSnapshot,
+  SportsOfficialStandingsGroup,
+  SportsOfficialStandingsEntry,
+  SportsOfficialStandingsStatistic,
   SportsNormalizedPeriodScore,
   SportsNormalizedPlayerAppearance,
   SportsNormalizedStatistic,
@@ -204,6 +209,169 @@ export class SportsMatchFactsNormalizationService {
       .digest('hex');
 
     return { ...base, normalizationHash };
+  }
+
+  /**
+   * Extracts ESPN's official standings section from a match Summary.
+   *
+   * This method is deliberately side-effect-free: Stage 1C persists the
+   * resulting competition-season snapshot independently from per-match facts.
+   * Missing/empty standings return null; malformed rows are reported and make
+   * the snapshot incomplete so callers cannot publish it as authoritative.
+   */
+  normalizeOfficialStandings(
+    input: SportsOfficialStandingsNormalizationInput,
+  ): SportsOfficialStandingsSnapshot | null {
+    const summary = this.asRecord(input.rawPayload);
+    const standings = this.asRecord(summary.standings);
+    if (!Object.keys(standings).length) return null;
+
+    const rawGroups = this.asArray(standings.groups);
+    const groupsToNormalize = rawGroups.length
+      ? rawGroups
+      : Array.isArray(standings.entries)
+        ? [{ standings, header: standings.header, href: standings.href }]
+        : [];
+    if (!groupsToNormalize.length) return null;
+
+    const diagnostics: string[] = [];
+    let isComplete = true;
+    let entryCount = 0;
+
+    const groups: SportsOfficialStandingsGroup[] = groupsToNormalize.map(
+      (groupValue, groupIndex) => {
+        const group = this.asRecord(groupValue);
+        const groupStandings = this.asRecord(group.standings);
+        const rawEntries = this.asArray(
+          groupStandings.entries ?? group.entries ?? groupStandings.rows,
+        );
+        if (!rawEntries.length) {
+          isComplete = false;
+          diagnostics.push(`STANDINGS_GROUP_WITHOUT_ENTRIES:${groupIndex + 1}`);
+        }
+
+        const groupId = this.text(
+          group.id ?? group.abbreviation ?? group.key,
+        ) ?? `group-${groupIndex + 1}`;
+        const groupName = this.text(
+          group.name ?? group.displayName ?? group.shortName ?? group.abbreviation,
+        );
+        const groupHeader = this.text(group.header);
+        const groupHref = this.text(
+          group.href ?? this.asRecord(group.link).href,
+        );
+
+        const seenTeamIds = new Set<string>();
+        const entries: SportsOfficialStandingsEntry[] = [];
+
+        rawEntries.forEach((entryValue, entryIndex) => {
+          const entry = this.asRecord(entryValue);
+          const teamValue = entry.team;
+          const team = this.asRecord(teamValue);
+          const espnTeamId = this.text(
+            team.id ?? entry.teamId ?? entry.id,
+          );
+          const teamName = typeof teamValue === 'string'
+            ? this.text(teamValue)
+            : this.text(
+                team.displayName ?? team.fullName ?? team.name
+                ?? entry.displayName ?? entry.name,
+              );
+
+          if (!espnTeamId || !teamName) {
+            isComplete = false;
+            diagnostics.push(
+              `STANDINGS_ENTRY_MISSING_TEAM_ID_OR_NAME:${groupIndex + 1}:${entryIndex + 1}`,
+            );
+            return;
+          }
+
+          const teamId = espnTeamId.startsWith('team:')
+            ? espnTeamId
+            : `team:${espnTeamId}`;
+          if (seenTeamIds.has(teamId)) {
+            isComplete = false;
+            diagnostics.push(
+              `STANDINGS_DUPLICATE_TEAM:${groupIndex + 1}:${espnTeamId}`,
+            );
+            return;
+          }
+          seenTeamIds.add(teamId);
+
+          const stats: SportsOfficialStandingsStatistic[] = this.asArray(
+            entry.stats ?? entry.statistics,
+          ).map((statValue) => {
+            const stat = this.asRecord(statValue);
+            return {
+              name: this.text(stat.name),
+              displayName: this.text(stat.displayName),
+              shortDisplayName: this.text(stat.shortDisplayName),
+              abbreviation: this.text(stat.abbreviation),
+              type: this.text(stat.type),
+              value: this.number(stat.value),
+              displayValue: this.text(stat.displayValue),
+              summary: this.text(stat.summary),
+              description: this.text(stat.description),
+            };
+          });
+
+          const rankStat = stats.find((stat) =>
+            this.key(stat.name ?? stat.type ?? stat.abbreviation ?? '') === 'rank'
+            || this.key(stat.abbreviation ?? '') === 'r',
+          );
+          const providerPosition = this.number(
+            rankStat?.value ?? rankStat?.displayValue ?? entry.rank ?? entry.position,
+          );
+          const logoValue = this.asArray(entry.logo ?? team.logo)[0];
+          const logo = this.asRecord(logoValue);
+          const linkValue = entry.link ?? team.href;
+
+          entries.push({
+            teamId,
+            espnTeamId: espnTeamId.replace(/^team:/, ''),
+            teamName,
+            abbreviation: this.text(team.abbreviation ?? entry.abbreviation),
+            logoUrl: this.text(logo.href),
+            link: this.text(linkValue),
+            position: providerPosition !== null && Number.isInteger(providerPosition)
+              && providerPosition > 0
+              ? providerPosition
+              : entryIndex + 1,
+            stats,
+          });
+        });
+
+        entryCount += entries.length;
+        if (entries.length !== rawEntries.length) isComplete = false;
+
+        return {
+          id: groupId,
+          name: groupName,
+          abbreviation: this.text(group.abbreviation),
+          header: groupHeader,
+          href: groupHref,
+          entries,
+        };
+      },
+    );
+
+    if (entryCount === 0) return null;
+
+    return {
+      id: `official-standings:${input.competitionId}:${input.seasonId}`,
+      competitionId: input.competitionId,
+      seasonId: input.seasonId,
+      provider: 'ESPN',
+      endpoint: input.endpoint,
+      sourcePayloadHash: input.sourcePayloadHash,
+      sourceRevision: Math.max(1, Math.floor(input.sourceRevision || 1)),
+      sourceCollectedAt: input.sourceCollectedAt,
+      header: this.text(standings.header),
+      groups,
+      entryCount,
+      isComplete,
+      diagnostics,
+    };
   }
 
   private resolveParticipants(
@@ -674,3 +842,4 @@ export class SportsMatchFactsNormalizationService {
     return value.toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 }
+

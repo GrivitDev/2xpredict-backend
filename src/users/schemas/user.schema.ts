@@ -48,6 +48,10 @@ export class User {
   @Prop({ required: true, select: false })
   password!: string;
 
+  @Prop({ type: String, unique: true, sparse: true, select: false })
+  googleId?: string;
+
+
   // ======================
   // LOCATION
   // ======================
@@ -86,6 +90,11 @@ export class User {
   // True while the first-verification referral/promo onboarding effects are pending.
   @Prop({ type: Boolean, default: false, select: false })
   verificationOnboardingPending!: boolean;
+
+  // Lease prevents concurrent Google sign-ins from running first-verification
+  // referral/promo onboarding side effects at the same time.
+  @Prop({ type: Date, default: undefined, select: false })
+  verificationOnboardingLockedUntil?: Date;
 
   // Retained for backwards compatibility only. Unverified registrations do not expire.
   @Prop({ type: Date, default: null })
@@ -183,4 +192,3 @@ export class User {
 }
 
 export const UserSchema = SchemaFactory.createForClass(User);
-

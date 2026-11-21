@@ -63,9 +63,9 @@ export class PredictionQueueService {
   ) {}
 
   /**
-   * Reconciles every retained, future Sports fixture. This is deliberately not
-   * restricted to a rolling kickoff horizon: the final fixture in a season must
-   * enter the durable queue as soon as Sports knows about it.
+   * Reconciles only retained Sports fixtures inside the rolling prediction
+   * horizon. Fixtures further away are picked up automatically when they enter
+   * this window; direct source-change triggers use the same boundary.
    *
    * Fixtures are processed page-by-page to keep memory and MongoDB $in queries
    * bounded. A fixture receives a durable WAITING_FOR_ODDS row even when Grivit
@@ -76,6 +76,9 @@ export class PredictionQueueService {
     force = false,
   ): Promise<PredictionQueueSyncResult> {
     const now = new Date();
+    const horizonEnd = new Date(
+      now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
+    );
     const pageSize = PREDICTION_QUEUE_SYNC_PAGE_SIZE;
     let cursor: string | undefined;
     let pagesScanned = 0;
@@ -92,6 +95,7 @@ export class PredictionQueueService {
     do {
       const page = await this.sportsRead.getFixtures({
         from: now,
+        to: horizonEnd,
         limit: pageSize,
         sortOrder: 'ASC',
         retainedOnly: true,
@@ -128,7 +132,7 @@ export class PredictionQueueService {
 
     await this.monitor.recordQueueSync(totals);
     this.logger.log(
-      `Full-season prediction queue reconciliation completed: pages=${pagesScanned}, fixtures=${totals.scannedFixtures}, oddsReady=${totals.eligibleFixtures}, waitingForOdds=${totals.oddsNotReady ?? 0}, enqueued=${totals.enqueued}, refreshed=${totals.refreshed}, missingSportsFreshness=${totals.missingSummary}.`,
+      `Seven-day prediction queue reconciliation completed: pages=${pagesScanned}, fixtures=${totals.scannedFixtures}, oddsReady=${totals.eligibleFixtures}, waitingForOdds=${totals.oddsNotReady ?? 0}, enqueued=${totals.enqueued}, refreshed=${totals.refreshed}, missingSportsFreshness=${totals.missingSummary}.`,
     );
 
     return totals;
@@ -538,11 +542,15 @@ export class PredictionQueueService {
     if (!fixture) return 'SKIPPED';
 
     const now = new Date();
+    const horizonEnd = new Date(
+      now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
+    );
     const kickoffAt = this.toDate(fixture.kickoffAt);
     const state = String(fixture.status?.state ?? 'UNKNOWN').toUpperCase();
     if (
       !kickoffAt ||
       kickoffAt.getTime() <= now.getTime() ||
+      kickoffAt.getTime() > horizonEnd.getTime() ||
       TERMINAL_FIXTURE_STATES.has(state) ||
       LIVE_FIXTURE_STATES.has(state) ||
       fixture.status?.isFinal === true
@@ -866,6 +874,9 @@ export class PredictionQueueService {
 
   async claimNext(): Promise<ClaimedPredictionQueueJob | null> {
     const now = new Date();
+    const horizonEnd = new Date(
+      now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
+    );
     const lockToken = randomUUID();
     const job = await this.queueModel
       .findOneAndUpdate(
@@ -873,6 +884,9 @@ export class PredictionQueueService {
           status: {
             $in: [PredictionQueueStatus.PENDING, PredictionQueueStatus.RETRY],
           },
+          // Existing queue rows outside the rolling horizon remain persisted,
+          // but cannot consume worker capacity before they enter the window.
+          fixtureDate: { $gt: now, $lte: horizonEnd },
           availableAt: { $lte: now },
           attempts: { $lt: PREDICTION_ENGINE_CONFIG.queue.maxAttempts },
         },
@@ -1155,3 +1169,4 @@ export class PredictionQueueService {
     return true;
   }
 }
+

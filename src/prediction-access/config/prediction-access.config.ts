@@ -4,10 +4,10 @@ import { MarketFamily } from '../../predictions-engine/enums/market-family.enum'
 import { FOOTBALL_MARKET_CATALOG } from '../../odds/catalog/football-market-catalog';
 
 /**
- * Visitor market allowance: seven useful, less-prominent markets across two
- * market families. The count refers to canonical market groups, not outcomes.
+ * Curated Visitor market allowance retained from the previous policy. Pick Center
+ * now uses ranked per-fixture market limits defined below.
  */
-const VISITOR_MARKET_KEYS = [
+const CURATED_VISITOR_MARKET_KEYS = [
   'FIRST_HALF_GOALS_OVER_UNDER',
   'SECOND_HALF_GOALS_OVER_UNDER',
   'BOTH_TEAMS_TO_SCORE_FIRST_HALF',
@@ -17,9 +17,9 @@ const VISITOR_MARKET_KEYS = [
   'AWAY_TEAM_CORNERS_OVER_UNDER',
 ] as const;
 
-/** Free expands the Visitor set to fifteen market groups. */
-const FREE_MARKET_KEYS = [
-  ...VISITOR_MARKET_KEYS,
+/** Curated Free expands the Visitor set to fifteen market groups. */
+const CURATED_FREE_MARKET_KEYS = [
+  ...CURATED_VISITOR_MARKET_KEYS,
   'MATCH_RESULT',
   'DOUBLE_CHANCE',
   'GOALS_OVER_UNDER',
@@ -30,9 +30,9 @@ const FREE_MARKET_KEYS = [
   'TOTAL_SHOTS_OVER_UNDER',
 ] as const;
 
-/** Regular expands the Free set to thirty-two market groups. */
-const REGULAR_MARKET_KEYS = [
-  ...FREE_MARKET_KEYS,
+/** Curated Regular expands the Free set to thirty-two market groups. */
+const CURATED_REGULAR_MARKET_KEYS = [
+  ...CURATED_FREE_MARKET_KEYS,
   'DRAW_NO_BET',
   'HOME_TEAM_GOALS_OVER_UNDER',
   'AWAY_TEAM_GOALS_OVER_UNDER',
@@ -81,9 +81,9 @@ const validateMarketTier = (
   }
 };
 
-validateMarketTier('Visitor', VISITOR_MARKET_KEYS, 7);
-validateMarketTier('Free', FREE_MARKET_KEYS, 15);
-validateMarketTier('Regular', REGULAR_MARKET_KEYS, 32);
+validateMarketTier('Curated Visitor', CURATED_VISITOR_MARKET_KEYS, 7);
+validateMarketTier('Curated Free', CURATED_FREE_MARKET_KEYS, 15);
+validateMarketTier('Curated Regular', CURATED_REGULAR_MARKET_KEYS, 32);
 
 export const PREDICTION_MARKET_FAMILY_BY_KEY: ReadonlyMap<
   string,
@@ -113,16 +113,28 @@ export const PREDICTION_ACCESS_CONFIG = {
   maximumMarketPageSize: 100,
   /** Operational query safeguard, not a per-user/day product quota. */
   maximumPickCenterMatches: 1000,
+  /** Pick Center exposes the highest-ranked distinct market groups per fixture. */
   marketVisibility: {
+    anonymous: { limit: 5, diversity: 'LIMITED' },
+    free: { limit: 12, diversity: 'LIMITED' },
+    regular: { limit: 22, diversity: 'EXPANDED' },
+    vip: { limit: 48, diversity: 'FULL' },
+    premium: { limit: null, diversity: 'FULL' },
+  } satisfies Record<
+    PredictionAccessPlan,
+    { limit: number | null; diversity: 'LIMITED' | 'EXPANDED' | 'FULL' }
+  >,
+  /** Curated predictions retain their previous explicit market-key entitlements. */
+  curatedMarketVisibility: {
     anonymous: {
       limit: 7,
-      marketKeys: VISITOR_MARKET_KEYS,
+      marketKeys: CURATED_VISITOR_MARKET_KEYS,
       families: [MarketFamily.PERIOD, MarketFamily.STATISTICS],
       diversity: 'LIMITED',
     },
     free: {
       limit: 15,
-      marketKeys: FREE_MARKET_KEYS,
+      marketKeys: CURATED_FREE_MARKET_KEYS,
       families: [
         MarketFamily.RESULT,
         MarketFamily.GOALS,
@@ -133,7 +145,7 @@ export const PREDICTION_ACCESS_CONFIG = {
     },
     regular: {
       limit: 32,
-      marketKeys: REGULAR_MARKET_KEYS,
+      marketKeys: CURATED_REGULAR_MARKET_KEYS,
       families: [
         MarketFamily.RESULT,
         MarketFamily.GOALS,
@@ -171,25 +183,24 @@ export const PREDICTION_ACCESS_CONFIG = {
    * for the day and nested across plans.
    */
   leagueVisibility: {
-    anonymous: 10,
-    free: 20,
-    regular: 60,
-    vip: 85,
+    anonymous: 50,
+    free: 60,
+    regular: 80,
+    vip: 95,
     premium: 100,
   } satisfies Record<PredictionAccessPlan, number>,
-  /** Curated picks are locked for Visitor/Free and proportionally allocated for paid tiers. */
+  /** Daily active Curated Prediction league allocation. */
   curatedLeagueVisibility: {
-    anonymous: 0,
-    free: 0,
-    regular: 60,
-    vip: 85,
+    anonymous: 2,
+    free: 8,
+    regular: 50,
+    vip: 75,
     premium: 100,
   } satisfies Record<PredictionAccessPlan, number>,
   enabledMarketCount: ENABLED_PREDICTION_MARKET_KEYS.length,
   enabledMarketFamilyCount: ENABLED_MARKET_FAMILIES.length,
   slipProducts: {
-    // All standard combined-odds products are Premium-only.
-    ODDS_10: { minOdds: 9, maxOdds: 10, requiredPlan: 'premium' },
+    ODDS_10: { minOdds: 9, maxOdds: 10, requiredPlan: 'vip' },
     ODDS_25: { minOdds: 23, maxOdds: 25, requiredPlan: 'premium' },
     ODDS_50: { minOdds: 48, maxOdds: 50, requiredPlan: 'premium' },
   } as const,
@@ -204,11 +215,11 @@ export const PREDICTION_ACCESS_CONFIG = {
       },
       SURE_5: {
         ...PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products.SURE_5,
-        requiredPlan: 'vip',
+        requiredPlan: 'premium',
       },
       SURE_7: {
         ...PREDICTION_ENGINE_CONFIG.slipCenter.sureOdds.products.SURE_7,
-        requiredPlan: 'vip',
+        requiredPlan: 'regular',
       },
     },
     // Compatibility values for older callers; product-specific ranges are authoritative.
@@ -233,3 +244,4 @@ export const PREDICTION_ACCESS_CONFIG = {
     premium: 4,
   } satisfies Record<PredictionAccessPlan, number>,
 } as const;
+

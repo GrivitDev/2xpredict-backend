@@ -200,7 +200,7 @@ export const SYSTEM_MONITOR_MODULE_REGISTRY: readonly SystemMonitorModuleDefinit
     module: 'sports', category: 'sports-data',
     description: 'Fixture discovery, provider collection, normalization, queues and derived Sports data.',
     monitoringLevel: 'deep', critical: true, probeMode: 'PERIODIC',
-    healthFreshnessMs: 5 * 60_000,
+    healthFreshnessMs: 10 * 60_000,
     moduleImports: ['settlement'], dataDependencies: [], runtimeDependencies: ['database'],
     externalDependencies: ['ESPN API', 'The Odds API', 'YouTube Data API'],
     externalProbeMode: 'MODULE_MONITORED',
@@ -209,7 +209,7 @@ export const SYSTEM_MONITOR_MODULE_REGISTRY: readonly SystemMonitorModuleDefinit
     module: 'odds', category: 'sports-data',
     description: 'Canonical market catalogue, bookmaker snapshots, pricing and market readiness.',
     monitoringLevel: 'deep', critical: true, probeMode: 'PERIODIC',
-    healthFreshnessMs: 5 * 60_000,
+    healthFreshnessMs: 10 * 60_000,
     moduleImports: ['sports'], dataDependencies: [],
     runtimeDependencies: ['database', 'realtime'],
     externalDependencies: [], externalProbeMode: 'NONE',
@@ -480,3 +480,4 @@ export function getSystemMonitorDefaultMonitoringLevel(
 export function getSystemMonitorDefaultCritical(moduleName: string): boolean {
   return getSystemMonitorModuleDefinition(moduleName)?.critical ?? false;
 }
+

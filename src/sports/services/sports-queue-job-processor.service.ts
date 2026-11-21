@@ -25,6 +25,7 @@ import {
   ClaimedSportsQueueJob,
 } from './sports-queue.service';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
+import { ODDS_CONFIG } from '../../odds/config/odds.config';
 
 const { DAY } = SPORTS_COLLECTION_TIME;
 
@@ -175,6 +176,9 @@ export class SportsQueueJobProcessorService {
         return;
       case SportsQueueJobType.MATCH_SUMMARY_BACKFILL:
         await this.processMatchSummaryBackfill(job.scope);
+        return;
+      case SportsQueueJobType.OFFICIAL_STANDINGS_BACKFILL:
+        await this.processOfficialStandingsBackfill(job.scope);
         return;
       case SportsQueueJobType.MATCH_PLAYS_COLLECTION:
         await this.processMatchPlays(job.scope);
@@ -1708,6 +1712,95 @@ export class SportsQueueJobProcessorService {
     );
   }
 
+  /**
+   * Locally re-extracts official standings from retained match Summary payloads.
+   * Missing Summary payloads are skipped; this job never calls ESPN or schedules
+   * MATCH_SUMMARY_COLLECTION, keeping this recovery pass quota-neutral.
+   */
+  private async processOfficialStandingsBackfill(
+    scope: SportsQueueScope,
+  ): Promise<void> {
+    const competitionId = this.required(scope.competitionId, 'competitionId');
+    const seasonId = this.required(scope.seasonId, 'seasonId');
+    const runId = this.required(scope.backfillRunId, 'backfillRunId');
+    const [competition, season] = await Promise.all([
+      this.collection.getCompetition(competitionId),
+      this.collection.getSeason(seasonId),
+    ]);
+
+    if (
+      !competition ||
+      competition.isActive !== true ||
+      !season ||
+      season.competitionId !== competitionId ||
+      season.isCurrent !== true ||
+      competition.currentSeasonId !== seasonId
+    ) {
+      this.logger.debug(
+        `Skipping stale official standings backfill scope ${competitionId}/${seasonId}; it is no longer the active current season.`,
+      );
+      return;
+    }
+
+    const config = SPORTS_COLLECTION_SCHEDULE.officialStandingsBackfill;
+    const page = await this.collection.getSummaryBackfillPage({
+      competitionId,
+      seasonId,
+      cursorKickoffAt: scope.backfillCursorKickoffAt,
+      cursorFixtureId: scope.backfillCursorFixtureId,
+      limit: config.pageSize,
+    });
+    if (!page.length) {
+      this.logger.log(
+        `Official standings backfill ${runId}: completed ${competitionId}/${seasonId}.`,
+      );
+      return;
+    }
+
+    let processed = 0;
+    let missingSummary = 0;
+    let unavailableStandings = 0;
+    let accepted = 0;
+
+    // Deliberately sequential: this is maintenance work behind the shared
+    // BackgroundWorkLimiter, not latency-sensitive prediction processing.
+    for (const item of page) {
+      if (!item.summaryPayloadHash) {
+        missingSummary += 1;
+        continue;
+      }
+      processed += 1;
+      const saved = await this.collection.normalizeStoredOfficialStandings(
+        item.fixture,
+      );
+      if (saved) accepted += 1;
+      else unavailableStandings += 1;
+    }
+
+    const lastFixture = page[page.length - 1].fixture;
+    if (page.length === config.pageSize) {
+      const cursorKickoffAt = new Date(lastFixture.kickoffAt).toISOString();
+      const cursorFixtureId = String(lastFixture.id);
+      await this.queue.enqueueIfMissing({
+        type: SportsQueueJobType.OFFICIAL_STANDINGS_BACKFILL,
+        scope: {
+          competitionId,
+          seasonId,
+          backfillRunId: runId,
+          backfillCursorKickoffAt: cursorKickoffAt,
+          backfillCursorFixtureId: cursorFixtureId,
+        },
+        priority: config.priority,
+        scheduledFor: new Date(Date.now() + config.nextPageDelayMs),
+        triggerEventId: `official-standings-backfill:${runId}:${competitionId}:${seasonId}:${cursorKickoffAt}:${cursorFixtureId}`,
+      });
+    }
+
+    this.logger.log(
+      `Official standings backfill ${runId}/${competitionId}/${seasonId}: scanned=${page.length}, summaries=${processed}, accepted=${accepted}, missingSummary=${missingSummary}, unavailableOrStale=${unavailableStandings}.`,
+    );
+  }
+
   private async processMatchPlays(scope: SportsQueueScope): Promise<void> {
     const fixtureId = this.required(scope.fixtureId, 'fixtureId');
     const fixture = await this.collection.getFixture(fixtureId);
@@ -1883,6 +1976,9 @@ export class SportsQueueJobProcessorService {
       ),
     );
     const now = new Date();
+    const pricingHorizonEnd = new Date(
+      now.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+    );
     const completedTeamIdList = [...completedTeamIds];
 
     // A season projection may be used by upcoming fixtures from another
@@ -1892,15 +1988,17 @@ export class SportsQueueJobProcessorService {
     const sameCompetitionUpcoming = await this.getUpcomingFixtures({
       competitionId,
       from: now,
+      to: pricingHorizonEnd,
     });
     const crossCompetitionUpcoming = await this.getUpcomingCrossCompetitionFixtures(
       completedTeamIdList,
       competitionId,
       now,
+      pricingHorizonEnd,
     );
     const upcomingById = new Map<string, SportsFixtureRecord>();
     for (const fixture of [...sameCompetitionUpcoming, ...crossCompetitionUpcoming]) {
-      if (this.isUpcomingFixture(fixture, now)) upcomingById.set(String(fixture.id), fixture);
+      if (this.isUpcomingFixture(fixture, now, pricingHorizonEnd)) upcomingById.set(String(fixture.id), fixture);
     }
     const upcomingFixtures = [...upcomingById.values()];
 
@@ -1931,6 +2029,7 @@ export class SportsQueueJobProcessorService {
     competitionId?: string;
     teamId?: string;
     from: Date;
+    to?: Date;
   }): Promise<SportsFixtureRecord[]> {
     const items = new Map<string, SportsFixtureRecord>();
     let cursor: string | undefined;
@@ -1939,6 +2038,9 @@ export class SportsQueueJobProcessorService {
         ...(query.competitionId ? { competitionId: query.competitionId } : {}),
         ...(query.teamId ? { teamId: query.teamId } : {}),
         from: query.from,
+        to: query.to ?? new Date(
+          query.from.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+        ),
         limit: 100,
         cursor,
         sortOrder: 'ASC',
@@ -1954,6 +2056,9 @@ export class SportsQueueJobProcessorService {
     teamIds: string[],
     sourceCompetitionId: string,
     now: Date,
+    horizonEnd = new Date(
+      now.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+    ),
   ): Promise<SportsFixtureRecord[]> {
     const uniqueTeamIds = [...new Set(teamIds.map((id) => String(id ?? '').trim()).filter(Boolean))];
     const results = new Map<string, SportsFixtureRecord>();
@@ -1962,11 +2067,11 @@ export class SportsQueueJobProcessorService {
     for (let offset = 0; offset < uniqueTeamIds.length; offset += 5) {
       const batch = uniqueTeamIds.slice(offset, offset + 5);
       const pages = await Promise.all(batch.map((teamId) =>
-        this.getUpcomingFixtures({ teamId, from: now }),
+        this.getUpcomingFixtures({ teamId, from: now, to: horizonEnd }),
       ));
       for (const fixturesForTeam of pages) {
         for (const fixture of fixturesForTeam) {
-          if (fixture.competitionId !== sourceCompetitionId && this.isUpcomingFixture(fixture, now)) {
+          if (fixture.competitionId !== sourceCompetitionId && this.isUpcomingFixture(fixture, now, horizonEnd)) {
             results.set(String(fixture.id), fixture);
           }
         }
@@ -1975,13 +2080,20 @@ export class SportsQueueJobProcessorService {
     return [...results.values()];
   }
 
-  private isUpcomingFixture(fixture: SportsFixtureRecord, now: Date): boolean {
+  private isUpcomingFixture(
+    fixture: SportsFixtureRecord,
+    now: Date,
+    horizonEnd = new Date(
+      now.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000,
+    ),
+  ): boolean {
     const kickoffAt = fixture.kickoffAt instanceof Date
       ? fixture.kickoffAt
       : new Date(fixture.kickoffAt as unknown as string);
     const state = String(fixture.status?.state ?? 'UNKNOWN').toUpperCase();
     return Number.isFinite(kickoffAt.getTime())
       && kickoffAt.getTime() > now.getTime()
+      && kickoffAt.getTime() <= horizonEnd.getTime()
       && !['LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES', 'COMPLETED', 'POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED'].includes(state)
       && fixture.status?.isFinal !== true;
   }
@@ -2678,3 +2790,4 @@ export class SportsQueueJobProcessorService {
     return normalized;
   }
 }
+

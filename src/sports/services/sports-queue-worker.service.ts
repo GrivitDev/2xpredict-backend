@@ -48,7 +48,7 @@ interface LaneRuntime {
 }
 
 const DEFAULT_LANE_CONCURRENCY = 1;
-const LIVE_SCOREBOARD_LANE_CONCURRENCY = 3;
+const LIVE_SCOREBOARD_LANE_CONCURRENCY = 1;
 
 function getLaneConcurrency(type: SportsQueueJobType): number {
   return type === SportsQueueJobType.LIVE_SCOREBOARD_REFRESH
@@ -69,6 +69,16 @@ const GLOBAL_GATE_BYPASS_JOB_TYPES: ReadonlySet<SportsQueueJobType> = new Set([
 ]);
 
 const IDLE_POLL_MS = 10_000;
+const LOW_PRIORITY_IDLE_POLL_MS = 30_000;
+const LOW_PRIORITY_IDLE_POLL_JOB_TYPES: ReadonlySet<SportsQueueJobType> = new Set([
+  SportsQueueJobType.LEAGUE_CATALOGUE_REFRESH,
+  SportsQueueJobType.LEAGUE_DETAIL_REFRESH,
+  SportsQueueJobType.SEASON_CATALOGUE_REFRESH,
+  SportsQueueJobType.TEAM_CATALOGUE_REFRESH,
+  SportsQueueJobType.TEAM_DETAIL_REFRESH,
+  SportsQueueJobType.MATCH_SUMMARY_BACKFILL,
+  SportsQueueJobType.SPORTS_RETENTION_CLEANUP,
+]);
 const ACTIVE_POLL_MS = 1_000;
 const LEASE_MS = 10 * 60_000;
 const HEARTBEAT_MS = 60_000;
@@ -76,9 +86,10 @@ const LEASE_RECOVERY_MS = 60_000;
 
 /**
  * Independent durable queue lane for every SportsQueueJobType.
- * Live scoreboard refresh can process up to three jobs concurrently; every
- * other lane remains single-job. Most lanes use the shared process-wide
- * limiter; live monitoring and short control gates bypass that shared gate.
+ * Live scoreboard refresh is serialized because ESPN returns an unfiltered
+ * scoreboard snapshot and concurrent jobs can persist overlapping fixtures.
+ * Most lanes use the shared process-wide limiter; live monitoring and short
+ * control gates bypass that shared gate.
  */
 @Injectable()
 export class SportsQueueWorkerService
@@ -202,7 +213,7 @@ export class SportsQueueWorkerService
       running: laneValues.some((lane) => lane.activeJobs > 0),
       startedAt: this.startedAt,
       laneCount: this.lanes.size,
-      // Retain the legacy default while exposing the live lane's higher cap.
+      // Expose the single-job live scoreboard lane capacity.
       laneConcurrency: DEFAULT_LANE_CONCURRENCY,
       maximumLaneConcurrency: LIVE_SCOREBOARD_LANE_CONCURRENCY,
       passCount: laneValues.reduce((sum, lane) => sum + lane.passes, 0),
@@ -380,8 +391,11 @@ export class SportsQueueWorkerService
       ) {
         // Preserve an already-scheduled immediate slot fill. Otherwise event
         // wakes and productive passes get the active cadence; idle lanes back off.
+        const idleDelayMs = LOW_PRIORITY_IDLE_POLL_JOB_TYPES.has(type)
+          ? LOW_PRIORITY_IDLE_POLL_MS
+          : IDLE_POLL_MS;
         const delayMs =
-          wakeRequested || processed > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+          wakeRequested || processed > 0 ? ACTIVE_POLL_MS : idleDelayMs;
         this.scheduleLane(type, delayMs);
       }
     }
@@ -517,5 +531,6 @@ export class SportsQueueWorkerService
           .slice(0, 500);
   }
 }
+
 
 

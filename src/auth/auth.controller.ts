@@ -17,6 +17,7 @@ import { VerifyEmailChangeDto } from './dto/verify-email-change.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { GoogleAuthDto } from './dto/google-auth.dto';
 
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { GetUser } from '../common/decorators/get-user.decorator';
@@ -42,6 +43,16 @@ export class AuthController {
     const userAgent = req.headers['user-agent'] || '';
 
     return this.authService.login(loginDto, ip.toString(), userAgent);
+  }
+
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 15 * 60 * 1000 } })
+  @Post('google')
+  googleAuth(@Body() dto: GoogleAuthDto, @Req() req: Request) {
+    const ip = req.ip || req.socket.remoteAddress || '';
+    const userAgent = req.headers['user-agent'] || '';
+
+    return this.authService.googleAuth(dto, ip.toString(), userAgent);
   }
 
   @UseGuards(JwtAuthGuard)

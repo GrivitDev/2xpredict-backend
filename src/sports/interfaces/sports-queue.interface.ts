@@ -17,6 +17,8 @@ export enum SportsQueueJobType {
   MATCH_SUMMARY_COLLECTION = 'MATCH_SUMMARY_COLLECTION',
   /** Bounded keyset scan that fills missing retained historical ESPN summaries. */
   MATCH_SUMMARY_BACKFILL = 'MATCH_SUMMARY_BACKFILL',
+  /** Local-only reprocessing of retained Summary payloads for official standings. */
+  OFFICIAL_STANDINGS_BACKFILL = 'OFFICIAL_STANDINGS_BACKFILL',
   MATCH_PLAYS_COLLECTION = 'MATCH_PLAYS_COLLECTION',
   YOUTUBE_HIGHLIGHT = 'YOUTUBE_HIGHLIGHT',
   /** Periodically recovers recent completed fixtures with missing/retryable highlights. */
@@ -145,5 +147,6 @@ export interface SportsQueueEnqueueRequest {
   recurrence?: SportsQueueRecurrence;
   triggerEventId?: string;
 }
+
 
 

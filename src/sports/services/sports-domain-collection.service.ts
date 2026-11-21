@@ -509,6 +509,19 @@ export class SportsDomainCollectionService {
         fixture: result.fixture ?? existingFixture,
       });
 
+      await this.normalizeAndPersistOfficialStandings({
+        competitionId: scope.competitionId,
+        seasonId:
+          result.fixture?.seasonId ??
+          scope.seasonId ??
+          existingFixture?.seasonId,
+        endpoint,
+        sourcePayloadHash: storedSummary.payloadHash,
+        sourceRevision: storedSummary.revision,
+        sourceCollectedAt: collectedAt,
+        rawPayload: result.rawResponse,
+      });
+
       if (result.fixture) {
         await this.persistence.saveFixtures([result.fixture]);
         await this.state.markSucceeded(input, undefined, endpoint);
@@ -960,6 +973,7 @@ export class SportsDomainCollectionService {
 
   async getSummaryBackfillPage(input: {
     competitionId: string;
+    seasonId?: string;
     cursorKickoffAt?: string;
     cursorFixtureId?: string;
     limit: number;
@@ -987,27 +1001,103 @@ export class SportsDomainCollectionService {
     )
       return false;
 
+    const endpoint = String(
+      summary.endpoint ?? `/summary?event=${fixture.espnEventId}`,
+    );
+    const sourceCollectedAt = new Date(
+      summary.lastCollectedAt ??
+        summary.firstCollectedAt ??
+        fixture.completedAt ??
+        fixture.kickoffAt,
+    );
+    const rawPayload = summary.rawPayload as Record<string, unknown>;
     const normalized = await this.matchFactsNormalization.normalizeAndPersist({
       fixtureId: fixture.id,
       espnEventId: fixture.espnEventId,
       competitionId: fixture.competitionId,
       seasonId: fixture.seasonId ?? summary.seasonId,
       seasonYear: fixture.seasonYear ?? summary.seasonYear,
-      endpoint: String(
-        summary.endpoint ?? `/summary?event=${fixture.espnEventId}`,
-      ),
+      endpoint,
       sourcePayloadHash: String(summary.payloadHash ?? ''),
       sourceRevision: Math.max(1, Number(summary.revision ?? 1)),
-      sourceCollectedAt: new Date(
-        summary.lastCollectedAt ??
-          summary.firstCollectedAt ??
-          fixture.completedAt ??
-          fixture.kickoffAt,
-      ),
-      rawPayload: summary.rawPayload as Record<string, unknown>,
+      sourceCollectedAt,
+      rawPayload,
       fixture,
     });
+    await this.normalizeAndPersistOfficialStandings({
+      competitionId: fixture.competitionId,
+      seasonId: fixture.seasonId ?? summary.seasonId,
+      endpoint,
+      sourcePayloadHash: String(summary.payloadHash ?? ''),
+      sourceRevision: Math.max(1, Number(summary.revision ?? 1)),
+      sourceCollectedAt,
+      rawPayload,
+    });
     return Boolean(normalized);
+  }
+
+  private async normalizeAndPersistOfficialStandings(input: {
+    competitionId: string;
+    seasonId?: string;
+    endpoint: string;
+    sourcePayloadHash: string;
+    sourceRevision: number;
+    sourceCollectedAt: Date;
+    rawPayload: Record<string, unknown>;
+  }): Promise<boolean> {
+    const seasonId = String(input.seasonId ?? '').trim();
+    if (!seasonId) return false;
+
+    const snapshot = this.matchFactsNormalization.normalizeOfficialStandings({
+      competitionId: input.competitionId,
+      seasonId,
+      endpoint: input.endpoint,
+      sourcePayloadHash: input.sourcePayloadHash,
+      sourceRevision: input.sourceRevision,
+      sourceCollectedAt: input.sourceCollectedAt,
+      rawPayload: input.rawPayload,
+    });
+    if (!snapshot) return false;
+
+    const result = await this.persistence.saveOfficialStandings(snapshot);
+    if (!result.saved && result.reason === 'INCOMPLETE') {
+      this.logger.warn(
+        `Official ESPN standings were not published for ${input.competitionId}/${seasonId}; the last valid snapshot was retained.`,
+      );
+    }
+    return result.saved || result.reason === 'UNCHANGED';
+  }
+
+  /**
+   * Extract official standings from an already-retained Summary document.
+   * This path deliberately does not rewrite Match Facts or call ESPN, avoiding
+   * unnecessary source-change events and provider requests during backfill.
+   */
+  async normalizeStoredOfficialStandings(
+    fixture: SportsFixtureRecord,
+  ): Promise<boolean> {
+    const summary = await this.persistence.getMatchSummaryByFixtureId(fixture.id);
+    if (!summary || !summary.rawPayload || typeof summary.rawPayload !== 'object') {
+      return false;
+    }
+
+    const sourceCollectedAt = new Date(
+      summary.lastCollectedAt ??
+        summary.firstCollectedAt ??
+        fixture.completedAt ??
+        fixture.kickoffAt,
+    );
+    if (!Number.isFinite(sourceCollectedAt.getTime())) return false;
+
+    return this.normalizeAndPersistOfficialStandings({
+      competitionId: fixture.competitionId,
+      seasonId: fixture.seasonId ?? summary.seasonId,
+      endpoint: String(summary.endpoint ?? `/summary?event=${fixture.espnEventId}`),
+      sourcePayloadHash: String(summary.payloadHash ?? ''),
+      sourceRevision: Math.max(1, Number(summary.revision ?? 1)),
+      sourceCollectedAt,
+      rawPayload: summary.rawPayload as Record<string, unknown>,
+    });
   }
 
   async getFixture(fixtureId: string): Promise<SportsFixtureRecord | null> {
@@ -1104,3 +1194,4 @@ export class SportsDomainCollectionService {
     };
   }
 }
+

@@ -41,6 +41,7 @@ describe('SportsQueueWorkerService global-gate routing', () => {
 
   afterEach(() => {
     worker.onModuleDestroy();
+    jest.useRealTimers();
   });
 
   it.each([
@@ -81,7 +82,7 @@ describe('SportsQueueWorkerService global-gate routing', () => {
     expect(releasePermit).toHaveBeenCalledTimes(1);
   });
 
-  it('allows up to three live scoreboard jobs at the same time', async () => {
+  it('serializes live scoreboard jobs to avoid overlapping fixture transactions', async () => {
     const resolvers: Array<(job: any) => void> = [];
     queue.claimNext.mockImplementation(
       () =>
@@ -100,16 +101,16 @@ describe('SportsQueueWorkerService global-gate routing', () => {
 
     await Promise.resolve();
 
-    expect(queue.claimNext).toHaveBeenCalledTimes(3);
+    expect(queue.claimNext).toHaveBeenCalledTimes(1);
     const workerIds = queue.claimNext.mock.calls.map((call) => call[0]);
-    expect(new Set(workerIds).size).toBe(3);
+    expect(new Set(workerIds).size).toBe(1);
 
     const liveStatus = (worker.getMonitorStatus() as any).lanes[liveType];
-    expect(liveStatus.activeJobs).toBe(3);
-    expect(liveStatus.concurrency).toBe(3);
+    expect(liveStatus.activeJobs).toBe(1);
+    expect(liveStatus.concurrency).toBe(1);
     expect(liveStatus.running).toBe(true);
 
-    resolvers.forEach((resolve) => resolve(null));
+    resolvers[0](null);
     await Promise.all(passes);
 
     const completedStatus = (worker.getMonitorStatus() as any).lanes[liveType];
@@ -117,6 +118,40 @@ describe('SportsQueueWorkerService global-gate routing', () => {
     expect(completedStatus.running).toBe(false);
   });
 
+
+
+  it.each([
+    [SportsQueueJobType.MATCH_SUMMARY_BACKFILL, 30_000],
+    [SportsQueueJobType.TEAM_DETAIL_REFRESH, 30_000],
+    [SportsQueueJobType.BOOTSTRAP_PHASE_GATE, 10_000],
+    [SportsQueueJobType.MATCH_SUMMARY_COLLECTION, 10_000],
+    [SportsQueueJobType.YOUTUBE_HIGHLIGHT, 10_000],
+    [SportsQueueJobType.SOCCER_NEWS_REFRESH, 10_000],
+  ])('uses the configured idle delay for lane %s (%i ms)', async (type: SportsQueueJobType, expectedDelayMs: number) => {
+    jest.useFakeTimers();
+
+    await (worker as any).pumpLane(type);
+    expect(queue.claimNext).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(expectedDelayMs - 1);
+    expect(queue.claimNext).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(1);
+    expect(queue.claimNext).toHaveBeenCalledTimes(2);
+  });
+
+  it('wakes a backed-off idle lane immediately when new work is signalled', async () => {
+    jest.useFakeTimers();
+    const type = SportsQueueJobType.MATCH_SUMMARY_BACKFILL;
+
+    await (worker as any).pumpLane(type);
+    expect(queue.claimNext).toHaveBeenCalledTimes(1);
+
+    (worker as any).wakeLane(type);
+    await jest.advanceTimersByTimeAsync(0);
+
+    expect(queue.claimNext).toHaveBeenCalledTimes(2);
+  });
 
   it('pauses only the YouTube lane when its daily quota is exhausted', async () => {
     const resumeAt = new Date(Date.now() + 60_000);
@@ -167,4 +202,5 @@ describe('SportsQueueWorkerService global-gate routing', () => {
     await Promise.all([first, second]);
   });
 });
+
 

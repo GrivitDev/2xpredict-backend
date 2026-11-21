@@ -5,6 +5,13 @@ import { Model } from 'mongoose';
 import { Subscription, SubscriptionDocument } from '../subscriptions/schemas/subscription.schema';
 import { Referral, ReferralDocument } from '../referrals/schemas/referral.schema';
 
+type SubscriptionLeaderboardFacet = {
+  topSubscribers: unknown[];
+  topVipSubscribers: unknown[];
+  topRegularSubscribers: unknown[];
+  topPremiumSubscribers: unknown[];
+};
+
 @Injectable()
 export class AnalyticsLeaderboardService {
   constructor(
@@ -13,20 +20,44 @@ export class AnalyticsLeaderboardService {
   ) {}
 
   async getLeaderboards() {
-    const [topSubscribers, topVipSubscribers, topRegularSubscribers, topPremiumSubscribers, topReferrers] =
-      await Promise.all([
-        this.getTopSubscribers(),
-        this.getTopPlanSubscribers('vip', 'totalVipSubscriptions'),
-        this.getTopPlanSubscribers('regular', 'totalRegularSubscriptions'),
-        this.getTopPlanSubscribers('premium', 'totalPremiumSubscriptions'),
-        this.getTopReferrers(),
-      ]);
+    // Four subscription rankings previously scanned the same collection in
+    // four separate aggregate commands. A $facet shares the input scan while
+    // retaining each ranking's original grouping, tie-break and top-five limit.
+    const [subscriptionFacets, topReferrers] = await Promise.all([
+      this.subscriptionModel.aggregate<SubscriptionLeaderboardFacet>([
+        {
+          $facet: {
+            topSubscribers: this.topSubscribersPipeline(),
+            topVipSubscribers: this.topPlanSubscribersPipeline(
+              'vip',
+              'totalVipSubscriptions',
+            ),
+            topRegularSubscribers: this.topPlanSubscribersPipeline(
+              'regular',
+              'totalRegularSubscriptions',
+            ),
+            topPremiumSubscribers: this.topPlanSubscribersPipeline(
+              'premium',
+              'totalPremiumSubscriptions',
+            ),
+          },
+        },
+      ]).exec(),
+      this.getTopReferrers(),
+    ]);
 
-    return { topSubscribers, topVipSubscribers, topRegularSubscribers, topPremiumSubscribers, topReferrers };
+    const rankings = subscriptionFacets[0];
+    return {
+      topSubscribers: rankings?.topSubscribers ?? [],
+      topVipSubscribers: rankings?.topVipSubscribers ?? [],
+      topRegularSubscribers: rankings?.topRegularSubscribers ?? [],
+      topPremiumSubscribers: rankings?.topPremiumSubscribers ?? [],
+      topReferrers,
+    };
   }
 
-  private async getTopSubscribers() {
-    return this.subscriptionModel.aggregate([
+  private topSubscribersPipeline(): any[] {
+    return [
       {
         $group: {
           _id: '$userId',
@@ -36,17 +67,20 @@ export class AnalyticsLeaderboardService {
       { $sort: { totalSubscriptions: -1, _id: 1 } },
       { $limit: 5 },
       ...this.lookupUser(),
-    ]).exec();
+    ];
   }
 
-  private async getTopPlanSubscribers(plan: 'vip' | 'regular' | 'premium', countField: string) {
-    return this.subscriptionModel.aggregate([
+  private topPlanSubscribersPipeline(
+    plan: 'vip' | 'regular' | 'premium',
+    countField: string,
+  ): any[] {
+    return [
       { $match: { plan } },
       { $group: { _id: '$userId', [countField]: { $sum: 1 } } },
       { $sort: { [countField]: -1, _id: 1 } },
       { $limit: 5 },
       ...this.lookupUser(),
-    ]).exec();
+    ];
   }
 
   private async getTopReferrers() {
@@ -76,7 +110,7 @@ export class AnalyticsLeaderboardService {
     ]).exec();
   }
 
-  private lookupUser() {
+  private lookupUser(): any[] {
     return [
       {
         $addFields: {
