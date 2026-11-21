@@ -1,41 +1,90 @@
-// Run with mongosh against the target 2xPredict database.
-// This replaces only the stale unique position index; it does not modify documents.
+/**
+ * Repairs the obsolete unique standings-position index in the production
+ * 2xPredict database.
+ *
+ * The active SportsCalculatedStandings schema stores one document per team
+ * with a top-level `position` field and declares this compound index as
+ * NON-UNIQUE. A unique position index left by an older deployment prevents
+ * teams from exchanging positions during unordered bulk updates.
+ *
+ * This migration:
+ *   1. Drops only an exact-match UNIQUE index on
+ *      { competitionId: 1, seasonId: 1, position: 1 }.
+ *   2. Ensures the same index exists as NON-UNIQUE.
+ *
+ * No standings documents are deleted or rewritten. The separate unique index
+ * on { competitionId: 1, seasonId: 1, teamId: 1 } or the unique `id` index
+ * is not modified.
+ */
 
-const collection = db.getCollection('sports_calculated_standings');
-const indexName = 'competitionId_1_seasonId_1_position_1';
-const expectedKey = { competitionId: 1, seasonId: 1, position: 1 };
+const targetDb = db.getSiblingDB('2xpredict');
+const collection = targetDb.getCollection('sports_calculated_standings');
+const expectedFields = ['competitionId', 'seasonId', 'position'];
+const expectedKey = {
+  competitionId: 1,
+  seasonId: 1,
+  position: 1,
+};
+const expectedIndexName =
+  'competitionId_1_seasonId_1_position_1';
 
-function hasExpectedKey(index) {
-  const fields = Object.keys(index.key || {});
+function hasExactKeyPattern(key) {
+  const entries = Object.entries(key || {});
   return (
-    fields.length === 3 &&
-    fields[0] === 'competitionId' &&
-    fields[1] === 'seasonId' &&
-    fields[2] === 'position' &&
-    index.key.competitionId === 1 &&
-    index.key.seasonId === 1 &&
-    index.key.position === 1
+    entries.length === expectedFields.length &&
+    entries.every(
+      ([field, direction], index) =>
+        field === expectedFields[index] && direction === 1,
+    )
   );
 }
 
-let existing = collection.getIndexes().find((index) => index.name === indexName);
+const initialIndexes = collection.getIndexes();
+const obsoleteUniqueIndexes = initialIndexes.filter(
+  (index) => index.unique === true && hasExactKeyPattern(index.key),
+);
 
-if (existing && (existing.unique === true || !hasExpectedKey(existing))) {
-  print(`Dropping stale index: ${indexName}`);
-  collection.dropIndex(indexName);
-  existing = undefined;
+for (const index of obsoleteUniqueIndexes) {
+  print(`Dropping obsolete unique index: ${index.name}`);
+  collection.dropIndex(index.name);
 }
 
-if (!existing) {
-  collection.createIndex(expectedKey, { name: indexName });
-  print(`Created non-unique index: ${indexName}`);
+let currentIndexes = collection.getIndexes();
+const nonUniquePositionIndex = currentIndexes.find(
+  (index) => index.unique !== true && hasExactKeyPattern(index.key),
+);
+
+if (!nonUniquePositionIndex) {
+  print('Creating the schema-aligned non-unique standings position index.');
+  collection.createIndex(expectedKey, { name: expectedIndexName });
 } else {
-  print(`Index already has the expected non-unique definition: ${indexName}`);
+  print(`Non-unique standings position index already exists: ${nonUniquePositionIndex.name}`);
 }
 
-const finalIndex = collection.getIndexes().find((index) => index.name === indexName);
-if (!finalIndex || finalIndex.unique === true || !hasExpectedKey(finalIndex)) {
-  throw new Error(`Index migration verification failed for ${indexName}`);
+currentIndexes = collection.getIndexes();
+const remainingUniquePositionIndexes = currentIndexes.filter(
+  (index) => index.unique === true && hasExactKeyPattern(index.key),
+);
+const remainingNonUniquePositionIndexes = currentIndexes.filter(
+  (index) => index.unique !== true && hasExactKeyPattern(index.key),
+);
+
+if (remainingUniquePositionIndexes.length > 0) {
+  throw new Error(
+    `Obsolete unique position index still exists: ${remainingUniquePositionIndexes
+      .map((index) => index.name)
+      .join(', ')}`,
+  );
 }
 
-print('Sports calculated standings index migration completed successfully.');
+if (remainingNonUniquePositionIndexes.length === 0) {
+  throw new Error(
+    'The expected non-unique standings position index was not created.',
+  );
+}
+
+print(
+  `sports_calculated_standings index migration complete. Non-unique position index: ${remainingNonUniquePositionIndexes
+    .map((index) => index.name)
+    .join(', ')}. Other indexes were left unchanged.`,
+);

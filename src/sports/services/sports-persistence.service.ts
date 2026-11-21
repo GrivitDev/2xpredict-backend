@@ -356,7 +356,15 @@ export class SportsPersistenceService {
     );
   }
 
-  /** Keep each team's competition membership aligned with the current-season catalogue. */
+  /**
+   * Align current competition membership using the canonical IDs stored by
+   * normalizeTeam(). ESPN catalogues return raw IDs (for example, "21540"),
+   * while persisted team entities use "team:21540".
+   *
+   * Team entities are deliberately never deleted here. A club can leave a
+   * current-season catalogue while retained historical fixtures still refer
+   * to it by canonical ID (including the YouTube highlight workflow).
+   */
   async reconcileTeamsForLeague(
     leagueId: string,
     currentTeamIds: string[],
@@ -366,22 +374,26 @@ export class SportsPersistenceService {
       .toLowerCase();
     const teamIds = [
       ...new Set(
-        currentTeamIds.map((id) => String(id ?? '').trim()).filter(Boolean),
+        currentTeamIds
+          .map((value) => String(value ?? '').trim())
+          .filter(Boolean)
+          .map((id) => (id.startsWith('team:') ? id : `team:${id}`)),
       ),
     ];
-    // An empty/invalid catalogue response must never erase existing team records.
+
+    // An empty/invalid catalogue response must never erase existing membership.
     if (!normalizedLeagueId || !teamIds.length) return 0;
 
-    await this.teamModel
+    const result = await this.teamModel
       .updateMany(
         { leagueIds: normalizedLeagueId, id: { $nin: teamIds } },
         { $pull: { leagueIds: normalizedLeagueId } },
       )
       .exec();
-    const deleted = await this.teamModel
-      .deleteMany({ leagueIds: { $size: 0 } })
-      .exec();
-    return deleted.deletedCount ?? 0;
+
+    // Preserve the team documents even when their current league membership
+    // becomes empty; historical fixtures still use them for team names.
+    return Number(result.modifiedCount ?? 0);
   }
 
   async saveTeams(items: SportsTeamRecord[]): Promise<number> {
@@ -1836,4 +1848,3 @@ export class SportsPersistenceService {
     ) as T;
   }
 }
-

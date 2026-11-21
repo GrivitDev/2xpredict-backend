@@ -3,6 +3,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
 import { getYoutubeLeaguePriority, YOUTUBE_CONFIG } from '../config/youtube.config';
+import { SPORTS_COLLECTION_SCHEDULE } from '../config/sports-collection-schedule.config';
 import { getYoutubeHighlightSearchPlan } from '../enums/official-youtube-channel.enum';
 import { SportsQueueJobType } from '../interfaces/sports-queue.interface';
 import { SportsFixtureRecord } from '../interfaces/sports-domain.interface';
@@ -21,6 +22,10 @@ const SUPPORTED_YOUTUBE_COMPETITIONS = new Set<string>(
 const HIGHLIGHT_RECONCILIATION_LOOKBACK_MS =
   YOUTUBE_CONFIG.reconciliationLookbackDays * 24 * 60 * 60_000;
 const SEARCHING_RECOVERY_GRACE_MS = 12 * 60_000;
+const TEAM_METADATA_RETRY_DELAY_MS =
+  SPORTS_COLLECTION_SCHEDULE.youtubeHighlights.intervalMs;
+const RECOVERABLE_TEAM_DATA_ERROR =
+  /normalized name data is unavailable|team metadata is incomplete|does not contain both home and away competitors|missing its (?:home|away) team ID/i;
 
 export type SportsYoutubeOutcome =
   | 'FOUND'
@@ -129,7 +134,18 @@ export class SportsYoutubeHighlightCollectionService {
           activeHighlightJobs: { $size: 0 },
           $or: [
             { highlight: null },
-            { 'highlight.status': { $in: ['PENDING', 'RETRY'] } },
+            {
+              $and: [
+                { 'highlight.status': { $in: ['PENDING', 'RETRY'] } },
+                {
+                  $or: [
+                    { 'highlight.nextRetryAt': { $exists: false } },
+                    { 'highlight.nextRetryAt': null },
+                    { 'highlight.nextRetryAt': { $lte: now } },
+                  ],
+                },
+              ],
+            },
             {
               $and: [
                 { 'highlight.status': 'SEARCHING' },
@@ -145,6 +161,12 @@ export class SportsYoutubeHighlightCollectionService {
               $and: [
                 { 'highlight.status': 'FAILED' },
                 { 'highlight.error': /quota.*exhausted|exhausted.*quota/i },
+              ],
+            },
+            {
+              $and: [
+                { 'highlight.status': 'FAILED' },
+                { 'highlight.error': RECOVERABLE_TEAM_DATA_ERROR },
               ],
             },
           ],
@@ -202,20 +224,36 @@ export class SportsYoutubeHighlightCollectionService {
     const existing = await this.highlightModel.findOne({ fixtureId: fixture.id }).lean().exec();
     if (existing?.status === 'FOUND') return false;
 
+    if (
+      existing?.status === 'RETRY' &&
+      existing.nextRetryAt &&
+      new Date(existing.nextRetryAt).getTime() > Date.now()
+    ) {
+      return false;
+    }
+
     let retryCount = Math.max(0, Number(existing?.retryCount ?? 0));
     if (existing?.status === 'FAILED') {
-      // The previous implementation marked quota exhaustion terminal after
-      // claiming (and incrementing) an attempt. Recover only those known
-      // quota-terminal rows; genuine no-result and data errors stay terminal.
-      if (!this.isQuotaExhaustionError(existing.error)) return false;
-      retryCount = Math.max(0, retryCount - 1);
+      // Quota claims were previously counted before the provider rejected them,
+      // so only those rows roll the attempt counter back. Missing team metadata
+      // failed locally before a YouTube request and can safely reuse the same
+      // attempt without consuming quota.
+      const quotaFailure = this.isQuotaExhaustionError(existing.error);
+      const recoverableTeamDataFailure = this.isRecoverableTeamDataError(
+        existing.error,
+      );
+      if (!quotaFailure && !recoverableTeamDataFailure) return false;
+      if (quotaFailure) retryCount = Math.max(0, retryCount - 1);
+
       const resumed = await this.highlightModel.updateOne(
         { fixtureId: fixture.id, status: 'FAILED' },
         {
           $set: {
             status: 'RETRY',
             retryCount,
-            error: 'Resuming a previously quota-paused highlight search.',
+            error: quotaFailure
+              ? 'Resuming a previously quota-paused highlight search.'
+              : 'Retrying a previously deferred highlight after team metadata recovery.',
             nextRetryAt: null,
           },
         },
@@ -285,56 +323,51 @@ export class SportsYoutubeHighlightCollectionService {
 
     if (!home || !away) {
       const reason =
-        'YouTube highlight skipped because the normalized fixture does not contain both home and away competitors.';
-      await this.markTerminal(
+        'YouTube highlight deferred because fixture team metadata is incomplete (the normalized fixture does not contain both home and away competitors).';
+      await this.deferForTeamMetadata(
         fixture,
         this.missingTeamLabel('home'),
         this.missingTeamLabel('away'),
         reason,
       );
-      this.logger.warn(`Skipping YouTube highlight for fixture ${fixture.id}: ${reason}`);
+      this.logger.debug(`Deferring YouTube highlight for fixture ${fixture.id}: ${reason}`);
       return 'SKIPPED';
     }
 
     const homeTeamId = String(home.teamId ?? '').trim();
     const awayTeamId = String(away.teamId ?? '').trim();
-    if (!homeTeamId || !awayTeamId) {
-      const missingReferences = [
-        !homeTeamId ? 'home team ID' : undefined,
-        !awayTeamId ? 'away team ID' : undefined,
-      ].filter((value): value is string => Boolean(value));
-      const reason =
-        `YouTube highlight skipped because the fixture is missing its ${missingReferences.join(' and ')}.`;
-      await this.markTerminal(
-        fixture,
-        this.missingTeamLabel('home', homeTeamId),
-        this.missingTeamLabel('away', awayTeamId),
-        reason,
-      );
-      this.logger.warn(`Skipping YouTube highlight for fixture ${fixture.id}: ${reason}`);
-      return 'SKIPPED';
-    }
-
     const [homeTeam, awayTeam] = await Promise.all([
-      this.teamModel.findOne({ id: homeTeamId }).lean().exec(),
-      this.teamModel.findOne({ id: awayTeamId }).lean().exec(),
+      homeTeamId
+        ? this.teamModel.findOne({ id: homeTeamId }).lean().exec()
+        : Promise.resolve(null),
+      awayTeamId
+        ? this.teamModel.findOne({ id: awayTeamId }).lean().exec()
+        : Promise.resolve(null),
     ]);
-    const homeName = this.normalizedTeamName(homeTeam);
-    const awayName = this.normalizedTeamName(awayTeam);
+
+    // Scoreboard competitors retain their raw ESPN payload, which usually
+    // contains team.displayName/name. Use it as a local fallback when a team
+    // catalogue record is missing; this avoids another ESPN request.
+    const homeName = this.normalizedTeamName(homeTeam, home);
+    const awayName = this.normalizedTeamName(awayTeam, away);
     if (!homeName || !awayName) {
       const missingNames = [
-        !homeName ? `home team ${homeTeamId}` : undefined,
-        !awayName ? `away team ${awayTeamId}` : undefined,
+        !homeName
+          ? `home team ${homeTeamId || '(missing team ID)'}`
+          : undefined,
+        !awayName
+          ? `away team ${awayTeamId || '(missing team ID)'}`
+          : undefined,
       ].filter((value): value is string => Boolean(value));
       const reason =
-        `YouTube highlight skipped because normalized name data is unavailable for ${missingNames.join(' and ')}.`;
-      await this.markTerminal(
+        `YouTube highlight deferred because normalized name data is unavailable for ${missingNames.join(' and ')}.`;
+      await this.deferForTeamMetadata(
         fixture,
         homeName || this.missingTeamLabel('home', homeTeamId),
         awayName || this.missingTeamLabel('away', awayTeamId),
         reason,
       );
-      this.logger.warn(`Skipping YouTube highlight for fixture ${fixture.id}: ${reason}`);
+      this.logger.debug(`Deferring YouTube highlight for fixture ${fixture.id}: ${reason}`);
       return 'SKIPPED';
     }
 
@@ -557,11 +590,13 @@ export class SportsYoutubeHighlightCollectionService {
     await this.highlightModel.updateOne(
       { fixtureId: fixture.id },
       {
-        $setOnInsert: {
-          fixtureId: fixture.id,
+        $set: {
           competitionId,
           homeTeam,
           awayTeam,
+        },
+        $setOnInsert: {
+          fixtureId: fixture.id,
           status: 'PENDING',
           retryCount: 0,
         },
@@ -571,6 +606,45 @@ export class SportsYoutubeHighlightCollectionService {
     const row = await this.highlightModel.findOne({ fixtureId: fixture.id }).lean().exec();
     if (!row) throw new Error(`YouTube highlight state could not be initialized for ${fixture.id}`);
     return row;
+  }
+
+  /**
+   * Missing normalized team data is a local data-availability issue, not a
+   * failed YouTube search. Defer the same attempt until the next bounded
+   * reconciliation cycle; this does not consume a YouTube quota request.
+   */
+  private async deferForTeamMetadata(
+    fixture: SportsFixtureRecord,
+    homeTeam: string,
+    awayTeam: string,
+    reason: string,
+  ): Promise<void> {
+    const existing = await this.highlightModel
+      .findOne({ fixtureId: fixture.id })
+      .lean()
+      .exec();
+
+    // Never downgrade a highlight that has already been found.
+    if (existing?.status === 'FOUND' && existing.videoId) return;
+
+    await this.highlightModel.updateOne(
+      { fixtureId: fixture.id },
+      {
+        $set: {
+          fixtureId: fixture.id,
+          competitionId: fixture.competitionId,
+          status: 'RETRY',
+          error: reason,
+          nextRetryAt: new Date(Date.now() + TEAM_METADATA_RETRY_DELAY_MS),
+        },
+        $setOnInsert: {
+          homeTeam,
+          awayTeam,
+          retryCount: 0,
+        },
+      },
+      { upsert: true, setDefaultsOnInsert: true },
+    ).exec();
   }
 
   private async markTerminal(
@@ -593,10 +667,36 @@ export class SportsYoutubeHighlightCollectionService {
     ).exec();
   }
 
-  private normalizedTeamName(team: any): string {
-    const displayName = String(team?.displayName ?? '').trim();
-    if (displayName) return displayName;
-    return String(team?.name ?? '').trim();
+  private normalizedTeamName(team: any, competitor?: any): string {
+    const readName = (value: any): string => {
+      if (!value || typeof value !== 'object') return '';
+      for (const candidate of [
+        value.displayName,
+        value.name,
+        value.shortDisplayName,
+        value.shortName,
+        value.nickname,
+        value.abbreviation,
+      ]) {
+        const normalized = String(candidate ?? '').trim();
+        if (normalized) return normalized;
+      }
+      return '';
+    };
+
+    const teamName = readName(team);
+    if (teamName) return teamName;
+
+    const rawPayload = competitor?.rawPayload;
+    const rawTeam =
+      rawPayload?.team && typeof rawPayload.team === 'object'
+        ? rawPayload.team
+        : rawPayload;
+    return readName(rawTeam) || readName(competitor);
+  }
+
+  private isRecoverableTeamDataError(value: unknown): boolean {
+    return RECOVERABLE_TEAM_DATA_ERROR.test(String(value ?? ''));
   }
 
   private missingTeamLabel(side: 'home' | 'away', teamId?: string): string {

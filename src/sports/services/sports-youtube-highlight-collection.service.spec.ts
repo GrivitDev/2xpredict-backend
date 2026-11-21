@@ -18,7 +18,7 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
     expect(service.fixtureModel.aggregate).not.toHaveBeenCalled();
   });
 
-  it('reconciles only recent completed fixtures with no terminal highlight record', async () => {
+  it('reconciles eligible recent completed fixtures and retryable highlight records', async () => {
     const rows = [
       {
         id: 'fixture-1',
@@ -116,6 +116,59 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
     expect(service.enqueueAttempt).toHaveBeenCalledWith(fixture, 'eng.1', 1);
   });
 
+  it('reopens a legacy missing-team-name failure and reuses the same attempt', async () => {
+    const fixture = {
+      id: 'fixture-recover-team-data',
+      competitionId: 'competition-1',
+      kickoffAt: new Date('2026-11-16T08:00:00.000Z'),
+      status: { state: 'COMPLETED', isFinal: true },
+    };
+    const query = (value: unknown) => ({
+      lean: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue(value),
+    });
+    const updateOne = jest.fn(() => ({
+      exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }),
+    }));
+    const service = Object.create(
+      SportsYoutubeHighlightCollectionService.prototype,
+    ) as any;
+    service.youtube = { isEnabled: jest.fn().mockReturnValue(true) };
+    service.competitionModel = {
+      findOne: jest.fn(() => query({ slug: 'eng.1' })),
+    };
+    service.highlightModel = {
+      findOne: jest.fn(() => query({
+        status: 'FAILED',
+        retryCount: 0,
+        homeTeam: 'Unknown home team (team:home-1)',
+        awayTeam: 'Chelsea',
+        error: 'YouTube highlight skipped because normalized name data is unavailable for home team team:home-1.',
+      })),
+      updateOne,
+    };
+    service.queue = { hasActiveFixtureJob: jest.fn().mockResolvedValue(false) };
+    service.enqueueAttempt = jest.fn().mockResolvedValue(true);
+
+    await expect(service.ensureFirstAttempt(fixture)).resolves.toBe(true);
+    expect(updateOne).toHaveBeenCalledWith(
+      { fixtureId: 'fixture-recover-team-data', status: 'FAILED' },
+      {
+        $set: {
+          status: 'RETRY',
+          retryCount: 0,
+          error: 'Retrying a previously deferred highlight after team metadata recovery.',
+          nextRetryAt: null,
+        },
+      },
+    );
+    expect(service.enqueueAttempt).toHaveBeenCalledWith(
+      fixture,
+      'eng.1',
+      1,
+    );
+  });
+
   it('defers the same search stage until Nigeria midnight without consuming an attempt', async () => {
     jest.useFakeTimers().setSystemTime(new Date('2026-11-16T10:00:00.000Z'));
 
@@ -195,6 +248,8 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
 
 
 describe('SportsYoutubeHighlightCollectionService incomplete fixture team data', () => {
+  afterEach(() => jest.useRealTimers());
+
   const query = (value: unknown) => ({
     lean: jest.fn().mockReturnThis(),
     exec: jest.fn().mockResolvedValue(value),
@@ -213,7 +268,72 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
     ],
   };
 
-  it('records a terminal skip when normalized team names are unavailable instead of retrying the queue job', async () => {
+  it('uses team names retained in the fixture payload when team documents are missing', async () => {
+    const fixture = {
+      ...completedFixture,
+      competitors: [
+        {
+          teamId: 'team:home-1',
+          homeAway: 'HOME',
+          rawPayload: { team: { displayName: 'Arsenal' } },
+        },
+        {
+          teamId: 'team:away-1',
+          homeAway: 'AWAY',
+          rawPayload: { team: { displayName: 'Chelsea' } },
+        },
+      ],
+    };
+    const updateOne = jest.fn(() => ({
+      exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }),
+    }));
+    const query = (value: unknown) => ({
+      lean: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue(value),
+    });
+    const findOneAndUpdate = jest.fn(() => ({
+      lean: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue({ retryCount: 1 }),
+    }));
+    const findHighlight = jest.fn().mockResolvedValue({
+      videoId: 'video-1',
+      videoUrl: 'https://www.youtube.com/watch?v=video-1',
+      title: 'Match highlights',
+      channelTitle: 'Sports',
+    });
+    const service = Object.create(
+      SportsYoutubeHighlightCollectionService.prototype,
+    ) as any;
+    service.youtube = {
+      isEnabled: jest.fn().mockReturnValue(true),
+      findHighlight,
+    };
+    service.quota = { getRemainingDailyRequests: jest.fn().mockResolvedValue(10) };
+    service.queue = { hasActiveFixtureJob: jest.fn().mockResolvedValue(false) };
+    service.fixtureModel = { findOne: jest.fn(() => query(fixture)) };
+    service.competitionModel = {
+      findOne: jest.fn(() => query({ slug: 'eng.1' })),
+    };
+    service.teamModel = { findOne: jest.fn(() => query(null)) };
+    service.highlightModel = {
+      updateOne,
+      findOne: jest.fn(() => query({ status: 'PENDING', retryCount: 0 })),
+      findOneAndUpdate,
+    };
+    service.logger = { log: jest.fn(), warn: jest.fn(), debug: jest.fn() };
+
+    await expect(
+      service.processAttempt('fixture-missing-team-name', 1),
+    ).resolves.toBe('FOUND');
+
+    expect(findHighlight).toHaveBeenCalled();
+    expect(findHighlight.mock.calls[0][0]).toBe('Arsenal');
+    expect(findHighlight.mock.calls[0][1]).toBe('Chelsea');
+    expect(findHighlight.mock.calls[0][2]).toEqual(expect.any(Date));
+  });
+
+  it('defers missing normalized team names without consuming a YouTube attempt', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-11-16T10:00:00.000Z'));
     const updateOne = jest.fn(() => ({
       exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }),
     }));
@@ -238,8 +358,11 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
         .mockImplementationOnce(() => query(null))
         .mockImplementationOnce(() => query({ displayName: '   ', name: 'Chelsea' })),
     };
-    service.highlightModel = { updateOne };
-    service.logger = { warn: jest.fn() };
+    service.highlightModel = {
+      updateOne,
+      findOne: jest.fn(() => query(null)),
+    };
+    service.logger = { debug: jest.fn() };
 
     await expect(service.processAttempt('fixture-missing-team-name', 1)).resolves.toBe('SKIPPED');
 
@@ -247,23 +370,27 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
       { fixtureId: 'fixture-missing-team-name' },
       expect.objectContaining({
         $set: expect.objectContaining({
+          fixtureId: 'fixture-missing-team-name',
+          competitionId: 'competition-1',
+          status: 'RETRY',
+          error: expect.stringContaining('normalized name data is unavailable'),
+          nextRetryAt: new Date('2026-11-16T10:15:00.000Z'),
+        }),
+        $setOnInsert: {
           homeTeam: 'Unknown home team (home-1)',
           awayTeam: 'Chelsea',
-          status: 'FAILED',
-          error: expect.stringContaining('normalized name data is unavailable'),
-          nextRetryAt: null,
-        }),
-        $setOnInsert: { retryCount: 0 },
+          retryCount: 0,
+        },
       }),
       { upsert: true, setDefaultsOnInsert: true },
     );
     expect(findHighlight).not.toHaveBeenCalled();
-    expect(service.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Skipping YouTube highlight for fixture fixture-missing-team-name'),
+    expect(service.logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining('Deferring YouTube highlight for fixture fixture-missing-team-name'),
     );
   });
 
-  it('records a terminal skip when either home or away competitor is missing', async () => {
+  it('defers retryably when either home or away competitor is missing', async () => {
     const fixture = {
       ...completedFixture,
       competitors: [{ teamId: 'home-1', homeAway: 'HOME' }],
@@ -280,8 +407,11 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
     service.competitionModel = {
       findOne: jest.fn(() => query({ slug: 'eng.1' })),
     };
-    service.highlightModel = { updateOne };
-    service.logger = { warn: jest.fn() };
+    service.highlightModel = {
+      updateOne,
+      findOne: jest.fn(() => query(null)),
+    };
+    service.logger = { debug: jest.fn() };
 
     await expect(service.processAttempt('fixture-missing-team-name', 1)).resolves.toBe('SKIPPED');
 
@@ -289,8 +419,8 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
       { fixtureId: 'fixture-missing-team-name' },
       expect.objectContaining({
         $set: expect.objectContaining({
-          status: 'FAILED',
-          error: expect.stringContaining('does not contain both home and away competitors'),
+          status: 'RETRY',
+          error: expect.stringContaining('team metadata is incomplete'),
         }),
       }),
       { upsert: true, setDefaultsOnInsert: true },
