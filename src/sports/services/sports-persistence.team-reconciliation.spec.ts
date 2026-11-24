@@ -46,4 +46,27 @@ describe('SportsPersistenceService team catalogue reconciliation', () => {
     expect(updateMany).not.toHaveBeenCalled();
     expect(deleteMany).not.toHaveBeenCalled();
   });
+  it('adds missing league membership idempotently without modifying other team fields', async () => {
+    const updateMany = jest.fn(() =>
+      query({ acknowledged: true, matchedCount: 2, modifiedCount: 2 }),
+    );
+    const service = Object.create(
+      SportsPersistenceService.prototype,
+    ) as any;
+    service.teamModel = { updateMany };
+
+    await expect(
+      service.ensureTeamLeagueMembership(['114', 'team:124', '114'], ' ITA.1 '),
+    ).resolves.toBe(2);
+
+    expect(updateMany).toHaveBeenCalledWith(
+      {
+        id: { $in: ['team:114', 'team:124'] },
+        leagueIds: { $ne: 'ita.1' },
+      },
+      { $addToSet: { leagueIds: 'ita.1' } },
+    );
+  });
+
 });
+

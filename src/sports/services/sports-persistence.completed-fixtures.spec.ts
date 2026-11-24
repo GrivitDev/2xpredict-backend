@@ -165,6 +165,51 @@ describe('SportsPersistenceService fixture score regression protection', () => {
     expect(result.competitors.map((item: any) => item.score)).toEqual([3, 1]);
   });
 
+
+  it('preserves previously collected compact team identity when a later scoreboard competitor is sparse', () => {
+    const previous = {
+      source: { collectedAt: new Date('2026-11-23T10:00:00.000Z') },
+      competitors: [
+        {
+          teamId: 'team:114',
+          homeAway: 'HOME',
+          teamIdentity: {
+            id: 'team:114',
+            espnId: '114',
+            name: 'Napoli',
+            displayName: 'SSC Napoli',
+            shortName: 'Napoli',
+            abbreviation: 'NAP',
+            logo: 'https://example.test/napoli.png',
+            country: 'Italy',
+            location: 'Naples',
+          },
+        },
+        { teamId: 'team:124', homeAway: 'AWAY' },
+      ],
+    };
+    const incoming = {
+      source: { collectedAt: new Date('2026-11-24T10:00:00.000Z') },
+      competitors: [
+        { teamId: 'team:114', homeAway: 'HOME' },
+        { teamId: 'team:124', homeAway: 'AWAY' },
+      ],
+    };
+
+    const result = service.preventFixtureRegression(incoming, previous);
+
+    expect(result.competitors[0].teamIdentity).toMatchObject({
+      id: 'team:114',
+      espnId: '114',
+      name: 'Napoli',
+      displayName: 'SSC Napoli',
+      logo: 'https://example.test/napoli.png',
+      country: 'Italy',
+      location: 'Naples',
+    });
+    expect(result.competitors[1]).not.toHaveProperty('teamIdentity');
+  });
+
   it('does not regress a previously live fixture to SCHEDULED when its kickoff is unchanged', () => {
     const kickoffAt = new Date('2026-11-18T18:00:00.000Z');
     const previous = {
@@ -193,4 +238,5 @@ describe('SportsPersistenceService fixture score regression protection', () => {
   });
 
 });
+
 

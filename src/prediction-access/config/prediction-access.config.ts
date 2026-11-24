@@ -8,13 +8,9 @@ import { FOOTBALL_MARKET_CATALOG } from '../../odds/catalog/football-market-cata
  * now uses ranked per-fixture market limits defined below.
  */
 const CURATED_VISITOR_MARKET_KEYS = [
-  'FIRST_HALF_GOALS_OVER_UNDER',
   'SECOND_HALF_GOALS_OVER_UNDER',
-  'BOTH_TEAMS_TO_SCORE_FIRST_HALF',
   'BOTH_TEAMS_TO_SCORE_SECOND_HALF',
   'TOTAL_CORNERS_OVER_UNDER',
-  'HOME_TEAM_CORNERS_OVER_UNDER',
-  'AWAY_TEAM_CORNERS_OVER_UNDER',
 ] as const;
 
 /** Curated Free expands the Visitor set to fifteen market groups. */
@@ -24,10 +20,6 @@ const CURATED_FREE_MARKET_KEYS = [
   'DOUBLE_CHANCE',
   'GOALS_OVER_UNDER',
   'BOTH_TEAMS_TO_SCORE',
-  'HOME_TEAM_TO_SCORE',
-  'AWAY_TEAM_TO_SCORE',
-  'TOTAL_CARDS_OVER_UNDER',
-  'TOTAL_SHOTS_OVER_UNDER',
 ] as const;
 
 /** Curated Regular expands the Free set to thirty-two market groups. */
@@ -42,14 +34,6 @@ const CURATED_REGULAR_MARKET_KEYS = [
   'TOTAL_SHOTS_ON_TARGET_OVER_UNDER',
   'TOTAL_YELLOW_CARDS_OVER_UNDER',
   'TOTAL_FOULS_OVER_UNDER',
-  'TOTAL_OFFSIDES_OVER_UNDER',
-  'ASIAN_TOTAL_GOALS',
-  'ODD_EVEN_TOTAL_GOALS',
-  'EXACT_TOTAL_GOALS',
-  'HOME_TEAM_CLEAN_SHEET',
-  'AWAY_TEAM_CLEAN_SHEET',
-  'HOME_TEAM_CARDS_OVER_UNDER',
-  'TOTAL_RED_CARDS_OVER_UNDER',
 ] as const;
 
 /** Only priceable canonical market groups can be exposed to active predictions. */
@@ -81,9 +65,9 @@ const validateMarketTier = (
   }
 };
 
-validateMarketTier('Curated Visitor', CURATED_VISITOR_MARKET_KEYS, 7);
-validateMarketTier('Curated Free', CURATED_FREE_MARKET_KEYS, 15);
-validateMarketTier('Curated Regular', CURATED_REGULAR_MARKET_KEYS, 32);
+validateMarketTier('Curated Visitor', CURATED_VISITOR_MARKET_KEYS, 3);
+validateMarketTier('Curated Free', CURATED_FREE_MARKET_KEYS, 7);
+validateMarketTier('Curated Regular', CURATED_REGULAR_MARKET_KEYS, 16);
 
 export const PREDICTION_MARKET_FAMILY_BY_KEY: ReadonlyMap<
   string,
@@ -115,9 +99,9 @@ export const PREDICTION_ACCESS_CONFIG = {
   maximumPickCenterMatches: 1000,
   /** Pick Center exposes the highest-ranked distinct market groups per fixture. */
   marketVisibility: {
-    anonymous: { limit: 5, diversity: 'LIMITED' },
-    free: { limit: 12, diversity: 'LIMITED' },
-    regular: { limit: 22, diversity: 'EXPANDED' },
+    anonymous: { limit: 3, diversity: 'LIMITED' },
+    free: { limit: 7, diversity: 'LIMITED' },
+    regular: { limit: 16, diversity: 'EXPANDED' },
     vip: { limit: 48, diversity: 'FULL' },
     premium: { limit: null, diversity: 'FULL' },
   } satisfies Record<
@@ -127,13 +111,13 @@ export const PREDICTION_ACCESS_CONFIG = {
   /** Curated predictions retain their previous explicit market-key entitlements. */
   curatedMarketVisibility: {
     anonymous: {
-      limit: 7,
+      limit: 3,
       marketKeys: CURATED_VISITOR_MARKET_KEYS,
       families: [MarketFamily.PERIOD, MarketFamily.STATISTICS],
       diversity: 'LIMITED',
     },
     free: {
-      limit: 15,
+      limit: 7,
       marketKeys: CURATED_FREE_MARKET_KEYS,
       families: [
         MarketFamily.RESULT,
@@ -144,7 +128,7 @@ export const PREDICTION_ACCESS_CONFIG = {
       diversity: 'LIMITED',
     },
     regular: {
-      limit: 32,
+      limit: 16,
       marketKeys: CURATED_REGULAR_MARKET_KEYS,
       families: [
         MarketFamily.RESULT,
@@ -183,9 +167,9 @@ export const PREDICTION_ACCESS_CONFIG = {
    * for the day and nested across plans.
    */
   leagueVisibility: {
-    anonymous: 50,
-    free: 60,
-    regular: 80,
+    anonymous: 20,
+    free: 30,
+    regular: 60,
     vip: 95,
     premium: 100,
   } satisfies Record<PredictionAccessPlan, number>,
@@ -193,7 +177,7 @@ export const PREDICTION_ACCESS_CONFIG = {
   curatedLeagueVisibility: {
     anonymous: 2,
     free: 8,
-    regular: 50,
+    regular: 40,
     vip: 75,
     premium: 100,
   } satisfies Record<PredictionAccessPlan, number>,
@@ -244,4 +228,3 @@ export const PREDICTION_ACCESS_CONFIG = {
     premium: 4,
   } satisfies Record<PredictionAccessPlan, number>,
 } as const;
-

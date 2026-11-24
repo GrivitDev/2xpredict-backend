@@ -1,6 +1,10 @@
 import { Prop, Schema as NestSchema, SchemaFactory } from '@nestjs/mongoose';
 
-import type { SportsDataProvider, SportsFixtureState } from '../../interfaces/sports-domain.interface';
+import type {
+  SportsDataProvider,
+  SportsFixtureState,
+  SportsFixtureTeamIdentity,
+} from '../../interfaces/sports-domain.interface';
 
 @NestSchema({ _id: false })
 export class SportsSourceMetadataEmbedded {
@@ -40,6 +44,7 @@ export const SportsFixtureStatusSchema = SchemaFactory.createForClass(SportsFixt
 @NestSchema({ _id: false })
 export class SportsFixtureCompetitorEmbedded {
   @Prop({ required: true, type: String, trim: true }) teamId!: string;
+  @Prop({ type: Object }) teamIdentity?: SportsFixtureTeamIdentity;
   @Prop({ type: String, trim: true }) espnCompetitorId?: string;
   @Prop({ required: true, type: String, enum: ['HOME', 'AWAY'] }) homeAway!: 'HOME' | 'AWAY';
   @Prop({ type: Number, min: 0, default: null }) score?: number | null;
@@ -94,3 +99,5 @@ export class SportsOddsBookmakerEmbedded {
   @Prop({ type: [SportsOddsMarketSchema], default: [] }) markets!: SportsOddsMarketEmbedded[];
 }
 export const SportsOddsBookmakerSchema = SchemaFactory.createForClass(SportsOddsBookmakerEmbedded);
+
+

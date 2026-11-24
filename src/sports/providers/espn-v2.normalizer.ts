@@ -8,6 +8,7 @@ import type {
   SportsFixturePeriodScore,
   SportsFixtureRecord,
   SportsFixtureState,
+  SportsFixtureTeamIdentity,
   SportsMatchOddsSnapshotRecord,
   SportsMatchTimelineEventRecord,
   SportsOddsBookmaker,
@@ -259,13 +260,15 @@ export class EspnV2Normalizer {
 
     for (const fixture of fixtures) {
       for (const competitor of fixture.competitors ?? []) {
-        const row = this.asRecord(competitor.rawPayload);
-        if (!row) continue;
+        const row = this.asRecord(competitor.rawPayload) ?? {};
+        const compactIdentity = this.asRecord(competitor.teamIdentity) ?? {};
+        if (!Object.keys(row).length && !Object.keys(compactIdentity).length) continue;
 
-        const nestedTeam = this.asRecord(row.team) ?? {};
+        const nestedTeam =
+          this.asRecord(row.team) ?? compactIdentity;
         const rawTeamId =
           this.readEntityId(nestedTeam) ??
-          this.readString(row.teamId, row.espnTeamId) ??
+          this.readString(row.teamId, row.espnTeamId, compactIdentity.espnId) ??
           String(competitor.teamId ?? '');
         const espnId = String(rawTeamId).replace(/^team:/i, '').trim();
         if (!espnId) continue;
@@ -302,6 +305,8 @@ export class EspnV2Normalizer {
             row.name,
             row.displayName,
             row.fullName,
+            compactIdentity.name,
+            compactIdentity.displayName,
             nestedTeam.shortDisplayName,
             nestedTeam.shortName,
           ),
@@ -311,12 +316,14 @@ export class EspnV2Normalizer {
             row.teamShortName,
             row.shortDisplayName,
             row.shortName,
+            compactIdentity.shortName,
             nestedTeam.abbreviation,
           ),
           abbreviation: this.readString(
             nestedTeam.abbreviation,
             row.teamAbbreviation,
             row.abbreviation,
+            compactIdentity.abbreviation,
           ),
           logos:
             nestedTeam.logos ?? row.teamLogos ?? row.logos,
@@ -326,6 +333,7 @@ export class EspnV2Normalizer {
             nestedTeam.crest,
             row.teamLogo,
             row.logo,
+            compactIdentity.logo,
           ),
           country:
             nestedTeam.country ?? row.teamCountry ?? row.country,
@@ -335,6 +343,7 @@ export class EspnV2Normalizer {
             row.teamCountryName,
             row.countryName,
             typeof row.country === 'string' ? row.country : undefined,
+            compactIdentity.country,
           ),
           location: this.readString(
             nestedTeam.location,
@@ -342,7 +351,12 @@ export class EspnV2Normalizer {
             row.teamLocation,
             row.location,
             row.city,
+            compactIdentity.location,
           ),
+          slug: this.readString(nestedTeam.slug, row.teamSlug, row.slug, compactIdentity.slug),
+          color: this.readString(nestedTeam.color, nestedTeam.primaryColor, row.teamColor, row.primaryColor, row.color, compactIdentity.primaryColor),
+          primaryColor: this.readString(nestedTeam.primaryColor, nestedTeam.color, row.teamColor, row.primaryColor, row.color, compactIdentity.primaryColor),
+          alternateColor: this.readString(nestedTeam.alternateColor, row.teamAlternateColor, row.alternateColor, compactIdentity.alternateColor),
         };
         // normalizeTeam accepts ESPN's optional `{ team: ... }` envelope.
         // This candidate is already flattened, so remove the original nested
@@ -1427,8 +1441,95 @@ export class EspnV2Normalizer {
         ? homeAwayRaw
         : undefined;
     if (!espnTeamId || !homeAway) return null;
+    const country = this.asRecord(team.country) ?? this.asRecord(row.teamCountry);
+    const teamIdentity: SportsFixtureTeamIdentity = {
+      id: this.teamId(espnTeamId),
+      espnId: espnTeamId,
+      name: this.readString(
+        team.name,
+        team.displayName,
+        team.fullName,
+        team.shortDisplayName,
+        team.shortName,
+        row.teamName,
+        row.teamDisplayName,
+        row.teamFullName,
+        row.name,
+        row.displayName,
+        row.fullName,
+      ),
+      displayName: this.readString(
+        team.displayName,
+        team.fullName,
+        team.name,
+        row.teamDisplayName,
+        row.teamFullName,
+        row.displayName,
+        row.fullName,
+        row.teamName,
+        row.name,
+      ),
+      shortName: this.readString(
+        team.shortDisplayName,
+        team.shortName,
+        row.teamShortName,
+        row.shortDisplayName,
+        row.shortName,
+      ),
+      abbreviation: this.readString(
+        team.abbreviation,
+        row.teamAbbreviation,
+        row.abbreviation,
+      ),
+      logo: this.readImage(
+        team.logos,
+        team.logo,
+        team.crest,
+        row.teamLogo,
+        row.teamLogos,
+        row.logo,
+      ),
+      country: this.readString(
+        country?.name,
+        country?.displayName,
+        country?.abbreviation,
+        team.countryName,
+        row.teamCountryName,
+        row.countryName,
+        typeof team.country === 'string' ? team.country : undefined,
+        typeof row.teamCountry === 'string' ? row.teamCountry : undefined,
+        typeof row.country === 'string' ? row.country : undefined,
+      ),
+      location: this.readString(
+        team.location,
+        team.city,
+        row.teamLocation,
+        row.location,
+        row.city,
+      ),
+      slug: this.readString(team.slug, row.teamSlug, row.slug),
+      primaryColor: this.readString(
+        team.color,
+        team.primaryColor,
+        row.teamColor,
+        row.primaryColor,
+        row.color,
+      ),
+      alternateColor: this.readString(
+        team.alternateColor,
+        row.teamAlternateColor,
+        row.alternateColor,
+      ),
+    };
+    const hasIdentity = Boolean(
+      teamIdentity.name || teamIdentity.displayName || teamIdentity.shortName ||
+      teamIdentity.abbreviation || teamIdentity.logo || teamIdentity.country ||
+      teamIdentity.location || teamIdentity.slug || teamIdentity.primaryColor ||
+      teamIdentity.alternateColor,
+    );
     return {
       teamId: this.teamId(espnTeamId),
+      ...(hasIdentity ? { teamIdentity } : {}),
       espnCompetitorId: this.readString(row.id),
       homeAway,
       score:
@@ -1913,6 +2014,8 @@ export class EspnV2Normalizer {
     return undefined;
   }
 }
+
+
 
 
 

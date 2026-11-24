@@ -88,8 +88,30 @@ export interface SportsFixtureStatus {
   isFinal: boolean;
 }
 
+/**
+ * Safe, allowlisted identity metadata extracted from an ESPN competitor snapshot.
+ * It supplements the canonical SportsTeam record for fixture presentation and
+ * never exposes the complete provider payload.
+ */
+export interface SportsFixtureTeamIdentity {
+  id: string;
+  espnId?: string;
+  name?: string;
+  displayName?: string;
+  shortName?: string;
+  abbreviation?: string;
+  logo?: string;
+  country?: string;
+  location?: string;
+  slug?: string;
+  primaryColor?: string;
+  alternateColor?: string;
+}
+
 export interface SportsFixtureCompetitor {
   teamId: string;
+  /** Compact identity snapshot retained with the fixture for presentation fallback. */
+  teamIdentity?: SportsFixtureTeamIdentity;
   espnCompetitorId?: string;
   homeAway: 'HOME' | 'AWAY';
   score?: number | null;
@@ -235,4 +257,6 @@ export interface SportsMatchOddsSnapshotRecord {
   source: SportsSourceMetadata;
   createdAt: Date;
 }
+
+
 

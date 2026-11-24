@@ -63,21 +63,25 @@ describe('PredictionAccessService commercial access policy', () => {
   });
 
   it('configures Pick Center daily league percentages and market caps', () => {
-    expect(plans.map((plan) => PREDICTION_ACCESS_CONFIG.leagueVisibility[plan])).toEqual([
-      50, 60, 80, 95, 100,
-    ]);
-    expect(plans.map((plan) => PREDICTION_ACCESS_CONFIG.marketVisibility[plan].limit)).toEqual([
-      5, 12, 22, 48, null,
-    ]);
+    expect(
+      plans.map((plan) => PREDICTION_ACCESS_CONFIG.leagueVisibility[plan]),
+    ).toEqual([20, 30, 60, 95, 100]);
+    expect(
+      plans.map(
+        (plan) => PREDICTION_ACCESS_CONFIG.marketVisibility[plan].limit,
+      ),
+    ).toEqual([3, 7, 16, 48, null]);
   });
 
   it('returns each fixture’s highest-ranked distinct Pick Center market groups up to the plan limit', () => {
-    const selections = ENABLED_PREDICTION_MARKET_KEYS.map((marketKey, index) => ({
-      marketKey,
-      marketPredictionId: `prediction-${index}`,
-      selectionKey: `selection-${index}`,
-      rank: index + 1,
-    })).reverse();
+    const selections = ENABLED_PREDICTION_MARKET_KEYS.map(
+      (marketKey, index) => ({
+        marketKey,
+        marketPredictionId: `prediction-${index}`,
+        selectionKey: `selection-${index}`,
+        rank: index + 1,
+      }),
+    ).reverse();
 
     for (const plan of plans) {
       const result = privateService.filterPickCenter(
@@ -85,9 +89,8 @@ describe('PredictionAccessService commercial access policy', () => {
         plan,
       );
       const limit = PREDICTION_ACCESS_CONFIG.marketVisibility[plan].limit;
-      const expected = limit === null
-        ? selections.length
-        : Math.min(limit, selections.length);
+      const expected =
+        limit === null ? selections.length : Math.min(limit, selections.length);
 
       expect(result.selectedMarkets).toHaveLength(expected);
       expect(result.visibleMarketCount).toBe(expected);
@@ -97,24 +100,26 @@ describe('PredictionAccessService commercial access policy', () => {
   });
 
   it('configures Curated Prediction daily league percentages', () => {
-    expect(plans.map((plan) => PREDICTION_ACCESS_CONFIG.curatedLeagueVisibility[plan])).toEqual([
-      2, 8, 50, 75, 100,
-    ]);
+    expect(
+      plans.map(
+        (plan) => PREDICTION_ACCESS_CONFIG.curatedLeagueVisibility[plan],
+      ),
+    ).toEqual([2, 8, 40, 75, 100]);
   });
 
   it('moves locked Curated league access to the next subscription tier', () => {
-    expect(privateService.nextRequiredCuratedPlan(PredictionAccessPlan.ANONYMOUS)).toBe(
-      PredictionAccessPlan.FREE,
-    );
-    expect(privateService.nextRequiredCuratedPlan(PredictionAccessPlan.FREE)).toBe(
-      PredictionAccessPlan.REGULAR,
-    );
-    expect(privateService.nextRequiredCuratedPlan(PredictionAccessPlan.REGULAR)).toBe(
-      PredictionAccessPlan.VIP,
-    );
-    expect(privateService.nextRequiredCuratedPlan(PredictionAccessPlan.VIP)).toBe(
-      PredictionAccessPlan.PREMIUM,
-    );
+    expect(
+      privateService.nextRequiredCuratedPlan(PredictionAccessPlan.ANONYMOUS),
+    ).toBe(PredictionAccessPlan.FREE);
+    expect(
+      privateService.nextRequiredCuratedPlan(PredictionAccessPlan.FREE),
+    ).toBe(PredictionAccessPlan.REGULAR);
+    expect(
+      privateService.nextRequiredCuratedPlan(PredictionAccessPlan.REGULAR),
+    ).toBe(PredictionAccessPlan.VIP);
+    expect(
+      privateService.nextRequiredCuratedPlan(PredictionAccessPlan.VIP),
+    ).toBe(PredictionAccessPlan.PREMIUM);
   });
 
   it('uses the requested Pick Center and Curated daily league allocations', () => {
@@ -122,8 +127,8 @@ describe('PredictionAccessService commercial access policy', () => {
       leagueId: `league-${index + 1}`,
       date: '2026-11-20T12:00:00.000Z',
     }));
-    const expectedPickCenter = [10, 12, 16, 19, 20];
-    const expectedCurated = [1, 2, 10, 15, 20];
+    const expectedPickCenter = [4, 6, 12, 19, 20];
+    const expectedCurated = [1, 2, 8, 15, 20];
 
     plans.forEach((plan, index) => {
       const pickCenter = privateService.buildDailyLeagueAccessAllocation(
@@ -146,7 +151,11 @@ describe('PredictionAccessService commercial access policy', () => {
   });
 
   it('grants ODDS 10 to VIP and Premium, but ODDS 25 and ODDS 50 only to Premium', () => {
-    const canAccess = (plan: PredictionAccessPlan, productType: string, odds: number) =>
+    const canAccess = (
+      plan: PredictionAccessPlan,
+      productType: string,
+      odds: number,
+    ) =>
       privateService.canAccessSlip(plan, {
         status: 'PUBLISHED',
         productType,
@@ -163,7 +172,11 @@ describe('PredictionAccessService commercial access policy', () => {
   });
 
   it('grants SURE 2 and SURE 7 from Regular upward, and SURE 5 only to Premium', () => {
-    const canAccess = (plan: PredictionAccessPlan, product: string, odds: number) =>
+    const canAccess = (
+      plan: PredictionAccessPlan,
+      product: string,
+      odds: number,
+    ) =>
       privateService.canAccessSlip(plan, {
         status: 'PUBLISHED',
         productType: 'SURE_ODDS',
@@ -188,7 +201,11 @@ describe('PredictionAccessService commercial access policy', () => {
   it('publishes the same Slip Center and Sure Odds entitlements as enforcement', () => {
     const policy = privateService.getPolicy().rules;
     expect(policy.vip.slipProducts).toEqual(['ODDS_10']);
-    expect(policy.premium.slipProducts).toEqual(['ODDS_10', 'ODDS_25', 'ODDS_50']);
+    expect(policy.premium.slipProducts).toEqual([
+      'ODDS_10',
+      'ODDS_25',
+      'ODDS_50',
+    ]);
     expect(policy.regular.sureOdds).toEqual(['SURE_2', 'SURE_7']);
     expect(policy.vip.sureOdds).toEqual(['SURE_2', 'SURE_7']);
     expect(policy.premium.sureOdds).toEqual(['SURE_2', 'SURE_5', 'SURE_7']);

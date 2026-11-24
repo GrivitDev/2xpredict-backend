@@ -30,12 +30,22 @@ export interface SportsFixtureReadResult {
   total?: number;
 }
 
+export interface SportsFixtureTeamReadModel extends SportsTeamRecord {
+  /** Indicates whether all data came from sports_teams or a fixture fallback was used. */
+  identitySource:
+    | 'TEAM_CATALOGUE'
+    | 'TEAM_CATALOGUE_WITH_FIXTURE_FALLBACK'
+    | 'FIXTURE_SNAPSHOT';
+  /** Known team fields that are still absent after merging the fixture snapshot. */
+  missingFields: string[];
+}
+
 export interface SportsFixtureContextReadModel {
   fixture: SportsFixtureRecord;
   competition: SportsCompetitionRecord | null;
   season: SportsSeasonRecord | null;
-  homeTeam: SportsTeamRecord | null;
-  awayTeam: SportsTeamRecord | null;
+  homeTeam: SportsFixtureTeamReadModel | null;
+  awayTeam: SportsFixtureTeamReadModel | null;
 }
 
 export interface SportsMatchSummaryMetadata {
@@ -82,5 +92,6 @@ export interface SportsTeamListQuery {
   search?: string;
   limit?: number;
 }
+
 
 

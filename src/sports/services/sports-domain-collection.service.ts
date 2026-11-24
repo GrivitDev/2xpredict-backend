@@ -21,6 +21,7 @@ import { SportsPersistenceService } from './sports-persistence.service';
 import { SportsProviderCollectionService } from './sports-provider-collection.service';
 import { SportsOddsCollectionService } from './sports-odds-collection.service';
 import { SportsMatchFactsNormalizationService } from './sports-match-facts-normalization.service';
+import { SportsFixtureTeamIntegrityService } from './sports-fixture-team-integrity.service';
 
 const timestampOf = (value: unknown): number => {
   if (value instanceof Date) return value.getTime();
@@ -50,6 +51,7 @@ export class SportsDomainCollectionService {
     private readonly state: SportsCollectionStateService,
     private readonly oddsCollection: SportsOddsCollectionService,
     private readonly matchFactsNormalization: SportsMatchFactsNormalizationService,
+    private readonly teamIntegrity?: SportsFixtureTeamIntegrityService,
   ) {}
 
   async discoverLeagueCatalogue(): Promise<{
@@ -328,20 +330,31 @@ export class SportsDomainCollectionService {
     espnTeamId: string,
     teamReference?: string,
   ): Promise<SportsTeamRecord> {
+    const requestedEspnId = String(espnTeamId ?? '').trim().replace(/^team:/i, '');
     const input = this.stateInput(
       'TEAM_DETAILS',
       'TEAM',
-      `team:${espnTeamId}`,
-      teamReference ?? `/leagues/${leagueId}/teams/${espnTeamId}`,
+      `team:${requestedEspnId}`,
+      teamReference ?? `/leagues/${leagueId}/teams/${requestedEspnId}`,
       30 * 24 * 60 * 60_000,
     );
     await this.state.markStarted(input);
     try {
+      if (!requestedEspnId) {
+        throw new Error('Team detail collection requires a valid ESPN team ID.');
+      }
       const result = await this.provider.collectTeamDetails(
         leagueId,
-        espnTeamId,
+        requestedEspnId,
         teamReference,
       );
+      const returnedEspnId = String(result.espnId ?? '').trim().replace(/^team:/i, '');
+      const expectedCanonicalId = `team:${requestedEspnId}`;
+      if (result.id !== expectedCanonicalId || returnedEspnId !== requestedEspnId) {
+        throw new Error(
+          `Team identity mismatch: requested ESPN team ${requestedEspnId}, received ${result.espnId ?? 'no ESPN ID'} (${result.id ?? 'no canonical ID'}).`,
+        );
+      }
       await this.persistence.saveTeams([result]);
       await this.state.markSucceeded(input, result.rawPayload);
       return result;
@@ -349,6 +362,48 @@ export class SportsDomainCollectionService {
       await this.state.markFailed(input, error);
       throw error;
     }
+  }
+
+  /**
+   * Keep the canonical team directory synchronized with every scoreboard
+   * snapshot. This is local normalization and persistence only; it does not
+   * make additional ESPN requests.
+   */
+  private async syncTeamsFromFixtureSnapshots(
+    leagueId: string,
+    fixtures: SportsFixtureRecord[],
+  ): Promise<number> {
+    const normalizedLeagueId = String(leagueId ?? '').trim().toLowerCase();
+    if (!normalizedLeagueId || !fixtures.length) return 0;
+
+    const snapshots = this.provider.normalizeTeamsFromFixtures(
+      fixtures,
+      normalizedLeagueId,
+    );
+    if (!snapshots.length) return 0;
+
+    const persistedCount = await this.persistence.saveTeams(snapshots);
+    this.logger.debug(
+      `Synchronized ${snapshots.length} team snapshot(s) from ${fixtures.length} fixture(s) for ${normalizedLeagueId}; ${persistedCount} team record(s) changed.`,
+    );
+    return persistedCount;
+  }
+
+  /**
+   * Run the fixture/team integrity gate after fixture persistence. The
+   * fallback keeps isolated collection-service tests and legacy harnesses
+   * compatible; the production module always provides the dedicated service.
+   */
+  private async ensureFixtureTeamIntegrity(
+    leagueId: string,
+    fixtures: SportsFixtureRecord[],
+  ): Promise<void> {
+    if (!fixtures.length) return;
+    if (this.teamIntegrity) {
+      await this.teamIntegrity.ensureFixtureTeams(leagueId, fixtures);
+      return;
+    }
+    await this.syncTeamsFromFixtureSnapshots(leagueId, fixtures);
   }
 
   async collectMonthlyFixtures(
@@ -402,6 +457,11 @@ export class SportsDomainCollectionService {
       }
       const saved = await this.persistence.saveFixtures(result.items);
       result.previousStates = saved.previousStates;
+      const summaryRecoveredIds = new Set(recovered.map((fixture) => fixture.id));
+      await this.ensureFixtureTeamIntegrity(
+        leagueId,
+        result.items.filter((fixture) => !summaryRecoveredIds.has(fixture.id)),
+      );
       await this.state.markSucceeded(input, undefined, result.endpoint);
       return result;
     } catch (error) {
@@ -431,6 +491,7 @@ export class SportsDomainCollectionService {
       );
       const saved = await this.persistence.saveFixtures(result.items);
       result.previousStates = saved.previousStates;
+      await this.ensureFixtureTeamIntegrity(leagueId, result.items);
       await this.state.markSucceeded(input, undefined, result.endpoint);
       return result;
     } catch (error) {
@@ -622,6 +683,7 @@ export class SportsDomainCollectionService {
 
       if (result.fixture) {
         await this.persistence.saveFixtures([result.fixture]);
+        await this.ensureFixtureTeamIntegrity(leagueId, [result.fixture]);
         await this.state.markSucceeded(input, undefined, endpoint);
       } else {
         await this.state.markNoData(
@@ -685,6 +747,7 @@ export class SportsDomainCollectionService {
       // would duplicate database work for the same match.
       const saved = await this.persistence.saveFixtures(result.items);
       result.previousStates = saved.previousStates;
+      await this.ensureFixtureTeamIntegrity(leagueId, result.items);
 
       const candidates = new Map<
         string,
@@ -1477,5 +1540,7 @@ export class SportsDomainCollectionService {
     };
   }
 }
+
+
 
 

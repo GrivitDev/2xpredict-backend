@@ -13,6 +13,7 @@ import type {
 import type {
   SportsCompetitionListQuery,
   SportsFixtureContextReadModel,
+  SportsFixtureTeamReadModel,
   SportsFixtureQuery,
   SportsFixtureReadResult,
   SportsMatchReadModel,
@@ -161,32 +162,54 @@ export class SportsDomainReadService {
   }
 
   async getTeam(teamId: string): Promise<SportsTeamRecord | null> {
-    const row = await this.teamModel
-      .findOne({ $or: [{ id: teamId }, { espnId: teamId }] })
+    const espnId = this.rawEspnTeamId(teamId);
+    if (!espnId) return null;
+    const canonicalId = `team:${espnId}`;
+    const row = (await this.teamModel
+      .findOne({ id: canonicalId })
       .select('-_id -rawPayload')
       .lean()
-      .exec();
-    return (row as SportsTeamRecord | null) ?? null;
+      .exec()) as SportsTeamRecord | null;
+    if (!row || String(row.id ?? '') !== canonicalId) return null;
+    const storedEspnId = this.rawEspnTeamId(row.espnId);
+    return !storedEspnId || storedEspnId === espnId ? row : null;
   }
 
-  /** Batch equivalent of getTeam(), including canonical and ESPN identifiers. */
+  /** Batch equivalent of getTeam(), accepting canonical and raw ESPN IDs. */
   async getTeamsByIdentifiers(teamIds: string[]): Promise<SportsTeamRecord[]> {
     const identifiers = [
-      ...new Set(teamIds.map((id) => String(id).trim()).filter(Boolean)),
+      ...new Set(
+        teamIds
+          .map((id) => this.rawEspnTeamId(id))
+          .filter(Boolean),
+      ),
     ];
     if (!identifiers.length) return [];
+    const canonicalIds = identifiers.map((id) => `team:${id}`);
 
-    const rows = await this.teamModel
+    const rows = (await this.teamModel
       .find({
         $or: [
-          { id: { $in: identifiers } },
+          { id: { $in: canonicalIds } },
           { espnId: { $in: identifiers } },
         ],
       })
       .select('-_id -rawPayload')
       .lean()
-      .exec();
-    return rows as SportsTeamRecord[];
+      .exec()) as SportsTeamRecord[];
+
+    const requested = new Set(canonicalIds);
+    return rows.filter((row) => {
+      const canonicalId = String(row.id ?? '').trim();
+      if (!requested.has(canonicalId)) return false;
+      const storedEspnId = this.rawEspnTeamId(row.espnId);
+      const canonicalSuffix = this.rawEspnTeamId(canonicalId);
+      return !storedEspnId || storedEspnId === canonicalSuffix;
+    });
+  }
+
+  private rawEspnTeamId(value: unknown): string {
+    return String(value ?? '').trim().replace(/^team:/i, '');
   }
 
   async getFixture(fixtureId: string): Promise<SportsFixtureRecord | null> {
@@ -389,23 +412,192 @@ export class SportsDomainReadService {
       teams.map((item: any) => [String(item.id), item]),
     );
 
-    return fixtures.map((fixture) => ({
-      fixture,
-      competition: competitionMap.get(fixture.competitionId) ?? null,
-      season: fixture.seasonId
-        ? (seasonMap.get(fixture.seasonId) ?? null)
-        : null,
-      homeTeam:
-        teamMap.get(
-          fixture.competitors.find((item) => item.homeAway === 'HOME')
-            ?.teamId ?? '',
-        ) ?? null,
-      awayTeam:
-        teamMap.get(
-          fixture.competitors.find((item) => item.homeAway === 'AWAY')
-            ?.teamId ?? '',
-        ) ?? null,
-    }));
+    return fixtures.map((fixture) => {
+      const competition = competitionMap.get(fixture.competitionId) ?? null;
+      const fixtureLeagueId =
+        competition?.slug ?? fixture.competitionId.replace(/^competition:/i, '');
+      const homeTeamId =
+        fixture.competitors.find((item) => item.homeAway === 'HOME')?.teamId ?? '';
+      const awayTeamId =
+        fixture.competitors.find((item) => item.homeAway === 'AWAY')?.teamId ?? '';
+
+      return {
+        fixture,
+        competition,
+        season: fixture.seasonId
+          ? (seasonMap.get(fixture.seasonId) ?? null)
+          : null,
+        homeTeam: this.buildFixtureTeamReadModel(
+          fixture,
+          'HOME',
+          teamMap.get(homeTeamId),
+          fixtureLeagueId,
+        ),
+        awayTeam: this.buildFixtureTeamReadModel(
+          fixture,
+          'AWAY',
+          teamMap.get(awayTeamId),
+          fixtureLeagueId,
+        ),
+      };
+    });
+  }
+
+  /**
+   * Prefer the canonical team catalogue, then fill only its missing fields
+   * from the safe fixture identity snapshot. This gives the frontend a useful
+   * team object even when sports_teams has not yet been fully recovered.
+   */
+  private buildFixtureTeamReadModel(
+    fixture: SportsFixtureRecord,
+    side: 'HOME' | 'AWAY',
+    storedTeam?: SportsTeamRecord,
+    leagueId?: string,
+  ): SportsFixtureTeamReadModel | null {
+    const competitor = fixture.competitors.find(
+      (item) => item.homeAway === side,
+    );
+    if (!competitor) return null;
+
+    const snapshot = competitor.teamIdentity;
+    if (!storedTeam && !snapshot) return null;
+
+    const chooseText = (...values: unknown[]): string | undefined => {
+      for (const value of values) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+      return undefined;
+    };
+    const chooseLogo = (...values: unknown[]): string | undefined => {
+      for (const value of values) {
+        if (typeof value !== 'string' || !value.trim()) continue;
+        try {
+          const parsed = new URL(value.trim());
+          if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+            return value.trim();
+          }
+        } catch {
+          // An invalid catalogue URL must not mask a valid fixture snapshot.
+        }
+      }
+      return undefined;
+    };
+    const id = chooseText(competitor.teamId, snapshot?.id, storedTeam?.id);
+    if (!id) return null;
+
+    const canonicalEspnId = /^team:(.+)$/i.exec(id)?.[1];
+    const storedEspnId = chooseText(storedTeam?.espnId)?.replace(/^team:/i, '');
+    // A malformed catalogue row must not cause one club's name/logo to be
+    // returned for another ESPN team ID. Use the fixture snapshot instead.
+    const safeStoredTeam =
+      canonicalEspnId && storedEspnId && canonicalEspnId !== storedEspnId
+        ? undefined
+        : storedTeam;
+    const espnId =
+      canonicalEspnId ??
+      chooseText(snapshot?.espnId, safeStoredTeam?.espnId) ??
+      id.replace(/^team:/i, '');
+    const fixtureSource = fixture.source ?? {
+      provider: 'ESPN' as const,
+      endpoint: '/fixture-snapshot',
+      collectedAt: fixture.kickoffAt ?? new Date(),
+    };
+    const createdAt = fixture.createdAt ?? fixtureSource.collectedAt;
+    const updatedAt = fixture.updatedAt ?? fixtureSource.collectedAt;
+    const storedLeagueIds = safeStoredTeam?.leagueIds ?? [];
+    const leagueIds = [
+      ...new Set([
+        ...storedLeagueIds,
+        ...(leagueId ? [leagueId.trim().toLowerCase()] : []),
+      ]),
+    ];
+    const snapshotFilledMissingField = Boolean(
+      (!chooseText(safeStoredTeam?.name) &&
+        chooseText(snapshot?.name, snapshot?.displayName, snapshot?.shortName)) ||
+        (!chooseText(safeStoredTeam?.displayName) &&
+          chooseText(snapshot?.displayName, snapshot?.name)) ||
+        (!chooseText(safeStoredTeam?.shortName) &&
+          chooseText(snapshot?.shortName, snapshot?.name)) ||
+        (!chooseText(safeStoredTeam?.abbreviation) &&
+          chooseText(snapshot?.abbreviation)) ||
+        (!chooseText(safeStoredTeam?.slug) && chooseText(snapshot?.slug)) ||
+        (!chooseLogo(safeStoredTeam?.logo) && chooseLogo(snapshot?.logo)) ||
+        (!chooseText(safeStoredTeam?.country) && chooseText(snapshot?.country)) ||
+        (!chooseText(safeStoredTeam?.location) && chooseText(snapshot?.location)) ||
+        (!chooseText(safeStoredTeam?.primaryColor) &&
+          chooseText(snapshot?.primaryColor)) ||
+        (!chooseText(safeStoredTeam?.alternateColor) &&
+          chooseText(snapshot?.alternateColor)) ||
+        (Boolean(leagueId) && !storedLeagueIds.includes(leagueId!.trim().toLowerCase())),
+    );
+    const team: SportsFixtureTeamReadModel = {
+      ...(safeStoredTeam ?? {}),
+      id,
+      espnId,
+      leagueIds,
+      name:
+        chooseText(
+          safeStoredTeam?.name,
+          snapshot?.name,
+          snapshot?.displayName,
+          snapshot?.shortName,
+        ) ?? '',
+      displayName: chooseText(
+        safeStoredTeam?.displayName,
+        snapshot?.displayName,
+        snapshot?.name,
+      ),
+      shortName: chooseText(
+        safeStoredTeam?.shortName,
+        snapshot?.shortName,
+        snapshot?.name,
+      ),
+      abbreviation: chooseText(
+        safeStoredTeam?.abbreviation,
+        snapshot?.abbreviation,
+      ),
+      slug: chooseText(safeStoredTeam?.slug, snapshot?.slug),
+      logo: chooseLogo(safeStoredTeam?.logo, snapshot?.logo),
+      country: chooseText(safeStoredTeam?.country, snapshot?.country),
+      location: chooseText(safeStoredTeam?.location, snapshot?.location),
+      primaryColor: chooseText(
+        safeStoredTeam?.primaryColor,
+        snapshot?.primaryColor,
+      ),
+      alternateColor: chooseText(
+        safeStoredTeam?.alternateColor,
+        snapshot?.alternateColor,
+      ),
+      source: safeStoredTeam?.source ?? {
+        provider: 'ESPN',
+        endpoint: `${fixtureSource.endpoint}#${side.toLowerCase()}-team:${id}`,
+        providerId: espnId,
+        collectedAt: fixtureSource.collectedAt,
+      },
+      createdAt: safeStoredTeam?.createdAt ?? createdAt,
+      updatedAt: safeStoredTeam?.updatedAt ?? updatedAt,
+      identitySource: safeStoredTeam
+        ? snapshotFilledMissingField
+          ? 'TEAM_CATALOGUE_WITH_FIXTURE_FALLBACK'
+          : 'TEAM_CATALOGUE'
+        : 'FIXTURE_SNAPSHOT',
+      missingFields: [],
+    };
+
+    team.missingFields = [
+      'name',
+      'displayName',
+      'shortName',
+      'abbreviation',
+      'slug',
+      'country',
+      'location',
+      'primaryColor',
+      'alternateColor',
+    ].filter((field) => !chooseText((team as unknown as Record<string, unknown>)[field]));
+    if (!team.logo) team.missingFields.push('logo');
+
+    return team;
   }
 
   async getMatch(fixtureId: string): Promise<SportsMatchReadModel | null> {
@@ -1008,4 +1200,5 @@ export class SportsDomainReadService {
     }
   }
 }
+
 

@@ -143,4 +143,3 @@ SportsProviderRateLimitSchema.index(
     unique: true,
   },
 );
-

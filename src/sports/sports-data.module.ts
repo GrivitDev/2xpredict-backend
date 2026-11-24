@@ -74,6 +74,7 @@ import { SportsDataChangeEventService } from './services/sports-data-change-even
 import { SportsDataChangeEventProcessorService } from './services/sports-data-change-event-processor.service';
 import { SportsDataChangeEventWorkerService } from './services/sports-data-change-event-worker.service';
 import { SportsDomainCollectionService } from './services/sports-domain-collection.service';
+import { SportsFixtureTeamIntegrityService } from './services/sports-fixture-team-integrity.service';
 import { SportsMatchFactsNormalizationService } from './services/sports-match-facts-normalization.service';
 import { SportsDomainReadService } from './services/sports-domain-read.service';
 import { SportsReadinessService } from './services/sports-readiness.service';
@@ -183,6 +184,7 @@ import {
     SportsDataChangeEventProcessorService,
     SportsDataChangeEventWorkerService,
     SportsDomainCollectionService,
+    SportsFixtureTeamIntegrityService,
     SportsMatchFactsNormalizationService,
     SportsQueueService,
     SportsDerivedProjectionService,
@@ -207,4 +209,5 @@ import {
   ],
 })
 export class SportsDataModule {}
+
 

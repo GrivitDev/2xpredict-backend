@@ -18,6 +18,7 @@ import type {
   SportsMatchTimelineEventRecord,
   SportsSeasonRecord,
   SportsTeamRecord,
+  SportsFixtureTeamIdentity,
 } from '../interfaces/sports-domain.interface';
 import {
   SportsCompetition,
@@ -34,6 +35,16 @@ import {
   SportsOfficialStandings,
 } from '../schemas';
 import { SportsDataChangeEventService } from './sports-data-change-event.service';
+
+const isUsableTeamLogo = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+};
 
 /** Idempotent Mongo persistence for normalized ESPN provider facts. */
 @Injectable()
@@ -399,15 +410,37 @@ export class SportsPersistenceService {
   async saveTeams(items: SportsTeamRecord[]): Promise<number> {
     if (!items.length) return 0;
 
+    // Duplicate fixture appearances are common in multi-fixture batches. Keep
+    // one deterministic upsert per canonical ID before entering the transaction.
+    const uniqueItems = [
+      ...new Map(items.map((item) => [String(item.id), item])).values(),
+    ];
+    const normalizeEspnId = (value: unknown): string =>
+      String(value ?? '').trim().replace(/^team:/i, '');
+
     const session = await this.teamModel.db.startSession();
     let persistedCount = 0;
     let outboxChanged = false;
 
     try {
       await session.withTransaction(async () => {
-        const ids = [...new Set(items.map((item) => String(item.id)))];
+        const ids = [...new Set(uniqueItems.map((item) => String(item.id)))];
+        const espnIds = [
+          ...new Set(
+            uniqueItems
+              .map((item) => normalizeEspnId(item.espnId))
+              .filter(Boolean),
+          ),
+        ];
+        const identityFilters: Record<string, unknown>[] = [
+          { id: { $in: ids } },
+        ];
+        if (espnIds.length) identityFilters.push({ espnId: { $in: espnIds } });
+
+        // Read by both identifiers. This detects a unique-ESPN-ID collision
+        // before MongoDB rejects an otherwise opaque bulkWrite with E11000.
         const previousRows = (await this.teamModel
-          .find({ id: { $in: ids } })
+          .find({ $or: identityFilters })
           .select('-_id')
           .session(session)
           .lean()
@@ -415,19 +448,171 @@ export class SportsPersistenceService {
         const previousById = new Map(
           previousRows.map((row) => [String(row.id), row]),
         );
+        const previousByEspnId = new Map(
+          previousRows.map((row) => [normalizeEspnId(row.espnId), row]),
+        );
 
-        const operations = items.map((item) => {
-          const team = this.stripUndefined(item) as unknown as Record<
+        const incomingOwnerByEspnId = new Map<string, string>();
+        for (const item of uniqueItems) {
+          const espnId = normalizeEspnId(item.espnId);
+          const canonicalId = String(item.id ?? '').trim();
+          if (!espnId) continue;
+          const incomingOwner = incomingOwnerByEspnId.get(espnId);
+          if (incomingOwner && incomingOwner !== canonicalId) {
+            throw new Error(
+              `Team identity conflict: ESPN ID ${espnId} appears under both ${incomingOwner} and ${canonicalId}.`,
+            );
+          }
+          incomingOwnerByEspnId.set(espnId, canonicalId);
+          const existingOwner = previousByEspnId.get(espnId);
+          if (existingOwner && String(existingOwner.id) !== canonicalId) {
+            throw new Error(
+              `Team identity conflict: ESPN ID ${espnId} is already assigned to ${existingOwner.id}, not ${canonicalId}.`,
+            );
+          }
+        }
+
+        const changedItems: Array<{
+          item: SportsTeamRecord;
+          merged: SportsTeamRecord;
+          sourceFingerprint: string;
+        }> = [];
+        const textFields = [
+          'name',
+          'displayName',
+          'shortName',
+          'abbreviation',
+          'slug',
+          'logo',
+          'country',
+          'location',
+          'primaryColor',
+          'alternateColor',
+        ] as const;
+        const operations: any[] = [];
+
+        for (const item of uniqueItems) {
+          const previous = previousById.get(String(item.id));
+          const incomingTime = new Date(item.source?.collectedAt ?? 0).getTime();
+          const previousTime = previous?.source?.collectedAt
+            ? new Date(previous.source.collectedAt).getTime()
+            : Number.NaN;
+          const incomingIsNewer =
+            !previous ||
+            !Number.isFinite(previousTime) ||
+            (Number.isFinite(incomingTime) && incomingTime >= previousTime);
+
+          const pickText = (
+            field: (typeof textFields)[number],
+          ): string | undefined => {
+            const incoming = item[field];
+            const existing = previous?.[field];
+            const incomingText =
+              typeof incoming === 'string' ? incoming.trim() : '';
+            const existingText =
+              typeof existing === 'string' ? existing.trim() : '';
+
+            // A non-empty but malformed image URL is still missing metadata.
+            // Prefer a valid incoming URL even when its fixture snapshot is
+            // older; never let an invalid URL replace a working one.
+            if (field === 'logo') {
+              const incomingLogo = isUsableTeamLogo(incoming) ? incoming.trim() : '';
+              const existingLogo = isUsableTeamLogo(existing) ? existing.trim() : '';
+              if (incomingLogo && (incomingIsNewer || !existingLogo)) {
+                return incomingLogo;
+              }
+              return existingLogo || incomingLogo || undefined;
+            }
+
+            if (incomingText && (incomingIsNewer || !existingText)) {
+              return incoming as string;
+            }
+            if (existingText) return existing as string;
+            return incomingText ? (incoming as string) : undefined;
+          };
+
+          const incomingEspnId = normalizeEspnId(item.espnId);
+          const canonicalSuffix = String(item.id ?? '').match(/^team:(.+)$/i)?.[1];
+          // Canonical IDs are derived from ESPN IDs in this module. A correct
+          // incoming mapping must repair a stale espnId already stored on the
+          // same canonical document; it must not be hidden by nullish fallback.
+          const resolvedEspnId =
+            canonicalSuffix && incomingEspnId === canonicalSuffix
+              ? incomingEspnId
+              : previous?.espnId ?? item.espnId;
+
+          const mergedRecord: SportsTeamRecord = {
+            ...(previous ?? {}),
+            ...item,
+            id: previous?.id ?? item.id,
+            espnId: resolvedEspnId,
+            leagueIds: [
+              ...new Set([
+                ...(previous?.leagueIds ?? []),
+                ...(item.leagueIds ?? []),
+              ]),
+            ],
+            name: pickText('name') ?? item.name,
+            displayName: pickText('displayName'),
+            shortName: pickText('shortName'),
+            abbreviation: pickText('abbreviation'),
+            slug: pickText('slug'),
+            logo: pickText('logo'),
+            country: pickText('country'),
+            location: pickText('location'),
+            primaryColor: pickText('primaryColor'),
+            alternateColor: pickText('alternateColor'),
+            source: incomingIsNewer
+              ? {
+                  ...(previous?.source ?? {}),
+                  ...item.source,
+                  providerId:
+                    item.source.providerId ?? previous?.source?.providerId,
+                  providerUpdatedAt:
+                    item.source.providerUpdatedAt ??
+                    previous?.source?.providerUpdatedAt,
+                }
+              : previous?.source ?? item.source,
+            rawPayload: incomingIsNewer
+              ? { ...(previous?.rawPayload ?? {}), ...(item.rawPayload ?? {}) }
+              : { ...(item.rawPayload ?? {}), ...(previous?.rawPayload ?? {}) },
+            createdAt: previous?.createdAt ?? item.createdAt,
+          };
+
+          const sourceFingerprint = this.entitySourceFingerprint(mergedRecord);
+          const previousFingerprint = previous
+            ? this.entitySourceFingerprint(previous)
+            : undefined;
+          const changed =
+            !previous || previousFingerprint !== sourceFingerprint;
+
+          // Scoreboards revisit the same clubs frequently. Skip the actual
+          // Mongo write and outbox event when identity fields and memberships
+          // have not changed; source timestamps alone do not create write load.
+          if (!changed) continue;
+
+          changedItems.push({ item, merged: mergedRecord, sourceFingerprint });
+          const team = this.stripUndefined(mergedRecord) as unknown as Record<
             string,
             unknown
           >;
           const { leagueIds, createdAt, ...fields } = team;
           delete fields.updatedAt;
-          return {
+          const unsetFields: Record<string, 1> = {};
+          if (
+            previous &&
+            previous.logo !== undefined &&
+            !isUsableTeamLogo(previous.logo) &&
+            !mergedRecord.logo
+          ) {
+            unsetFields.logo = 1;
+          }
+          operations.push({
             updateOne: {
               filter: { id: item.id },
               update: {
                 $set: fields,
+                ...(Object.keys(unsetFields).length ? { $unset: unsetFields } : {}),
                 $addToSet: {
                   leagueIds: { $each: (leagueIds ?? []) as unknown[] },
                 },
@@ -435,39 +620,26 @@ export class SportsPersistenceService {
               },
               upsert: true,
             },
-          };
-        });
-        const result = await this.teamModel.bulkWrite(operations, {
-          ordered: false,
-          session,
-        });
-        persistedCount =
-          Number(result.upsertedCount ?? 0) + Number(result.modifiedCount ?? 0);
+          });
+        }
 
-        for (const item of items) {
-          const previous = previousById.get(String(item.id));
-          const merged = {
-            ...item,
-            leagueIds: [
-              ...new Set([
-                ...(previous?.leagueIds ?? []),
-                ...(item.leagueIds ?? []),
-              ]),
-            ],
-          };
-          const sourceFingerprint = this.entitySourceFingerprint(merged);
-          if (
-            previous &&
-            this.entitySourceFingerprint(previous) === sourceFingerprint
-          )
-            continue;
+        if (operations.length) {
+          const result = await this.teamModel.bulkWrite(operations, {
+            ordered: false,
+            session,
+          });
+          persistedCount =
+            Number(result.upsertedCount ?? 0) +
+            Number(result.modifiedCount ?? 0);
+        }
 
+        for (const { item, merged, sourceFingerprint } of changedItems) {
           const queued = await this.changeEvents.enqueueChanged(
             {
               entity: 'TEAM',
               entityId: String(item.id),
               teamIds: [String(item.id)],
-              changedAt: item.source?.collectedAt ?? new Date(),
+              changedAt: merged.source?.collectedAt ?? new Date(),
               sourceFingerprint,
             },
             session,
@@ -1271,6 +1443,33 @@ export class SportsPersistenceService {
     return records;
   }
 
+  /** Add a fixture's competition membership without changing other team fields. */
+  async ensureTeamLeagueMembership(
+    teamIds: string[],
+    leagueId: string,
+  ): Promise<number> {
+    const normalizedLeagueId = String(leagueId ?? '').trim().toLowerCase();
+    const canonicalIds = [
+      ...new Set(
+        teamIds
+          .map((value) => String(value ?? '').trim())
+          .filter(Boolean)
+          .map((id) => (id.startsWith('team:') ? id : `team:${id}`)),
+      ),
+    ];
+    if (!normalizedLeagueId || !canonicalIds.length) return 0;
+    const result = await this.teamModel
+      .updateMany(
+        {
+          id: { $in: canonicalIds },
+          leagueIds: { $ne: normalizedLeagueId },
+        },
+        { $addToSet: { leagueIds: normalizedLeagueId } },
+      )
+      .exec();
+    return Number(result.modifiedCount ?? 0);
+  }
+
   async getFixturesByIds(fixtureIds: string[]): Promise<SportsFixtureRecord[]> {
     if (!fixtureIds.length) return [];
     const rows = (await this.fixtureModel
@@ -1735,6 +1934,11 @@ export class SportsPersistenceService {
       };
     }
 
+    // Competitor snapshots can become sparse on later ESPN refreshes. Preserve
+    // previously collected identity fields by the canonical team ID so a later
+    // scoreboard response cannot erase a name, logo, country or other metadata.
+    safeIncoming = this.preserveFixtureTeamIdentities(safeIncoming, previous);
+
     if (staleRegression) {
       return {
         ...safeIncoming,
@@ -1761,6 +1965,92 @@ export class SportsPersistenceService {
       return { ...safeIncoming, completedAt: new Date(previous.completedAt) };
     }
     return safeIncoming;
+  }
+
+  private preserveFixtureTeamIdentities(
+    incoming: SportsFixtureRecord,
+    previous: Partial<SportsFixtureRecord>,
+  ): SportsFixtureRecord {
+    const previousByTeam = new Map(
+      (previous.competitors ?? []).map((competitor) => [
+        String(competitor.teamId ?? '').trim(),
+        competitor,
+      ] as const),
+    );
+    const incomingTime = new Date(incoming.source?.collectedAt ?? Number.NaN).getTime();
+    const previousTime = previous.source?.collectedAt
+      ? new Date(previous.source.collectedAt).getTime()
+      : Number.NaN;
+    const incomingIsNewer =
+      !Number.isFinite(previousTime) ||
+      (Number.isFinite(incomingTime) && incomingTime >= previousTime);
+
+    const competitors = incoming.competitors.map((competitor) => {
+      const canonicalId = String(competitor.teamId ?? '').trim();
+      const suffix = canonicalId.replace(/^team:/i, '');
+      const previousIdentity = previousByTeam.get(canonicalId)?.teamIdentity;
+      if (!previousIdentity || !suffix) return competitor;
+
+      const previousIdentityId = String(
+        previousIdentity.espnId ?? previousIdentity.id ?? '',
+      ).trim().replace(/^team:/i, '');
+      if (previousIdentityId && previousIdentityId !== suffix) return competitor;
+
+      const rawIncomingIdentity = competitor.teamIdentity;
+      const incomingIdentityId = String(
+        rawIncomingIdentity?.espnId ?? rawIncomingIdentity?.id ?? '',
+      ).trim().replace(/^team:/i, '');
+      const incomingIdentityIsValid =
+        !incomingIdentityId || incomingIdentityId === suffix;
+      const safeIncomingIdentity = incomingIdentityIsValid
+        ? rawIncomingIdentity
+        : undefined;
+
+      const pickText = (
+        key: Exclude<keyof SportsFixtureTeamIdentity, 'id' | 'espnId' | 'logo'>,
+      ): string | undefined => {
+        const current = safeIncomingIdentity?.[key];
+        const existing = previousIdentity[key];
+        const currentText = typeof current === 'string' ? current.trim() : '';
+        const existingText = typeof existing === 'string' ? existing.trim() : '';
+        if (currentText && (incomingIsNewer || !existingText)) return currentText;
+        return existingText || currentText || undefined;
+      };
+
+      const incomingLogo = isUsableTeamLogo(safeIncomingIdentity?.logo)
+        ? safeIncomingIdentity!.logo!.trim()
+        : undefined;
+      const previousLogo = isUsableTeamLogo(previousIdentity.logo)
+        ? previousIdentity.logo.trim()
+        : undefined;
+      const logo = incomingLogo && (incomingIsNewer || !previousLogo)
+        ? incomingLogo
+        : previousLogo ?? incomingLogo;
+
+      const identity: SportsFixtureTeamIdentity = {
+        id: canonicalId,
+        espnId: suffix,
+        name: pickText('name'),
+        displayName: pickText('displayName'),
+        shortName: pickText('shortName'),
+        abbreviation: pickText('abbreviation'),
+        ...(logo ? { logo } : {}),
+        country: pickText('country'),
+        location: pickText('location'),
+        slug: pickText('slug'),
+        primaryColor: pickText('primaryColor'),
+        alternateColor: pickText('alternateColor'),
+      };
+      const compactIdentity = Object.fromEntries(
+        Object.entries(identity).filter(([, value]) => value !== undefined),
+      ) as SportsFixtureTeamIdentity;
+      return { ...competitor, teamIdentity: compactIdentity };
+    });
+
+    return {
+      ...incoming,
+      competitors: competitors as typeof incoming.competitors,
+    };
   }
 
   private fixtureSourceFingerprint(fixture: SportsFixtureRecord): string {
@@ -1913,3 +2203,5 @@ export class SportsPersistenceService {
     ) as T;
   }
 }
+
+
