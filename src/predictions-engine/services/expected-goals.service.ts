@@ -50,7 +50,7 @@ export class ExpectedGoalsService {
     // baseline. Blend it conservatively with dated fixture rows so it remains
     // useful when the local history window is sparse without dominating it.
     const projectionMatches = Number(context.competitionScoring?.fixturesPlayed ?? 0);
-    if (projectionMatches >= 6 && Number.isFinite(context.competitionScoring?.homeGoals)
+    if (projectionMatches > 0 && Number.isFinite(context.competitionScoring?.homeGoals)
       && Number.isFinite(context.competitionScoring?.awayGoals)) {
       const projectionWeight = Math.min(0.45, projectionMatches / (projectionMatches + 30) * 0.45);
       const projectionHome = context.competitionScoring!.homeGoals / projectionMatches;
@@ -106,14 +106,16 @@ export class ExpectedGoalsService {
     const recentAway = this.recentRates(context.historicalFixtures, awayId, kickoff, cfg.recentFormMatchesPerTeam);
     const homeFormEvidence = context.homeForm?.results.filter((item) => new Date(item.kickoffAt).getTime() < kickoff).slice(0, cfg.recentFormMatchesPerTeam) ?? [];
     const awayFormEvidence = context.awayForm?.results.filter((item) => new Date(item.kickoffAt).getTime() < kickoff).slice(0, cfg.recentFormMatchesPerTeam) ?? [];
-    const useHomeForm = recentHome.matches >= 2 ? recentHome : this.formRates(homeFormEvidence);
-    const useAwayForm = recentAway.matches >= 2 ? recentAway : this.formRates(awayFormEvidence);
+    // Even one valid completed match is useful evidence. Sparse samples receive
+    // proportionally smaller weights rather than being discarded by a hard gate.
+    const useHomeForm = recentHome.matches > 0 ? recentHome : this.formRates(homeFormEvidence);
+    const useAwayForm = recentAway.matches > 0 ? recentAway : this.formRates(awayFormEvidence);
 
-    const homeRecentWeight = useHomeForm.matches >= 2
-      ? Math.min(0.25, useHomeForm.matches / cfg.recentFormMatchesPerTeam * 0.25)
+    const homeRecentWeight = useHomeForm.matches > 0
+      ? Math.min(0.25, useHomeForm.matches / Math.max(1, cfg.recentFormMatchesPerTeam) * 0.25)
       : 0;
-    const awayRecentWeight = useAwayForm.matches >= 2
-      ? Math.min(0.25, useAwayForm.matches / cfg.recentFormMatchesPerTeam * 0.25)
+    const awayRecentWeight = useAwayForm.matches > 0
+      ? Math.min(0.25, useAwayForm.matches / Math.max(1, cfg.recentFormMatchesPerTeam) * 0.25)
       : 0;
     if (homeRecentWeight) {
       homeAttack = this.blend(homeAttack, useHomeForm.scored, homeRecentWeight);
@@ -140,12 +142,11 @@ export class ExpectedGoalsService {
     const observedPeriodSplit = homePeriodSplit.share !== null && awayPeriodSplit.share !== null;
 
     const h2h = this.readHeadToHead(context, kickoff);
-    if (h2h.matches >= 3) {
-      lambdaHome = lambdaHome * 0.92 + h2h.homeGoals * 0.08;
-      lambdaAway = lambdaAway * 0.92 + h2h.awayGoals * 0.08;
-    } else if (h2h.matches === 2) {
-      lambdaHome = lambdaHome * 0.96 + h2h.homeGoals * 0.04;
-      lambdaAway = lambdaAway * 0.96 + h2h.awayGoals * 0.04;
+    if (h2h.matches > 0) {
+      // Keep H2H influence deliberately small when the sample is sparse.
+      const h2hWeight = h2h.matches >= 3 ? 0.08 : h2h.matches === 2 ? 0.04 : 0.02;
+      lambdaHome = lambdaHome * (1 - h2hWeight) + h2h.homeGoals * h2hWeight;
+      lambdaAway = lambdaAway * (1 - h2hWeight) + h2h.awayGoals * h2hWeight;
     }
 
     const standings = this.standingStrength(context);
@@ -165,15 +166,31 @@ export class ExpectedGoalsService {
       lambdaAway = this.blend(lambdaAway, symmetric, 0.12);
     }
 
-    const homeSampleCount = Math.max(homeSamples.scored.length, context.scoringRecords.home?.fixturesPlayed ?? 0, context.homeAwayRecords.home?.home.played ?? 0);
-    const awaySampleCount = Math.max(awaySamples.scored.length, context.scoringRecords.away?.fixturesPlayed ?? 0, context.homeAwayRecords.away?.away.played ?? 0);
+    const homeSampleCount = Math.max(
+      homeSamples.scored.length,
+      context.scoringRecords.home?.fixturesPlayed ?? 0,
+      context.homeAwayRecords.home?.home.played ?? 0,
+      useHomeForm.matches,
+    );
+    const awaySampleCount = Math.max(
+      awaySamples.scored.length,
+      context.scoringRecords.away?.fixturesPlayed ?? 0,
+      context.homeAwayRecords.away?.away.played ?? 0,
+      useAwayForm.matches,
+    );
     const leagueSampleCount = Math.max(league.length, context.competitionScoring?.fixturesPlayed ?? 0);
-    const independentEvidenceAvailable = homeSampleCount > 0 || awaySampleCount > 0 || leagueSampleCount > 0 || h2h.matches > 0;
+    const independentEvidenceAvailable = homeSampleCount > 0
+      || awaySampleCount > 0
+      || leagueSampleCount > 0
+      || h2h.matches > 0;
+    const minimumTeamSample = Math.min(homeSampleCount, awaySampleCount);
     const evidenceLevel: ExpectedGoalsModel['evidenceLevel'] =
-      !independentEvidenceAvailable ? 'INSUFFICIENT'
+      !independentEvidenceAvailable ? 'PRIOR_ONLY'
         : homeSampleCount >= cfg.minimumHistoricalMatchesPerTeam
           && awaySampleCount >= cfg.minimumHistoricalMatchesPerTeam
-          && leagueSampleCount >= 20 ? 'STRONG' : 'PARTIAL';
+          && leagueSampleCount >= 20 ? 'STRONG'
+          : minimumTeamSample >= 2 || leagueSampleCount >= 6 ? 'DEVELOPING'
+            : 'LIMITED';
 
     const evidence: string[] = [
       `Sports normalized goal history: home team ${homeSampleCount} matches; away team ${awaySampleCount} matches; completed competition sample ${leagueSampleCount}.`,
@@ -181,14 +198,26 @@ export class ExpectedGoalsService {
       `Competition scoring prior uses ${league.length} dated results, regularized with ${leaguePriorMatches} pseudo-matches; Sports scoring projection reports ${projectionMatches} completed fixtures.`,
       `First-half goal shares: home ${homePeriodSplit.share === null ? 'assumed' : 'observed'} ${homeFirstHalfGoalShare.toFixed(3)} (${homePeriodSplit.samples} period-score samples); away ${awayPeriodSplit.share === null ? 'assumed' : 'observed'} ${awayFirstHalfGoalShare.toFixed(3)} (${awayPeriodSplit.samples} period-score samples).`,
     ];
+    const sparseTeamEvidence: string[] = [];
+    if (homeSampleCount > 0 && homeSampleCount < cfg.minimumHistoricalMatchesPerTeam) {
+      sparseTeamEvidence.push(`home team ${homeSampleCount}/${cfg.minimumHistoricalMatchesPerTeam} required historical matches`);
+    }
+    if (awaySampleCount > 0 && awaySampleCount < cfg.minimumHistoricalMatchesPerTeam) {
+      sparseTeamEvidence.push(`away team ${awaySampleCount}/${cfg.minimumHistoricalMatchesPerTeam} required historical matches`);
+    }
+    if (sparseTeamEvidence.length) {
+      evidence.push(
+        `sparse team evidence: ${sparseTeamEvidence.join('; ')}. These observations are retained with sample-aware weighting and will be refined as more completed results arrive.`,
+      );
+    }
     if (homeRecentWeight || awayRecentWeight) {
       evidence.push(`Recent form is blended conservatively: home ${useHomeForm.matches} matches (${Math.round(homeRecentWeight * 100)}% weight), away ${useAwayForm.matches} matches (${Math.round(awayRecentWeight * 100)}% weight).`);
     }
     if (h2h.matches) evidence.push(`Sports head-to-head projection supplied ${h2h.matches} prior meetings; H2H influence is capped at 8%.`);
     if (standings) evidence.push('Sports-calculated standings points-per-game were applied as a bounded strength adjustment.');
     else evidence.push('Sports-calculated standings were unavailable for both teams; no standings adjustment was applied.');
-    if (!independentEvidenceAvailable) evidence.push('INSUFFICIENT INDEPENDENT EVIDENCE: default goal rates are priors only. Score-matrix and period-matrix predictions remain unavailable; bookmaker prices are not substituted for independent model probabilities.');
-    else if (evidenceLevel === 'PARTIAL') evidence.push('PARTIAL EVIDENCE: supported markets may calculate, but confidence and data quality remain limited by the sample count.');
+    if (!independentEvidenceAvailable) evidence.push('PRIOR_ONLY BASELINE: no usable team-specific or competition observations were available. The model still generates a statistical baseline from the configured regularised football goal priors; evidence quality remains explicitly low until Sports data arrives.');
+    else if (evidenceLevel === 'LIMITED' || evidenceLevel === 'DEVELOPING') evidence.push(`${evidenceLevel} EVIDENCE: available team, form, head-to-head or competition observations are used with sample-aware weights; estimates will be recalculated as more data arrives.`);
 
     lambdaHome = PredictionMathUtil.clamp(lambdaHome, cfg.minimumExpectedGoals, cfg.maximumExpectedGoals);
     lambdaAway = PredictionMathUtil.clamp(lambdaAway, cfg.minimumExpectedGoals, cfg.maximumExpectedGoals);
@@ -205,7 +234,9 @@ export class ExpectedGoalsService {
       observedPeriodSplit,
       homePeriodSplitSamples: homePeriodSplit.samples,
       awayPeriodSplitSamples: awayPeriodSplit.samples,
-      calculationMethod: 'Sports-normalized, venue-aware Poisson model: season attack/defence records, competition scoring prior, recent form and low-weight head-to-head evidence.',
+      calculationMethod: independentEvidenceAvailable
+        ? 'Progressive Sports-normalized, venue-aware Poisson model: available season attack/defence records, regularised competition prior, sparse recent form and low-weight head-to-head evidence.'
+        : 'Prior-only baseline Poisson model: configured home/away football goal priors, with no claim of team-specific evidence.',
       independentEvidenceAvailable,
       evidenceLevel,
       historicalHeadToHeadMatches: h2h.matches,
@@ -348,3 +379,5 @@ export class ExpectedGoalsService {
     return base * (1 - weight) + observed * weight;
   }
 }
+
+

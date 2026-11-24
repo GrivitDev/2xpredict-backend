@@ -85,3 +85,74 @@ describe('SportsDataChangeEventProcessorService Grivit pricing horizon', () => {
       .toBe('fixture-inside-window');
   });
 });
+
+
+describe('SportsDataChangeEventProcessorService independent prediction fan-out', () => {
+  it('attempts both Odds and Prediction handoffs even when one consumer queue fails', async () => {
+    const service = Object.create(SportsDataChangeEventProcessorService.prototype) as any;
+    service.enqueueAffectedOddsPricing = jest.fn().mockRejectedValue(new Error('Odds queue unavailable'));
+    service.enqueueAffectedPredictionRecalculations = jest.fn().mockResolvedValue(undefined);
+
+    await expect(service.dispatch({
+      eventId: 'source-event-independent-1',
+      entity: 'TEAM',
+      entityId: 'team-1',
+      revision: 4,
+      changedAt: new Date(),
+      fixtureIds: [],
+      teamIds: ['team-1'],
+      competitionIds: [],
+      seasonIds: [],
+    } as any)).rejects.toThrow('Odds queue unavailable');
+
+    expect(service.enqueueAffectedOddsPricing).toHaveBeenCalledTimes(1);
+    expect(service.enqueueAffectedPredictionRecalculations).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues a revision-qualified prediction trigger for an eligible fixture', async () => {
+    const fixture = {
+      id: 'fixture-upcoming-1',
+      kickoffAt: new Date(Date.now() + 24 * 60 * 60_000),
+      status: { state: 'SCHEDULED', isFinal: false },
+      competitors: [
+        { homeAway: 'HOME', teamId: 'team-home' },
+        { homeAway: 'AWAY', teamId: 'team-away' },
+      ],
+    };
+    const fixtureModel = {
+      find: jest.fn(() => ({
+        select: jest.fn().mockReturnThis(),
+        sort: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue([fixture]),
+      })),
+    };
+    const queue = {
+      enqueueIfMissing: jest.fn().mockResolvedValue({ created: true }),
+    };
+    const service = Object.create(SportsDataChangeEventProcessorService.prototype) as any;
+    service.fixtureModel = fixtureModel;
+    service.queue = queue;
+    service.logger = { debug: jest.fn(), log: jest.fn() };
+    service.predictionEnqueueConcurrency = 2;
+
+    await service.enqueuePredictionRecalculationsForIds(
+      ['fixture-upcoming-1'],
+      {
+        eventId: 'source-event-team-update-5',
+        entity: 'TEAM',
+        entityId: 'team-home',
+        revision: 5,
+        changedAt: new Date(),
+      } as any,
+    );
+
+    const trigger = queue.enqueueIfMissing.mock.calls[0][0];
+    expect(trigger.type).toBe('PREDICTION_ENGINE_RECALCULATION');
+    expect(trigger.scope.fixtureId).toBe('fixture-upcoming-1');
+    expect(trigger.scope.sourceFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(trigger.triggerEventId).toBe(
+      'prediction:source:source-event-team-update-5:fixture-upcoming-1',
+    );
+  });
+});

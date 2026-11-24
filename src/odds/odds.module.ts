@@ -4,6 +4,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { SportsModule } from '../sports/sports.module';
 import { BackgroundWorkModule } from '../common/background-work/background-work.module';
 import { FixtureOdds, FixtureOddsSchema } from './schemas/fixture-odds.schema';
+import { FixtureOddsHistory, FixtureOddsHistorySchema } from './schemas/fixture-odds-history.schema';
 import { OddsService } from './services/odds.service';
 import { OddsReadService } from './services/odds-read.service';
 import { OddsPricingEngineService } from './services/odds-pricing-engine.service';
@@ -21,7 +22,10 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
   imports: [
     BackgroundWorkModule,
     SportsModule,
-    MongooseModule.forFeature([{ name: FixtureOdds.name, schema: FixtureOddsSchema }]),
+    MongooseModule.forFeature([
+      { name: FixtureOdds.name, schema: FixtureOddsSchema },
+      { name: FixtureOddsHistory.name, schema: FixtureOddsHistorySchema },
+    ]),
   ],
   controllers: [OddsCenterController],
   providers: [
@@ -32,7 +36,8 @@ import { adminRealtimeRegistrationProvider } from '../realtime/admin-realtime-re
     OddsWorkerService,
     OddsMonitorService,
   ],
-  exports: [OddsReadService],
+  exports: [OddsReadService, OddsWorkerService],
 })
 export class OddsModule {}
+
 

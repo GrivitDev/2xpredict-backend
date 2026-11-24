@@ -6,9 +6,10 @@ import {
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { AnyBulkWriteOperation, Model } from 'mongoose';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { MarketPrediction } from '../schemas/market-prediction.schema';
+import { MarketPredictionHistory } from '../schemas/market-prediction-history.schema';
 import { PredictionRun } from '../schemas/prediction-run.schema';
 import { PredictionRunStatus } from '../enums/prediction-run-status.enum';
 import { PredictionStatus } from '../enums/prediction-status.enum';
@@ -27,7 +28,6 @@ import { PredictionEngineMonitorService } from './prediction-engine-monitor.serv
 import { getMarketDefinition } from '../catalog/football-market-catalog';
 import { MarketCalibrationService } from './market-calibration.service';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
-import { OddsReadService } from '../../odds/services/odds-read.service';
 import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
 import { hasReusableFinalMarketSnapshot } from '../utils/prediction-market-snapshot.util';
 
@@ -48,13 +48,18 @@ export class PredictionEngineService {
     private readonly monitor: PredictionEngineMonitorService,
     private readonly marketCalibrationService: MarketCalibrationService,
     private readonly settlementTrigger: SettlementTriggerService,
-    private readonly oddsService: OddsReadService,
+    @InjectModel(MarketPredictionHistory.name)
+    private readonly marketPredictionHistoryModel?: Model<MarketPredictionHistory>,
   ) {}
 
-  async generateForFixture(eventId: string): Promise<any> {
-    // Prediction generation consumes canonical Sports facts and Odds-module prices.
-    // Sports owns fixture collection; the Odds module gates exact selection readiness.
+  async generateForFixture(
+    eventId: string,
+    options: { forceRecalculation?: boolean } = {},
+  ): Promise<any> {
+    // Prediction generation is based on normalized Sports evidence and its
+    // regularized model baseline. Odds prices are optional enrichment, never a gate.
     const startedAt = new Date();
+    const forceRecalculation = options.forceRecalculation === true;
     const runId = randomUUID();
     const modelVersion = PREDICTION_ENGINE_CONFIG.modelVersion;
     let runRecordId: string | undefined;
@@ -76,15 +81,6 @@ export class PredictionEngineService {
         context.fixture.eventId,
       );
 
-      // The Odds module is authoritative. This gate also protects direct/admin
-      // calls that bypass the durable prediction queue worker.
-      const readinessByEvent = await this.oddsService.getPredictionReadinessForEvents([context.fixture.eventId]);
-      const readiness = readinessByEvent.get(String(context.fixture.eventId));
-      if (!readiness?.ready) {
-        throw new UnprocessableEntityException(
-          readiness?.reason ?? 'The Odds module has not marked this fixture prediction-ready.',
-        );
-      }
       const expectedGoals = this.expectedGoalsService.estimate(context);
       const marketOdds = this.marketOddsService.extractMatchResultOdds(context);
       const scoreMatrixBase = PredictionMathUtil.scoreMatrix(
@@ -181,9 +177,10 @@ export class PredictionEngineService {
       const sourceSummaryCollectedAt = context.fixture.summaryCollectedAt
         ? new Date(context.fixture.summaryCollectedAt)
         : null;
+      // Load complete current documents because a valid recalculation may
+      // supersede them. Their full selection-level payload is archived first.
       const existingMarketRows = (await this.marketPredictionModel
         .find({ eventId: context.fixture.eventId, modelVersion })
-        .select({ marketKey: 1, status: 1, fixtureSourceRevision: 1, selections: 1 })
         .lean()
         .exec()) as Array<Record<string, any>>;
       const existingByMarketKey = new Map(
@@ -207,25 +204,71 @@ export class PredictionEngineService {
             context.fixture.eventId,
             context.fixtureSourceRevision,
           );
+          await this.predictionDataService.assertSourceRevisionFingerprint(
+            context.fixture.eventId,
+            context.sourceRevisionFingerprint,
+          );
 
           const operations: AnyBulkWriteOperation<MarketPrediction>[] = [];
+          const historyOperations: AnyBulkWriteOperation<MarketPredictionHistory>[] = [];
           for (const calculation of batch) {
             const marketKey = String(calculation.marketKey);
             const canonicalMarket = FOOTBALL_MARKET_BY_PREDICTION_KEY.get(marketKey);
             const existing = existingByMarketKey.get(marketKey);
+            const isBaselineResultMarket = marketKey === 'MATCH_RESULT';
             const hasFinalSelection = calculation.status === PredictionStatus.CALCULATED
               && calculation.selections.some((selection) =>
                 selection.status === PredictionStatus.CALCULATED
                 && selection.isFinalSelection === true
                 && selection.recommendationEligible === true
-                && selection.oddsPredictionReady === true
-                && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED'),
+                && selection.probability !== null
+                && selection.probability !== undefined
+                && Number.isFinite(Number(selection.probability))
+                && (isBaselineResultMarket || (
+                  selection.oddsPredictionReady === true
+                  && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED')
+                )),
               );
 
-            // Keep an existing good market only if its Sports revision and its
-            // exact current Odds quote have not changed. A newly available price
-            // or better model result will replace it immediately in this batch.
-            if (!hasFinalSelection
+            // Preserve a previously valid result if this new pass cannot
+            // produce a valid replacement. This applies even after a source
+            // revision changes: incomplete evidence must not erase the last
+            // usable market result while its durable recalculation is retried.
+            const existingHasValidResult = Array.isArray(existing?.selections)
+              && (isBaselineResultMarket
+                ? existing.status === PredictionStatus.CALCULATED
+                  && existing.selections.length >= 3
+                  && existing.selections.every((selection: any) =>
+                    selection.status === PredictionStatus.CALCULATED
+                    && selection.probability !== null
+                    && selection.probability !== undefined
+                    && Number.isFinite(Number(selection.probability)))
+                : existing.selections.some((selection: any) =>
+                    selection.status === PredictionStatus.CALCULATED
+                    && selection.isFinalSelection === true
+                    && selection.recommendationEligible === true
+                    && selection.oddsPredictionReady === true
+                    && selection.probability !== null
+                    && selection.probability !== undefined
+                    && Number.isFinite(Number(selection.probability))
+                    && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED')));
+            const hasValidReplacement = isBaselineResultMarket
+              ? calculation.status === PredictionStatus.CALCULATED
+                && calculation.selections.length >= 3
+                && calculation.selections.every((selection) =>
+                  selection.status === PredictionStatus.CALCULATED
+                  && selection.probability !== null
+                  && selection.probability !== undefined
+                  && Number.isFinite(Number(selection.probability)))
+              : hasFinalSelection;
+
+            if (existingHasValidResult && !hasValidReplacement) {
+              preservedMarketDocuments += 1;
+              continue;
+            }
+
+            // Keep the existing revision/quote fast path for unchanged inputs.
+            if (!hasValidReplacement
               && getMarketDefinition(marketKey)?.pricingEnabled !== false
               && canonicalMarket
               && hasReusableFinalMarketSnapshot(
@@ -233,9 +276,15 @@ export class PredictionEngineService {
                 canonicalMarket.id,
                 context.fixtureSourceRevision,
                 context.storedOdds ?? [],
+                context.sourceRevisionFingerprint,
+                forceRecalculation,
               )) {
               preservedMarketDocuments += 1;
               continue;
+            }
+
+            if (existing) {
+              historyOperations.push(this.createMarketHistoryOperation(existing));
             }
 
             operations.push({
@@ -252,6 +301,7 @@ export class PredictionEngineService {
                     fixtureDate: context.fixture.fixtureDate,
                     retentionExpiresAt: context.fixture.retentionExpiresAt ?? null,
                     fixtureSourceRevision: context.fixtureSourceRevision,
+                    sourceRevisionFingerprint: context.sourceRevisionFingerprint,
                     live: false,
                     completed: false,
                     homeTeamId: context.fixture.homeTeamId,
@@ -298,6 +348,13 @@ export class PredictionEngineService {
             });
           }
 
+          if (historyOperations.length && this.marketPredictionHistoryModel) {
+            // Archive before mutating current rows. Upsert-by-snapshotId makes
+            // this safe when a partial bulk write is retried.
+            await this.marketPredictionHistoryModel.bulkWrite(historyOperations, { ordered: false });
+          } else if (historyOperations.length) {
+            throw new Error('Market prediction history model is unavailable; current predictions were not overwritten.');
+          }
           if (operations.length) {
             await this.marketPredictionModel.bulkWrite(operations, { ordered: false });
             persistedMarketDocuments += operations.length;
@@ -317,6 +374,10 @@ export class PredictionEngineService {
       await this.predictionDataService.assertFixtureSourceRevision(
         context.fixture.eventId,
         context.fixtureSourceRevision,
+      );
+      await this.predictionDataService.assertSourceRevisionFingerprint(
+        context.fixture.eventId,
+        context.sourceRevisionFingerprint,
       );
       const hasSettlementTarget = calculations.some(
         (calculation) =>
@@ -439,6 +500,8 @@ export class PredictionEngineService {
       const diagnostics = [
         ...expectedGoals.evidence,
         `Sports fixture source revision used: ${context.fixtureSourceRevision}.`,
+        `Combined Sports source fingerprint used: ${context.sourceRevisionFingerprint}.`,
+        ...(forceRecalculation ? ['A durable Sports/projection trigger required all eligible markets to be recalculated.'] : []),
         `Core evidence assessment: ${expectedGoals.evidenceLevel}; independent statistical evidence ${expectedGoals.independentEvidenceAvailable ? 'available' : 'unavailable'}.`,
         `Evidence counts: home form ${expectedGoals.homeRecentFormSamples}; away form ${expectedGoals.awayRecentFormSamples}; H2H ${expectedGoals.historicalHeadToHeadMatches}; league scored fixtures ${expectedGoals.leagueSamples}; matched standings for both teams ${expectedGoals.standingsStrengthAvailable ? 'yes' : 'no'}.`,
         `Market selection audit: ${providerMissingCount} calculated candidates use estimated Odds-module prices; ${providerPricedNonFinalAlternatives} other provider-priced candidates were not chosen as their market's single final outcome; ${pricedButUnmodelledSelections} Odds-ready quotes were retained as prices but withheld from prediction because no independent model probability was available.`,
@@ -504,6 +567,10 @@ export class PredictionEngineService {
         context.fixture.eventId,
         context.fixtureSourceRevision,
       );
+      await this.predictionDataService.assertSourceRevisionFingerprint(
+        context.fixture.eventId,
+        context.sourceRevisionFingerprint,
+      );
       const pickCenterResult = await this.pickCenterService.rebuildForEvent(
         context.fixture.eventId,
         runSummary,
@@ -533,6 +600,8 @@ export class PredictionEngineService {
         persistenceBatches,
         oddsBaseline: marketOdds,
         expectedGoals,
+        sourceRevisionFingerprint: context.sourceRevisionFingerprint,
+        forceRecalculation,
         pickCenter: pickCenterResult,
       };
     } catch (error) {
@@ -580,7 +649,61 @@ export class PredictionEngineService {
     }
   }
 
+  /** Build an idempotent append-only snapshot for the prediction being replaced. */
+  private createMarketHistoryOperation(
+    existing: Record<string, any>,
+  ): AnyBulkWriteOperation<MarketPredictionHistory> {
+    const calculatedAtValue = existing.generatedAt instanceof Date
+      ? existing.generatedAt
+      : new Date(String(existing.generatedAt ?? ''));
+    const calculatedAt = Number.isFinite(calculatedAtValue.getTime())
+      ? calculatedAtValue
+      : new Date();
+    const snapshotIdentity = [
+      String(existing._id ?? ''),
+      String(existing.eventId ?? ''),
+      String(existing.marketKey ?? ''),
+      String(existing.modelVersion ?? ''),
+      calculatedAt.toISOString(),
+      String(existing.sourceRevisionFingerprint ?? ''),
+      String(existing.fixtureSourceRevision ?? 0),
+      JSON.stringify(existing),
+    ].join('\n');
+    const snapshotId = createHash('sha256').update(snapshotIdentity).digest('hex');
+    const retentionExpiresAtValue = existing.retentionExpiresAt
+      ? new Date(existing.retentionExpiresAt)
+      : undefined;
+    const retentionExpiresAt = retentionExpiresAtValue
+      && Number.isFinite(retentionExpiresAtValue.getTime())
+      ? retentionExpiresAtValue
+      : undefined;
+
+    return {
+      updateOne: {
+        filter: { snapshotId },
+        update: {
+          $setOnInsert: {
+            snapshotId,
+            eventId: String(existing.eventId ?? ''),
+            marketKey: String(existing.marketKey ?? ''),
+            modelVersion: String(existing.modelVersion ?? ''),
+            fixtureSourceRevision: Math.max(0, Number(existing.fixtureSourceRevision ?? 0) || 0),
+            ...(existing.sourceRevisionFingerprint
+              ? { sourceRevisionFingerprint: String(existing.sourceRevisionFingerprint) }
+              : {}),
+            calculatedAt,
+            archivedAt: new Date(),
+            ...(retentionExpiresAt ? { retentionExpiresAt } : {}),
+            snapshot: existing,
+          },
+        },
+        upsert: true,
+      },
+    } as AnyBulkWriteOperation<MarketPredictionHistory>;
+  }
+
 }
+
 
 
 

@@ -59,6 +59,18 @@ export class PredictionQueue {
   @Prop({ type: Number, min: 0 })
   lastProcessedFixtureSourceRevision?: number;
 
+  /** Latest combined Sports source generation observed for this fixture. */
+  @Prop({ type: String, trim: true })
+  sourceRevisionFingerprint?: string;
+
+  /** Combined Sports source generation consumed by the last completed run. */
+  @Prop({ type: String, trim: true })
+  lastProcessedSourceRevisionFingerprint?: string;
+
+  /** A durable source/projection trigger requires market snapshots to be recalculated. */
+  @Prop({ type: Boolean, default: false })
+  forceRecalculation?: boolean;
+
   @Prop({ type: Date })
   oddsUpdatedAt?: Date;
 
@@ -110,6 +122,7 @@ PredictionQueueSchema.index(
   { retentionExpiresAt: 1 },
   { expireAfterSeconds: 0, name: 'ttl_prediction_queue_fixture_retention' },
 );
+
 
 
 

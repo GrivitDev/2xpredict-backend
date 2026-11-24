@@ -19,6 +19,21 @@ const QUEUE_POLL_MS = 3_000;
 const QUEUE_LEASE_MS = 10 * 60_000;
 const QUEUE_HEARTBEAT_MS = 60_000;
 
+type FixturePricingOutcome =
+  | { status: 'PRICED'; priceCount: number }
+  | { status: 'UNPRICEABLE'; priceCount: 0 }
+  | { status: 'NO_PRICE'; priceCount: 0 };
+
+/** A valid upcoming fixture that produced no prices must remain retryable. */
+class RetryableOddsPricingOutputError extends Error {
+  readonly retryable = true;
+
+  constructor(fixtureId: string) {
+    super(`Grivit pricing produced no price rows for eligible fixture ${fixtureId}.`);
+    this.name = 'RetryableOddsPricingOutputError';
+  }
+}
+
 @Injectable()
 export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OddsWorkerService.name);
@@ -47,6 +62,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private inventorySweepFixtures = 0;
   private inventorySweepSucceeded = 0;
   private inventorySweepFailed = 0;
+  private inventorySweepNoPriceCount = 0;
   private inventorySweepsCompleted = 0;
   private lastInventorySweepStartedAt?: Date;
   private lastInventorySweepCompletedAt?: Date;
@@ -55,7 +71,13 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private lastInventorySweepFixtures = 0;
   private lastInventorySweepSucceeded = 0;
   private lastInventorySweepFailed = 0;
+  private lastInventorySweepNoPriceCount = 0;
   private lastSuccessfulInventorySweepAt?: Date;
+  private inventoryBackfillRequested = false;
+  private inventoryBackfillInProgress = false;
+  private lastInventoryBackfillRequestedAt?: Date;
+  private lastInventoryBackfillStartedAt?: Date;
+  private lastInventoryBackfillCompletedAt?: Date;
   private consecutivePartialInventorySweeps = 0;
 
   private cyclesCompleted = 0;
@@ -70,6 +92,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
   private lastBatchSize = 0;
   private lastRefreshedCount = 0;
   private lastFailedCount = 0;
+  private lastNoPriceCount = 0;
 
   private retentionCyclesCompleted = 0;
   private retentionCyclesFailed = 0;
@@ -157,7 +180,15 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       lastBatchSize: this.lastBatchSize,
       lastRefreshedCount: this.lastRefreshedCount,
       lastFailedCount: this.lastFailedCount,
+      lastNoPriceCount: this.lastNoPriceCount,
       cursorPresent: Boolean(this.cursor),
+      inventoryBackfill: {
+        requested: this.inventoryBackfillRequested,
+        inProgress: this.inventoryBackfillInProgress,
+        lastRequestedAt: this.lastInventoryBackfillRequestedAt ?? null,
+        lastStartedAt: this.lastInventoryBackfillStartedAt ?? null,
+        lastCompletedAt: this.lastInventoryBackfillCompletedAt ?? null,
+      },
       inventorySweep: {
         inProgress: Boolean(this.inventorySweepStartedAt),
         startedAt: this.inventorySweepStartedAt ?? null,
@@ -168,6 +199,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         visitedFixtures: this.inventorySweepFixtures,
         successfullyPricedFixtures: this.inventorySweepSucceeded,
         failedFixtures: this.inventorySweepFailed,
+        fixturesWithNoPriceOutput: this.inventorySweepNoPriceCount,
         fixturesPerMinute: this.inventorySweepStartedAt
           ? Number((this.inventorySweepFixtures / Math.max(1 / 60, (Date.now() - this.inventorySweepStartedAt.getTime()) / 60_000)).toFixed(1))
           : null,
@@ -179,6 +211,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         lastFixtures: this.lastInventorySweepFixtures,
         lastSuccessfullyPricedFixtures: this.lastInventorySweepSucceeded,
         lastFailedFixtures: this.lastInventorySweepFailed,
+        lastFixturesWithNoPriceOutput: this.lastInventorySweepNoPriceCount,
         lastSuccessfulAt: this.lastSuccessfulInventorySweepAt ?? null,
         consecutivePartialFailureSweeps: this.consecutivePartialInventorySweeps,
       },
@@ -202,6 +235,50 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       queueWorkerId: this.workerId,
       dataSource: 'SPORTS_MODULE',
       externalApiCalls: 0,
+    };
+  }
+
+  /**
+   * Schedule a fresh pass over the configured upcoming-fixture window.
+   * This does not run an unbounded HTTP request or bypass the worker's normal
+   * page size, concurrency, background-work limiter, or retry behaviour.
+   */
+  requestInventoryBackfill(): {
+    accepted: boolean;
+    status: 'QUEUED' | 'ALREADY_PENDING' | 'DISABLED';
+    requestedAt: Date | null;
+    lookaheadHours: number;
+  } {
+    if (this.stopping || !ODDS_CONFIG.enabled) {
+      return {
+        accepted: false,
+        status: 'DISABLED',
+        requestedAt: null,
+        lookaheadHours: ODDS_CONFIG.pricingLookaheadHours,
+      };
+    }
+
+    if (this.inventoryBackfillRequested || this.inventoryBackfillInProgress) {
+      return {
+        accepted: false,
+        status: 'ALREADY_PENDING',
+        requestedAt: this.lastInventoryBackfillRequestedAt ?? null,
+        lookaheadHours: ODDS_CONFIG.pricingLookaheadHours,
+      };
+    }
+
+    const requestedAt = new Date();
+    this.inventoryBackfillRequested = true;
+    this.lastInventoryBackfillRequestedAt = requestedAt;
+    // Run immediately when idle. If the worker is busy, its next scheduled
+    // cycle consumes the request after the active page has safely completed.
+    if (!this.busy) void this.runSafely();
+
+    return {
+      accepted: true,
+      status: 'QUEUED',
+      requestedAt,
+      lookaheadHours: ODDS_CONFIG.pricingLookaheadHours,
     };
   }
 
@@ -236,6 +313,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.inventorySweepFixtures = 0;
     this.inventorySweepSucceeded = 0;
     this.inventorySweepFailed = 0;
+    this.inventorySweepNoPriceCount = 0;
   }
 
   private completeInventorySweep(at: Date): void {
@@ -250,6 +328,11 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.lastInventorySweepFixtures = this.inventorySweepFixtures;
     this.lastInventorySweepSucceeded = this.inventorySweepSucceeded;
     this.lastInventorySweepFailed = this.inventorySweepFailed;
+    this.lastInventorySweepNoPriceCount = this.inventorySweepNoPriceCount;
+    if (this.inventoryBackfillInProgress) {
+      this.inventoryBackfillInProgress = false;
+      this.lastInventoryBackfillCompletedAt = at;
+    }
     if (this.inventorySweepFailed > 0) {
       this.consecutivePartialInventorySweeps += 1;
     } else {
@@ -263,6 +346,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.inventorySweepFixtures = 0;
     this.inventorySweepSucceeded = 0;
     this.inventorySweepFailed = 0;
+    this.inventorySweepNoPriceCount = 0;
   }
 
   /** One page per pass; repeated passes cover upcoming fixtures within the seven-day window. */
@@ -271,6 +355,24 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     this.busy = true;
     const startedAt = Date.now();
     this.lastCycleStartedAt = new Date(startedAt);
+
+    if (this.inventoryBackfillRequested) {
+      // Restart from the first keyset page using a new stable time window.
+      // Existing prices are upserted idempotently by OddsService.
+      this.cursor = undefined;
+      this.inventorySweepStartedAt = undefined;
+      this.inventoryWindowFrom = undefined;
+      this.inventoryWindowTo = undefined;
+      this.inventorySweepPages = 0;
+      this.inventorySweepFixtures = 0;
+      this.inventorySweepSucceeded = 0;
+      this.inventorySweepFailed = 0;
+      this.inventorySweepNoPriceCount = 0;
+      this.inventoryBackfillRequested = false;
+      this.inventoryBackfillInProgress = true;
+      this.lastInventoryBackfillStartedAt = new Date(startedAt);
+    }
+
     this.beginInventorySweep(new Date(startedAt));
 
     let releasePermit: (() => void) | undefined;
@@ -313,6 +415,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       this.lastBatchSize = fixtures.length;
       let refreshed = 0;
       let failed = 0;
+      let noPriceCount = 0;
       const successfullyRefreshedFixtures: SportsFixtureRecord[] = [];
       let interrupted = false;
       for (let offset = 0; offset < fixtures.length; offset += ODDS_CONFIG.workerConcurrency) {
@@ -328,17 +431,27 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
             return { fixture, success: false, skipped: true };
           }
           try {
-            await this.oddsService.refreshFixture(fixture.id);
-            return { fixture, success: true, skipped: false };
+            const outcome = await this.refreshFixtureWithOutcome(fixture);
+            if (outcome.status === 'PRICED') {
+              return { fixture, success: true, skipped: false, noPrice: false };
+            }
+            if (outcome.status === 'UNPRICEABLE') {
+              return { fixture, success: false, skipped: true, noPrice: false };
+            }
+            this.logger.warn(
+              `Grivit pricing produced zero price rows for eligible fixture ${fixture.id}; it will be retried on a later inventory sweep.`,
+            );
+            return { fixture, success: false, skipped: false, noPrice: true };
           } catch (error) {
             this.logger.warn(`Grivit pricing failed for fixture ${fixture.id}: ${this.errorMessage(error)}`);
-            return { fixture, success: false, skipped: false };
+            return { fixture, success: false, skipped: false, noPrice: false };
           }
         }));
         const succeeded = outcomes.filter((item) => item.success);
         successfullyRefreshedFixtures.push(...succeeded.map((item) => item.fixture));
         refreshed += succeeded.length;
-        failed += outcomes.filter((item) => !item.success && !item.skipped).length;
+        noPriceCount += outcomes.filter((item) => item.noPrice).length;
+        failed += outcomes.filter((item) => !item.success && !item.skipped && !item.noPrice).length;
       }
 
       // Do not advance the keyset cursor for an interrupted page. The page is
@@ -355,17 +468,20 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
 
       this.inventorySweepPages += 1;
       this.inventorySweepFixtures += fixtures.length;
+      const failedTotal = failed + noPriceCount;
       this.inventorySweepSucceeded += refreshed;
-      this.inventorySweepFailed += failed;
+      this.inventorySweepFailed += failedTotal;
+      this.inventorySweepNoPriceCount += noPriceCount;
       this.cursor = result.nextCursor;
       if (!result.nextCursor) this.completeInventorySweep(new Date());
       this.lastRefreshedCount = refreshed;
-      this.lastFailedCount = failed;
+      this.lastFailedCount = failedTotal;
+      this.lastNoPriceCount = noPriceCount;
       this.cyclesCompleted += 1;
       this.consecutiveCycleFailures = 0;
-      if (failed > 0) {
+      if (failedTotal > 0) {
         this.consecutivePartialFailureCycles += 1;
-        this.lastCycleError = `${failed} fixture calculation(s) failed; the full scan will revisit them.`;
+        this.lastCycleError = `${failedTotal} fixture(s) were not priced (${noPriceCount} returned zero price rows; ${failed} raised calculation errors); the full scan will revisit them.`;
       } else {
         this.consecutivePartialFailureCycles = 0;
         this.lastCycleError = undefined;
@@ -373,13 +489,15 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
       }
 
       this.adminGateway.setModuleOperationalStatus(
-        'odds', failed ? 'DEGRADED' : 'READY',
-        `Grivit pricing batch processed ${fixtures.length} fixtures (${refreshed} successful, ${failed} failed) within the configured upcoming-fixture horizon.`,
+        'odds', failedTotal ? 'DEGRADED' : 'READY',
+        `Grivit pricing batch processed ${fixtures.length} fixtures (${refreshed} priced, ${noPriceCount} returned no prices, ${failed} calculation errors) within the configured upcoming-fixture horizon.`,
       );
       this.adminGateway.publishModuleEvent('odds', 'odds:cycle-completed', {
         fixtureCount: fixtures.length,
         refreshed,
-        failed,
+        failed: failedTotal,
+        calculationErrors: failed,
+        noPriceCount,
         nextPageAvailable: Boolean(result.nextCursor),
         scanScope: 'UPCOMING_NEXT_7_DAYS',
         inventorySweep: this.getMonitorStatus().inventorySweep,
@@ -466,7 +584,22 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
         }
         return;
       }
-      await this.oddsService.refreshFixture(fixtureId);
+      const pricingOutcome = await this.refreshFixtureWithOutcome(fixture);
+      if (pricingOutcome.status === 'NO_PRICE') {
+        throw new RetryableOddsPricingOutputError(fixtureId);
+      }
+      if (pricingOutcome.status === 'UNPRICEABLE') {
+        const completed = await this.queue.markCompleted(job.jobKey, workerId);
+        if (completed) {
+          this.queueJobsCompleted += 1;
+          this.logger.debug(
+            `Completed Grivit pricing job for ${fixtureId}; fixture status ${String(fixture.status?.state ?? 'UNKNOWN')} is not priceable.`,
+          );
+        } else {
+          this.logger.warn(`Odds queue job ${job.jobKey} lost its processing lease before invalid-fixture completion.`);
+        }
+        return;
+      }
       await this.enqueuePredictionRecalculationForFixture(fixtureId);
       const completed = await this.queue.markCompleted(job.jobKey, workerId);
       if (completed) {
@@ -483,6 +616,31 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     } finally {
       clearInterval(heartbeat);
     }
+  }
+
+  /**
+   * A successful method call is not enough: refreshFixture returns the number
+   * of persisted rows, and zero rows on an eligible fixture is missing coverage.
+   */
+  private async refreshFixtureWithOutcome(
+    fixture: SportsFixtureRecord,
+  ): Promise<FixturePricingOutcome> {
+    const priceCount = Number(await this.oddsService.refreshFixture(String(fixture.id)));
+    if (Number.isFinite(priceCount) && priceCount > 0) {
+      return { status: 'PRICED', priceCount };
+    }
+    if (this.isPermanentlyUnpriceableFixture(fixture)) {
+      return { status: 'UNPRICEABLE', priceCount: 0 };
+    }
+    return { status: 'NO_PRICE', priceCount: 0 };
+  }
+
+  /** Only genuinely non-priceable fixture states are acknowledged without retry. */
+  private isPermanentlyUnpriceableFixture(fixture: SportsFixtureRecord): boolean {
+    const state = String(fixture.status?.state ?? 'UNKNOWN').toUpperCase();
+    if (['POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED'].includes(state)) return true;
+    const retentionExpiresAt = this.toDate((fixture as any).retentionExpiresAt);
+    return Boolean(retentionExpiresAt && retentionExpiresAt.getTime() <= Date.now());
   }
 
   private async enqueuePredictionRecalculationForFixture(
@@ -640,6 +798,7 @@ export class OddsWorkerService implements OnModuleInit, OnModuleDestroy {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 
 
 

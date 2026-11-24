@@ -67,8 +67,10 @@ export const YOUTUBE_CONFIG = {
   ] as const,
 
   /**
-   * Four searches per fixture: league/club publisher, one fallback publisher,
-   * then an unrestricted search. Quota pauses never consume an attempt.
+   * Four bounded search stages per fixture. The plan prioritizes the league
+   * and both clubs, uses a broad publisher when a channel slot remains, and
+   * reserves the final stage for unrestricted search. Quota pauses never
+   * consume an attempt.
    */
   searchWorkflow: {
     maximumRequestsPerFixture: 4,
@@ -81,3 +83,4 @@ export const YOUTUBE_CONFIG = {
 } as const;
 
 export type YoutubeConfig = typeof YOUTUBE_CONFIG;
+

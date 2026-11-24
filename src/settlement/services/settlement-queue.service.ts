@@ -119,7 +119,7 @@ export class SettlementQueueService {
     const activeJob = await this.jobModel
       .findOne({
         eventId,
-        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PROCESSING] },
+        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL, SettlementJobStatus.PROCESSING] },
       })
       .sort({ updatedAt: -1 })
       .exec();
@@ -143,9 +143,9 @@ export class SettlementQueueService {
       return { enqueued: false, alreadyExists: true, reason: 'ACTIVE_JOB_STATE_CHANGED' as const, jobKey: activeJob.jobKey };
     }
 
-    if (activeJob && [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY].includes(activeJob.status)) {
+    if (activeJob && [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL].includes(activeJob.status)) {
       const resumed = await this.jobModel.updateOne(
-        { _id: activeJob._id, status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY] } },
+        { _id: activeJob._id, status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL] } },
         {
           $set: {
             status: SettlementJobStatus.QUEUED,
@@ -499,7 +499,7 @@ export class SettlementQueueService {
       .findOneAndUpdate(
         {
           status: {
-            $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY],
+            $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL],
           },
           nextRunAt: { $lte: now },
         },
@@ -548,6 +548,10 @@ export class SettlementQueueService {
               : input.partial
                 ? SettlementJobStatus.PARTIAL
                 : SettlementJobStatus.COMPLETED,
+            // A PARTIAL result is a successful evaluation with incomplete
+            // evidence, not a processing failure. Do not let repeated live
+            // rechecks consume the transient exception retry budget.
+            ...(input.partial ? { attempts: 0 } : {}),
             nextRunAt: new Date(Date.now() + (
               input.skipped
                 ? SETTLEMENT_CONFIG.queue.skippedRecoveryIntervalMs
@@ -818,7 +822,7 @@ export class SettlementQueueService {
     const next = (await this.jobModel
       .findOne({
         status: {
-          $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY],
+          $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL],
         },
       })
       .sort({ nextRunAt: 1 })
@@ -865,6 +869,7 @@ export class SettlementQueueService {
     return 'Unknown settlement error';
   }
 }
+
 
 
 

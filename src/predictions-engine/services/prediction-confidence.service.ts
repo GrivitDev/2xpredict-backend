@@ -7,12 +7,14 @@ import type {
 } from '../interfaces/prediction-match-context.interface';
 
 export interface ConfidenceResult {
-  /** Evidence quality score from 0 to 98; it is not the probability of winning. */
+  /** User-facing model confidence score; it is not the probability of an outcome. */
   confidence: number;
+  /** Raw evidence-derived score before the configured display floor is applied. */
   evidenceConfidence: number;
   dataQuality: number;
   signals: Record<string, number>;
   notes: string[];
+  evidenceLevel: 'PRIOR_ONLY' | 'LIMITED' | 'DEVELOPING' | 'STRONG' | 'MARKET_SPECIFIC';
 }
 
 @Injectable()
@@ -24,6 +26,7 @@ export class PredictionConfidenceService {
     _confidenceSeed = `${context.fixture.eventId}:${context.fixture.homeTeamId}:${context.fixture.awayTeamId}`,
     modelEvidence?: ExpectedGoalsModel,
     marketModel: MarketModel = MarketModel.SCORE_MATRIX,
+    calibrationAssessment?: { active?: boolean; sampleSize?: number; reliabilityScore?: number },
   ): ConfidenceResult {
     const cfg = PREDICTION_ENGINE_CONFIG.model;
     const kickoff = context.fixture.fixtureDate.getTime();
@@ -87,7 +90,7 @@ export class PredictionConfidenceService {
             : 0.15;
     const marketSignal = Math.max(0, Math.min(1, Number.isFinite(marketSpecificDataQuality) ? marketSpecificDataQuality : 0));
 
-    const signals = {
+    const signals: Record<string, number> = {
       history: historySignal,
       leagueSample: leagueSignal,
       odds: oddsSignal,
@@ -137,7 +140,43 @@ export class PredictionConfidenceService {
       + freshnessSignal * weights.freshness
       + marketSignal * weights.market
     ) / confidenceWeightTotal;
-    const confidence = Math.max(0, Math.min(cfg.maximumConfidence, Math.round(cfg.maximumConfidence * weightedEvidence)));
+    const evidenceConfidence = Math.max(0, Math.min(cfg.maximumConfidence, Math.round(cfg.maximumConfidence * weightedEvidence)));
+    const minimumDisplayedConfidence = Math.max(0, Math.min(
+      cfg.maximumConfidence,
+      Number(cfg.minimumDisplayedConfidence ?? 40),
+    ));
+    const rawCalibrationSampleSize = Number(calibrationAssessment?.sampleSize ?? 0);
+    const calibrationSampleSize = Number.isFinite(rawCalibrationSampleSize)
+      ? Math.max(0, rawCalibrationSampleSize)
+      : 0;
+    const calibrationIsUsable = calibrationAssessment?.active === true
+      && calibrationSampleSize >= PREDICTION_ENGINE_CONFIG.calibration.minimumSettledSamples;
+    const rawCalibrationReliability = Number(calibrationAssessment?.reliabilityScore ?? 0);
+    const calibrationReliability = calibrationIsUsable
+      ? Math.max(0, Math.min(1, Number.isFinite(rawCalibrationReliability) ? rawCalibrationReliability / 100 : 0))
+      : 1;
+    const calibrationSupport = calibrationIsUsable
+      ? Math.max(0, Math.min(1, calibrationSampleSize / (calibrationSampleSize + PREDICTION_ENGINE_CONFIG.calibration.minimumSettledSamples)))
+      : 0;
+    const configuredReliabilityPenalty = Number(PREDICTION_ENGINE_CONFIG.calibration.maximumConfidenceReliabilityPenalty ?? 0.15);
+    const maximumReliabilityPenalty = Number.isFinite(configuredReliabilityPenalty)
+      ? Math.max(0, Math.min(0.30, configuredReliabilityPenalty))
+      : 0.15;
+    // A proven calibration problem may reduce displayed confidence by up to
+    // the configured penalty. It can never inflate confidence above the
+    // evidence-derived score. No settled calibration means no adjustment.
+    const reliabilityPenalty = calibrationIsUsable
+      ? maximumReliabilityPenalty * calibrationSupport * (1 - calibrationReliability)
+      : 0;
+    const reliabilityAdjustedConfidence = Math.round(evidenceConfidence * (1 - reliabilityPenalty));
+    // Keep the requested display floor separate from raw evidence and quality.
+    const confidence = Math.max(minimumDisplayedConfidence, reliabilityAdjustedConfidence);
+    const evidenceLevel: ConfidenceResult['evidenceLevel'] = isScoreBasedModel
+      ? modelEvidence?.evidenceLevel ?? 'PRIOR_ONLY'
+      : 'MARKET_SPECIFIC';
+    signals.historicalCalibrationReliability = calibrationIsUsable ? calibrationReliability : 0;
+    signals.historicalCalibrationSupport = calibrationSupport;
+    signals.historicalCalibrationPenalty = reliabilityPenalty;
 
     const qualityWeights = isScoreBasedModel
       ? {
@@ -183,18 +222,26 @@ export class PredictionConfidenceService {
       notes.push('Goal-score history is sparse; this market is assessed primarily using its own relevant historical observations and evidence quality.');
     }
     if (isScoreBasedModel && leagueCount < 30) notes.push(`Limited completed league score sample (${leagueCount}); league-baseline uncertainty is higher.`);
-    if (!hasUsableMatchOdds) notes.push('No fresh provider quote was available for this market; bookmaker value cannot be established from this market result.');
-    if (!context.summaryAvailable) notes.push('The current normalized Sports match projection is unavailable; markets without an independent historical data path remain unavailable.');
+    if (!hasUsableMatchOdds) notes.push('No independent provider market quote was available. Internally generated Grivit prices are not counted as independent evidence because they are derived from the same pricing model.');
+    if (!context.summaryAvailable) notes.push('The normalized Sports match projection is unavailable; this forecast relies more heavily on the remaining historical inputs and configured priors.');
     if (context.sportsDataAgeHours === null) notes.push('Normalized Sports fixture freshness is unknown; no freshness bonus was assumed.');
     else if (context.sportsDataAgeHours > cfg.sourceDataStaleHours) notes.push('Normalized Sports fixture data is older than the configured freshness window.');
     if (isScoreBasedModel && !standingsSignal) notes.push('Usable points-per-game standings strength was not matched for both target teams.');
     if (requiresPlayerEvidence && !context.hasPlayerAppearanceEvidence) {
       notes.push('Validated pre-match player appearance rates are unavailable from the current Sports read contract; player-specific probabilities remain withheld.');
     }
-    if (isScoreBasedModel && modelEvidence?.evidenceLevel === 'INSUFFICIENT') {
-      notes.push('Independent core statistical evidence was insufficient. Score-based predictions are withheld; Odds-module quotes remain separate price information and are not substituted for model probabilities.');
+    if (isScoreBasedModel && evidenceLevel === 'PRIOR_ONLY') {
+      notes.push('PRIOR_ONLY evidence: no independent team or competition results were available. The model still produces a baseline; the displayed confidence floor does not increase evidenceConfidence or dataQuality.');
+    } else if (isScoreBasedModel && evidenceLevel === 'LIMITED') {
+      notes.push('LIMITED evidence: only a small number of independent observations support this forecast. The prediction is still calculated and will be updated as new Sports data arrives.');
+    } else if (isScoreBasedModel && evidenceLevel === 'DEVELOPING') {
+      notes.push('DEVELOPING evidence: early team or competition observations are available, but the evidence base is not yet mature.');
+    }
+    if (calibrationIsUsable) {
+      notes.push(`Historical outcome calibration used ${calibrationSampleSize} settled selections with reliability ${Math.round(calibrationReliability * 100)}/100; displayed confidence was conservatively adjusted by ${(reliabilityPenalty * 100).toFixed(1)}%.`);
     }
 
-    return { confidence, evidenceConfidence: confidence, dataQuality, signals, notes };
+    return { confidence, evidenceConfidence, dataQuality, signals, notes, evidenceLevel };
   }
 }
+

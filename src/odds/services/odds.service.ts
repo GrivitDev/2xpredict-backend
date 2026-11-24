@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
@@ -14,6 +14,7 @@ import {
   toValidDate,
 } from '../config/odds.config';
 import { FixtureOdds } from '../schemas/fixture-odds.schema';
+import { FixtureOddsHistory } from '../schemas/fixture-odds-history.schema';
 import { SportsDomainReadService } from '../../sports/services/sports-domain-read.service';
 import { SportsDataChangeEventService } from '../../sports/services/sports-data-change-event.service';
 import { SportsReadinessService } from '../../sports/services/sports-readiness.service';
@@ -23,6 +24,7 @@ import type {
   SportsOddsOutcome,
 } from '../../sports/interfaces/sports-domain.interface';
 import type { SportsMatchReadModel } from '../../sports/interfaces/sports-read.interface';
+import type { SportsFixtureReadiness } from '../../sports/interfaces/sports-readiness.interface';
 import { OddsPricingEngineService } from './odds-pricing-engine.service';
 import type { OddsPricingContext } from './odds-pricing-engine.service';
 
@@ -77,6 +79,9 @@ export interface OddsQuoteSnapshot {
   fixtureSourceRevision?: number;
   sourceDataUpdatedAt?: Date;
   calculationVersion?: string;
+  pricingStatus?: 'CURRENT' | 'STALE';
+  staleReason?: string;
+  staleAt?: Date;
   oddsCapturedAt: Date | null;
   oddsFreshUntil: Date | null;
   isFresh: boolean;
@@ -108,6 +113,8 @@ const PREDICTION_READINESS_LOOKUP_BATCH_SIZE = 100;
 
 @Injectable()
 export class OddsService {
+  private readonly logger = new Logger(OddsService.name);
+
   constructor(
     @InjectModel(FixtureOdds.name)
     private readonly oddsModel: Model<FixtureOdds>,
@@ -115,7 +122,62 @@ export class OddsService {
     private readonly sportsRevisions: SportsDataChangeEventService,
     private readonly sportsReadiness: SportsReadinessService,
     private readonly pricingEngine: OddsPricingEngineService,
+    @InjectModel(FixtureOddsHistory.name)
+    private readonly oddsHistoryModel?: Model<FixtureOddsHistory>,
   ) {}
+
+  /** Minimal readiness contract used only to price a valid fixture from priors. */
+  private createBaselineReadiness(fixture: SportsMatchReadModel['fixture']): SportsFixtureReadiness {
+    const fixtureEligible = !['POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED'].includes(
+      String(fixture.status?.state ?? '').toUpperCase(),
+    );
+    const unavailableMeasure = {
+      state: 'MISSING',
+      ready: false,
+      sampleSize: 0,
+      minimumSampleSize: 0,
+      quality: 0,
+      minimumQuality: 1,
+      reason: 'Sports team-specific evidence is not currently available; baseline pricing uses regularized football priors.',
+    } as any;
+    return {
+      fixtureId: String(fixture.id),
+      competitionId: String(fixture.competitionId),
+      ...(fixture.seasonId ? { seasonId: String(fixture.seasonId) } : {}),
+      checkedAt: new Date(),
+      fixtureEligible,
+      scoreMatrix: { ...unavailableMeasure, homeSampleSize: 0, awaySampleSize: 0 },
+      periodMatrix: { ...unavailableMeasure, homeSampleSize: 0, awaySampleSize: 0 },
+      goalOrderMarkets: { ...unavailableMeasure },
+      teamStatistics: {},
+      timeline: { ...unavailableMeasure, coverageRate: 0, minimumCoverageRate: 1 },
+      eventMarkets: {
+        redCard: { ...unavailableMeasure },
+        penaltyAwarded: { ...unavailableMeasure },
+        ownGoal: { ...unavailableMeasure },
+      },
+      playerMarkets: {
+        state: 'UNSUPPORTED', ready: false, sampleSize: 0, minimumSampleSize: 0,
+        quality: null, minimumQuality: 1, pricingSupported: false,
+        reason: 'Player pricing requires validated player availability and appearance evidence.',
+      },
+      sourceComputedAt: {
+        homeScoring: null, awayScoring: null, homeAway: null, awayAway: null,
+        competitionScoring: null, homeStatistics: null, awayStatistics: null, headToHead: null,
+      },
+    } as unknown as SportsFixtureReadiness;
+  }
+
+  /** Read one optional evidence source without blocking the baseline model. */
+  private async readOptional<T>(label: string, read: () => Promise<T>): Promise<T | null> {
+    try {
+      return await read();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Odds evidence source '${label}' was unavailable; the pricing model will use its remaining inputs: ${message}`);
+      return null;
+    }
+  }
 
   /**
    * Re-price one canonical Sports fixture. All factual inputs are read from
@@ -129,7 +191,14 @@ export class OddsService {
     // newer revision than the facts it actually consumed.
     const fixtureSourceRevision = await this.sportsRevisions.getCurrentRevision('FIXTURE', id);
     const match = await this.sportsRead.getMatch(id);
-    if (!match) return 0;
+    if (!match) {
+      await this.markFixturePricesStale(
+        id,
+        fixtureSourceRevision,
+        'FIXTURE_SNAPSHOT_UNAVAILABLE',
+      );
+      return 0;
+    }
 
     const fixture = match.fixture;
     const retentionExpiresAt = toValidDate((fixture as any).retentionExpiresAt);
@@ -141,8 +210,8 @@ export class OddsService {
 
     // Upcoming, live and completed fixtures are all priced. Only fixtures
     // that cannot produce a valid sporting result remain unpriced.
-    const isUnavailable = ['POSTPONED', 'CANCELLED', 'ABANDONED'].includes(
-      fixture.status.state,
+    const isUnavailable = ['POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED'].includes(
+      String(fixture.status?.state ?? '').toUpperCase(),
     );
     if (isUnavailable) {
       await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
@@ -153,8 +222,16 @@ export class OddsService {
     const home = fixture.competitors.find((item) => item.homeAway === 'HOME');
     const away = fixture.competitors.find((item) => item.homeAway === 'AWAY');
     if (!home || !away) {
+      // A temporarily incomplete fixture payload is not evidence that previous
+      // prices should be destroyed. Retain them as explicitly stale so consumers
+      // cannot mistake the previous quote generation for a current calculation.
       await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
-      await this.removeFixturePrices(fixture.id, fixtureSourceRevision);
+      await this.markFixturePricesStale(
+        fixture.id,
+        fixtureSourceRevision,
+        'FIXTURE_TEAMS_UNAVAILABLE',
+      );
+      this.logger.warn(`Fixture ${fixture.id} is missing a home or away participant; previous Grivit prices were retained as stale for retry.`);
       return 0;
     }
 
@@ -163,76 +240,64 @@ export class OddsService {
     // Keep a fixture pricing pass to at most two concurrent Sports reads.
     // These reads are independent, but launching all ten together creates a
     // short-lived MongoDB connection/query burst on the production instance.
+    // Each supporting Sports projection is optional. A delayed/missing team
+    // statistics or timeline read must not prevent the mandatory 1X2 baseline
+    // from being calculated using the remaining sources and configured priors.
     const [homeScoring, awayScoring] = hasSeason
       ? await Promise.all([
-          this.sportsRead.getTeamScoringRecord(
-            home.teamId,
-            fixture.competitionId,
-            seasonId!,
-            'HOME',
-          ),
-          this.sportsRead.getTeamScoringRecord(
-            away.teamId,
-            fixture.competitionId,
-            seasonId!,
-            'AWAY',
-          ),
+          this.readOptional('home scoring', () => this.sportsRead.getTeamScoringRecord(
+            home.teamId, fixture.competitionId, seasonId!, 'HOME',
+          )),
+          this.readOptional('away scoring', () => this.sportsRead.getTeamScoringRecord(
+            away.teamId, fixture.competitionId, seasonId!, 'AWAY',
+          )),
         ])
       : [null, null];
 
     const [homeAwayRecord, awayAwayRecord] = hasSeason
       ? await Promise.all([
-          this.sportsRead.getTeamHomeAwayRecord(
-            home.teamId,
-            fixture.competitionId,
-            seasonId!,
-          ),
-          this.sportsRead.getTeamHomeAwayRecord(
-            away.teamId,
-            fixture.competitionId,
-            seasonId!,
-          ),
+          this.readOptional('home/away record', () => this.sportsRead.getTeamHomeAwayRecord(
+            home.teamId, fixture.competitionId, seasonId!,
+          )),
+          this.readOptional('away/home record', () => this.sportsRead.getTeamHomeAwayRecord(
+            away.teamId, fixture.competitionId, seasonId!,
+          )),
         ])
       : [null, null];
 
     const competitionScoring = hasSeason
-      ? await this.sportsRead.getCompetitionScoringTotals(
-          fixture.competitionId,
-          seasonId!,
-        )
+      ? await this.readOptional('competition scoring', () => this.sportsRead.getCompetitionScoringTotals(
+          fixture.competitionId, seasonId!,
+        ))
       : null;
 
     const [homeStatistics, awayStatistics] = hasSeason
       ? await Promise.all([
-          this.sportsRead.getTeamStatisticsAggregate(
-            home.teamId,
-            fixture.competitionId,
-            seasonId!,
-            'HOME',
-          ),
-          this.sportsRead.getTeamStatisticsAggregate(
-            away.teamId,
-            fixture.competitionId,
-            seasonId!,
-            'AWAY',
-          ),
+          this.readOptional('home team statistics', () => this.sportsRead.getTeamStatisticsAggregate(
+            home.teamId, fixture.competitionId, seasonId!, 'HOME',
+          )),
+          this.readOptional('away team statistics', () => this.sportsRead.getTeamStatisticsAggregate(
+            away.teamId, fixture.competitionId, seasonId!, 'AWAY',
+          )),
         ])
       : [null, null];
 
     const [homeTeamData, awayTeamData] = await Promise.all([
-      this.sportsRead.getTeamData(home.teamId, 40, fixture.competitionId, seasonId),
-      this.sportsRead.getTeamData(away.teamId, 40, fixture.competitionId, seasonId),
+      this.readOptional('home team form', () => this.sportsRead.getTeamData(
+        home.teamId, 40, fixture.competitionId, seasonId,
+      )),
+      this.readOptional('away team form', () => this.sportsRead.getTeamData(
+        away.teamId, 40, fixture.competitionId, seasonId,
+      )),
     ]);
-    const headToHead = await this.sportsRead.getHeadToHead(
-      home.teamId,
-      away.teamId,
-      fixture.competitionId,
-    );
+    const headToHead = await this.readOptional('head-to-head history', () => this.sportsRead.getHeadToHead(
+      home.teamId, away.teamId, fixture.competitionId,
+    ));
 
     // Evaluate coverage using the exact Sports records already loaded for this
     // pricing pass. This avoids a second set of reads and keeps readiness and
     // the actual Grivit calculation on the same source snapshot.
-    const readiness = await this.sportsReadiness.getFixtureReadiness(id, {
+    const evaluatedReadiness = await this.readOptional('fixture readiness', () => this.sportsReadiness.getFixtureReadiness(id, {
       match,
       homeScoring,
       awayScoring,
@@ -244,10 +309,11 @@ export class OddsService {
       homeTeamData,
       awayTeamData,
       headToHead,
-    });
-    if (!readiness) {
-      throw new Error(`Sports readiness could not be evaluated for fixture ${id}.`);
-    }
+    }));
+    // A fixture with real home/away participants can still receive a generic
+    // baseline if Sports cannot form team-specific readiness (for example, a
+    // newly ingested fixture before both team IDs are fully normalized).
+    const readiness = evaluatedReadiness ?? this.createBaselineReadiness(fixture);
 
     // Sports owns every reusable football projection. Odds consumes those
     // projections as-is and does not reconstruct missing facts locally.
@@ -303,8 +369,16 @@ export class OddsService {
     // more simultaneous database operations to the same pricing pass.
     const models = this.pricingEngine.calculate(context);
     if (!models.length) {
+      // A temporarily incomplete recalculation is not permission to erase the
+      // last valid prices. Keep the prior rows, but mark them stale until a
+      // complete replacement is successfully persisted.
       await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
-      await this.removeFixturePrices(fixture.id, fixtureSourceRevision);
+      await this.markFixturePricesStale(
+        fixture.id,
+        fixtureSourceRevision,
+        'NO_MODELS_PRODUCED',
+      );
+      this.logger.warn(`No Grivit models were produced for eligible fixture ${fixture.id}; previous prices were retained as stale for retry.`);
       return 0;
     }
 
@@ -313,7 +387,7 @@ export class OddsService {
     // failed; equal existing/current counts alone would incorrectly treat that
     // partial snapshot as complete on retry.
     const expectedDocumentCount = models.filter((model) => {
-      const decimalOdds = model.fairOdds / (1 + ODDS_CONFIG.grivitOverroundPercent / 100);
+      const decimalOdds = Math.max(1.01, model.fairOdds / (1 + ODDS_CONFIG.grivitOverroundPercent / 100));
       return Number.isFinite(decimalOdds)
         && decimalOdds >= 1.01
         && decimalOdds <= ODDS_CONFIG.maximumDecimalOdds
@@ -358,7 +432,7 @@ export class OddsService {
 
     const now = new Date();
     const documents = models.flatMap((model) => {
-      const decimalOdds = model.fairOdds / (1 + ODDS_CONFIG.grivitOverroundPercent / 100);
+      const decimalOdds = Math.max(1.01, model.fairOdds / (1 + ODDS_CONFIG.grivitOverroundPercent / 100));
       if (
         !Number.isFinite(decimalOdds) ||
         decimalOdds < 1.01 ||
@@ -394,8 +468,8 @@ export class OddsService {
         bookmaker: 'Grivit',
         pricingSource: 'GRIVIT_MODEL' as const,
         fairOdds: model.fairOdds,
-        fairOddsBasis: 'MODEL' as const,
-        oddsBasis: 'HISTORICAL_ONLY' as const,
+        fairOddsBasis: model.oddsBasis === 'PRIOR_ONLY' ? 'PRIOR' as const : 'MODEL' as const,
+        oddsBasis: model.oddsBasis,
         oddsCalculationMethod: model.calculationMethod,
         marketFairOdds: externalConsensusFairOdds,
         externalBookmakerCount,
@@ -425,38 +499,37 @@ export class OddsService {
     });
 
     if (!documents.length) {
+      // Do not clear the previous valid price set when this pass cannot produce
+      // a complete replacement. Mark it stale and let the durable Odds job retry.
       await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
-      await this.removeFixturePrices(fixture.id, fixtureSourceRevision);
+      await this.markFixturePricesStale(
+        fixture.id,
+        fixtureSourceRevision,
+        'NO_VALID_PRICES_PRODUCED',
+      );
+      this.logger.warn(`No valid Grivit price documents were produced for eligible fixture ${fixture.id}; previous prices were retained as stale for retry.`);
       return 0;
     }
 
     // If Sports changed while this price set was being calculated, leave the
-    // prior rows untouched and retry the durable pricing job against the new
-    // source snapshot instead of persisting a stale calculation.
+    // prior rows untouched and retry against the new source snapshot.
     await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
 
+    // Capture only quote versions that this valid output is about to replace.
+    // The history write is idempotent and happens before the current-row upsert,
+    // so a failed later batch cannot destroy the last good calculation.
+    await this.archiveSupersededPriceRows(fixture.id, documents);
+    await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
     await this.writePriceDocuments(documents);
-
-    const currentKeys = documents.map((document) => ({
-      marketId: document.marketId,
-      selectionKey: document.selectionKey,
-      ...(document.line !== undefined
-        ? { line: document.line }
-        : { $or: [{ line: { $exists: false } }, { line: null }] }),
-    }));
-    // A source update may commit immediately after the pre-write check. Only
-    // clean up obsolete rows at this calculation's revision; never let an
-    // older pricing pass delete rows already written for a newer revision.
+    // Detect a Sports update that committed while the batched write was running.
+    // The stored revision makes those rows visibly stale and the durable queue
+    // retries against the newer source generation.
     await this.assertFixtureSourceRevisionUnchanged(fixture.id, fixtureSourceRevision);
-    await this.oddsModel
-      .deleteMany({
-        eventId: fixture.id,
-        $and: [
-          { $nor: currentKeys },
-          this.fixtureSourceRevisionAtMostFilter(fixtureSourceRevision),
-        ],
-      })
-      .exec();
+
+    // Intentionally retain old selections that this pass could not price. They
+    // remain tagged with their old source revision, so freshness checks will not
+    // treat them as current evidence. A later valid calculation can replace and
+    // archive them. This prevents partial source data from deleting good prices.
     return documents.length;
   }
 
@@ -477,10 +550,17 @@ export class OddsService {
                 : { $or: [{ line: { $exists: false } }, { line: null }] }),
             },
             update: {
-              $set: Object.fromEntries(
-                Object.entries(document).filter(([field]) => field !== '$unset'),
-              ),
-              $unset: document.$unset,
+              $set: {
+                ...Object.fromEntries(
+                  Object.entries(document).filter(([field]) => field !== '$unset'),
+                ),
+                pricingStatus: 'CURRENT',
+              },
+              $unset: {
+                ...(document.$unset ?? {}),
+                staleReason: 1,
+                staleAt: 1,
+              },
             },
             upsert: true,
           },
@@ -590,6 +670,9 @@ export class OddsService {
           decimalOdds: 1,
           predictionReady: 1,
           calculationVersion: 1,
+          pricingStatus: 1,
+          staleReason: 1,
+          staleAt: 1,
           priceType: 1,
           provider: 1,
           bookmaker: 1,
@@ -640,13 +723,17 @@ export class OddsService {
         byEvent.set(key, pricedRows);
 
         const currentFixtureRevision = hasCurrentFixtureRevision(row);
-        if (!currentFixtureRevision) {
+        const explicitlyStale = String(row.pricingStatus ?? 'CURRENT').toUpperCase() === 'STALE';
+        if (!currentFixtureRevision || explicitlyStale) {
           staleByEvent.set(key, (staleByEvent.get(key) ?? 0) + 1);
         }
 
-        // This reproduces the former candidate query predicates and validation:
-        // active model row, current calculation version, current fixture revision,
-        // valid decimal odds, and a sufficiently supported Grivit estimate.
+        // A stale quote remains part of the stored inventory, but it cannot be
+        // consumed as a current price or satisfy baseline readiness.
+        if (explicitlyStale) continue;
+
+        // Baseline 1X2 rows may be prior-only; advanced markets still need their
+        // market-specific sample and data-quality thresholds to count as ready.
         if (
           row.predictionReady !== true
           || row.calculationVersion !== ODDS_CONFIG.modelVersion
@@ -668,6 +755,9 @@ export class OddsService {
         // fixture prediction-ready.
         if (row.priceType === 'PROVIDER') continue;
 
+        const isBaselineResultSelection = row.marketId === 'MATCH_RESULT'
+          && ['HOME_WIN', 'DRAW', 'AWAY_WIN'].includes(String(row.selectionKey));
+        const hasValidProvenance = row.oddsBasis === 'PRIOR_ONLY' || row.oddsBasis === 'HISTORICAL_ONLY';
         if (
           row.priceType !== 'ESTIMATED'
           || row.bookmaker !== 'Grivit'
@@ -679,8 +769,11 @@ export class OddsService {
           || !Number.isFinite(Number(row.fairProbability))
           || Number(row.fairProbability) <= 0
           || Number(row.fairProbability) >= 1
-          || !(Number(row.dataQuality) >= ODDS_CONFIG.minimumPredictionDataQuality)
-          || !(Number(row.sampleSize) >= ODDS_CONFIG.minimumHistoricalSampleSize)
+          || !hasValidProvenance
+          || (!isBaselineResultSelection && (
+            !(Number(row.dataQuality) >= ODDS_CONFIG.minimumPredictionDataQuality)
+            || !(Number(row.sampleSize) >= ODDS_CONFIG.minimumHistoricalSampleSize)
+          ))
         ) {
           continue;
         }
@@ -694,6 +787,13 @@ export class OddsService {
         const priced = byEvent.get(id) ?? [];
         const staleSelections = staleByEvent.get(id) ?? 0;
         const ready = readyByEvent.get(id) ?? [];
+        const baselineSelections = new Set(
+          ready
+            .filter((row) => row.marketId === 'MATCH_RESULT')
+            .map((row) => String(row.selectionKey)),
+        );
+        const baselineComplete = ['HOME_WIN', 'DRAW', 'AWAY_WIN']
+          .every((selectionKey) => baselineSelections.has(selectionKey));
         const providerCount = ready.filter(
           (row) => row.bookmaker === 'Grivit' && row.pricingSource === 'GRIVIT_MODEL',
         ).length;
@@ -721,7 +821,7 @@ export class OddsService {
 
         result.set(id, {
           eventId: id,
-          ready: ready.length > 0,
+          ready: baselineComplete,
           expectedSelections: priced.length,
           pricedSelections: priced.length,
           missingSelections: Math.max(0, priced.length - ready.length),
@@ -734,7 +834,7 @@ export class OddsService {
           bookmakerInformedEstimates: 0,
           historicalEstimates: estimates,
           externalValidatedSelections: ready.filter((row) => Number(row.externalBookmakerCount ?? 0) > 0).length,
-          priorOnlySelections: 0,
+          priorOnlySelections: priced.filter((row) => row.oddsBasis === 'PRIOR_ONLY').length,
           marketCount: grouped.size,
           marketReadiness: [...grouped.entries()].map(
             ([marketId, selections]) => ({
@@ -742,13 +842,13 @@ export class OddsService {
               readySelections: selections,
             }),
           ),
-          reason: ready.length
+          reason: baselineComplete
             ? null
             : staleSelections > 0
               ? 'Grivit prices are based on an older Sports fixture revision and are awaiting recalculation.'
               : priced.length
-                ? 'Grivit prices exist, but none passed the current market-specific sample and data-quality requirements.'
-                : 'No market currently has sufficient Sports historical data for a Grivit price.',
+                ? `Grivit has ${baselineSelections.size}/3 current Match Result baseline selections; remaining 1X2 prices are awaiting recalculation.`
+                : 'No Grivit prices are currently stored for this fixture; the baseline pricing worker will retry.',
         });
       }
     }
@@ -767,8 +867,173 @@ export class OddsService {
         this.fixtureSourceRevisionAtMostFilter(Number(maximumFixtureSourceRevision)),
       ];
     }
+    const rows = await this.oddsModel.find(filter).lean().exec() as PlainRecord[];
+    if (rows.length) await this.archivePriceRows(rows);
     const result = await this.oddsModel.deleteMany(filter).exec();
     return result.deletedCount ?? 0;
+  }
+
+  /** Store the previous quote generation before a replacement is persisted. */
+  private async archiveSupersededPriceRows(
+    eventId: string,
+    incomingDocuments: PlainRecord[],
+  ): Promise<void> {
+    if (!incomingDocuments.length) return;
+    const existingRows = await this.oddsModel
+      .find({ eventId })
+      .lean()
+      .exec() as PlainRecord[];
+    if (!existingRows.length) return;
+
+    const incomingByKey = new Map(
+      incomingDocuments.map((row) => [
+        this.priceKey(row.marketId, row.selectionKey, typeof row.line === 'number' ? row.line : undefined),
+        row,
+      ]),
+    );
+    const superseded = existingRows.filter((existing) => {
+      if (existing.priceType !== 'ESTIMATED' || existing.pricingSource !== 'GRIVIT_MODEL') {
+        return false;
+      }
+      const incoming = incomingByKey.get(this.priceKey(
+        clean(existing.marketId),
+        clean(existing.selectionKey),
+        typeof existing.line === 'number' ? existing.line : undefined,
+      ));
+      const generationChanged =
+        clean(existing.sourceDataHash) !== clean(incomingDocuments[0].sourceDataHash)
+        || clean(existing.calculationVersion) !== clean(incomingDocuments[0].calculationVersion)
+        || Number(existing.fixtureSourceRevision ?? 0) !== Number(incomingDocuments[0].fixtureSourceRevision ?? 0)
+        || Number(existing.sourceRevision ?? 0) !== Number(incomingDocuments[0].sourceRevision ?? 0);
+      if (generationChanged) return true;
+      if (!incoming) return true;
+      const sameOptionalNumber = (left: unknown, right: unknown): boolean =>
+        (left === null || left === undefined) && (right === null || right === undefined)
+          ? true
+          : left !== null && left !== undefined
+            && right !== null && right !== undefined
+            && Number(left) === Number(right);
+      return !(
+        sameOptionalNumber(existing.decimalOdds, incoming.decimalOdds)
+        && sameOptionalNumber(existing.fairOdds, incoming.fairOdds)
+        && sameOptionalNumber(existing.fairProbability, incoming.fairProbability)
+      );
+    });
+    if (superseded.length) await this.archivePriceRows(superseded);
+
+    const missingMarkets = existingRows.filter((existing) =>
+      existing.priceType === 'ESTIMATED'
+      && existing.pricingSource === 'GRIVIT_MODEL'
+      && !incomingByKey.has(this.priceKey(
+        clean(existing.marketId),
+        clean(existing.selectionKey),
+        typeof existing.line === 'number' ? existing.line : undefined,
+      )),
+    );
+    const missingIds = missingMarkets
+      .map((row) => row._id)
+      .filter((value) => value !== undefined && value !== null);
+    if (missingIds.length) {
+      await this.oddsModel.updateMany(
+        { _id: { $in: missingIds }, pricingSource: 'GRIVIT_MODEL' },
+        {
+          $set: {
+            pricingStatus: 'STALE',
+            predictionReady: false,
+            staleReason: 'MARKET_NOT_REPRODUCED',
+            staleAt: new Date(),
+          },
+        },
+      ).exec();
+    }
+  }
+
+  /** Explicitly stale retained prices when a replacement calculation is incomplete. */
+  private async markFixturePricesStale(
+    fixtureId: string,
+    maximumFixtureSourceRevision: number,
+    reason: 'FIXTURE_SNAPSHOT_UNAVAILABLE'
+      | 'FIXTURE_TEAMS_UNAVAILABLE'
+      | 'NO_MODELS_PRODUCED'
+      | 'NO_VALID_PRICES_PRODUCED'
+      | 'MARKET_NOT_REPRODUCED',
+  ): Promise<number> {
+    const eventId = clean(fixtureId);
+    if (!eventId) return 0;
+    const filter: PlainRecord = {
+      eventId,
+      pricingSource: 'GRIVIT_MODEL',
+      $or: [
+        { pricingStatus: { $ne: 'STALE' } },
+        { predictionReady: true },
+        { staleReason: { $ne: reason } },
+      ],
+    };
+    if (
+      Number.isSafeInteger(maximumFixtureSourceRevision)
+      && maximumFixtureSourceRevision >= 0
+    ) {
+      filter.$and = [
+        this.fixtureSourceRevisionAtMostFilter(maximumFixtureSourceRevision),
+      ];
+    }
+    const result = await this.oddsModel.updateMany(
+      filter,
+      {
+        $set: {
+          pricingStatus: 'STALE',
+          predictionReady: false,
+          staleReason: reason,
+          staleAt: new Date(),
+        },
+      },
+    ).exec() as PlainRecord;
+    return Number(result.modifiedCount ?? result.nModified ?? 0);
+  }
+
+  /** Idempotent archive write; a retry cannot duplicate the same old quote. */
+  private async archivePriceRows(rows: PlainRecord[]): Promise<void> {
+    if (!rows.length || !this.oddsHistoryModel) return;
+    const archivedAt = new Date();
+    const operations = rows.map((row) => {
+      const updatedAt = toValidDate(row.updatedAt);
+      const sourceUpdatedAt = toValidDate(row.sourceDataUpdatedAt);
+      const calculatedAt = updatedAt ?? sourceUpdatedAt ?? toValidDate(row.createdAt) ?? archivedAt;
+      const snapshotIdentity = [
+        String(row._id ?? ''),
+        clean(row.eventId),
+        clean(row.marketId),
+        clean(row.selectionKey),
+        typeof row.line === 'number' ? String(row.line) : '-',
+        calculatedAt.toISOString(),
+        clean(row.sourceDataHash),
+        clean(row.calculationVersion),
+        String(row.fixtureSourceRevision ?? 0),
+        JSON.stringify(row),
+      ].join('\n');
+      const snapshotId = createHash('sha256').update(snapshotIdentity).digest('hex');
+      const expiresAt = toValidDate(row.expiresAt);
+      return {
+        updateOne: {
+          filter: { snapshotId },
+          update: {
+            $setOnInsert: {
+              snapshotId,
+              eventId: clean(row.eventId),
+              marketId: clean(row.marketId),
+              selectionKey: clean(row.selectionKey),
+              ...(typeof row.line === 'number' ? { line: row.line } : {}),
+              calculatedAt,
+              archivedAt,
+              ...(expiresAt ? { expiresAt } : {}),
+              snapshot: row,
+            },
+          },
+          upsert: true,
+        },
+      };
+    });
+    await this.oddsHistoryModel.bulkWrite(operations as any, { ordered: false });
   }
 
   /** Match rows at or behind a source revision, including legacy unversioned quotes. */
@@ -1640,7 +1905,9 @@ export class OddsService {
       && Number.isSafeInteger(Number(storedFixtureRevision))
       && Number(storedFixtureRevision) === currentFixtureRevision;
     const isFresh =
-      row.priceType === 'PROVIDER'
+      String(row.pricingStatus ?? 'CURRENT').toUpperCase() === 'STALE'
+        ? false
+        : row.priceType === 'PROVIDER'
         ? false
         : row.priceType === 'ESTIMATED'
           ? row.bookmaker === 'Grivit' &&

@@ -17,9 +17,11 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
   },
   YOUTUBE: {
     enabled: true,
-    // Shared MongoDB quota reservation hard-stops search.list at 90/day,
-    // leaving headroom below the requested absolute ceiling of 95.
+    // Google currently grants 100 search.list calls per quota day by default.
+    // Keep an internal ceiling of 90 to preserve a safety margin.
     dailyRequestLimit: 90,
+    // YouTube resets daily quota at midnight Pacific Time, not Nigeria time.
+    dailyQuotaTimeZone: 'America/Los_Angeles',
     rateLimit: {
       minIntervalSeconds: 200,
     },
@@ -27,3 +29,4 @@ export const SPORTS_DATA_COLLECTION_CONFIG = {
 } as const;
 
 export type SportsDataCollectionConfig = typeof SPORTS_DATA_COLLECTION_CONFIG;
+

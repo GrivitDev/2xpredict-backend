@@ -305,6 +305,9 @@ describe('SportsQueueJobProcessorService post-match lifecycle', () => {
       getCompetition: jest.fn().mockResolvedValue(competition),
       getFixturesForCompetitionDate: jest.fn().mockResolvedValue([match]),
     };
+    service.queue = {
+      enqueueIfMissing: jest.fn().mockResolvedValue({ created: true }),
+    };
     service.youtubeHighlights = {
       ensureFirstAttempt: jest.fn().mockResolvedValue(undefined),
     };

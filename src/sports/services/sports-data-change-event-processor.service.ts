@@ -1,4 +1,5 @@
 import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 
@@ -11,14 +12,27 @@ import { SportsSeason } from '../schemas/domain/season.schema';
 import { SportsQueueJobType } from '../interfaces/sports-queue.interface';
 import { SportsQueueService } from './sports-queue.service';
 import { ODDS_CONFIG } from '../../odds/config/odds.config';
+import { PREDICTION_ENGINE_CONFIG } from '../../predictions-engine/config/prediction-engine.config';
 
 type FixtureIdRow = { id: string };
+type PredictionFixtureRow = {
+  id: string;
+  kickoffAt?: Date | string;
+  status?: { state?: string; isFinal?: boolean };
+  competitors?: Array<{ homeAway?: string; teamId?: string }>;
+};
+
+const TERMINAL_PREDICTION_FIXTURE_STATES = new Set([
+  'COMPLETED', 'POSTPONED', 'CANCELLED', 'CANCELED', 'ABANDONED',
+  'LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES', 'IN_PROGRESS', 'INPLAY',
+  'IN_PLAY', 'PLAYING', 'SUSPENDED', 'INTERRUPTED',
+]);
 
 /**
  * Drains the durable Sports source-data outbox and fans relevant changes into
- * Settlement, Sports derived projections and Grivit pricing. Prediction Engine
- * is deliberately not called here: the Odds worker releases a durable
- * prediction-recalculation job only after the affected Grivit prices are ready.
+ * Settlement, Sports derived projections, Grivit pricing and Prediction Engine.
+ * Odds and Prediction receive independent durable jobs from the same source event;
+ * neither consumer waits for the other to succeed or become ready.
  */
 @Injectable()
 export class SportsDataChangeEventProcessorService {
@@ -27,6 +41,7 @@ export class SportsDataChangeEventProcessorService {
   );
   private readonly fixturePageSize = 100;
   private readonly oddsEnqueueConcurrency = 2;
+  private readonly predictionEnqueueConcurrency = 2;
 
   constructor(
     private readonly changeEvents: SportsDataChangeEventService,
@@ -106,8 +121,12 @@ export class SportsDataChangeEventProcessorService {
       ...(event.entity === 'FIXTURE' ? [event.entityId] : []),
     ]);
 
+    const downstreamJobs: Array<Promise<unknown>> = [];
+
     // A pre-match fixture update is a Prediction/Odds input change, not a
     // settlement trigger. Keep Settlement restricted to live and final facts.
+    // Settlement and projection handoffs are isolated as well: one downstream
+    // outage must not prevent either pricing or baseline prediction refresh.
     if (
       [
         'FIXTURE',
@@ -117,24 +136,42 @@ export class SportsDataChangeEventProcessorService {
       ].includes(event.entity) &&
       fixtureIds.length > 0
     ) {
-      const settleableIds = await this.getSettleableFixtureIds(fixtureIds);
-      if (settleableIds.length > 0) {
-        await this.settlementTrigger.onSportsDataChanged(
-          settleableIds,
-          event.entity as
-            | 'FIXTURE'
-            | 'MATCH_TIMELINE'
-            | 'MATCH_STATISTICS'
-            | 'MATCH_LINEUP',
-        );
-      }
-      await this.enqueueAffectedSeasonProjections(fixtureIds, event.eventId);
+      downstreamJobs.push((async () => {
+        const settleableIds = await this.getSettleableFixtureIds(fixtureIds);
+        if (settleableIds.length > 0) {
+          await this.settlementTrigger.onSportsDataChanged(
+            settleableIds,
+            event.entity as
+              | 'FIXTURE'
+              | 'MATCH_TIMELINE'
+              | 'MATCH_STATISTICS'
+              | 'MATCH_LINEUP',
+          );
+        }
+      })());
+      downstreamJobs.push(
+        this.enqueueAffectedSeasonProjections(fixtureIds, event.eventId),
+      );
     }
 
-    // Grivit repricing is restricted to affected upcoming fixtures inside its
-    // configured horizon. The worker publishes prediction triggers only when
-    // the resulting prices also pass readiness.
-    await this.enqueueAffectedOddsPricing(event, fixtureIds);
+    downstreamJobs.push(this.enqueueAffectedOddsPricing(event, fixtureIds));
+    downstreamJobs.push(this.enqueueAffectedPredictionRecalculations(event, fixtureIds));
+
+    // These are separate durable consumer lanes. Promise.allSettled ensures an
+    // Odds, Settlement or projection queue outage cannot prevent baseline
+    // predictions (or vice versa). The outbox remains retryable until every
+    // downstream handoff is durable; existing jobs are idempotently coalesced.
+    const handoffs = await Promise.allSettled(downstreamJobs);
+    const failures = handoffs.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length) {
+      throw new Error(
+        `Sports source event ${event.eventId} downstream handoff failed: ${failures
+          .map((failure) => failure.reason instanceof Error ? failure.reason.message : String(failure.reason))
+          .join('; ')}`,
+      );
+    }
   }
 
   private async getSettleableFixtureIds(
@@ -162,68 +199,230 @@ export class SportsDataChangeEventProcessorService {
     event: SportsDataChangedEvent,
     knownFixtureIds: string[],
   ): Promise<void> {
-    if (knownFixtureIds.length > 0) {
-      await this.enqueueOddsPricingForIds(knownFixtureIds, event);
-      return;
+    const directFixtureIds = this.unique([
+      ...knownFixtureIds,
+      ...(event.entity === 'MATCH_ODDS' ? [event.entityId] : []),
+    ]);
+    if (directFixtureIds.length) {
+      await this.enqueueOddsPricingForIds(directFixtureIds, event);
     }
+    if (event.entity === 'MATCH_ODDS') return;
 
-    let query: Record<string, any> | undefined;
-    if (
-      event.entity === 'TEAM' ||
-      event.entity === 'TEAM_ROSTER' ||
-      event.entity === 'ATHLETE'
-    ) {
-      const teamIds = this.unique([
-        ...(event.teamIds ?? []),
-        ...(event.entity === 'TEAM' ? [event.entityId] : []),
+    const relatedScope = await this.getAffectedUpcomingFixtureScope(
+      event,
+      knownFixtureIds,
+    );
+    if (!relatedScope) return;
+
+    const now = new Date();
+    await this.enqueueOddsPricingForQuery({
+      ...relatedScope,
+      kickoffAt: {
+        $gt: now,
+        $lte: new Date(now.getTime() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000),
+      },
+      'status.state': { $nin: ['COMPLETED'] },
+    }, event);
+  }
+
+  /**
+   * Fan out source changes directly into the Prediction-owned consumer lane.
+   * This path is intentionally independent of Grivit price readiness. Odds
+   * price updates can still enqueue a later supplemental prediction refresh.
+   */
+  private async enqueueAffectedPredictionRecalculations(
+    event: SportsDataChangedEvent,
+    knownFixtureIds: string[],
+  ): Promise<void> {
+    const directFixtureIds = this.unique([
+      ...knownFixtureIds,
+      ...(event.entity === 'MATCH_ODDS' ? [event.entityId] : []),
+    ]);
+    if (directFixtureIds.length) {
+      await this.enqueuePredictionRecalculationsForIds(directFixtureIds, event);
+    }
+    if (event.entity === 'MATCH_ODDS') return;
+
+    const relatedScope = await this.getAffectedUpcomingFixtureScope(
+      event,
+      knownFixtureIds,
+    );
+    if (!relatedScope) return;
+
+    const now = new Date();
+    const horizonEnd = new Date(
+      now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
+    );
+    await this.enqueuePredictionRecalculationsForQuery({
+      ...relatedScope,
+      kickoffAt: { $gt: now, $lte: horizonEnd },
+      'status.state': { $nin: [...TERMINAL_PREDICTION_FIXTURE_STATES] },
+      'status.isFinal': { $ne: true },
+    }, event);
+  }
+
+  /**
+   * Resolve the source scopes affected by a normalized Sports change. Historical
+   * fixture/statistics corrections fan out to the teams and competition whose
+   * rolling projections they feed. Ordinary upcoming fixture edits only refresh
+   * that fixture, avoiding a whole-competition recalculation on every schedule
+   * timestamp update.
+   */
+  private async getAffectedUpcomingFixtureScope(
+    event: SportsDataChangedEvent,
+    knownFixtureIds: string[],
+  ): Promise<Record<string, any> | undefined> {
+    const directScopeEntities = new Set([
+      'TEAM', 'TEAM_ROSTER', 'ATHLETE', 'COMPETITION', 'SEASON',
+    ]);
+    const historicalSourceEntities = new Set([
+      'FIXTURE', 'MATCH_STATISTICS', 'MATCH_LINEUP', 'MATCH_TIMELINE',
+    ]);
+    let shouldExpand = directScopeEntities.has(event.entity);
+
+    if (!shouldExpand && historicalSourceEntities.has(event.entity)) {
+      const sourceFixtureIds = this.unique([
+        ...knownFixtureIds,
+        ...(event.entity === 'FIXTURE' ? [event.entityId] : []),
       ]);
-      if (!teamIds.length) {
-        this.logger.warn(
-          `Sports ${event.entity} event ${event.eventId} has no teamIds or fixtureIds; affected fixtures cannot be resolved.`,
-        );
-        return;
+      if (sourceFixtureIds.length) {
+        const completed = await this.fixtureModel
+          .find({
+            id: { $in: sourceFixtureIds },
+            $or: [{ 'status.state': 'COMPLETED' }, { 'status.isFinal': true }],
+          })
+          .select('id')
+          .lean()
+          .exec() as FixtureIdRow[];
+        shouldExpand = completed.length > 0;
       }
-      query = {
-        'competitors.teamId': { $in: teamIds },
-        kickoffAt: {
-          $gt: new Date(),
-          $lte: new Date(Date.now() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000),
-        },
-        'status.state': { $nin: ['COMPLETED'] },
-      };
-    } else if (event.entity === 'MATCH_ODDS') {
-      const targetIds = this.unique([
-        ...(event.fixtureIds ?? []),
-        event.entityId,
-      ]);
-      await this.enqueueOddsPricingForIds(targetIds, event);
-      return;
-    } else if (event.entity === 'COMPETITION' || event.entity === 'SEASON') {
-      const competitionIds = this.unique([
-        ...(event.competitionIds ?? []),
-        ...(event.entity === 'COMPETITION' ? [event.entityId] : []),
-      ]);
-      const seasonIds = this.unique([
-        ...(event.seasonIds ?? []),
-        ...(event.entity === 'SEASON' ? [event.entityId] : []),
-      ]);
-      const scopes: Record<string, unknown>[] = [];
-      if (competitionIds.length)
-        scopes.push({ competitionId: { $in: competitionIds } });
-      if (seasonIds.length) scopes.push({ seasonId: { $in: seasonIds } });
-      if (!scopes.length) return;
-      query = {
-        $or: scopes,
-        kickoffAt: {
-          $gt: new Date(),
-          $lte: new Date(Date.now() + ODDS_CONFIG.pricingLookaheadHours * 60 * 60_000),
-        },
-        'status.state': { $nin: ['COMPLETED'] },
-      };
     }
+    if (!shouldExpand) return undefined;
 
-    if (!query) return;
-    await this.enqueueOddsPricingForQuery(query, event);
+    const teamIds = this.unique([
+      ...(event.teamIds ?? []),
+      ...(event.entity === 'TEAM' ? [event.entityId] : []),
+    ]);
+    const competitionIds = this.unique([
+      ...(event.competitionIds ?? []),
+      ...(event.entity === 'COMPETITION' ? [event.entityId] : []),
+    ]);
+    const seasonIds = this.unique([
+      ...(event.seasonIds ?? []),
+      ...(event.entity === 'SEASON' ? [event.entityId] : []),
+    ]);
+    const scopes: Record<string, unknown>[] = [];
+    if (teamIds.length) scopes.push({ 'competitors.teamId': { $in: teamIds } });
+    if (competitionIds.length) scopes.push({ competitionId: { $in: competitionIds } });
+    if (seasonIds.length) scopes.push({ seasonId: { $in: seasonIds } });
+    return scopes.length ? { $or: scopes } : undefined;
+  }
+
+  private async enqueuePredictionRecalculationsForIds(
+    fixtureIds: string[],
+    event: SportsDataChangedEvent,
+  ): Promise<void> {
+    const ids = this.unique(fixtureIds);
+    if (!ids.length) return;
+    const now = new Date();
+    const horizonEnd = new Date(
+      now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
+    );
+    const rows = await this.fixtureModel
+      .find({
+        $or: [
+          { id: { $in: ids } },
+          { espnEventId: { $in: ids } },
+        ],
+        kickoffAt: { $gt: now, $lte: horizonEnd },
+        'status.state': { $nin: [...TERMINAL_PREDICTION_FIXTURE_STATES] },
+        'status.isFinal': { $ne: true },
+      } as any)
+      .select('id kickoffAt status competitors')
+      .sort({ id: 1 })
+      .lean()
+      .exec() as PredictionFixtureRow[];
+    await this.enqueuePredictionFixtureRows(rows, event);
+  }
+
+  private async enqueuePredictionRecalculationsForQuery(
+    baseQuery: Record<string, any>,
+    event: SportsDataChangedEvent,
+  ): Promise<void> {
+    let cursor: string | undefined;
+    let scanned = 0;
+    while (true) {
+      const page = await this.fixtureModel
+        .find({ ...baseQuery, ...(cursor ? { id: { $gt: cursor } } : {}) })
+        .select('id kickoffAt status competitors')
+        .sort({ id: 1 })
+        .limit(this.fixturePageSize)
+        .lean()
+        .exec() as PredictionFixtureRow[];
+      if (!page.length) break;
+      await this.enqueuePredictionFixtureRows(page, event);
+      scanned += page.length;
+      cursor = String(page[page.length - 1].id);
+      if (page.length < this.fixturePageSize) break;
+    }
+    if (scanned > 0) {
+      this.logger.log(
+        `Sports source event ${event.eventId} queued independent prediction refreshes across ${scanned} affected upcoming fixture(s).`,
+      );
+    }
+  }
+
+  private async enqueuePredictionFixtureRows(
+    rows: PredictionFixtureRow[],
+    event: SportsDataChangedEvent,
+  ): Promise<void> {
+    const now = Date.now();
+    const horizonEnd = now + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000;
+    const eligible = rows.filter((row) => {
+      const kickoff = row.kickoffAt instanceof Date
+        ? row.kickoffAt
+        : new Date(String(row.kickoffAt ?? ''));
+      const state = String(row.status?.state ?? 'UNKNOWN').toUpperCase();
+      const home = row.competitors?.find((item) => item.homeAway === 'HOME');
+      const away = row.competitors?.find((item) => item.homeAway === 'AWAY');
+      return Number.isFinite(kickoff.getTime())
+        && kickoff.getTime() > now
+        && kickoff.getTime() <= horizonEnd
+        && !TERMINAL_PREDICTION_FIXTURE_STATES.has(state)
+        && row.status?.isFinal !== true
+        && Boolean(home?.teamId && away?.teamId);
+    });
+    if (!eligible.length) return;
+
+    const scheduledFor = event.changedAt instanceof Date && Number.isFinite(event.changedAt.getTime())
+      ? event.changedAt
+      : new Date();
+    for (let offset = 0; offset < eligible.length; offset += this.predictionEnqueueConcurrency) {
+      const batch = eligible.slice(offset, offset + this.predictionEnqueueConcurrency);
+      const results = await Promise.all(batch.map((fixture) => {
+        const fixtureId = String(fixture.id);
+        const sourceFingerprint = createHash('sha256')
+          .update(`prediction-source
+${event.eventId}
+${event.entity}
+${event.revision}
+${fixtureId}`)
+          .digest('hex');
+        return this.queue.enqueueIfMissing({
+          type: SportsQueueJobType.PREDICTION_ENGINE_RECALCULATION,
+          scope: { fixtureId, sourceFingerprint },
+          priority: 75,
+          scheduledFor,
+          triggerEventId: `prediction:source:${event.eventId}:${fixtureId}`,
+        });
+      }));
+      const created = results.filter((result) => result.created).length;
+      if (created > 0) {
+        this.logger.debug(
+          `Queued ${created}/${batch.length} independent prediction triggers for Sports source event ${event.eventId}.`,
+        );
+      }
+    }
   }
 
   private async enqueueOddsPricingForQuery(
@@ -399,4 +598,6 @@ export class SportsDataChangeEventProcessorService {
     ];
   }
 }
+
+
 

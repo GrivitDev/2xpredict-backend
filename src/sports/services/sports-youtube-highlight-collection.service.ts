@@ -402,7 +402,7 @@ export class SportsYoutubeHighlightCollectionService {
         homeName,
         awayName,
         requestedAttempt,
-        'YouTube daily search quota is exhausted; the search is deferred until the next Nigeria-time quota day.',
+        'YouTube daily search quota is exhausted; the search is deferred until the next provider quota reset.',
         currentJobKey,
       );
       return 'QUOTA_EXHAUSTED';
@@ -435,10 +435,25 @@ export class SportsYoutubeHighlightCollectionService {
 
     const channelReference = plan[requestedAttempt - 1] ?? undefined;
     try {
-      const result = await this.youtube.findHighlight(homeName, awayName, kickoff, channelReference);
+      const competitionName = String(
+        competition?.displayName ?? competition?.name ?? competitionSlug,
+      ).trim();
+      const searchResult = await this.youtube.findHighlightWithDiagnostics(
+        homeName,
+        awayName,
+        kickoff,
+        channelReference,
+        competitionName,
+      );
+      const result = searchResult.video;
+
       if (result) {
-        await this.highlightModel.updateOne(
-          { fixtureId: fixture.id },
+        const saved = await this.highlightModel.updateOne(
+          {
+            fixtureId: fixture.id,
+            status: 'SEARCHING',
+            retryCount: requestedAttempt,
+          },
           {
             $set: {
               status: 'FOUND', videoId: result.videoId, videoUrl: result.videoUrl,
@@ -446,13 +461,50 @@ export class SportsYoutubeHighlightCollectionService {
               channelTitle: result.channelTitle,
               publishedAt: result.publishedAt ? new Date(result.publishedAt) : undefined,
               thumbnailUrl: result.thumbnailUrl,
+              lastSearchDiagnostics: searchResult.diagnostics,
               nextRetryAt: null, error: null,
+            },
+            $push: {
+              searchDiagnostics: {
+                $each: [searchResult.diagnostics],
+                $slice: -YOUTUBE_CONFIG.searchWorkflow.maximumRequestsPerFixture,
+              },
             },
           },
         ).exec();
+        if (Number(saved.matchedCount ?? saved.modifiedCount ?? 0) !== 1) {
+          const latest = await this.highlightModel.findOne({ fixtureId: fixture.id }).lean().exec();
+          return latest?.status === 'FOUND' && latest.videoId
+            ? 'FOUND'
+            : 'ALREADY_ATTEMPTED';
+        }
         this.logger.log(`YouTube highlight found for ${competitionSlug}/${fixture.espnEventId} on attempt ${requestedAttempt}/${maximumAttempts}.`);
         return 'FOUND';
       }
+
+      const diagnosticsSaved = await this.highlightModel.updateOne(
+        {
+          fixtureId: fixture.id,
+          status: 'SEARCHING',
+          retryCount: requestedAttempt,
+        },
+        {
+          $set: { lastSearchDiagnostics: searchResult.diagnostics },
+          $push: {
+            searchDiagnostics: {
+              $each: [searchResult.diagnostics],
+              $slice: -YOUTUBE_CONFIG.searchWorkflow.maximumRequestsPerFixture,
+            },
+          },
+        },
+      ).exec();
+      if (Number(diagnosticsSaved.matchedCount ?? diagnosticsSaved.modifiedCount ?? 0) !== 1) {
+        const latest = await this.highlightModel.findOne({ fixtureId: fixture.id }).lean().exec();
+        return latest?.status === 'FOUND' && latest.videoId
+          ? 'FOUND'
+          : 'ALREADY_ATTEMPTED';
+      }
+
       await this.scheduleNext(fixture, competitionSlug, homeName, awayName, requestedAttempt, maximumAttempts, 'No suitable video was found on this channel stage.');
       return 'NOT_FOUND';
     } catch (error) {
@@ -502,9 +554,7 @@ export class SportsYoutubeHighlightCollectionService {
     currentJobKey?: string,
     period: 'daily' | 'monthly' = 'daily',
   ): Promise<void> {
-    const retryAt = period === 'monthly'
-      ? this.getNextUtcMonthStart()
-      : this.getNextLagosMidnight();
+    const retryAt = this.quota.getQuotaResumeAt('youtube', period);
     // Keep the current stage pending for the next quota period. There is no
     // post-kickoff publication expiry, so an overnight pause cannot terminalise it.
     await this.highlightModel.updateOne(
@@ -706,30 +756,6 @@ export class SportsYoutubeHighlightCollectionService {
       : `Unknown ${side} team`;
   }
 
-  private getNextLagosMidnight(from = new Date()): Date {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Africa/Lagos',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).formatToParts(from);
-    const values = new Map(parts.map((part) => [part.type, part.value]));
-    return new Date(
-      Date.UTC(
-        Number(values.get('year')),
-        Number(values.get('month')) - 1,
-        Number(values.get('day')) + 1,
-        0,
-        0,
-        0,
-      ) - 60 * 60_000,
-    );
-  }
-
-  private getNextUtcMonthStart(from = new Date()): Date {
-    return new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + 1, 1));
-  }
-
   private isCompleted(fixture: SportsFixtureRecord): boolean {
     return fixture.status?.state === 'COMPLETED' || fixture.status?.isFinal === true;
   }
@@ -742,3 +768,4 @@ export class SportsYoutubeHighlightCollectionService {
     return error instanceof Error ? error.message.replace(/[\r\n]+/g, ' ').slice(0, 220) : String(error).slice(0, 220);
   }
 }
+

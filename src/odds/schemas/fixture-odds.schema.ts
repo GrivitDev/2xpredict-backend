@@ -33,6 +33,25 @@ export class FixtureOdds {
   @Prop({ type: Boolean, default: false, index: true })
   predictionReady!: boolean;
 
+  /** Current prices may be consumed; stale prices are retained for reference only. */
+  @Prop({ type: String, enum: ['CURRENT', 'STALE'], default: 'CURRENT', index: true })
+  pricingStatus?: 'CURRENT' | 'STALE';
+
+  @Prop({
+    type: String,
+    enum: [
+      'FIXTURE_SNAPSHOT_UNAVAILABLE',
+      'FIXTURE_TEAMS_UNAVAILABLE',
+      'NO_MODELS_PRODUCED',
+      'NO_VALID_PRICES_PRODUCED',
+      'MARKET_NOT_REPRODUCED',
+    ],
+  })
+  staleReason?: string;
+
+  @Prop({ type: Date })
+  staleAt?: Date;
+
   /** Reserved for legacy provider rows; Grivit prices do not have a provider. */
   @Prop({ type: String, enum: ['ESPN', 'THE_ODDS_API', 'ODDS_API', 'API_FOOTBALL'] })
   provider?: 'ESPN' | 'THE_ODDS_API' | 'ODDS_API' | 'API_FOOTBALL';
@@ -138,3 +157,4 @@ FixtureOddsSchema.index({ eventId: 1, predictionReady: 1, updatedAt: -1 }, { nam
 FixtureOddsSchema.index({ eventId: 1, calculationVersion: 1, predictionReady: 1, updatedAt: -1 }, { name: 'fixture_odds_active_model_lookup' });
 FixtureOddsSchema.index({ eventId: 1, marketId: 1, updatedAt: -1 }, { name: 'fixture_odds_market_lookup' });
 FixtureOddsSchema.index({ pricingSource: 1, externalValidationStatus: 1, updatedAt: -1 }, { name: 'fixture_odds_grivit_validation_lookup' });
+

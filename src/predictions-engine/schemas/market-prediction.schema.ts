@@ -102,13 +102,17 @@ export class MarketSelectionPrediction {
   @Prop({ type: String, trim: true })
   bookmaker?: string;
 
-  /** Evidence-derived confidence; intentionally never padded. */
+  /** User-facing confidence score; the configured display floor does not alter evidence quality. */
   @Prop({ type: Number, min: 0, max: 98, default: null })
   confidence!: number | null;
 
   /** Unpadded evidence score used by products with stricter confidence ceilings. */
   @Prop({ type: Number, min: 0, max: 98, default: null })
   evidenceConfidence?: number | null;
+
+  /** Actual source-evidence tier; independent of the user-facing confidence floor. */
+  @Prop({ type: String, enum: ['PRIOR_ONLY', 'LIMITED', 'DEVELOPING', 'STRONG', 'MARKET_SPECIFIC'] })
+  evidenceLevel?: 'PRIOR_ONLY' | 'LIMITED' | 'DEVELOPING' | 'STRONG' | 'MARKET_SPECIFIC';
 
   @Prop({ type: Number, min: 0, max: 1 })
   calibrationReliability?: number;
@@ -279,6 +283,10 @@ export class MarketPrediction {
   @Prop({ type: Number, min: 0, default: 0 })
   fixtureSourceRevision!: number;
 
+  /** Deterministic Sports source generation used by this market calculation. */
+  @Prop({ type: String, trim: true })
+  sourceRevisionFingerprint?: string;
+
   @Prop({ required: true, trim: true })
   calculationMethod!: string;
 
@@ -327,14 +335,3 @@ MarketPredictionSchema.index(
   { retentionExpiresAt: 1 },
   { expireAfterSeconds: 0, name: 'ttl_prediction_market_retention' },
 );
-
-
-
-
-
-
-
-
-
-
-

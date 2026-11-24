@@ -28,6 +28,8 @@ interface ProviderLimitConfig {
   minIntervalSeconds: number;
   dailyLimit?: number;
   monthlyLimit?: number;
+  /** Provider-defined daily quota timezone; defaults to Nigeria time. */
+  dailyQuotaTimeZone?: string;
 }
 
 interface ExecuteOptions {
@@ -123,6 +125,8 @@ export class SportsProviderRateLimitService {
       minIntervalSeconds:
         SPORTS_DATA_COLLECTION_CONFIG.YOUTUBE.rateLimit.minIntervalSeconds,
       dailyLimit: SPORTS_DATA_COLLECTION_CONFIG.YOUTUBE.dailyRequestLimit,
+      dailyQuotaTimeZone:
+        SPORTS_DATA_COLLECTION_CONFIG.YOUTUBE.dailyQuotaTimeZone,
     },
   };
 
@@ -420,7 +424,7 @@ export class SportsProviderRateLimitService {
     now: Date,
   ): Promise<boolean> {
     const config = this.getConfig(provider);
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
     const monthlyPeriod = this.getMonthlyPeriod(now);
 
     /*
@@ -432,10 +436,12 @@ export class SportsProviderRateLimitService {
      */
     await this.ensurePeriodState(provider, now);
 
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
     const filter: Record<string, unknown> = {
       provider,
       endpoint: this.PROVIDER_QUOTA_ENDPOINT,
       dailyPeriod,
+      dailyTimeZone: dailyQuotaTimeZone,
       monthlyPeriod,
     };
 
@@ -469,6 +475,7 @@ export class SportsProviderRateLimitService {
             provider,
             endpoint: this.PROVIDER_QUOTA_ENDPOINT,
             dailyPeriod,
+            dailyTimeZone: dailyQuotaTimeZone,
             monthlyPeriod,
           },
         },
@@ -501,7 +508,8 @@ export class SportsProviderRateLimitService {
     provider: SportsProvider,
     now: Date,
   ): Promise<void> {
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
     const monthlyPeriod = this.getMonthlyPeriod(now);
 
     /*
@@ -526,11 +534,18 @@ export class SportsProviderRateLimitService {
               provider,
               endpoint: this.PROVIDER_QUOTA_ENDPOINT,
               dailyPeriod,
+              dailyTimeZone: dailyQuotaTimeZone,
               monthlyPeriod,
               dailyRequests: {
                 $cond: [
-                  { $ne: ['$dailyPeriod', dailyPeriod] },
-                  1,
+                  { $eq: ['$dailyTimeZone', dailyQuotaTimeZone] },
+                  {
+                    $cond: [
+                      { $eq: ['$dailyPeriod', dailyPeriod] },
+                      { $add: [{ $ifNull: ['$dailyRequests', 0] }, 1] },
+                      1,
+                    ],
+                  },
                   { $add: [{ $ifNull: ['$dailyRequests', 0] }, 1] },
                 ],
               },
@@ -558,7 +573,8 @@ export class SportsProviderRateLimitService {
     endpoint: string,
     now: Date,
   ): Promise<void> {
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
     const monthlyPeriod = this.getMonthlyPeriod(now);
 
     /*
@@ -579,11 +595,18 @@ export class SportsProviderRateLimitService {
               provider,
               endpoint,
               dailyPeriod,
+              dailyTimeZone: dailyQuotaTimeZone,
               monthlyPeriod,
               dailyRequests: {
                 $cond: [
-                  { $ne: ['$dailyPeriod', dailyPeriod] },
-                  1,
+                  { $eq: ['$dailyTimeZone', dailyQuotaTimeZone] },
+                  {
+                    $cond: [
+                      { $eq: ['$dailyPeriod', dailyPeriod] },
+                      { $add: [{ $ifNull: ['$dailyRequests', 0] }, 1] },
+                      1,
+                    ],
+                  },
                   { $add: [{ $ifNull: ['$dailyRequests', 0] }, 1] },
                 ],
               },
@@ -613,11 +636,11 @@ export class SportsProviderRateLimitService {
 
   /** Returns the provider quota period boundary used to resume a paused lane. */
   getQuotaResumeAt(
-    _provider: SportsProvider,
+    provider: SportsProvider,
     period: 'daily' | 'monthly',
     from = new Date(),
   ): Date {
-    if (period === 'daily') return this.getNextLagosMidnight(from);
+    if (period === 'daily') return this.getNextDailyReset(provider, from);
     return new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + 1, 1));
   }
 
@@ -667,9 +690,10 @@ export class SportsProviderRateLimitService {
     if (config.dailyLimit === undefined) return;
 
     const now = new Date();
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
     const monthlyPeriod = this.getMonthlyPeriod(now);
-    const blockedUntil = this.getNextLagosMidnight(now);
+    const blockedUntil = this.getNextDailyReset(provider, now);
 
     await this.ensurePeriodState(provider, now);
     await this.rateLimitModel.updateOne(
@@ -682,6 +706,7 @@ export class SportsProviderRateLimitService {
         $set: {
           dailyRequests: config.dailyLimit,
           dailyPeriod,
+          dailyTimeZone: dailyQuotaTimeZone,
           monthlyPeriod,
           quotaBlockedUntil: blockedUntil,
         },
@@ -689,7 +714,39 @@ export class SportsProviderRateLimitService {
     ).exec();
 
     this.logger.warn(
-      `${provider} provider daily quota is exhausted; outbound requests are blocked until ${blockedUntil.toISOString()} (Nigeria time)`,
+      `${provider} provider daily quota is exhausted; outbound requests are blocked until ${blockedUntil.toISOString()} (${dailyQuotaTimeZone})`,
+    );
+  }
+
+  /**
+   * Blocks a provider lane until its next quota reset without consuming the
+   * application's search.list counter. Used when a different YouTube endpoint
+   * (for example channels.list) exhausts the general API quota pool.
+   */
+  async markProviderDailyQuotaBlocked(provider: SportsProvider): Promise<void> {
+    const now = new Date();
+    const dailyPeriod = this.getDailyPeriod(provider, now);
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
+    const blockedUntil = this.getNextDailyReset(provider, now);
+
+    await this.ensurePeriodState(provider, now);
+    await this.rateLimitModel.updateOne(
+      {
+        provider,
+        endpoint: this.PROVIDER_QUOTA_ENDPOINT,
+        dailyPeriod,
+      },
+      {
+        $set: {
+          dailyPeriod,
+          dailyTimeZone: dailyQuotaTimeZone,
+          quotaBlockedUntil: blockedUntil,
+        },
+      },
+    ).exec();
+
+    this.logger.warn(
+      `${provider} provider API quota pool is exhausted; requests are blocked until ${blockedUntil.toISOString()} (${dailyQuotaTimeZone})`,
     );
   }
 
@@ -736,7 +793,7 @@ export class SportsProviderRateLimitService {
       .lean()
       .exec();
 
-    return state?.dailyPeriod === this.getDailyPeriod(now)
+    return state?.dailyPeriod === this.getDailyPeriod(provider, now)
       ? (state.dailyRequests ?? 0)
       : 0;
   }
@@ -783,7 +840,7 @@ export class SportsProviderRateLimitService {
       .lean()
       .exec();
 
-    return state?.dailyPeriod === this.getDailyPeriod(now)
+    return state?.dailyPeriod === this.getDailyPeriod(provider, now)
       ? (state.dailyRequests ?? 0)
       : 0;
   }
@@ -883,7 +940,7 @@ export class SportsProviderRateLimitService {
       throw new SportsProviderQuotaExceededError(provider, 'daily');
     }
 
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
     const monthlyPeriod = this.getMonthlyPeriod(now);
 
     if (
@@ -917,7 +974,7 @@ export class SportsProviderRateLimitService {
       .lean()
       .exec();
 
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
 
     if (
       state?.quotaBlockedUntil instanceof Date &&
@@ -945,7 +1002,8 @@ export class SportsProviderRateLimitService {
     provider: SportsProvider,
     now: Date,
   ): Promise<void> {
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
     const monthlyPeriod = this.getMonthlyPeriod(now);
 
     /*
@@ -965,12 +1023,22 @@ export class SportsProviderRateLimitService {
               provider,
               endpoint: this.PROVIDER_QUOTA_ENDPOINT,
               dailyPeriod,
+              dailyTimeZone: dailyQuotaTimeZone,
               monthlyPeriod,
               dailyRequests: {
                 $cond: [
-                  { $eq: ['$dailyPeriod', dailyPeriod] },
+                  { $eq: ['$dailyTimeZone', dailyQuotaTimeZone] },
+                  {
+                    $cond: [
+                      { $eq: ['$dailyPeriod', dailyPeriod] },
+                      { $ifNull: ['$dailyRequests', 0] },
+                      0,
+                    ],
+                  },
+                  // On the first run after deploying provider-specific timezones,
+                  // preserve the old counter rather than accidentally granting
+                  // a fresh allowance before the provider's next real reset.
                   { $ifNull: ['$dailyRequests', 0] },
-                  0,
                 ],
               },
               monthlyRequests: {
@@ -978,6 +1046,17 @@ export class SportsProviderRateLimitService {
                   { $eq: ['$monthlyPeriod', monthlyPeriod] },
                   { $ifNull: ['$monthlyRequests', 0] },
                   0,
+                ],
+              },
+              // A legacy WAT reset timestamp can be later than YouTube's next
+              // Pacific reset. The retained daily counter remains conservative;
+              // clear only the obsolete timestamp so remaining-quota evaluation
+              // can reapply the correct provider boundary when the cap is hit.
+              quotaBlockedUntil: {
+                $cond: [
+                  { $eq: ['$dailyTimeZone', dailyQuotaTimeZone] },
+                  '$quotaBlockedUntil',
+                  null,
                 ],
               },
             },
@@ -997,7 +1076,8 @@ export class SportsProviderRateLimitService {
     endpoint: string,
     now: Date,
   ): Promise<void> {
-    const dailyPeriod = this.getDailyPeriod(now);
+    const dailyPeriod = this.getDailyPeriod(provider, now);
+    const dailyQuotaTimeZone = this.getDailyQuotaTimeZone(provider);
     const monthlyPeriod = this.getMonthlyPeriod(now);
 
     await this.rateLimitModel
@@ -1012,12 +1092,19 @@ export class SportsProviderRateLimitService {
               provider,
               endpoint,
               dailyPeriod,
+              dailyTimeZone: dailyQuotaTimeZone,
               monthlyPeriod,
               dailyRequests: {
                 $cond: [
-                  { $eq: ['$dailyPeriod', dailyPeriod] },
+                  { $eq: ['$dailyTimeZone', dailyQuotaTimeZone] },
+                  {
+                    $cond: [
+                      { $eq: ['$dailyPeriod', dailyPeriod] },
+                      { $ifNull: ['$dailyRequests', 0] },
+                      0,
+                    ],
+                  },
                   { $ifNull: ['$dailyRequests', 0] },
-                  0,
                 ],
               },
               monthlyRequests: {
@@ -1073,31 +1160,96 @@ export class SportsProviderRateLimitService {
     );
   }
 
-  private getNextLagosMidnight(date: Date): Date {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Africa/Lagos',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).formatToParts(date);
-    const values = new Map(parts.map((part) => [part.type, part.value]));
-    const year = Number(values.get('year'));
-    const month = Number(values.get('month'));
-    const day = Number(values.get('day'));
-
-    // Nigeria is UTC+1 year-round: 00:00 WAT is 23:00 UTC on the prior date.
-    return new Date(Date.UTC(year, month - 1, day + 1, 0, 0, 0) - 60 * 60_000);
+  private getDailyQuotaTimeZone(provider: SportsProvider): string {
+    return this.getConfig(provider).dailyQuotaTimeZone ?? 'Africa/Lagos';
   }
 
-  private getDailyPeriod(date: Date): string {
+  private getNextDailyReset(provider: SportsProvider, date: Date): Date {
+    const timeZone = this.getDailyQuotaTimeZone(provider);
+    const dateParts = this.getDatePartsInTimeZone(date, timeZone);
+    const nextCalendarDay = new Date(
+      Date.UTC(dateParts.year, dateParts.month - 1, dateParts.day + 1),
+    );
+    const targetWallClockUtc = Date.UTC(
+      nextCalendarDay.getUTCFullYear(),
+      nextCalendarDay.getUTCMonth(),
+      nextCalendarDay.getUTCDate(),
+      0,
+      0,
+      0,
+    );
+
+    // Convert local midnight into UTC using the timezone offset at the target
+    // boundary. Iteration handles Pacific daylight-saving transitions without
+    // assuming a fixed UTC offset.
+    let candidateUtc = targetWallClockUtc;
+    for (let iteration = 0; iteration < 3; iteration += 1) {
+      const localParts = this.getDateTimePartsInTimeZone(
+        new Date(candidateUtc),
+        timeZone,
+      );
+      const representedAsUtc = Date.UTC(
+        localParts.year,
+        localParts.month - 1,
+        localParts.day,
+        localParts.hour,
+        localParts.minute,
+        localParts.second,
+      );
+      const adjustment = targetWallClockUtc - representedAsUtc;
+      if (adjustment === 0) break;
+      candidateUtc += adjustment;
+    }
+    return new Date(candidateUtc);
+  }
+
+  private getDailyPeriod(provider: SportsProvider, date: Date): string {
+    const timeZone = this.getDailyQuotaTimeZone(provider);
+    const parts = this.getDatePartsInTimeZone(date, timeZone);
+    return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+  }
+
+  private getDatePartsInTimeZone(
+    date: Date,
+    timeZone: string,
+  ): { year: number; month: number; day: number } {
     const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Africa/Lagos',
+      timeZone,
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
     }).formatToParts(date);
     const values = new Map(parts.map((part) => [part.type, part.value]));
-    return `${values.get('year')}-${values.get('month')}-${values.get('day')}`;
+    return {
+      year: Number(values.get('year')),
+      month: Number(values.get('month')),
+      day: Number(values.get('day')),
+    };
+  }
+
+  private getDateTimePartsInTimeZone(
+    date: Date,
+    timeZone: string,
+  ): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date);
+    const values = new Map(parts.map((part) => [part.type, part.value]));
+    return {
+      year: Number(values.get('year')),
+      month: Number(values.get('month')),
+      day: Number(values.get('day')),
+      hour: Number(values.get('hour')),
+      minute: Number(values.get('minute')),
+      second: Number(values.get('second')),
+    };
   }
 
   private getMonthlyPeriod(date: Date): string {
@@ -1114,6 +1266,7 @@ export class SportsProviderRateLimitService {
     });
   }
 }
+
 
 
 

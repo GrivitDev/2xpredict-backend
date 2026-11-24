@@ -29,11 +29,11 @@ export interface SelectionPredictionResult {
   calibrationApplied?: boolean;
   /** Conservative selection safety score from 0 to 1; distinct from probability. */
   safetyScore?: number;
-  /** Odds module explicitly endorses this exact selection and line. */
+  /** True only when the Odds module has a current price for this exact selection and line. */
   oddsPredictionReady?: boolean;
-  /** Exactly one Odds-ready calculated selection is final for each market document. */
+  /** Exactly one model-selected outcome is final for each market; baseline 1X2 does not require an Odds quote. */
   isFinalSelection?: boolean;
-  /** Backward-compatible flag: true only for the market engine's final selection. */
+  /** True for the market engine's final user-facing prediction; independent of whether a price is already attached. */
   recommendationEligible?: boolean;
   bookmakerOdds?: number | null;
   decimalOdds?: number | null;
@@ -50,6 +50,8 @@ export interface SelectionPredictionResult {
   bookmaker?: string | null;
   confidence: number | null;
   evidenceConfidence?: number | null;
+  /** Actual information tier behind this outcome; never raised by the display confidence floor. */
+  evidenceLevel?: 'PRIOR_ONLY' | 'LIMITED' | 'DEVELOPING' | 'STRONG' | 'MARKET_SPECIFIC';
   status: PredictionStatus;
   sources: PredictionSource[];
   calculationMethod?: string;
@@ -78,4 +80,5 @@ export interface MarketPredictionCalculationResult {
   diagnostics: string[];
   dataQuality: number;
 }
+
 

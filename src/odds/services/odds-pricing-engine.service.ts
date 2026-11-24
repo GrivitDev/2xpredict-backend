@@ -40,6 +40,7 @@ export interface ModelSelectionPrice {
   sampleSize: number;
   calculationMethod: string;
   predictionReady: boolean;
+  oddsBasis: 'HISTORICAL_ONLY' | 'PRIOR_ONLY';
 }
 
 interface ScoreMatrix {
@@ -127,62 +128,105 @@ export class OddsPricingEngineService {
     return [...prices.values()];
   }
 
-  private buildGoalModel(context: OddsPricingContext): { full: ScoreMatrix; first: ScoreMatrix; second: ScoreMatrix; quality: number; sampleSize: number; observedPeriodSplit: boolean } | null {
-    const homeTeamId = context.match.fixture.competitors.find((item) => item.homeAway === 'HOME')?.teamId;
-    const awayTeamId = context.match.fixture.competitors.find((item) => item.homeAway === 'AWAY')?.teamId;
-    if (!homeTeamId || !awayTeamId) return null;
+  private buildGoalModel(context: OddsPricingContext): {
+    full: ScoreMatrix;
+    first: ScoreMatrix;
+    second: ScoreMatrix;
+    quality: number;
+    sampleSize: number;
+    observedPeriodSplit: boolean;
+    oddsBasis: 'HISTORICAL_ONLY' | 'PRIOR_ONLY';
+  } | null {
+    const homeTeamId = context.match.fixture.competitors.find((item) => item.homeAway === 'HOME')?.teamId || 'HOME';
+    const awayTeamId = context.match.fixture.competitors.find((item) => item.homeAway === 'AWAY')?.teamId || 'AWAY';
 
     const homeHomeSplit = context.homeAwayRecord?.home;
     const awayAwaySplit = context.awayAwayRecord?.away;
-    const homeAttack = this.valueOrUndefined(
-      homeHomeSplit && homeHomeSplit.played >= 3 ? homeHomeSplit.goalsFor / homeHomeSplit.played : undefined,
-      context.homeScoring?.averageGoalsFor ?? undefined,
-    );
-    const awayDefence = this.valueOrUndefined(
-      awayAwaySplit && awayAwaySplit.played >= 3 ? awayAwaySplit.goalsAgainst / awayAwaySplit.played : undefined,
-      context.awayScoring?.averageGoalsAgainst ?? undefined,
-    );
-    const awayAttack = this.valueOrUndefined(
-      awayAwaySplit && awayAwaySplit.played >= 3 ? awayAwaySplit.goalsFor / awayAwaySplit.played : undefined,
-      context.awayScoring?.averageGoalsFor ?? undefined,
-    );
-    const homeDefence = this.valueOrUndefined(
-      homeHomeSplit && homeHomeSplit.played >= 3 ? homeHomeSplit.goalsAgainst / homeHomeSplit.played : undefined,
-      context.homeScoring?.averageGoalsAgainst ?? undefined,
-    );
-    const compHome = context.competitionScoring && context.competitionScoring.fixturesPlayed >= 5
-      ? context.competitionScoring.homeGoals / context.competitionScoring.fixturesPlayed
+    const competitionSamples = Math.max(0, Number(context.competitionScoring?.fixturesPlayed ?? 0));
+    const competitionHomeGoals = context.competitionScoring?.homeGoals;
+    const competitionAwayGoals = context.competitionScoring?.awayGoals;
+    const competitionHomeRate = competitionSamples > 0
+      && typeof competitionHomeGoals === 'number'
+      && Number.isFinite(competitionHomeGoals)
+      && competitionHomeGoals >= 0
+      ? competitionHomeGoals / competitionSamples
       : undefined;
-    const compAway = context.competitionScoring && context.competitionScoring.fixturesPlayed >= 5
-      ? context.competitionScoring.awayGoals / context.competitionScoring.fixturesPlayed
+    const competitionAwayRate = competitionSamples > 0
+      && typeof competitionAwayGoals === 'number'
+      && Number.isFinite(competitionAwayGoals)
+      && competitionAwayGoals >= 0
+      ? competitionAwayGoals / competitionSamples
       : undefined;
+
+    // Each source is regularized toward a football prior instead of being
+    // discarded until an arbitrary minimum sample has accumulated. Venue
+    // records are preferred when present; season records fill their gaps.
+    const homeAttack = this.progressiveGoalRate(
+      homeHomeSplit?.played ?? 0,
+      homeHomeSplit?.goalsFor,
+      context.homeScoring?.averageGoalsFor,
+      context.homeScoring?.fixturesPlayed ?? 0,
+      ODDS_CONFIG.baselineHomeGoals,
+    );
+    const awayDefence = this.progressiveGoalRate(
+      awayAwaySplit?.played ?? 0,
+      awayAwaySplit?.goalsAgainst,
+      context.awayScoring?.averageGoalsAgainst,
+      context.awayScoring?.fixturesPlayed ?? 0,
+      ODDS_CONFIG.baselineHomeGoals,
+    );
+    const awayAttack = this.progressiveGoalRate(
+      awayAwaySplit?.played ?? 0,
+      awayAwaySplit?.goalsFor,
+      context.awayScoring?.averageGoalsFor,
+      context.awayScoring?.fixturesPlayed ?? 0,
+      ODDS_CONFIG.baselineAwayGoals,
+    );
+    const homeDefence = this.progressiveGoalRate(
+      homeHomeSplit?.played ?? 0,
+      homeHomeSplit?.goalsAgainst,
+      context.homeScoring?.averageGoalsAgainst,
+      context.homeScoring?.fixturesPlayed ?? 0,
+      ODDS_CONFIG.baselineAwayGoals,
+    );
+    const compHome = this.progressiveCompetitionRate(
+      competitionHomeRate,
+      competitionSamples,
+      ODDS_CONFIG.baselineHomeGoals,
+    );
+    const compAway = this.progressiveCompetitionRate(
+      competitionAwayRate,
+      competitionSamples,
+      ODDS_CONFIG.baselineAwayGoals,
+    );
 
     const baseHomeMean = this.weightedMean([
       { value: homeAttack, weight: 0.45 },
       { value: awayDefence, weight: 0.35 },
       { value: compHome, weight: 0.20 },
-    ]);
+    ]) ?? ODDS_CONFIG.baselineHomeGoals;
     const baseAwayMean = this.weightedMean([
       { value: awayAttack, weight: 0.45 },
       { value: homeDefence, weight: 0.35 },
       { value: compAway, weight: 0.20 },
-    ]);
-    if (baseHomeMean === null || baseAwayMean === null) return null;
+    ]) ?? ODDS_CONFIG.baselineAwayGoals;
 
     const homeRecent = this.recentGoalRates(context.homeTeamData, homeTeamId, context.match.fixture.competitionId);
     const awayRecent = this.recentGoalRates(context.awayTeamData, awayTeamId, context.match.fixture.competitionId);
-    const homeMean = homeRecent && awayRecent
-      ? baseHomeMean * 0.70 + homeRecent.goalsFor * 0.15 + awayRecent.goalsAgainst * 0.15
-      : baseHomeMean;
-    const awayMean = awayRecent && homeRecent
-      ? baseAwayMean * 0.70 + awayRecent.goalsFor * 0.15 + homeRecent.goalsAgainst * 0.15
-      : baseAwayMean;
+    const recentHomeWeight = homeRecent ? Math.min(0.15, homeRecent.sampleSize / 5 * 0.15) : 0;
+    const recentAwayWeight = awayRecent ? Math.min(0.15, awayRecent.sampleSize / 5 * 0.15) : 0;
+    const homeMean = baseHomeMean * (1 - recentHomeWeight - recentAwayWeight)
+      + (homeRecent?.goalsFor ?? baseHomeMean) * recentHomeWeight
+      + (awayRecent?.goalsAgainst ?? baseHomeMean) * recentAwayWeight;
+    const awayMean = baseAwayMean * (1 - recentAwayWeight - recentHomeWeight)
+      + (awayRecent?.goalsFor ?? baseAwayMean) * recentAwayWeight
+      + (homeRecent?.goalsAgainst ?? baseAwayMean) * recentHomeWeight;
 
     const h2h = context.headToHead?.matches ?? [];
     const recentH2h = h2h.slice(0, 8);
     let adjustedHome = homeMean;
     let adjustedAway = awayMean;
-    if (recentH2h.length >= 3) {
+    if (recentH2h.length > 0) {
       const weights = recentH2h.map((item, index) => item.recencyWeight ?? 1 / (index + 1));
       const totalWeight = weights.reduce((sum, value) => sum + value, 0);
       if (totalWeight > 0) {
@@ -190,24 +234,45 @@ export class OddsPricingEngineService {
           sum + (item.homeTeamId === homeTeamId ? item.homeScore : item.awayScore) * weights[index], 0) / totalWeight;
         const h2hAway = recentH2h.reduce((sum, item, index) =>
           sum + (item.homeTeamId === homeTeamId ? item.awayScore : item.homeScore) * weights[index], 0) / totalWeight;
-        adjustedHome = homeMean * 0.90 + h2hHome * 0.10;
-        adjustedAway = awayMean * 0.90 + h2hAway * 0.10;
+        const h2hWeight = recentH2h.length >= 3 ? 0.08 : recentH2h.length === 2 ? 0.04 : 0.02;
+        adjustedHome = homeMean * (1 - h2hWeight) + h2hHome * h2hWeight;
+        adjustedAway = awayMean * (1 - h2hWeight) + h2hAway * h2hWeight;
       }
     }
 
-    const homeSamples = Math.max(context.homeScoring?.fixturesPlayed ?? 0, context.homeAwayRecord?.home.played ?? 0);
-    const awaySamples = Math.max(context.awayScoring?.fixturesPlayed ?? 0, context.awayAwayRecord?.away.played ?? 0);
+    const homeSamples = Math.max(
+      context.homeScoring?.fixturesPlayed ?? 0,
+      context.homeAwayRecord?.home.played ?? 0,
+      homeRecent?.sampleSize ?? 0,
+    );
+    const awaySamples = Math.max(
+      context.awayScoring?.fixturesPlayed ?? 0,
+      context.awayAwayRecord?.away.played ?? 0,
+      awayRecent?.sampleSize ?? 0,
+    );
     const sampleSize = Math.min(homeSamples, awaySamples);
-    if (sampleSize < ODDS_CONFIG.minimumHistoricalSampleSize) return null;
+    const hasObservedEvidence = homeSamples > 0 || awaySamples > 0
+      || competitionSamples > 0 || recentH2h.length > 0;
 
-    const seasonCoverage = Math.min(1, sampleSize / 10);
-    const venueCoverage = context.homeAwayRecord && context.awayAwayRecord ? 1 : 0;
-    const competitionCoverage = context.competitionScoring && context.competitionScoring.fixturesPlayed >= 10 ? 1 : 0;
-    const h2hCoverage = recentH2h.length >= 3 ? 1 : 0;
-    const recentCoverage = homeRecent && awayRecent ? 1 : 0;
+    // Quality remains an honest evidence measure. It is deliberately not a
+    // gate for the mandatory Match Result baseline price.
+    const homeTeamCoverage = Math.min(1, homeSamples / 10);
+    const awayTeamCoverage = Math.min(1, awaySamples / 10);
+    const teamCoverage = (homeTeamCoverage + awayTeamCoverage) / 2;
+    const balancedTeamCoverage = Math.min(1, sampleSize / 10);
+    const venueCoverage = (
+      Number(Boolean(context.homeAwayRecord?.home))
+      + Number(Boolean(context.awayAwayRecord?.away))
+    ) / 2;
+    const competitionCoverage = Math.min(1, competitionSamples / 10);
+    const h2hCoverage = Math.min(1, recentH2h.length / 3);
+    const recentCoverage = Math.max(homeRecent ? 0.5 : 0, awayRecent ? 0.5 : 0)
+      + (homeRecent && awayRecent ? 0.5 : 0);
     const quality = clamp(
-      0.35 * seasonCoverage + 0.20 * venueCoverage + 0.20 * competitionCoverage + 0.10 * h2hCoverage + 0.15 * recentCoverage,
-      0,
+      0.05 + 0.20 * teamCoverage + 0.10 * balancedTeamCoverage
+        + 0.15 * venueCoverage + 0.20 * competitionCoverage
+        + 0.10 * h2hCoverage + 0.10 * recentCoverage,
+      0.05,
       0.96,
     );
 
@@ -228,7 +293,61 @@ export class OddsPricingEngineService {
       quality,
       sampleSize,
       observedPeriodSplit,
+      oddsBasis: hasObservedEvidence ? 'HISTORICAL_ONLY' : 'PRIOR_ONLY',
     };
+  }
+
+  private progressiveGoalRate(
+    venuePlayed: number,
+    venueTotal: number | undefined,
+    seasonAverage: number | undefined,
+    seasonSamples: number,
+    prior: number,
+  ): number {
+    const safeVenuePlayed = Math.max(0, Number(venuePlayed) || 0);
+    const safeSeasonSamples = Math.max(0, Number(seasonSamples) || 0);
+    const venueRate = safeVenuePlayed > 0
+      && typeof venueTotal === 'number'
+      && Number.isFinite(venueTotal)
+      && venueTotal >= 0
+      ? venueTotal / safeVenuePlayed
+      : undefined;
+    const safeSeasonAverage = safeSeasonSamples > 0
+      && typeof seasonAverage === 'number'
+      && Number.isFinite(seasonAverage)
+      && seasonAverage >= 0
+      ? seasonAverage
+      : undefined;
+
+    let observedRate = safeSeasonAverage ?? venueRate ?? prior;
+    let observedSamples = safeSeasonSamples || safeVenuePlayed;
+    if (venueRate !== undefined && safeSeasonAverage !== undefined) {
+      const venueWeight = Math.min(0.75, safeVenuePlayed / (safeVenuePlayed + 3));
+      observedRate = safeSeasonAverage * (1 - venueWeight) + venueRate * venueWeight;
+      observedSamples = Math.max(safeSeasonSamples, safeVenuePlayed);
+    }
+    if (observedSamples <= 0) return prior;
+
+    const priorSamples = ODDS_CONFIG.baselinePriorMatches;
+    return clamp(
+      (observedRate * observedSamples + prior * priorSamples) / (observedSamples + priorSamples),
+      0.10,
+      5.0,
+    );
+  }
+
+  private progressiveCompetitionRate(
+    observedRate: number | undefined,
+    sampleSize: number,
+    prior: number,
+  ): number {
+    if (!Number.isFinite(Number(observedRate)) || sampleSize <= 0) return prior;
+    const priorSamples = ODDS_CONFIG.baselinePriorMatches * 1.5;
+    return clamp(
+      (Number(observedRate) * sampleSize + prior * priorSamples) / (sampleSize + priorSamples),
+      0.10,
+      5.0,
+    );
   }
 
   private recentGoalRates(
@@ -237,12 +356,16 @@ export class OddsPricingEngineService {
     competitionId: string,
   ): { goalsFor: number; goalsAgainst: number; sampleSize: number } | null {
     if (!teamData?.form?.length) return null;
-    const results = teamData.form
+    const allResults = teamData.form.flatMap((record) => record.results ?? []);
+    const competitionResults = teamData.form
       .filter((record) => !record.competitionId || record.competitionId === competitionId)
-      .flatMap((record) => record.results ?? [])
+      .flatMap((record) => record.results ?? []);
+    // Prefer same-competition form, but retain valid team form from other
+    // competitions when the target league has not started or has no sample.
+    const results = (competitionResults.length ? competitionResults : allResults)
       .sort((left, right) => right.kickoffAt.getTime() - left.kickoffAt.getTime())
       .slice(0, 5);
-    if (results.length < 3) return null;
+    if (results.length < 1) return null;
     let weightedGoalsFor = 0;
     let weightedGoalsAgainst = 0;
     let totalWeight = 0;
@@ -275,10 +398,9 @@ export class OddsPricingEngineService {
   }
 
   /**
-   * Sports is the authority on market-specific evidence coverage. The model
-   * may calculate a probability only after the corresponding coverage contract
-   * has approved that market; unrelated missing statistics do not block other
-   * markets.
+   * Sports is the authority on market-specific evidence coverage. The mandatory
+   * Match Result model is the exception: it uses the progressive score baseline
+   * and priors, while independent statistics/event markets retain their own gates.
    */
   private isMarketReady(
     market: CanonicalMarketDefinition,
@@ -286,6 +408,9 @@ export class OddsPricingEngineService {
   ): boolean {
     if (!readiness.fixtureEligible) return false;
     if (market.family === 'PLAYER') return false;
+    // Match Result is the mandatory baseline market. The score matrix itself
+    // always exists because buildGoalModel regularizes missing evidence to priors.
+    if (market.id === 'MATCH_RESULT') return true;
     if (market.family === 'STATISTICS') {
       return market.statisticKey
         ? readiness.teamStatistics[market.statisticKey]?.ready === true
@@ -306,7 +431,7 @@ export class OddsPricingEngineService {
     return false;
   }
 
-  private priceScoreMarkets(context: OddsPricingContext, model: { full: ScoreMatrix; first: ScoreMatrix; second: ScoreMatrix; quality: number; sampleSize: number; observedPeriodSplit: boolean }, out: Map<string, ModelSelectionPrice>): void {
+  private priceScoreMarkets(context: OddsPricingContext, model: { full: ScoreMatrix; first: ScoreMatrix; second: ScoreMatrix; quality: number; sampleSize: number; observedPeriodSplit: boolean; oddsBasis: 'HISTORICAL_ONLY' | 'PRIOR_ONLY' }, out: Map<string, ModelSelectionPrice>): void {
     const homeTeam = context.match.homeTeam?.displayName ?? context.match.homeTeam?.name ?? 'Home Team';
     const awayTeam = context.match.awayTeam?.displayName ?? context.match.awayTeam?.name ?? 'Away Team';
     for (const market of FOOTBALL_MARKET_CATALOG) {
@@ -321,7 +446,8 @@ export class OddsPricingEngineService {
           : this.scoreMarketProbability(market, selection, model.full, model.first, model.second);
         if (probability === null) continue;
         const periodQuality = market.model === 'PERIOD_MATRIX' && !model.observedPeriodSplit ? model.quality * 0.55 : model.quality;
-        this.addPrice(out, market, selection, probability, periodQuality, model.sampleSize, this.scoreMethod(market));
+        const oddsBasis = market.id === 'MATCH_RESULT' ? model.oddsBasis : 'HISTORICAL_ONLY';
+        this.addPrice(out, market, selection, probability, periodQuality, model.sampleSize, this.scoreMethod(market), oddsBasis, market.id === 'MATCH_RESULT');
       }
     }
   }
@@ -731,11 +857,11 @@ export class OddsPricingEngineService {
     return Number.isFinite(parsed) ? parsed : null;
   }
 
-  private addPrice(out: Map<string, ModelSelectionPrice>, market: CanonicalMarketDefinition, selection: CanonicalExpandedSelection, probability: number, quality: number, sampleSize: number, method: string): void {
+  private addPrice(out: Map<string, ModelSelectionPrice>, market: CanonicalMarketDefinition, selection: CanonicalExpandedSelection, probability: number, quality: number, sampleSize: number, method: string, oddsBasis: 'HISTORICAL_ONLY' | 'PRIOR_ONLY' = 'HISTORICAL_ONLY', allowSparseBaseline = false): void {
     if (!Number.isFinite(probability)) return;
 
-    // Do not persist speculative prices. A market is priced only when its own
-    // minimum sample and the shared data-quality floor are both satisfied.
+    // Advanced markets retain their own evidence floors. The baseline 1X2
+    // market is explicitly allowed to price from regularized priors and sparse data.
     const configuredMinimum = market.minimumSampleSize ?? (
       market.family === 'STATISTICS'
         ? ODDS_CONFIG.minimumStatisticalSampleSize
@@ -747,16 +873,16 @@ export class OddsPricingEngineService {
       ODDS_CONFIG.minimumHistoricalSampleSize,
       configuredMinimum,
     );
-    if (
+    if (!allowSparseBaseline && (
       !Number.isFinite(sampleSize) ||
       sampleSize < requiredSampleSize ||
       !Number.isFinite(quality) ||
       quality < ODDS_CONFIG.minimumPredictionDataQuality
-    ) return;
+    )) return;
 
     const safeProbability = clamp(probability, ODDS_CONFIG.modelProbabilityFloor, ODDS_CONFIG.modelProbabilityCeiling);
     const fairOdds = round(1 / safeProbability, 4);
-    if (!Number.isFinite(fairOdds) || fairOdds < 1.01 || fairOdds > ODDS_CONFIG.maximumDecimalOdds) return;
+    if (!Number.isFinite(fairOdds) || fairOdds < (allowSparseBaseline ? 1 : 1.01) || fairOdds > ODDS_CONFIG.maximumDecimalOdds) return;
     const key = `${market.id}:${selection.key}:${selection.line ?? '-'}`;
     const dataQuality = round(quality, 4);
     out.set(key, {
@@ -769,6 +895,7 @@ export class OddsPricingEngineService {
       sampleSize,
       calculationMethod: method,
       predictionReady: true,
+      oddsBasis,
     });
   }
 
@@ -859,4 +986,5 @@ export class OddsPricingEngineService {
     return clamp(mean, 0.10, 5.0);
   }
 }
+
 

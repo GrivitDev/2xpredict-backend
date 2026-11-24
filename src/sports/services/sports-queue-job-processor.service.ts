@@ -26,6 +26,7 @@ import {
 } from './sports-queue.service';
 import { SettlementTriggerService } from '../../settlement/services/settlement-trigger.service';
 import { ODDS_CONFIG } from '../../odds/config/odds.config';
+import { PREDICTION_ENGINE_CONFIG } from '../../predictions-engine/config/prediction-engine.config';
 
 const { DAY } = SPORTS_COLLECTION_TIME;
 
@@ -911,6 +912,62 @@ export class SportsQueueJobProcessorService {
     );
     const competition = await this.collection.getCompetition(competitionId);
     const seasonYear = competition?.currentSeasonYear;
+    const canonicalTeamIds = result.teamIds.map(
+      (teamId) => `team:${teamId.replace(/^team:/i, '')}`,
+    );
+    let existingTeams = await this.collection.getTeamsByIdentifiers(
+      canonicalTeamIds,
+    );
+    const teamById = new Map(
+      existingTeams.map((team) => [String(team.id), team]),
+    );
+    const teamsNeedingSnapshotRecovery = result.teamIds.filter((teamId) => {
+      const id = `team:${teamId.replace(/^team:/i, '')}`;
+      const team = teamById.get(id);
+      return (
+        !team?.name?.trim() ||
+        !team?.logo?.trim() ||
+        !team?.country?.trim()
+      );
+    });
+
+    // First recover names, logos and country values already present in stored
+    // fixture competitors.
+    // This does not spend ESPN quota and can repair older team documents even
+    // when a previous team-detail queue job was quarantined.
+    if (
+      teamsNeedingSnapshotRecovery.length > 0 &&
+      competition?.currentSeasonId
+    ) {
+      const recovered = await this.collection.recoverTeamSnapshotsFromFixtures(
+        leagueId,
+        competitionId,
+        competition.currentSeasonId,
+        teamsNeedingSnapshotRecovery,
+        existingTeams,
+      );
+      if (recovered > 0) {
+        this.logger.log(
+          `Recovered ${recovered} ${leagueId} team identity record(s) from stored fixture snapshots.`,
+        );
+        existingTeams = await this.collection.getTeamsByIdentifiers(
+          canonicalTeamIds,
+        );
+      }
+    }
+
+    const finalTeamById = new Map(
+      existingTeams.map((team) => [String(team.id), team]),
+    );
+    const teamsNeedingDetailRefresh = result.teamIds.filter((teamId) => {
+      const id = `team:${teamId.replace(/^team:/i, '')}`;
+      const team = finalTeamById.get(id);
+      return (
+        !team?.name?.trim() ||
+        !team?.logo?.trim() ||
+        !team?.country?.trim()
+      );
+    });
 
     if (scope.bootstrapRunId) {
       const bootstrap = await this.getBootstrapState(scope.bootstrapRunId);
@@ -976,6 +1033,52 @@ export class SportsQueueJobProcessorService {
         },
         triggerEventId: `team-detail:${leagueId}:${teamId}`,
       });
+    }
+
+    // enqueueIfMissing intentionally remembers terminal jobs, which is correct
+    // for most idempotent work but can permanently suppress a team-detail job
+    // after it has been quarantined. Re-open only incomplete teams whose last
+    // detail attempt is older than the normal 30-day collection cadence.
+    if (teamsNeedingDetailRefresh.length > 0) {
+      const recoveryCutoff = new Date(
+        Date.now() - SPORTS_COLLECTION_SCHEDULE.teamDetails.intervalMs,
+      );
+      const recentlyAttempted =
+        await this.queue.getRecentTeamDetailJobTeamIds(
+          leagueId,
+          teamsNeedingDetailRefresh,
+          recoveryCutoff,
+        );
+      const recoveryRunId = `team-detail-recovery:${new Date().toISOString()}`;
+      let recoveryJobsQueued = 0;
+
+      for (const teamId of teamsNeedingDetailRefresh) {
+        if (recentlyAttempted.has(teamId)) continue;
+        const recovery = await this.queue.enqueueIfMissing({
+          type: SportsQueueJobType.TEAM_DETAIL_REFRESH,
+          scope: {
+            leagueId,
+            teamId,
+            teamReference: result.teamReferences[teamId],
+            seasonYear,
+            sourceFingerprint: recoveryRunId,
+          },
+          priority: 78,
+          scheduledFor: new Date(),
+          recurrence: {
+            intervalMs: SPORTS_COLLECTION_SCHEDULE.teamDetails.intervalMs,
+            repeatUntil: 'NEVER',
+          },
+          triggerEventId: `${recoveryRunId}:${leagueId}:${teamId}`,
+        });
+        if (recovery.created) recoveryJobsQueued += 1;
+      }
+
+      if (recoveryJobsQueued > 0) {
+        this.logger.warn(
+          `Queued ${recoveryJobsQueued} recovery team-detail request(s) for incomplete ${leagueId} team records.`,
+        );
+      }
     }
   }
 
@@ -2002,9 +2105,13 @@ export class SportsQueueJobProcessorService {
     }
     const upcomingFixtures = [...upcomingById.values()];
 
+    const predictionHorizonEnd = new Date(
+      now.getTime() + PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours * 60 * 60_000,
+    );
+    let predictionTriggers = 0;
     for (let offset = 0; offset < upcomingFixtures.length; offset += 20) {
       const batch = upcomingFixtures.slice(offset, offset + 20);
-      await Promise.all(batch.map((fixture) => this.queue.enqueueIfMissing({
+      const oddsJobs = batch.map((fixture) => this.queue.enqueueIfMissing({
         type: SportsQueueJobType.ODDS_PRICING_RECALCULATION,
         scope: {
           fixtureId: String(fixture.id),
@@ -2015,12 +2122,39 @@ export class SportsQueueJobProcessorService {
         priority: 70,
         scheduledFor: now,
         triggerEventId: `odds:projection:${competitionId}:${seasonId}:${projectionWindow}:${fixture.id}`,
-      })));
+      }));
+      const predictionJobs = batch
+        .filter((fixture) => {
+          const kickoff = fixture.kickoffAt instanceof Date
+            ? fixture.kickoffAt
+            : new Date(fixture.kickoffAt as unknown as string);
+          const home = fixture.competitors?.find((team) => team.homeAway === 'HOME');
+          const away = fixture.competitors?.find((team) => team.homeAway === 'AWAY');
+          return Number.isFinite(kickoff.getTime())
+            && kickoff.getTime() > now.getTime()
+            && kickoff.getTime() <= predictionHorizonEnd.getTime()
+            && Boolean(home?.teamId && away?.teamId);
+        })
+        .map((fixture) => this.queue.enqueueIfMissing({
+          type: SportsQueueJobType.PREDICTION_ENGINE_RECALCULATION,
+          scope: {
+            fixtureId: String(fixture.id),
+            sourceFingerprint: `DERIVED_PROJECTION:${competitionId}:${seasonId}:${projectionWindow}`,
+          },
+          priority: 75,
+          scheduledFor: now,
+          triggerEventId: `prediction:projection:${competitionId}:${seasonId}:${projectionWindow}:${fixture.id}`,
+        }));
+      const [, predictionResults] = await Promise.all([
+        Promise.all(oddsJobs),
+        Promise.all(predictionJobs),
+      ]);
+      predictionTriggers += predictionResults.filter((result) => result.created).length;
     }
 
     if (upcomingFixtures.length) {
       this.logger.log(
-        `Derived projections refreshed for ${competitionId}/${seasonId}; queued Grivit repricing for ${upcomingFixtures.length} upcoming fixtures.`,
+        `Derived projections refreshed for ${competitionId}/${seasonId}; queued Grivit repricing for ${upcomingFixtures.length} upcoming fixtures and ${predictionTriggers} independent prediction trigger(s) inside the ${PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours}-hour prediction horizon.`,
       );
     }
   }
@@ -2802,4 +2936,6 @@ export class SportsQueueJobProcessorService {
     return normalized;
   }
 }
+
+
 

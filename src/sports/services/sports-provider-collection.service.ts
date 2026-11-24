@@ -134,6 +134,21 @@ export class SportsProviderCollectionService {
     };
   }
 
+  normalizeTeamsFromFixtures(
+    fixtures: Array<
+      Pick<SportsFixtureRecord, 'espnEventId' | 'competitors' | 'source'>
+    >,
+    leagueId: string,
+    onlyTeamIds?: string[],
+  ): SportsTeamRecord[] {
+    return this.normalizer.normalizeTeamsFromFixtures(
+      fixtures,
+      leagueId,
+      new Date(),
+      onlyTeamIds,
+    );
+  }
+
   async collectTeamDetails(
     leagueId: string,
     teamId: string,
@@ -405,6 +420,7 @@ export class SportsProviderCollectionService {
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 
 
 

@@ -22,8 +22,11 @@ import { EngineEventType } from '../enums/engine-event-type.enum';
 import { PredictionQueueStatus } from '../enums/prediction-queue-status.enum';
 import { PredictionRunStatus } from '../enums/prediction-run-status.enum';
 import { PredictionStatus } from '../enums/prediction-status.enum';
+import { PredictionMarket } from '../enums/prediction-market.enum';
 import { SlipStatus } from '../enums/slip-status.enum';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
+import { ODDS_CONFIG } from '../../odds/config/odds.config';
+import { evaluateFixtureCoverage } from '../utils/fixture-coverage-audit.util';
 import { PredictionEngineDashboard } from '../interfaces/prediction-monitor.interface';
 import { FOOTBALL_MARKET_CATALOG } from '../catalog/football-market-catalog';
 import { FOOTBALL_MARKET_BY_PREDICTION_KEY } from '../../odds/catalog/football-market-catalog';
@@ -2745,6 +2748,453 @@ export class PredictionEngineMonitorService implements OnModuleInit {
       coverageByMarket,
       fixtures,
       note: 'Read-only page-level coverage summary. It uses the durable prediction queue so fixtures with no market prediction documents remain visible, and compares persisted prediction revisions with the current Sports fixture revision. It does not enqueue work, generate predictions, refresh Odds, or mutate Pick Center.',
+    };
+  }
+
+  /**
+   * Read-only end-to-end baseline coverage audit. Unlike the market inventory,
+   * this starts from normalized Sports fixtures rather than Prediction queue
+   * rows, so a fixture that never entered the queue is still counted.
+   * It verifies only the always-required Full-Time Match Result (1X2) baseline;
+   * advanced markets retain their own evidence-dependent coverage rules.
+   */
+  async getFixtureCoverageInventory(input: {
+    from?: string;
+    to?: string;
+    leagueId?: string;
+    cursor?: string;
+    pageSize?: number;
+  } = {}): Promise<Record<string, unknown>> {
+    const generatedAt = new Date();
+    const from = input.from ? new Date(input.from) : generatedAt;
+    const defaultHorizonHours = Math.max(
+      PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours,
+      ODDS_CONFIG.pricingLookaheadHours,
+    );
+    const to = input.to
+      ? new Date(input.to)
+      : new Date(generatedAt.getTime() + defaultHorizonHours * 3_600_000);
+
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+      throw new BadRequestException('Fixture coverage dates must be valid ISO date values.');
+    }
+    if (to.getTime() < from.getTime()) {
+      throw new BadRequestException('Fixture coverage "to" date must be on or after the "from" date.');
+    }
+    if (to.getTime() - from.getTime() > 31 * 24 * 3_600_000) {
+      throw new BadRequestException('Fixture coverage range cannot exceed 31 days per request.');
+    }
+
+    const pageSize = Math.max(1, Math.min(100, Math.floor(Number(input.pageSize) || 50)));
+    const leagueId = String(input.leagueId ?? '').trim().toLowerCase();
+    const fixtureQuery = {
+      from,
+      to,
+      limit: pageSize,
+      sortOrder: 'ASC' as const,
+      retainedOnly: true,
+      ...(leagueId ? { competitionId: leagueId } : {}),
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    };
+
+    const [fixturePage, totalSportsFixtures] = await Promise.all([
+      this.sportsRead.getFixtures(fixtureQuery),
+      this.sportsRead.countFixtures({
+        from,
+        to,
+        retainedOnly: true,
+        ...(leagueId ? { competitionId: leagueId } : {}),
+      }),
+    ]);
+
+    const fixtures = fixturePage.items ?? [];
+    const eventIds = fixtures
+      .map((fixture) => String(fixture.id ?? '').trim())
+      .filter(Boolean);
+
+    if (!eventIds.length) {
+      return {
+        generatedAt,
+        modelVersions: {
+          prediction: PREDICTION_ENGINE_CONFIG.modelVersion,
+          odds: ODDS_CONFIG.modelVersion,
+        },
+        range: { from, to, leagueId: leagueId || null },
+        horizons: {
+          predictionHours: PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours,
+          oddsHours: ODDS_CONFIG.pricingLookaheadHours,
+        },
+        pagination: {
+          pageSize,
+          totalSportsFixtures,
+          hasMore: Boolean(fixturePage.nextCursor),
+          nextCursor: fixturePage.nextCursor ?? null,
+          note: 'Coverage totals and rates describe this page only. Follow nextCursor until hasMore is false to verify the full range.',
+        },
+        totals: {
+          sportsFixturesScanned: 0,
+          eligibleFixtures: 0,
+          excludedFixtures: 0,
+          predictionRequiredFixtures: 0,
+          fixturesWithPredictionQueue: 0,
+          fixturesMissingPredictionQueue: 0,
+          fixturesWithBaselinePrediction: 0,
+          fixturesMissingBaselinePrediction: 0,
+          fixturesWithCurrentPrediction: 0,
+          fixturesMissingCurrentPrediction: 0,
+          oddsRequiredFixtures: 0,
+          fixturesWithBaselineGrivitOdds: 0,
+          fixturesMissingBaselineGrivitOdds: 0,
+          fixturesWithCurrentGrivitOdds: 0,
+          fixturesMissingCurrentGrivitOdds: 0,
+          fullyCoveredFixtures: 0,
+          fixturesWithPredictionQueueNotReady: 0,
+          fixturesAwaitingRecalculation: 0,
+          fixturesWithProvisionalPredictions: 0,
+          fixturesWithProvisionalGrivitOdds: 0,
+          fixturesWithProvisionalCalculations: 0,
+          fixturesWithFailedCalculations: 0,
+          fixturesWithUnresolvedCoverageGaps: 0,
+          fixturesMissingFixtureInformation: 0,
+          fixturesMissingHomeTeamInformation: 0,
+          fixturesMissingAwayTeamInformation: 0,
+          fixturesOutsideConfiguredHorizons: 0,
+          fixturesGenuinelyIneligible: 0,
+          predictionCoverageRate: null,
+          oddsCoverageRate: null,
+          endToEndCoverageRate: null,
+          coverageStateCounts: {},
+        },
+        fixtures: [],
+        note: 'Read-only Sports-first baseline coverage audit. No queue, prediction, Odds, or Pick Center records were changed.',
+      };
+    }
+
+    const [queueRows, predictionRows, oddsQuotes, fixtureRevisions] = await Promise.all([
+      this.queueModel
+        .find({ eventId: { $in: eventIds } })
+        .select({
+          eventId: 1,
+          status: 1,
+          modelVersion: 1,
+          sourceRevisionFingerprint: 1,
+          errorMessage: 1,
+          attempts: 1,
+          updatedAt: 1,
+        })
+        .lean()
+        .exec() as Promise<any[]>,
+      this.marketModel
+        .find({
+          eventId: { $in: eventIds },
+          marketKey: PredictionMarket.MATCH_RESULT,
+        })
+        .select({
+          eventId: 1,
+          marketKey: 1,
+          modelVersion: 1,
+          status: 1,
+          fixtureSourceRevision: 1,
+          sourceRevisionFingerprint: 1,
+          selections: 1,
+          generatedAt: 1,
+        })
+        .sort({ generatedAt: -1 })
+        .lean()
+        .exec() as Promise<any[]>,
+      this.oddsRead.getPricesForFixtures(eventIds),
+      this.sportsRevisions.getCurrentRevisions('FIXTURE', eventIds),
+    ]);
+
+    const queueByEvent = new Map<string, any>();
+    for (const row of queueRows) queueByEvent.set(String(row.eventId), row);
+
+    const predictionRowsByEvent = new Map<string, any[]>();
+    for (const row of predictionRows) {
+      const id = String(row.eventId ?? '').trim();
+      if (!id) continue;
+      const rows = predictionRowsByEvent.get(id) ?? [];
+      rows.push(row);
+      predictionRowsByEvent.set(id, rows);
+    }
+
+    const oddsByEvent = new Map<string, any[]>();
+    for (const quote of oddsQuotes as any[]) {
+      const id = String(quote.eventId ?? '').trim();
+      if (!id) continue;
+      const rows = oddsByEvent.get(id) ?? [];
+      rows.push(quote);
+      oddsByEvent.set(id, rows);
+    }
+
+    const totals = {
+      sportsFixturesScanned: fixtures.length,
+      eligibleFixtures: 0,
+      excludedFixtures: 0,
+      predictionRequiredFixtures: 0,
+      fixturesWithPredictionQueue: 0,
+      fixturesMissingPredictionQueue: 0,
+      fixturesWithBaselinePrediction: 0,
+      fixturesMissingBaselinePrediction: 0,
+      fixturesWithCurrentPrediction: 0,
+      fixturesMissingCurrentPrediction: 0,
+      oddsRequiredFixtures: 0,
+      fixturesWithBaselineGrivitOdds: 0,
+      fixturesMissingBaselineGrivitOdds: 0,
+      fixturesWithCurrentGrivitOdds: 0,
+      fixturesMissingCurrentGrivitOdds: 0,
+      fullyCoveredFixtures: 0,
+      fixturesWithPredictionQueueNotReady: 0,
+      fixturesAwaitingRecalculation: 0,
+      fixturesWithProvisionalPredictions: 0,
+      fixturesWithProvisionalGrivitOdds: 0,
+      fixturesWithProvisionalCalculations: 0,
+      fixturesWithFailedCalculations: 0,
+      fixturesWithUnresolvedCoverageGaps: 0,
+      fixturesMissingFixtureInformation: 0,
+      fixturesMissingHomeTeamInformation: 0,
+      fixturesMissingAwayTeamInformation: 0,
+      fixturesOutsideConfiguredHorizons: 0,
+      fixturesGenuinelyIneligible: 0,
+    };
+    const fixtureResults: Array<Record<string, unknown>> = [];
+    const coverageStateCounts: Record<string, number> = {};
+
+    for (const fixture of fixtures) {
+      const eventId = String(fixture.id ?? '').trim();
+      if (!eventId) {
+        totals.excludedFixtures += 1;
+        totals.fixturesMissingFixtureInformation += 1;
+        coverageStateCounts.MISSING_FIXTURE_INFORMATION =
+          (coverageStateCounts.MISSING_FIXTURE_INFORMATION ?? 0) + 1;
+        fixtureResults.push({
+          eventId: null,
+          leagueId: fixture.competitionId ?? null,
+          kickoffAt: fixture.kickoffAt ?? null,
+          fixtureStatus: fixture.status?.state ?? 'UNKNOWN',
+          coverageState: 'MISSING_FIXTURE_INFORMATION',
+          required: { prediction: false, odds: false },
+          eligible: false,
+          exclusionReasons: ['MISSING_FIXTURE_ID'],
+          missingInformation: {
+            fixture: ['MISSING_FIXTURE_ID'],
+            teams: [],
+          },
+          issueCodes: ['MISSING_FIXTURE_ID'],
+        });
+        continue;
+      }
+      const homeTeamId = fixture.competitors?.find(
+        (competitor) => competitor.homeAway === 'HOME',
+      )?.teamId;
+      const awayTeamId = fixture.competitors?.find(
+        (competitor) => competitor.homeAway === 'AWAY',
+      )?.teamId;
+      const queue = queueByEvent.get(eventId) ?? null;
+      const allPredictionRows = predictionRowsByEvent.get(eventId) ?? [];
+      const currentPrediction = allPredictionRows.find(
+        (row) => row.modelVersion === PREDICTION_ENGINE_CONFIG.modelVersion,
+      ) ?? null;
+      const currentFixtureSourceRevision = fixtureRevisions.get(eventId) ?? 0;
+      const result = evaluateFixtureCoverage({
+        now: generatedAt,
+        kickoffAt: fixture.kickoffAt,
+        fixtureStatus: fixture.status,
+        homeTeamId,
+        awayTeamId,
+        predictionHorizonHours: PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours,
+        oddsHorizonHours: ODDS_CONFIG.pricingLookaheadHours,
+        predictionModelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
+        oddsModelVersion: ODDS_CONFIG.modelVersion,
+        maximumDecimalOdds: ODDS_CONFIG.maximumDecimalOdds,
+        currentFixtureSourceRevision,
+        queue,
+        predictionDocument: currentPrediction,
+        hasPredictionDocumentFromOtherModel: allPredictionRows.length > 0 && !currentPrediction,
+        oddsQuotes: oddsByEvent.get(eventId) ?? [],
+      });
+
+      if (result.eligible) totals.eligibleFixtures += 1;
+      else totals.excludedFixtures += 1;
+
+      if (result.missingFixtureInformation.length) {
+        totals.fixturesMissingFixtureInformation += 1;
+      }
+      if (result.missingTeamInformation.includes('MISSING_HOME_TEAM_ID')) {
+        totals.fixturesMissingHomeTeamInformation += 1;
+      }
+      if (result.missingTeamInformation.includes('MISSING_AWAY_TEAM_ID')) {
+        totals.fixturesMissingAwayTeamInformation += 1;
+      }
+      if (
+        !result.eligible
+        && result.missingFixtureInformation.length === 0
+        && result.missingTeamInformation.length === 0
+      ) {
+        totals.fixturesGenuinelyIneligible += 1;
+      }
+
+      if (result.predictionRequired) {
+        totals.predictionRequiredFixtures += 1;
+        if (result.queuePresent) totals.fixturesWithPredictionQueue += 1;
+        else totals.fixturesMissingPredictionQueue += 1;
+        if (!result.queueCovered) totals.fixturesWithPredictionQueueNotReady += 1;
+        if (currentPrediction) {
+          totals.fixturesWithBaselinePrediction += 1;
+        } else {
+          totals.fixturesMissingBaselinePrediction += 1;
+        }
+        if (result.predictionCovered) totals.fixturesWithCurrentPrediction += 1;
+        else totals.fixturesMissingCurrentPrediction += 1;
+        if (result.predictionProvisional) totals.fixturesWithProvisionalPredictions += 1;
+      }
+      if (result.oddsRequired) {
+        totals.oddsRequiredFixtures += 1;
+        if (result.oddsCovered) totals.fixturesWithBaselineGrivitOdds += 1;
+        else totals.fixturesMissingBaselineGrivitOdds += 1;
+        if (result.oddsCovered) totals.fixturesWithCurrentGrivitOdds += 1;
+        else totals.fixturesMissingCurrentGrivitOdds += 1;
+        if (result.oddsProvisional) totals.fixturesWithProvisionalGrivitOdds += 1;
+      }
+
+      const hasRequiredCoverage = result.predictionRequired || result.oddsRequired;
+      if (result.eligible && !hasRequiredCoverage) {
+        totals.fixturesOutsideConfiguredHorizons += 1;
+      }
+      if (result.pendingRecalculation) totals.fixturesAwaitingRecalculation += 1;
+      if (result.failedCalculation) totals.fixturesWithFailedCalculations += 1;
+      if (result.predictionProvisional || result.oddsProvisional) {
+        totals.fixturesWithProvisionalCalculations += 1;
+      }
+      if (hasRequiredCoverage && !result.fullyCovered) {
+        totals.fixturesWithUnresolvedCoverageGaps += 1;
+      }
+      if (result.fullyCovered && hasRequiredCoverage) totals.fullyCoveredFixtures += 1;
+
+      const coverageState = !result.eligible
+        ? result.missingFixtureInformation.length
+          ? 'MISSING_FIXTURE_INFORMATION'
+          : result.missingTeamInformation.length
+            ? 'MISSING_TEAM_INFORMATION'
+            : 'NOT_ELIGIBLE'
+        : !hasRequiredCoverage
+          ? 'OUTSIDE_REQUIRED_HORIZONS'
+          : result.failedCalculation
+            ? 'FAILED_CALCULATION'
+            : result.pendingRecalculation
+              ? 'RECALCULATION_REQUIRED'
+              : result.fullyCovered && (result.predictionProvisional || result.oddsProvisional)
+                ? 'PROVISIONAL_COVERAGE'
+                : result.fullyCovered && !result.queueCovered
+                  ? 'FULLY_COVERED_QUEUE_GAP'
+                  : result.fullyCovered
+                    ? 'FULLY_COVERED'
+                    : !result.predictionCovered && !result.oddsCovered
+                      ? 'PREDICTION_AND_ODDS_GAP'
+                      : !result.predictionCovered
+                        ? 'PREDICTION_GAP'
+                        : 'ODDS_GAP';
+      coverageStateCounts[coverageState] = (coverageStateCounts[coverageState] ?? 0) + 1;
+
+      fixtureResults.push({
+        eventId,
+        leagueId: fixture.competitionId,
+        kickoffAt: fixture.kickoffAt,
+        fixtureStatus: fixture.status?.state ?? 'UNKNOWN',
+        homeTeamId: homeTeamId ?? null,
+        awayTeamId: awayTeamId ?? null,
+        currentFixtureSourceRevision,
+        coverageState,
+        required: {
+          prediction: result.predictionRequired,
+          odds: result.oddsRequired,
+        },
+        queue: {
+          present: result.queuePresent,
+          covered: result.queueCovered,
+          status: queue?.status ?? null,
+          modelVersion: queue?.modelVersion ?? null,
+          attempts: Number(queue?.attempts ?? 0),
+          errorMessage: queue?.errorMessage ?? null,
+          updatedAt: queue?.updatedAt ?? null,
+        },
+        prediction: {
+          covered: result.predictionCovered,
+          provisional: result.predictionProvisional,
+          evidenceLevels: result.predictionEvidenceLevels,
+          modelVersion: currentPrediction?.modelVersion ?? null,
+          status: currentPrediction?.status ?? null,
+          selectionCount: result.predictionSelectionCount,
+          probabilityTotal: result.probabilityTotal,
+          generatedAt: currentPrediction?.generatedAt ?? null,
+          sourceRevisionFingerprint: currentPrediction?.sourceRevisionFingerprint ?? null,
+        },
+        odds: {
+          covered: result.oddsCovered,
+          provisional: result.oddsProvisional,
+          bases: result.oddsBases,
+          requiredSelectionCount: 3,
+          availableSelectionCount: result.oddsSelectionCount,
+          calculationVersion: ODDS_CONFIG.modelVersion,
+        },
+        recalculation: {
+          required: result.pendingRecalculation,
+        },
+        calculation: {
+          failed: result.failedCalculation,
+        },
+        missingInformation: {
+          fixture: result.missingFixtureInformation,
+          teams: result.missingTeamInformation,
+        },
+        eligible: result.eligible,
+        exclusionReasons: result.exclusionReasons,
+        issueCodes: result.issueCodes,
+      });
+    }
+
+    const ratio = (numerator: number, denominator: number): number | null =>
+      denominator > 0 ? Number((numerator / denominator).toFixed(4)) : null;
+    const endToEndRequired = fixtureResults.filter((fixture: any) =>
+      fixture.eligible && (fixture.required.prediction || fixture.required.odds),
+    ).length;
+
+    return {
+      generatedAt,
+      modelVersions: {
+        prediction: PREDICTION_ENGINE_CONFIG.modelVersion,
+        odds: ODDS_CONFIG.modelVersion,
+      },
+      range: { from, to, leagueId: leagueId || null },
+      horizons: {
+        predictionHours: PREDICTION_ENGINE_CONFIG.queue.forwardWindowHours,
+        oddsHours: ODDS_CONFIG.pricingLookaheadHours,
+      },
+      pagination: {
+        pageSize,
+        totalSportsFixtures,
+        hasMore: Boolean(fixturePage.nextCursor),
+        nextCursor: fixturePage.nextCursor ?? null,
+        note: 'Coverage totals and rates describe this page only. Follow nextCursor until hasMore is false to verify the full range.',
+      },
+      totals: {
+        ...totals,
+        predictionCoverageRate: ratio(
+          totals.fixturesWithCurrentPrediction,
+          totals.predictionRequiredFixtures,
+        ),
+        oddsCoverageRate: ratio(
+          totals.fixturesWithCurrentGrivitOdds,
+          totals.oddsRequiredFixtures,
+        ),
+        endToEndCoverageRate: ratio(
+          totals.fullyCoveredFixtures,
+          endToEndRequired,
+        ),
+        coverageStateCounts,
+      },
+      fixtures: fixtureResults,
+      note: 'Read-only Sports-first audit of eligible fixtures and baseline Full-Time Match Result (1X2) coverage. Coverage rates measure persisted match-level probabilities and Grivit prices; queue presence is reported separately so an operational queue gap does not erase an already valid calculation. The audit also classifies provisional evidence, failed calculations, pending recalculation, missing fixture/team information and fixtures outside both configured horizons. Advanced markets are not treated as mandatory. No queue, prediction, Odds, Sports, or Pick Center records were changed.',
     };
   }
 

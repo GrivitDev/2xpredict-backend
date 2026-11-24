@@ -13,6 +13,7 @@ import { PredictionQueueSyncResult } from '../interfaces/prediction-queue.interf
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 import { OddsReadService } from '../../odds/services/odds-read.service';
 import { SportsDataChangeEventService } from '../../sports/services/sports-data-change-event.service';
+import { getPredictionSourceRevisionSnapshots } from '../utils/prediction-source-revision.util';
 
 export type ClaimedPredictionQueueJob = Pick<
   PredictionQueue,
@@ -23,6 +24,8 @@ export type ClaimedPredictionQueueJob = Pick<
   | 'oddsUpdatedAt'
   | 'scoreSnapshot'
   | 'fixtureSourceRevision'
+  | 'sourceRevisionFingerprint'
+  | 'forceRecalculation'
 > & { lockToken: string };
 
 const PREDICTION_QUEUE_SYNC_PAGE_SIZE = 100;
@@ -68,9 +71,8 @@ export class PredictionQueueService {
    * this window; direct source-change triggers use the same boundary.
    *
    * Fixtures are processed page-by-page to keep memory and MongoDB $in queries
-   * bounded. A fixture receives a durable WAITING_FOR_ODDS row even when Grivit
-   * has not priced any market yet. Once Odds becomes ready, the same row moves
-   * to PENDING and can be claimed by a worker.
+   * bounded. Every otherwise eligible upcoming Sports fixture receives a
+   * durable PENDING prediction job, independently of Grivit/Odds readiness.
    */
   async syncUpcomingFixtures(
     force = false,
@@ -114,7 +116,16 @@ export class PredictionQueueService {
         // implemented separately so a pending job cannot become an in-play run.
         if (LIVE_FIXTURE_STATES.has(state)) return false;
         const kickoff = this.toDate(fixture.kickoffAt);
-        return Boolean(kickoff && kickoff.getTime() >= now.getTime());
+        const home = fixture.competitors?.find((competitor) => competitor.homeAway === 'HOME');
+        const away = fixture.competitors?.find((competitor) => competitor.homeAway === 'AWAY');
+        // A model calculation needs normalized identities for both sides. Missing
+        // team IDs are a Sports-data integrity problem, not a historical-sample gate.
+        return Boolean(
+          kickoff
+          && kickoff.getTime() >= now.getTime()
+          && home?.teamId
+          && away?.teamId,
+        );
       });
 
       if (fixtures.length) {
@@ -132,7 +143,7 @@ export class PredictionQueueService {
 
     await this.monitor.recordQueueSync(totals);
     this.logger.log(
-      `Seven-day prediction queue reconciliation completed: pages=${pagesScanned}, fixtures=${totals.scannedFixtures}, oddsReady=${totals.eligibleFixtures}, waitingForOdds=${totals.oddsNotReady ?? 0}, enqueued=${totals.enqueued}, refreshed=${totals.refreshed}, missingSportsFreshness=${totals.missingSummary}.`,
+      `Seven-day prediction queue reconciliation completed: pages=${pagesScanned}, fixtures=${totals.scannedFixtures}, eligible=${totals.eligibleFixtures}, missingOdds=${totals.oddsNotReady ?? 0}, enqueued=${totals.enqueued}, refreshed=${totals.refreshed}, missingSportsFreshness=${totals.missingSummary}.`,
     );
 
     return totals;
@@ -177,13 +188,18 @@ export class PredictionQueueService {
     });
 
     const eventIds = fixtures.map((fixture) => String(fixture.id));
-    const [readinessByEvent, fixtureRevisionsByEvent] = await Promise.all([
-      this.oddsService.getPredictionReadinessForEvents(eventIds),
-      this.sportsRevisions.getCurrentRevisions('FIXTURE', eventIds),
+    const [readinessByEvent, sourceSnapshotsByEvent] = await Promise.all([
+      this.oddsService.getPredictionReadinessForEvents(eventIds).catch((error: unknown) => {
+        this.logger.warn(
+          `Optional Odds readiness lookup failed for ${eventIds.length} fixture(s); prediction queueing will continue: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return new Map();
+      }),
+      getPredictionSourceRevisionSnapshots(fixtures, this.sportsRevisions),
     ]);
-    const eligibleFixtures = fixtures.filter((fixture) =>
-      readinessByEvent.get(String(fixture.id))?.ready === true,
-    );
+    // Odds readiness is diagnostic metadata only. It does not determine whether
+    // an otherwise eligible Sports fixture receives a prediction job.
+    const eligibleFixtures = fixtures;
 
     const existingRows = (await this.queueModel
       .find({ eventId: { $in: eventIds } })
@@ -198,6 +214,8 @@ export class PredictionQueueService {
         summaryCollectedAt: 1,
         fixtureSourceRevision: 1,
         lastProcessedFixtureSourceRevision: 1,
+        sourceRevisionFingerprint: 1,
+        lastProcessedSourceRevisionFingerprint: 1,
         modelVersion: 1,
         lastProcessedOddsAt: 1,
         oddsUpdatedAt: 1,
@@ -280,7 +298,9 @@ export class PredictionQueueService {
 
       const latestOddsUpdatedAt = this.toDate(readiness?.latestOddsUpdatedAt);
       const retentionExpiresAt = this.toDate(fixture.retentionExpiresAt);
-      const fixtureSourceRevision = fixtureRevisionsByEvent.get(eventId) ?? 0;
+      const sourceSnapshot = sourceSnapshotsByEvent.get(eventId);
+      const fixtureSourceRevision = sourceSnapshot?.fixtureSourceRevision ?? 0;
+      const sourceRevisionFingerprint = sourceSnapshot?.fingerprint ?? '';
       const currentPriority = priorityMap.get(String(fixture.competitionId)) ?? 100;
 
       const setFields: Record<string, any> = {
@@ -290,76 +310,14 @@ export class PredictionQueueService {
         priority: currentPriority,
         summaryCollectedAt: sourceDate,
         fixtureSourceRevision,
+        sourceRevisionFingerprint,
         modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
         scoreSnapshot,
         ...(latestOddsUpdatedAt ? { oddsUpdatedAt: latestOddsUpdatedAt } : {}),
         ...(retentionExpiresAt ? { retentionExpiresAt } : {}),
       };
 
-      // A queue row is created for every retained upcoming fixture, even when
-      // the Odds module has not yet priced a single market. This is the key
-      // coverage correction: absence of Odds no longer means absence of a job.
-      if (!readiness?.ready) {
-        oddsNotReady += 1;
-        if (existing?.status === PredictionQueueStatus.PROCESSING) continue;
-
-        const currentFixtureDate = this.toDate(existing?.fixtureDate);
-        const currentSourceDate = this.toDate(existing?.summaryCollectedAt);
-        const currentRetentionDate = this.toDate(existing?.retentionExpiresAt);
-        const waitingReason = readiness?.reason
-          ?? 'Odds module has not marked this Sports fixture prediction-ready.';
-        const needsWaitingUpdate = !existing
-          || existing.status !== PredictionQueueStatus.WAITING_FOR_ODDS
-          || !currentFixtureDate
-          || currentFixtureDate.getTime() !== fixtureDate.getTime()
-          || !currentSourceDate
-          || currentSourceDate.getTime() !== sourceDate.getTime()
-          || existing.modelVersion !== PREDICTION_ENGINE_CONFIG.modelVersion
-          || Number(existing.fixtureSourceRevision ?? -1) !== fixtureSourceRevision
-          || existing.leagueId !== String(fixture.competitionId)
-          || existing.priority !== currentPriority
-          || existing.scoreSnapshot !== scoreSnapshot
-          || existing.errorMessage !== waitingReason
-          || Number(existing.attempts ?? 0) !== 0
-          || (retentionExpiresAt?.getTime() ?? 0) !== (currentRetentionDate?.getTime() ?? 0)
-          || force;
-
-        if (!needsWaitingUpdate) continue;
-
-        await pushOperation({
-          updateOne: {
-            filter: {
-              eventId,
-              status: { $ne: PredictionQueueStatus.PROCESSING },
-            },
-            update: {
-              $set: {
-                ...setFields,
-                status: PredictionQueueStatus.WAITING_FOR_ODDS,
-                availableAt: now,
-                // Reset attempts for an existing row. For a new row, initialize
-                // attempts through $setOnInsert below so MongoDB never receives
-                // the same path in both update operators.
-                ...(existing ? { attempts: 0 } : {}),
-                reason: 'WAITING_FOR_ODDS',
-                errorMessage: waitingReason,
-              },
-              ...(existing ? {} : { $setOnInsert: { attempts: 0, refreshCount: 0 } }),
-              $unset: {
-                lockedAt: 1,
-                lockToken: 1,
-                completedAt: 1,
-                ...(!retentionExpiresAt ? { retentionExpiresAt: 1 } : {}),
-              },
-            },
-            upsert: !existing,
-          },
-        });
-
-        if (!existing) enqueued += 1;
-        else refreshed += 1;
-        continue;
-      }
+      if (!readiness?.ready) oddsNotReady += 1;
 
       if (existing?.status === PredictionQueueStatus.PROCESSING) continue;
 
@@ -400,6 +358,14 @@ export class PredictionQueueService {
       const fixtureRevisionChanged = Boolean(
         existing && Number(revisionBaseline ?? -1) !== fixtureSourceRevision,
       );
+      // Older completed queue rows pre-date the composite source fingerprint.
+      // A missing legacy value is not proof that Sports changed; explicit
+      // fixture/entity source-change events still trigger recalculation, while
+      // the established 72-hour recovery interval remains intact.
+      const storedSourceFingerprint = String(existing?.sourceRevisionFingerprint ?? '').trim();
+      const sourceRevisionChanged = Boolean(
+        existing && storedSourceFingerprint && storedSourceFingerprint !== sourceRevisionFingerprint,
+      );
 
       const existingCompletedAt = this.toDate(existing?.completedAt);
       const refreshCompletedDue = Boolean(
@@ -422,7 +388,7 @@ export class PredictionQueueService {
         PredictionQueueStatus.FAILED,
         PredictionQueueStatus.SKIPPED,
       ].includes(existing?.status as PredictionQueueStatus);
-      const inputsChanged = sourceChanged || oddsChanged || modelChanged || scoreChanged || kickoffChanged || retentionChanged || fixtureRevisionChanged;
+      const inputsChanged = sourceChanged || oddsChanged || modelChanged || scoreChanged || kickoffChanged || retentionChanged || fixtureRevisionChanged || sourceRevisionChanged;
       const shouldRequeue = !existing
         || existing.status === PredictionQueueStatus.WAITING_FOR_ODDS
         || (existing.status === PredictionQueueStatus.PENDING && (inputsChanged || force))
@@ -435,15 +401,15 @@ export class PredictionQueueService {
         setFields.reason = !existing
           ? 'INITIAL'
           : existing.status === PredictionQueueStatus.WAITING_FOR_ODDS
-            ? 'ODDS_BECAME_READY'
+            ? 'LEGACY_WAITING_FOR_ODDS_PROMOTED'
             : modelChanged
               ? 'MODEL_VERSION_UPDATED'
               : oddsChanged
                 ? 'ODDS_UPDATED'
                 : scoreChanged
                   ? 'SPORTS_FIXTURE_STATE_UPDATED'
-                  : fixtureRevisionChanged
-                    ? 'SPORTS_FIXTURE_REVISION_UPDATED'
+                  : fixtureRevisionChanged || sourceRevisionChanged
+                    ? 'SPORTS_SOURCE_REVISION_UPDATED'
                     : sourceChanged
                       ? 'SPORTS_FIXTURE_UPDATED'
                       : kickoffChanged
@@ -458,7 +424,16 @@ export class PredictionQueueService {
                               ? 'RETRY_BACKOFF_ELAPSED'
                               : existing.reason;
 
-        if (existing && terminalStatus && (force || refreshCompletedDue || recoverFailedDue || inputsChanged)) {
+        // Legacy WAITING_FOR_ODDS rows are being promoted into the current
+        // mandatory-baseline queue flow. Clear their old attempt count so a
+        // prior wait/failure history does not consume retries for the new run.
+        if (
+          existing
+          && (
+            existing.status === PredictionQueueStatus.WAITING_FOR_ODDS
+            || (terminalStatus && (force || refreshCompletedDue || recoverFailedDue || inputsChanged))
+          )
+        ) {
           setFields.attempts = 0;
         }
         if (existing && inputsChanged) {
@@ -475,7 +450,8 @@ export class PredictionQueueService {
         || modelChanged
         || scoreChanged
         || retentionChanged
-        || fixtureRevisionChanged;
+        || fixtureRevisionChanged
+        || sourceRevisionChanged;
 
       if (!existing || shouldRequeue || metadataChanged) {
         const update: Record<string, any> = { $set: setFields };
@@ -527,7 +503,7 @@ export class PredictionQueueService {
 
   /**
    * Apply a Sports/Odds source-change trigger to one fixture. The source-change
-   * worker calls this only after the Odds worker has completed repricing.
+   * worker calls this directly from the Sports outbox; Odds readiness is optional enrichment only.
    * Processing rows are not unlocked or overwritten: they receive a durable
    * refresh marker and are returned to PENDING by complete()/fail() afterwards.
    */
@@ -558,11 +534,19 @@ export class PredictionQueueService {
       return 'SKIPPED';
     }
 
-    const [readinessByEvent, fixtureSourceRevision] = await Promise.all([
-      this.oddsService.getPredictionReadinessForEvents([id]),
-      this.sportsRevisions.getCurrentRevision('FIXTURE', id),
+    const [readinessByEvent, sourceSnapshotsByEvent] = await Promise.all([
+      this.oddsService.getPredictionReadinessForEvents([id]).catch((error: unknown) => {
+        this.logger.warn(
+          `Optional Odds readiness lookup failed for source-triggered fixture ${id}; prediction refresh will continue: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return new Map();
+      }),
+      getPredictionSourceRevisionSnapshots([fixture], this.sportsRevisions),
     ]);
     const readiness = readinessByEvent.get(id);
+    const sourceSnapshot = sourceSnapshotsByEvent.get(String(fixture.id));
+    const fixtureSourceRevision = sourceSnapshot?.fixtureSourceRevision ?? 0;
+    const sourceRevisionFingerprint = sourceSnapshot?.fingerprint ?? '';
     const competition = await this.sportsRead.getCompetition(String(fixture.competitionId));
     const region = String(competition?.region ?? '').toUpperCase();
     const priority = region === 'EUROPE' ? 400
@@ -593,8 +577,6 @@ export class PredictionQueueService {
       String(fixture.status?.clock ?? fixture.status?.displayClock ?? ''),
     ].join('|');
     const ready = readiness?.ready === true;
-    const waitingReason = readiness?.reason
-      ?? 'Grivit has not produced a prediction-ready price for this fixture.';
     const updateFields: Record<string, unknown> = {
       eventId: id,
       leagueId: String(fixture.competitionId),
@@ -602,16 +584,17 @@ export class PredictionQueueService {
       priority,
       summaryCollectedAt: sourceDate,
       fixtureSourceRevision,
+      sourceRevisionFingerprint,
+      forceRecalculation: true,
       modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
       scoreSnapshot,
-      status: ready ? PredictionQueueStatus.PENDING : PredictionQueueStatus.WAITING_FOR_ODDS,
+      status: PredictionQueueStatus.PENDING,
       availableAt: now,
       attempts: 0,
-      reason: ready ? 'SPORTS_ODDS_SOURCE_CHANGED' : 'WAITING_FOR_ODDS',
+      reason: ready ? 'SPORTS_ODDS_SOURCE_CHANGED' : 'SPORTS_SOURCE_CHANGED',
       refreshCount: 0,
       ...(latestOddsUpdatedAt ? { oddsUpdatedAt: latestOddsUpdatedAt } : {}),
       ...(retentionExpiresAt ? { retentionExpiresAt } : {}),
-      ...(!ready ? { errorMessage: waitingReason } : {}),
     };
 
     // Retry the conditional transition if a prediction worker claims or
@@ -633,6 +616,8 @@ export class PredictionQueueService {
               priority,
               summaryCollectedAt: sourceDate,
               fixtureSourceRevision,
+              sourceRevisionFingerprint,
+              forceRecalculation: true,
               modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
               scoreSnapshot,
               ...(latestOddsUpdatedAt ? { oddsUpdatedAt: latestOddsUpdatedAt } : {}),
@@ -663,14 +648,14 @@ export class PredictionQueueService {
               refreshRequestedAt: 1,
               refreshRequestedReason: 1,
               sourceChangeEventId: 1,
-              ...(ready ? { errorMessage: 1 } : {}),
+              errorMessage: 1,
               ...(!retentionExpiresAt ? { retentionExpiresAt: 1 } : {}),
             },
           },
           { upsert: !existing },
         ).exec();
         if ((updated.matchedCount ?? 0) > 0 || (updated.upsertedCount ?? 0) > 0) {
-          return ready ? 'QUEUED' : 'WAITING_FOR_ODDS';
+          return 'QUEUED';
         }
       } catch (error) {
         // A concurrent first insert can win the unique eventId race. Re-read
@@ -843,35 +828,6 @@ export class PredictionQueueService {
     return true;
   }
 
-  async deferForOddsNotReady(
-    job: Pick<ClaimedPredictionQueueJob, 'eventId' | 'attempts' | 'lockToken'>,
-    reason: string,
-  ): Promise<boolean> {
-    const result = await this.queueModel.updateOne(
-      {
-        eventId: String(job.eventId),
-        status: PredictionQueueStatus.PROCESSING,
-        lockToken: job.lockToken,
-      },
-      {
-        $set: {
-          status: PredictionQueueStatus.WAITING_FOR_ODDS,
-          reason: 'WAITING_FOR_ODDS',
-          errorMessage: reason,
-        },
-        $inc: { attempts: -1 },
-        $unset: {
-          lockedAt: 1,
-          lockToken: 1,
-          refreshRequestedAt: 1,
-          refreshRequestedReason: 1,
-          sourceChangeEventId: 1,
-        },
-      },
-    ).exec();
-    return (result.modifiedCount ?? 0) > 0;
-  }
-
   async claimNext(): Promise<ClaimedPredictionQueueJob | null> {
     const now = new Date();
     const horizonEnd = new Date(
@@ -943,10 +899,11 @@ export class PredictionQueueService {
   async complete(
     job: Pick<
       ClaimedPredictionQueueJob,
-      'eventId' | 'lockToken' | 'summaryCollectedAt' | 'oddsUpdatedAt' | 'scoreSnapshot' | 'fixtureSourceRevision'
+      'eventId' | 'lockToken' | 'summaryCollectedAt' | 'oddsUpdatedAt' | 'scoreSnapshot' | 'fixtureSourceRevision' | 'sourceRevisionFingerprint'
     >,
     durationMs: number,
     processedFixtureSourceRevision?: number,
+    processedSourceRevisionFingerprint?: string,
   ): Promise<boolean> {
     const filter = {
       eventId: job.eventId,
@@ -960,11 +917,24 @@ export class PredictionQueueService {
       && processedRevisionValue >= 0
       ? processedRevisionValue
       : 0;
-    const currentFixtureSourceRevision = await this.sportsRevisions.getCurrentRevision(
-      'FIXTURE',
-      String(job.eventId),
+    const currentFixture = await this.sportsRead.getFixture(String(job.eventId));
+    const currentSourceSnapshot = currentFixture
+      ? (await getPredictionSourceRevisionSnapshots([currentFixture], this.sportsRevisions))
+        .get(String(currentFixture.id))
+      : undefined;
+    const currentFixtureSourceRevision = currentSourceSnapshot?.fixtureSourceRevision
+      ?? await this.sportsRevisions.getCurrentRevision('FIXTURE', String(job.eventId));
+    const consumedSourceFingerprint = String(
+      processedSourceRevisionFingerprint ?? job.sourceRevisionFingerprint ?? '',
     );
-    const fixtureChangedDuringProcessing = currentFixtureSourceRevision !== processedRevision;
+    const sourceFingerprintChangedDuringProcessing = Boolean(
+      currentSourceSnapshot?.fingerprint
+      && consumedSourceFingerprint
+      && currentSourceSnapshot.fingerprint !== consumedSourceFingerprint,
+    );
+    const fixtureChangedDuringProcessing =
+      currentFixtureSourceRevision !== processedRevision
+      || sourceFingerprintChangedDuringProcessing;
 
     // A source trigger may be waiting in the Sports outbox and not yet have
     // written refreshRequestedAt. Revision comparison closes that gap: never
@@ -973,7 +943,7 @@ export class PredictionQueueService {
       ? filter
       : { ...filter, refreshRequestedAt: { $exists: true } };
     const refreshReason = fixtureChangedDuringProcessing
-      ? 'SPORTS_FIXTURE_REVISION_CHANGED_DURING_PROCESSING'
+      ? 'SPORTS_SOURCE_REVISION_CHANGED_DURING_PROCESSING'
       : 'SOURCE_CHANGED_DURING_PROCESSING';
     const refreshed = await this.queueModel.updateOne(
       refreshFilter,
@@ -984,7 +954,9 @@ export class PredictionQueueService {
           attempts: 0,
           reason: refreshReason,
           fixtureSourceRevision: currentFixtureSourceRevision,
+          sourceRevisionFingerprint: currentSourceSnapshot?.fingerprint ?? job.sourceRevisionFingerprint,
           lastProcessedFixtureSourceRevision: processedRevision,
+          lastProcessedSourceRevisionFingerprint: consumedSourceFingerprint || undefined,
           lastProcessedSummaryAt: job.summaryCollectedAt,
           ...(job.oddsUpdatedAt ? { lastProcessedOddsAt: job.oddsUpdatedAt } : {}),
           ...(job.scoreSnapshot ? { lastProcessedScoreSnapshot: job.scoreSnapshot } : {}),
@@ -1011,13 +983,15 @@ export class PredictionQueueService {
           status: PredictionQueueStatus.COMPLETED,
           completedAt: new Date(),
           fixtureSourceRevision: currentFixtureSourceRevision,
+          sourceRevisionFingerprint: currentSourceSnapshot?.fingerprint ?? job.sourceRevisionFingerprint,
           lastProcessedFixtureSourceRevision: processedRevision,
+          lastProcessedSourceRevisionFingerprint: consumedSourceFingerprint || undefined,
           lastProcessedSummaryAt: job.summaryCollectedAt,
           ...(job.oddsUpdatedAt ? { lastProcessedOddsAt: job.oddsUpdatedAt } : {}),
           ...(job.scoreSnapshot ? { lastProcessedScoreSnapshot: job.scoreSnapshot } : {}),
           processingDurationMs: durationMs,
         },
-        $unset: { lockedAt: 1, lockToken: 1, errorMessage: 1 },
+        $unset: { lockedAt: 1, lockToken: 1, errorMessage: 1, forceRecalculation: 1 },
       },
     ).exec();
     if ((completed.modifiedCount ?? 0) > 0) return true;
@@ -1033,7 +1007,9 @@ export class PredictionQueueService {
           attempts: 0,
           reason: 'SOURCE_CHANGED_DURING_PROCESSING',
           fixtureSourceRevision: currentFixtureSourceRevision,
+          sourceRevisionFingerprint: currentSourceSnapshot?.fingerprint ?? job.sourceRevisionFingerprint,
           lastProcessedFixtureSourceRevision: processedRevision,
+          lastProcessedSourceRevisionFingerprint: consumedSourceFingerprint || undefined,
           lastProcessedSummaryAt: job.summaryCollectedAt,
           ...(job.oddsUpdatedAt ? { lastProcessedOddsAt: job.oddsUpdatedAt } : {}),
           ...(job.scoreSnapshot ? { lastProcessedScoreSnapshot: job.scoreSnapshot } : {}),

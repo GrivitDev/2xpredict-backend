@@ -16,6 +16,7 @@ export interface ExistingMarketSelectionSnapshot {
 export interface ExistingMarketPredictionSnapshot {
   status?: unknown;
   fixtureSourceRevision?: unknown;
+  sourceRevisionFingerprint?: unknown;
   selections?: ExistingMarketSelectionSnapshot[];
 }
 
@@ -49,10 +50,14 @@ export function hasReusableFinalMarketSnapshot(
   marketId: string,
   fixtureSourceRevision: number,
   currentOdds: StoredFixtureOdds[] = [],
+  sourceRevisionFingerprint?: string,
+  forceRecalculation = false,
 ): boolean {
+  if (forceRecalculation) return false;
   if (!existing || existing.status !== 'CALCULATED') return false;
   const revision = Number(existing.fixtureSourceRevision);
   if (!Number.isSafeInteger(revision) || revision !== fixtureSourceRevision) return false;
+  if (sourceRevisionFingerprint && existing.sourceRevisionFingerprint !== sourceRevisionFingerprint) return false;
 
   const finalSelections = (existing.selections ?? []).filter((selection) =>
     selection?.status === 'CALCULATED'
@@ -82,3 +87,4 @@ export function hasReusableFinalMarketSnapshot(
       && Math.abs(quoteOdds - selectionOdds) < 0.000001;
   });
 }
+

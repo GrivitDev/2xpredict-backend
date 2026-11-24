@@ -22,7 +22,11 @@ export class OddsReadService {
       period: market.period,
       lines: market.lines ? [...market.lines] : undefined,
       pricingEnabled: market.pricingEnabled !== false,
-      pricingStatus: market.pricingEnabled === false ? 'UNAVAILABLE' : 'HISTORICAL_DATA_REQUIRED',
+      pricingStatus: market.pricingEnabled === false
+        ? 'UNAVAILABLE'
+        : market.id === 'MATCH_RESULT'
+          ? 'BASELINE_ALWAYS_AVAILABLE_PROGRESSIVE'
+          : 'PROGRESSIVE_EVIDENCE_BASED',
       sourceOfTruth: 'GRIVIT_MODEL',
       bookmakerOfRecord: 'Grivit',
       externalBookmakerValidation: 'OPTIONAL_REFERENCE_ONLY',
@@ -38,8 +42,10 @@ export class OddsReadService {
                 ? 'SPORTS_SCORE_MATRIX'
                 : market.model,
       requiredData: market.requiredData ? [...market.requiredData] : [],
-      minimumSampleSize: market.minimumSampleSize ?? null,
-      notes: market.notes ?? null,
+      minimumSampleSize: market.id === 'MATCH_RESULT' ? 0 : market.minimumSampleSize ?? null,
+      notes: market.id === 'MATCH_RESULT'
+        ? 'Baseline Home/Draw/Away prices are always calculated from available evidence and regularized football priors; additional historical information progressively improves the estimate.'
+        : market.notes ?? null,
       selections: expandCanonicalSelections(market),
     }));
   }
@@ -65,3 +71,4 @@ export class OddsReadService {
     return this.oddsService.getInventorySummary();
   }
 }
+

@@ -63,9 +63,8 @@ export class SportsProviderRateLimit {
   lastRequestAt?: Date;
 
   /**
-   * Current UTC day: YYYY-MM-DD
-   *
-   * Used by provider-wide quota accounting.
+   * Current provider-local quota day: YYYY-MM-DD.
+   * The configured timezone is stored separately in dailyTimeZone.
    */
   @Prop({
     required: true,
@@ -73,6 +72,10 @@ export class SportsProviderRateLimit {
     index: true,
   })
   dailyPeriod!: string;
+
+  /** IANA timezone used to calculate dailyPeriod (e.g. America/Los_Angeles). */
+  @Prop({ type: String, trim: true })
+  dailyTimeZone?: string;
 
   /**
    * Requests used during dailyPeriod.
@@ -89,8 +92,8 @@ export class SportsProviderRateLimit {
 
   /**
    * Optional hard stop for provider-reported or internally exhausted daily
-   * quotas. It survives UTC counter rollover so YouTube searches cannot resume
-   * in the middle of the user's Nigerian calendar day.
+   * quotas. It survives counter rollover until the provider's configured daily
+   * quota reset boundary.
    */
   @Prop({
     type: Date,
@@ -140,3 +143,4 @@ SportsProviderRateLimitSchema.index(
     unique: true,
   },
 );
+

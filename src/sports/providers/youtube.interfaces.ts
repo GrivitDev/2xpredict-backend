@@ -61,3 +61,31 @@ export interface YouTubeSearchResponse {
 
 
 
+
+
+export interface YouTubeHighlightSearchDiagnostics {
+  searchedAt: Date;
+  query: string;
+  channelReference?: string;
+  channelId?: string;
+  channelResolutionFailed?: boolean;
+  itemsReturned: number;
+  videoCandidates: number;
+  acceptedCandidates: number;
+  rejected: {
+    invalidPublicationTime: number;
+    publishedBeforeKickoff: number;
+    publishedInFuture: number;
+    missingMetadata: number;
+    insufficientFixtureIdentity: number;
+    contradictoryMatchDate: number;
+    nonHighlightContent: number;
+    notHighlightLike: number;
+    channelMismatch: number;
+  };
+}
+
+export interface YouTubeHighlightSearchResult {
+  video: YouTubeVideoResult | null;
+  diagnostics: YouTubeHighlightSearchDiagnostics;
+}

@@ -1,4 +1,12 @@
-import { BadRequestException, Controller, Get, Param, Query } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+} from '@nestjs/common';
 
 import type {
   SportsCompetitionRegion,
@@ -53,6 +61,30 @@ export class SportsDomainReadController {
     @Query('limit') limit?: string,
   ) {
     return this.read.getTeams({ leagueId, country, search, limit: this.parseInteger(limit, 'limit') });
+  }
+
+  /** Resolve a bounded set of fixture team IDs with one normalized database read. */
+  @Post('teams/lookup')
+  lookupTeams(@Body('ids') ids: unknown) {
+    if (!Array.isArray(ids)) {
+      throw new BadRequestException('ids must be an array of team identifiers.');
+    }
+    if (ids.length > 1_000) {
+      throw new BadRequestException('A maximum of 1000 team identifiers can be resolved per request.');
+    }
+
+    const identifiers = [...new Set(ids.map((value) => {
+      if (typeof value !== 'string' && typeof value !== 'number') {
+        throw new BadRequestException('Every team identifier must be a string or number.');
+      }
+      const id = String(value).trim();
+      if (!id || id.length > 128) {
+        throw new BadRequestException('Team identifiers must contain between 1 and 128 characters.');
+      }
+      return id;
+    }))];
+
+    return identifiers.length ? this.read.getTeamsByIdentifiers(identifiers) : [];
   }
 
   @Get('teams/:teamId')

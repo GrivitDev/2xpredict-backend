@@ -16,7 +16,6 @@ import { PredictionQueueService } from './prediction-queue.service';
 import { PredictionEngineService } from './prediction-engine.service';
 import { PredictionEngineMonitorService } from './prediction-engine-monitor.service';
 import { SystemMonitorService } from '../../system-monitor/system-monitor.service';
-import { OddsReadService } from '../../odds/services/odds-read.service';
 import { MarketCalibrationService } from './market-calibration.service';
 import { CuratedPredictionService } from './curated-prediction.service';
 import { SlipCenterService } from './slip-center.service';
@@ -50,7 +49,6 @@ export class PredictionQueueWorkerService
     private readonly engine: PredictionEngineService,
     private readonly monitor: PredictionEngineMonitorService,
     private readonly systemMonitor: SystemMonitorService,
-    private readonly oddsService: OddsReadService,
     private readonly marketCalibrationService: MarketCalibrationService,
     private readonly curatedPredictionService: CuratedPredictionService,
     private readonly slipCenterService: SlipCenterService,
@@ -78,8 +76,8 @@ export class PredictionQueueWorkerService
     this.systemMonitor.reportModuleHealth('predictions-engine', 'HEALTHY', {
       source: 'worker-lifecycle',
       message:
-        'Prediction worker is starting immediately and will process fixtures as soon as Odds-module readiness is available.',
-      details: { enabled: true, readinessGate: 'ODDS_MODULE' },
+        'Prediction worker is starting immediately and will process eligible pre-match Sports fixtures independently of Odds availability.',
+      details: { enabled: true, readinessGate: 'PREMATCH_SPORTS_FIXTURE' },
     });
     this.start();
   }
@@ -104,7 +102,7 @@ export class PredictionQueueWorkerService
       message: '2xPredict market prediction worker started.',
       metadata: {
         modelVersion: PREDICTION_ENGINE_CONFIG.modelVersion,
-        timingGate: 'ODDS_READINESS',
+        timingGate: 'PREMATCH_SPORTS_FIXTURE',
         workerIntervalMs: PREDICTION_ENGINE_CONFIG.queue.workerIntervalMs,
         queueSyncIntervalMs: PREDICTION_ENGINE_CONFIG.queue.syncIntervalMs,
       },
@@ -221,7 +219,7 @@ export class PredictionQueueWorkerService
         failed = true;
         this.monitor.recordOperationFailure(
           'prediction-worker',
-          'Prediction queue item failed during generation or Sports/Odds source-change handoff.',
+          'Prediction queue item failed during generation or independent Sports/Odds source-change handoff.',
           { eventId: outcome.eventId },
         );
       }
@@ -537,26 +535,10 @@ export class PredictionQueueWorkerService
     }, leaseIntervalMs);
 
     try {
-      const readinessByEvent =
-        await this.oddsService.getPredictionReadinessForEvents([eventId]);
-      const readiness = readinessByEvent.get(eventId);
-      if (!readiness?.ready) {
-        const deferred = await this.queue.deferForOddsNotReady(
-          job,
-          readiness?.reason ??
-            'Odds module has not marked this fixture prediction-ready.',
-        );
-        if (deferred) queueTransitionCommitted = true;
-        if (!deferred) {
-          this.logger.warn(
-            `Prediction job ${eventId} was not deferred because this worker no longer owns its processing lease.`,
-          );
-        }
-        return { processed: false, eventId };
-      }
-
       if (leaseLost) return { processed: false, eventId };
-      const predictionResult = await this.engine.generateForFixture(eventId);
+      const predictionResult = await this.engine.generateForFixture(eventId, {
+        forceRecalculation: job.forceRecalculation === true,
+      });
       const processedRevisionValue = Number(
         (predictionResult as { fixtureSourceRevision?: unknown } | null)?.fixtureSourceRevision,
       );
@@ -564,10 +546,16 @@ export class PredictionQueueWorkerService
         && processedRevisionValue >= 0
         ? processedRevisionValue
         : Number(job.fixtureSourceRevision ?? 0);
+      const processedSourceRevisionFingerprint = String(
+        (predictionResult as { sourceRevisionFingerprint?: unknown } | null)?.sourceRevisionFingerprint
+          ?? job.sourceRevisionFingerprint
+          ?? '',
+      );
       const completed = await this.queue.complete(
         job,
         Date.now() - startedAt,
         processedFixtureSourceRevision,
+        processedSourceRevisionFingerprint || undefined,
       );
       if (!completed) {
         this.logger.warn(
@@ -763,4 +751,5 @@ export class PredictionQueueWorkerService
     return error instanceof Error ? error.message : String(error);
   }
 }
+
 

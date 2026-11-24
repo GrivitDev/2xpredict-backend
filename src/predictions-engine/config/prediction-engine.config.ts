@@ -1,6 +1,6 @@
 export const PREDICTION_ENGINE_CONFIG = {
   enabled: true,
-  modelVersion: '2XP-FOOTBALL-3.1.0',
+  modelVersion: '2XP-FOOTBALL-3.2.0',
   queue: {
     /** Periodic reconciliation only considers fixtures inside this rolling window. */
     forwardWindowHours: 7 * 24,
@@ -33,6 +33,8 @@ export const PREDICTION_ENGINE_CONFIG = {
     /** Provider prices are a modest prior, never a substitute for the statistical model. */
     oddsBlendWeight: 0.25,
     maximumConfidence: 98,
+    /** Display floor for a generated forecast; evidenceConfidence/dataQuality retain the uncapped evidence assessment. */
+    minimumDisplayedConfidence: 40,
     defaultLeagueHomeGoals: 1.45,
     defaultLeagueAwayGoals: 1.15,
     minimumExpectedGoals: 0.15,
@@ -63,6 +65,8 @@ export const PREDICTION_ENGINE_CONFIG = {
     refreshIntervalMs: 15 * 60_000,
     /** Strong enough to correct demonstrated bias while retaining shrinkage for limited samples. */
     maximumCorrectionBlendWeight: 0.8,
+    /** Historical calibration can conservatively reduce displayed confidence, never increase it. */
+    maximumConfidenceReliabilityPenalty: 0.15,
   },
   curatedPredictions: {
     enabled: true,
@@ -176,5 +180,6 @@ export const PREDICTION_ENGINE_CONFIG = {
 } as const;
 
 export type PredictionEngineConfig = typeof PREDICTION_ENGINE_CONFIG;
+
 
 

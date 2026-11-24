@@ -1,3 +1,5 @@
+import type { YouTubeHighlightSearchDiagnostics } from '../providers/youtube.interfaces';
+
 /** Normalized YouTube highlight metadata; this is a media feature, not a sports-data feed. */
 export type SportsYoutubeHighlightStatus =
   | 'PENDING'
@@ -22,8 +24,12 @@ export interface SportsYoutubeHighlightRecord {
   channelTitle?: string;
   publishedAt?: Date;
   thumbnailUrl?: string;
+  lastSearchDiagnostics?: YouTubeHighlightSearchDiagnostics;
+  /** Last four bounded attempts, matching the configured per-fixture request cap. */
+  searchDiagnostics?: YouTubeHighlightSearchDiagnostics[];
   error?: string;
   createdAt: Date;
   updatedAt: Date;
 }
+
 

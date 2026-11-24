@@ -1244,6 +1244,33 @@ export class SportsPersistenceService {
     return record ?? null;
   }
 
+  /** Fetch many canonical/ESPN team identifiers in one bounded database read. */
+  async getTeamsByIdentifiers(teamIds: string[]): Promise<SportsTeamRecord[]> {
+    const identifiers = [
+      ...new Set(
+        teamIds
+          .map((value) => String(value ?? '').trim())
+          .map((id) => id.replace(/^team:/i, ''))
+          .filter(Boolean),
+      ),
+    ];
+    if (!identifiers.length) return [];
+
+    const espnIds = identifiers;
+    const canonicalIds = espnIds.map((id) => `team:${id}`);
+    const records = (await this.teamModel
+      .find({
+        $or: [
+          { id: { $in: canonicalIds } },
+          { espnId: { $in: espnIds } },
+        ],
+      })
+      .select('-_id')
+      .lean()
+      .exec()) as unknown as SportsTeamRecord[];
+    return records;
+  }
+
   async getFixturesByIds(fixtureIds: string[]): Promise<SportsFixtureRecord[]> {
     if (!fixtureIds.length) return [];
     const rows = (await this.fixtureModel
@@ -1394,6 +1421,44 @@ export class SportsPersistenceService {
       summaryPayloadHash: summaryByFixture.get(String(fixture.id)),
       factsPayloadHash: factsByFixture.get(String(fixture.id)),
     }));
+  }
+
+  /**
+   * Lean fixture projection used only for team-identity recovery. It deliberately
+   * excludes the fixture-level raw scoreboard payload and selects the embedded
+   * competitor snapshots required by the normalizer.
+   */
+  async getCurrentSeasonFixtureTeamIdentitySources(
+    competitionId: string,
+    seasonId: string,
+    teamIds: string[],
+  ): Promise<
+    Array<Pick<SportsFixtureRecord, 'espnEventId' | 'competitors' | 'source'>>
+  > {
+    const canonicalTeamIds = [
+      ...new Set(
+        teamIds
+          .map((value) => String(value ?? '').trim())
+          .filter(Boolean)
+          .map((id) => `team:${id.replace(/^team:/i, '')}`),
+      ),
+    ];
+    if (!canonicalTeamIds.length) return [];
+
+    // Match only fixtures containing one of the requested teams. A whole-season
+    // scan would load every retained fixture into memory during catalogue repair.
+    const records = (await this.fixtureModel
+      .find({
+        competitionId,
+        seasonId,
+        'competitors.teamId': { $in: canonicalTeamIds },
+      })
+      .select('espnEventId competitors source')
+      .lean()
+      .exec()) as unknown as Array<
+      Pick<SportsFixtureRecord, 'espnEventId' | 'competitors' | 'source'>
+    >;
+    return records;
   }
 
   async getCurrentSeasonFixtures(
@@ -1601,7 +1666,7 @@ export class SportsPersistenceService {
       return incoming;
     }
     const oldState = String(previous.status?.state ?? 'UNKNOWN');
-    const newState = incoming.status.state;
+    const newState = String(incoming.status?.state ?? 'UNKNOWN');
     // A postponed fixture may be rescheduled by ESPN and must be allowed to
     // return to SCHEDULED with a corrected kickoff. Completed/cancelled/abandoned
     // records are protected from stale scoreboard regressions.
@@ -1611,7 +1676,7 @@ export class SportsPersistenceService {
     );
     const previousKickoffAt =
       previous.kickoffAt?.getTime() ?? Number.NaN;
-    const incomingKickoffAt = incoming.kickoffAt.getTime();
+    const incomingKickoffAt = incoming.kickoffAt?.getTime?.() ?? Number.NaN;
     const previouslyStarted =
       ['LIVE', 'HALFTIME', 'EXTRA_TIME', 'PENALTIES', 'COMPLETED'].includes(oldState);
     const regressedToNotStarted =

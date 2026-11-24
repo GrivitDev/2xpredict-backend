@@ -162,7 +162,7 @@ describe('SettlementQueueService reliability', () => {
     expect(result).toBe(claimedJob);
     expect(jobModel.findOneAndUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
-        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY] },
+        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL] },
         nextRunAt: { $lte: expect.any(Date) },
       }),
       expect.objectContaining({
@@ -179,6 +179,104 @@ describe('SettlementQueueService reliability', () => {
       }),
     );
     expect(jobModel.findOneAndUpdate.mock.results[0].value.select).toHaveBeenCalledWith('+claimToken');
+  });
+
+  it('claims due PARTIAL jobs so the configured partial retry is actually executed', async () => {
+    const claimedJob = {
+      _id: 'partial-job',
+      jobKey: 'fixture-1:partial-fingerprint',
+      status: SettlementJobStatus.PROCESSING,
+      lockedBy: 'worker-a',
+      claimToken: 'partial-lease-token',
+    };
+    const { service, jobModel } = createService({
+      findOneAndUpdateResults: [claimedJob],
+    });
+
+    await expect(service.claimNextDueJob('worker-a')).resolves.toBe(claimedJob);
+    expect(jobModel.findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL] },
+        nextRunAt: { $lte: expect.any(Date) },
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it('coalesces a new Sports trigger into an existing PARTIAL job instead of leaving it outside the active queue', async () => {
+    const { service, jobModel } = createService({
+      predictionTarget: true,
+      activeJob: {
+        _id: 'partial-job',
+        jobKey: 'fixture-1:partial-fingerprint',
+        eventId: 'fixture-1',
+        sourceFingerprint: 'partial-fingerprint',
+        status: SettlementJobStatus.PARTIAL,
+      },
+      updateOneResult: { modifiedCount: 1 },
+    });
+
+    const result = await service.enqueueForSportsFixtureChange('fixture-1');
+
+    expect(result).toMatchObject({
+      enqueued: true,
+      alreadyExists: true,
+      reason: 'ACTIVE_JOB_COALESCED',
+    });
+    expect(jobModel.updateOne).toHaveBeenCalledWith(
+      {
+        _id: 'partial-job',
+        status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL] },
+      },
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: SettlementJobStatus.QUEUED,
+          attempts: 0,
+          nextRunAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
+  it('resets transient failure attempts after a PARTIAL evidence evaluation', async () => {
+    const { service, jobModel } = createService({
+      findOneAndUpdateResults: [null],
+      updateOneResult: { modifiedCount: 1 },
+    });
+    const job = {
+      _id: 'job-partial',
+      jobKey: 'fixture-1:fingerprint',
+      status: SettlementJobStatus.PROCESSING,
+      lockedBy: 'worker-a',
+      claimToken: 'lease-token',
+      attempts: 4,
+    } as any;
+
+    await expect(service.complete(job, {
+      partial: true,
+      counts: { predictionSelectionsUnresolved: 1 },
+      unresolvedReasons: ['Insufficient evidence'],
+      durationMs: 25,
+    })).resolves.toBe(false);
+
+    const update = jobModel.updateOne.mock.calls[0][1];
+    expect(update.$set).toMatchObject({
+      status: SettlementJobStatus.PARTIAL,
+      attempts: 0,
+      nextRunAt: expect.any(Date),
+    });
+    expect(update.$set.nextRunAt.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('includes PARTIAL jobs when calculating the next worker wake time', async () => {
+    const nextRunAt = new Date(Date.now() + 3 * 60_000);
+    const { service, jobModel } = createService({ activeJob: { nextRunAt } });
+
+    await expect(service.getNextWakeAt()).resolves.toEqual(nextRunAt);
+    expect(jobModel.findOne).toHaveBeenCalledWith({
+      status: { $in: [SettlementJobStatus.QUEUED, SettlementJobStatus.RETRY, SettlementJobStatus.PARTIAL] },
+    });
   });
 
   it('requires the exact worker and claim token before accepting lease ownership', async () => {
@@ -305,3 +403,4 @@ describe('SettlementQueueService reliability', () => {
     });
   });
 });
+

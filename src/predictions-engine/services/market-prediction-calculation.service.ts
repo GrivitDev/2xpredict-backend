@@ -224,20 +224,15 @@ export class MarketPredictionCalculationService {
       };
     }
 
-    // The Odds module is a price/provenance source, not a substitute for an
-    // independent probability model. Do not publish score/period distributions
-    // when Sports supplies no independent goal evidence. Live period markets
-    // also stay unavailable until a live-period-conditioned model is available.
-    const goalEvidenceBlocked =
-      (definition.model === MarketModel.SCORE_MATRIX || definition.model === MarketModel.PERIOD_MATRIX)
-      && input.expectedGoals.evidenceLevel === 'INSUFFICIENT';
+    // Expected Goals always supplies a regularized baseline, including PRIOR_ONLY.
+    // Keep that baseline usable while evidence level and confidence communicate
+    // how much supporting information was actually available. Live period markets
+    // remain unavailable until a live-conditioned model is available.
     const livePeriodBlocked = input.context.fixture.live === true
       && definition.model === MarketModel.PERIOD_MATRIX;
     let registeredEngine: MarketEngineOutput | undefined;
-    if (goalEvidenceBlocked || livePeriodBlocked) {
-      const reason = livePeriodBlocked
-        ? 'Live first-half/second-half probabilities are withheld because the current engine does not yet condition period distributions on the live match clock and score.'
-        : 'Independent Sports goal evidence is insufficient. Default goal-rate priors and bookmaker prices are not used as stand-alone prediction probabilities.';
+    if (livePeriodBlocked) {
+      const reason = 'Live first-half/second-half probabilities are withheld because the current engine does not yet condition period distributions on the live match clock and score.';
       registeredEngine = {
         handled: true,
         selections: selections.map((selection) => ({
@@ -355,6 +350,7 @@ export class MarketPredictionCalculationService {
           providerPrice?.priceType === 'PROVIDER'
           || (input.marketOdds && definition.model === MarketModel.SCORE_MATRIX),
         );
+        const marketCalibration = calibrations.get(String(definition.key).toUpperCase());
         const confidenceResult =
           probability === null
             ? null
@@ -365,6 +361,7 @@ export class MarketPredictionCalculationService {
                 `${input.context.fixture.eventId}:${definition.key}:${output.selection.key}`,
                 input.expectedGoals,
                 definition.model,
+                marketCalibration,
               );
         const sources = [...output.source];
         if (providerPrice) sources.push(providerPrice.source);
@@ -419,11 +416,13 @@ export class MarketPredictionCalculationService {
           bookmakerOdds: providerPrice?.priceType === 'PROVIDER' ? providerPrice.decimalOdds : undefined,
           confidence: confidenceResult ? confidenceResult.confidence : null,
           evidenceConfidence: confidenceResult ? confidenceResult.evidenceConfidence : null,
+          evidenceLevel: confidenceResult ? confidenceResult.evidenceLevel : undefined,
           // A valid probability remains a calculated prediction even when
           // confidence is low. Confidence is metadata, not a calculation gate;
           // Slip Center may apply its own product-specific quality requirements.
           status:
-            probability === null || !confidenceResult || !providerPrice
+            probability === null || !confidenceResult
+              || (!providerPrice && definition.key !== PredictionMarket.MATCH_RESULT)
               ? PredictionStatus.UNAVAILABLE
               : PredictionStatus.CALCULATED,
           sources: [...new Set(sources)],
@@ -435,7 +434,9 @@ export class MarketPredictionCalculationService {
               ? ['An Odds-module quote exists, but the specialized Sports-based model did not calculate this selection; the quote is retained as price information only and is not converted into a prediction probability.']
               : []),
             ...(!providerPrice
-              ? ['No valid Odds-module quote is ready for this exact market, selection, and line; the selection is not emitted as a calculated prediction.']
+              ? definition.key === PredictionMarket.MATCH_RESULT
+                ? ['Baseline Match Result probability was calculated independently of Odds. The price can be attached when Odds calculation becomes available.']
+                : ['No valid Odds-module quote is ready for this exact market, selection, and line; this non-baseline market remains unavailable until its price is available.']
               : []),
             ...(providerPrice?.priceType === 'PROVIDER' &&
             !oddsAdjustedProbabilities.has(output.selection.key) &&
@@ -496,20 +497,77 @@ export class MarketPredictionCalculationService {
       };
     });
 
-    // The market engine—not Pick Center—owns the final outcome for this market.
-    // Select exactly one calculated selection with an explicitly Odds-ready price.
-    // This is a relative ranking, not a hard probability, odds, value, or provider gate.
+    // Calibration is applied independently to each outcome. Re-normalize the
+    // calibrated 1X2 triplet so Home + Draw + Away remains exactly 100%.
+    if (definition.key === PredictionMarket.MATCH_RESULT) {
+      const outcomeField: Record<string, 'home' | 'draw' | 'away'> = {
+        HOME_WIN: 'home',
+        DRAW: 'draw',
+        AWAY_WIN: 'away',
+      };
+      const outcomeValues = Object.keys(outcomeField).map((key) =>
+        selectionResults.find((selection) => selection.key === key),
+      );
+      const hasCompleteResult = outcomeValues.every((selection) =>
+        selection?.status === PredictionStatus.CALCULATED
+        && selection.probability !== null
+        && Number.isFinite(Number(selection.probability))
+        && Number(selection.probability) >= 0,
+      );
+      if (hasCompleteResult) {
+        const normalized = PredictionMathUtil.normalizeThreeWay({
+          home: Number(outcomeValues[0]!.probability),
+          draw: Number(outcomeValues[1]!.probability),
+          away: Number(outcomeValues[2]!.probability),
+        });
+        selectionResults = selectionResults.map((selection) => {
+          const field = outcomeField[selection.key];
+          if (!field) return selection;
+          const probability = normalized[field];
+          const hasBookmakerPrice = selection.priceType === 'PROVIDER'
+            && selection.oddsBasis === 'BOOKMAKER_ONLY'
+            && Number.isFinite(Number(selection.decimalOdds));
+          const expectedValue = hasBookmakerPrice
+            ? PredictionMathUtil.expectedValue(
+                probability,
+                Number(selection.decimalOdds),
+                selection.settlementProfile,
+              )
+            : null;
+          return {
+            ...selection,
+            probability,
+            probabilityPercent: Number((probability * 100).toFixed(2)),
+            fairOdds: probability > 0 ? Number((1 / probability).toFixed(4)) : null,
+            expectedValue,
+            expectedValuePercent: expectedValue === null
+              ? null
+              : Number((expectedValue * 100).toFixed(2)),
+            diagnostics: [
+              ...(selection.diagnostics ?? []),
+              'Calibrated Home/Draw/Away probabilities were jointly normalized to preserve a 100% Match Result distribution.',
+            ],
+          };
+        });
+      }
+    }
+
+    // The baseline 1X2 market always chooses one model outcome, even before
+    // Odds has produced a price. Other markets retain their exact-price checks.
+    const isBaselineResultMarket = definition.key === PredictionMarket.MATCH_RESULT;
     const finalCandidates = selectionResults.filter((selection) =>
       selection.status === PredictionStatus.CALCULATED
       && selection.probability !== null
       && Number.isFinite(Number(selection.probability))
       && Number(selection.probability) > 0
       && Number(selection.probability) < 1
-      && selection.oddsPredictionReady === true
-      && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED')
-      && Number.isFinite(Number(selection.decimalOdds))
-      && Number(selection.decimalOdds) >= PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds
-      && Number(selection.decimalOdds) <= PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds,
+      && (isBaselineResultMarket || (
+        selection.oddsPredictionReady === true
+        && (selection.priceType === 'PROVIDER' || selection.priceType === 'ESTIMATED')
+        && Number.isFinite(Number(selection.decimalOdds))
+        && Number(selection.decimalOdds) >= PREDICTION_ENGINE_CONFIG.selectionEligibility.minimumDecimalOdds
+        && Number(selection.decimalOdds) <= PREDICTION_ENGINE_CONFIG.selectionEligibility.maximumDecimalOdds
+      )),
     );
     const sourceScore = (selection: SelectionPredictionResult): number => {
       if (selection.priceType === 'PROVIDER' && selection.oddsBasis === 'BOOKMAKER_ONLY') return 1;
@@ -527,9 +585,13 @@ export class MarketPredictionCalculationService {
       const calibrationSupport = samples >= PREDICTION_ENGINE_CONFIG.calibration.minimumSettledSamples
         ? calibrationReliability * (samples / (samples + 30))
         : 0.5; // neutral when history is sparse; active evidence remains relevant even if correction is tiny
-      const independentEvidence = input.expectedGoals.independentEvidenceAvailable
+      const independentEvidence = input.expectedGoals.evidenceLevel === 'STRONG'
         ? 1
-        : input.expectedGoals.evidenceLevel === 'PARTIAL' ? 0.5 : 0;
+        : input.expectedGoals.evidenceLevel === 'DEVELOPING'
+          ? 0.65
+          : input.expectedGoals.evidenceLevel === 'LIMITED'
+            ? 0.30
+            : 0;
       const providerValue = selection.priceType === 'PROVIDER' && Number.isFinite(Number(selection.expectedValue))
         ? Math.max(0, Math.min(1, Number(selection.expectedValue) / 0.5))
         : 0;
@@ -556,9 +618,11 @@ export class MarketPredictionCalculationService {
       const safetyScore = Number(finalScore(selection).toFixed(6));
       const diagnostics = [...(selection.diagnostics ?? [])];
       if (isFinalSelection) {
-        diagnostics.push(selection.priceType === 'PROVIDER' && selection.oddsBasis === 'BOOKMAKER_ONLY'
-          ? 'Final selection chosen for safety by this market engine. Odds module marked the exact selection and price prediction-ready; the value is a direct provider/bookmaker quote.'
-          : `Final selection chosen for safety by this market engine. Odds module marked the ${selection.priceType === 'ESTIMATED' ? 'estimated' : 'provider-backed'} price prediction-ready; provenance is ${selection.oddsBasis ?? 'unknown'}. This price is not represented as a direct bookmaker offer.`);
+        diagnostics.push(!selection.priceType
+          ? 'Final baseline Match Result selection chosen from the independent model probability. No Odds quote was required to calculate or save this prediction.'
+          : selection.priceType === 'PROVIDER' && selection.oddsBasis === 'BOOKMAKER_ONLY'
+            ? 'Final selection chosen for safety by this market engine. Odds module marked the exact selection and price prediction-ready; the value is a direct provider/bookmaker quote.'
+            : `Final selection chosen for safety by this market engine. Odds module marked the ${selection.priceType === 'ESTIMATED' ? 'estimated' : 'provider-backed'} price prediction-ready; provenance is ${selection.oddsBasis ?? 'unknown'}. This price is not represented as a direct bookmaker offer.`);
         diagnostics.push(`Safety score ${(safetyScore * 100).toFixed(1)}/100 incorporates calibrated probability, evidence confidence, data quality, price provenance, calibration reliability, independent evidence and a capped value signal.`);
         if (Number(selection.decimalOdds) < 1.01) {
           diagnostics.push('Selection rejected because decimal odds are below 1.01.');
@@ -591,7 +655,9 @@ export class MarketPredictionCalculationService {
       sources: allSources,
       calculationMethod: engine.calculationMethod,
       unavailableReason: finalKey === undefined
-        ? 'No calculated selection with an explicitly Odds-ready quote was available for this market.'
+        ? isBaselineResultMarket
+          ? 'The independent model did not return a valid Match Result probability.'
+          : 'No calculated selection with an explicitly Odds-ready quote was available for this market.'
         : engine.unavailableReason,
       diagnostics: [
         ...engine.diagnostics,
@@ -789,6 +855,7 @@ export class MarketPredictionCalculationService {
     return adjusted;
   }
 }
+
 
 
 

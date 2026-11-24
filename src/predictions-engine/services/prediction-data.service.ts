@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
@@ -15,6 +16,7 @@ import type {
 import { OddsReadService } from '../../odds/services/odds-read.service';
 import { SportsDataChangeEventService } from '../../sports/services/sports-data-change-event.service';
 import { PREDICTION_ENGINE_CONFIG } from '../config/prediction-engine.config';
+import { getPredictionSourceRevisionSnapshots } from '../utils/prediction-source-revision.util';
 import type {
   PredictionCurrentMatchStatistics,
   PredictionFixtureCore,
@@ -41,9 +43,9 @@ const asRecord = (value: unknown): Record<string, any> | null =>
 
 /** A source revision changed during calculation; the queue must re-run, not skip the fixture. */
 export class PredictionSourceRevisionChangedError extends UnprocessableEntityException {
-  constructor(eventId: string, expectedRevision: number, currentRevision: number) {
+  constructor(eventId: string, expectedRevision: string | number, currentRevision: string | number) {
     super(
-      `Sports fixture ${eventId} changed during prediction generation (source revision ${expectedRevision} -> ${currentRevision}); the result must be recalculated.`,
+      `Sports source data for fixture ${eventId} changed during prediction generation (${expectedRevision} -> ${currentRevision}); the result must be recalculated.`,
     );
     this.name = 'PredictionSourceRevisionChangedError';
   }
@@ -65,6 +67,8 @@ const uniqueFixtures = (rows: SportsFixtureRecord[]): SportsFixtureRecord[] => {
 
 @Injectable()
 export class PredictionDataService {
+  private readonly logger = new Logger(PredictionDataService.name);
+
   constructor(
     private readonly sportsRead: SportsDomainReadService,
     private readonly oddsService: OddsReadService,
@@ -103,6 +107,33 @@ export class PredictionDataService {
         requestedId,
         expectedRevision,
         currentRevision,
+      );
+    }
+  }
+
+  /**
+   * Verify all normalized Sports entities that influence this fixture forecast,
+   * not only the fixture document. Team, competition, season, statistics,
+   * lineup and timeline corrections must also invalidate an in-flight result.
+   */
+  async assertSourceRevisionFingerprint(
+    eventId: string,
+    expectedFingerprint: string,
+  ): Promise<void> {
+    const requestedId = String(eventId ?? '').trim();
+    if (!requestedId) throw new NotFoundException('A Sports fixture ID is required.');
+
+    const fixture = await this.sportsRead.getFixture(requestedId);
+    if (!fixture) throw new NotFoundException(`Sports fixture ${requestedId} was not found.`);
+    const snapshot = (await getPredictionSourceRevisionSnapshots(
+      [fixture],
+      this.sportsRevisions,
+    )).get(String(fixture.id));
+    if (!snapshot || snapshot.fingerprint !== expectedFingerprint) {
+      throw new PredictionSourceRevisionChangedError(
+        String(fixture.id),
+        expectedFingerprint,
+        snapshot?.fingerprint ?? 'UNAVAILABLE',
       );
     }
   }
@@ -160,10 +191,17 @@ export class PredictionDataService {
     // Capture the revision for the canonical source entity, then reload the
     // fixture. If Sports changes during context assembly, the final revision
     // assertion rejects the mixed-generation result and the queue retries it.
-    const fixtureSourceRevision = await this.sportsRevisions.getCurrentRevision(
-      'FIXTURE',
-      canonicalFixtureId,
-    );
+    const initialSourceSnapshot = (await getPredictionSourceRevisionSnapshots(
+      [initiallyResolvedFixture],
+      this.sportsRevisions,
+    )).get(canonicalFixtureId);
+    if (!initialSourceSnapshot) {
+      throw new UnprocessableEntityException(
+        `Sports fixture ${canonicalFixtureId} could not produce a source revision snapshot.`,
+      );
+    }
+    const fixtureSourceRevision = initialSourceSnapshot.fixtureSourceRevision;
+    const sourceRevisionFingerprint = initialSourceSnapshot.fingerprint;
     const fixture = await this.sportsRead.getFixture(canonicalFixtureId);
     if (!fixture) {
       throw new NotFoundException(`Sports fixture ${canonicalFixtureId} was not found.`);
@@ -177,12 +215,19 @@ export class PredictionDataService {
       throw new UnprocessableEntityException('The Sports fixture is missing a normalized home or away team.');
     }
 
-    const [match, homeData, awayData, storedOdds] = await Promise.all([
+    const [match, homeData, awayData] = await Promise.all([
       this.sportsRead.getMatch(fixture.id),
       this.sportsRead.getTeamData(homeCompetitor.teamId),
       this.sportsRead.getTeamData(awayCompetitor.teamId),
-      this.oddsService.getFixturePrices(fixture.id),
     ]);
+    // Odds improves the forecast when present, but its temporary unavailability
+    // must not stop the independent statistical prediction from being generated.
+    const storedOdds = await this.oddsService.getFixturePrices(fixture.id).catch((error: unknown) => {
+      this.logger.warn(
+        `Optional Odds lookup failed for fixture ${fixture.id}; prediction will continue without Odds enrichment: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    });
     if (!match) throw new NotFoundException(`Normalized Sports match ${fixture.id} was not found.`);
 
     const competition = match.competition ?? await this.sportsRead.getCompetition(fixture.competitionId);
@@ -327,10 +372,12 @@ export class PredictionDataService {
     const awayForm = this.selectForm(awayData?.form ?? [], fixture);
 
     await this.assertFixtureSourceRevision(canonicalFixtureId, fixtureSourceRevision);
+    await this.assertSourceRevisionFingerprint(canonicalFixtureId, sourceRevisionFingerprint);
 
     return {
       fixture: core,
       fixtureSourceRevision,
+      sourceRevisionFingerprint,
       summary: {
         source: 'NORMALIZED_SPORTS_DOMAIN',
         competition: competition?.displayName ?? competition?.name ?? null,
@@ -574,4 +621,5 @@ export class PredictionDataService {
       .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
   }
 }
+
 

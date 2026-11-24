@@ -18,6 +18,10 @@ export const ODDS_CONFIG = {
   seasonRetentionGraceMonths: 3,
   maximumReadBatchSize: 500,
   minimumHistoricalSampleSize: 5,
+  /** Baseline football goal priors used when team/competition samples are absent. */
+  baselineHomeGoals: 1.45,
+  baselineAwayGoals: 1.15,
+  baselinePriorMatches: 12,
   minimumStatisticalSampleSize: 5,
   /** Event markets require a sufficiently large and representative Plays sample. */
   minimumEventTimelineSampleSize: 8,
@@ -27,7 +31,7 @@ export const ODDS_CONFIG = {
   grivitOverroundPercent: 5,
   maximumDecimalOdds: 100_000,
   maximumModelGoals: 10,
-  modelVersion: '2XP-ODDS-4.1.0',
+  modelVersion: '2XP-ODDS-4.2.0',
   modelProbabilityFloor: 0.00001,
   modelProbabilityCeiling: 0.99999,
   /** Period split is a model assumption applied to Sports-derived expected goals. */
@@ -51,6 +55,7 @@ export function isOddsQuoteFresh(value: unknown, now = Date.now()): boolean {
   return age >= -ODDS_CONFIG.futureTimestampToleranceMs &&
     age <= ODDS_CONFIG.maximumQuoteAgeHours * 3_600_000;
 }
+
 
 
 

@@ -173,34 +173,52 @@ export class EspnV2Normalizer {
     const espnId = this.readEntityId(raw);
     const name = this.readString(
       raw.displayName,
+      raw.fullName,
       raw.name,
       raw.shortDisplayName,
+      raw.shortName,
       raw.nickname,
     );
     if (!espnId || !name)
       throw new Error('ESPN team details must contain a team ID and name.');
     const country = this.asRecord(raw.country);
-    const logo = this.readImage(raw.logos, raw.logo, raw.crest);
+    const logo = this.readImage(
+      raw.logos,
+      raw.logo,
+      raw.crest,
+      raw.badge,
+      raw.teamLogo,
+    );
+    const countryName = this.readString(
+      country?.name,
+      country?.displayName,
+      country?.abbreviation,
+      raw.countryName,
+      typeof raw.country === 'string' ? raw.country : undefined,
+    );
     return {
       id: this.teamId(espnId),
       espnId,
       leagueIds: [leagueId.trim().toLowerCase()],
       name,
-      displayName: this.readString(raw.displayName, raw.name),
+      displayName: this.readString(
+        raw.displayName,
+        raw.fullName,
+        raw.name,
+      ),
       shortName: this.readString(
         raw.shortDisplayName,
+        raw.shortName,
         raw.abbreviation,
         raw.name,
       ),
       abbreviation: this.readString(raw.abbreviation, raw.abbr),
       slug: this.readString(raw.slug),
       logo,
-      country: this.readString(
-        country?.name,
-        country?.abbreviation,
-        raw.countryName,
-      ),
-      location: this.readString(raw.location, raw.city, raw.name),
+      country: countryName,
+      // A team's city/location is distinct from its name and country. Do not
+      // manufacture a location by copying the club name into this field.
+      location: this.readString(raw.location, raw.city, raw.locality),
       primaryColor: this.readString(raw.color, raw.primaryColor),
       alternateColor: this.readString(raw.alternateColor),
       rawPayload: this.cloneRaw(raw),
@@ -213,6 +231,177 @@ export class EspnV2Normalizer {
       createdAt: collectedAt,
       updatedAt: collectedAt,
     };
+  }
+
+  /**
+   * Derive safe team identity snapshots from already-persisted fixture
+   * competitors. These snapshots are a recovery source when a separate ESPN
+   * team-detail request was missed or temporarily failed. Detailed team
+   * records remain the preferred source and can enrich these snapshots later.
+   */
+  normalizeTeamsFromFixtures(
+    fixtures: Array<
+      Pick<SportsFixtureRecord, 'espnEventId' | 'competitors' | 'source'>
+    >,
+    leagueId: string,
+    collectedAt = new Date(),
+    onlyTeamIds?: string[],
+  ): SportsTeamRecord[] {
+    const allowedTeamIds = onlyTeamIds?.length
+      ? new Set(
+          onlyTeamIds
+            .map((value) => String(value ?? '').trim())
+            .map((id) => `team:${id.replace(/^team:/i, '')}`)
+            .filter((id) => id !== 'team:'),
+        )
+      : undefined;
+    const teamsById = new Map<string, SportsTeamRecord>();
+
+    for (const fixture of fixtures) {
+      for (const competitor of fixture.competitors ?? []) {
+        const row = this.asRecord(competitor.rawPayload);
+        if (!row) continue;
+
+        const nestedTeam = this.asRecord(row.team) ?? {};
+        const rawTeamId =
+          this.readEntityId(nestedTeam) ??
+          this.readString(row.teamId, row.espnTeamId) ??
+          String(competitor.teamId ?? '');
+        const espnId = String(rawTeamId).replace(/^team:/i, '').trim();
+        if (!espnId) continue;
+        const canonicalTeamId = this.teamId(espnId);
+        if (allowedTeamIds && !allowedTeamIds.has(canonicalTeamId)) continue;
+
+        // ESPN may put the display fields on `team`, on the competitor, or
+        // split them between both. The canonical team ID always comes from
+        // the nested team reference/competitor.teamId, never competitor.id.
+        const candidate: ProviderJsonObject = {
+          ...row,
+          ...nestedTeam,
+          id: espnId,
+          displayName: this.readString(
+            nestedTeam.displayName,
+            nestedTeam.fullName,
+            nestedTeam.name,
+            row.teamDisplayName,
+            row.teamFullName,
+            row.displayName,
+            row.fullName,
+            row.teamName,
+            row.name,
+            nestedTeam.shortDisplayName,
+            nestedTeam.shortName,
+          ),
+          name: this.readString(
+            nestedTeam.name,
+            nestedTeam.displayName,
+            nestedTeam.fullName,
+            row.teamName,
+            row.teamDisplayName,
+            row.teamFullName,
+            row.name,
+            row.displayName,
+            row.fullName,
+            nestedTeam.shortDisplayName,
+            nestedTeam.shortName,
+          ),
+          shortDisplayName: this.readString(
+            nestedTeam.shortDisplayName,
+            nestedTeam.shortName,
+            row.teamShortName,
+            row.shortDisplayName,
+            row.shortName,
+            nestedTeam.abbreviation,
+          ),
+          abbreviation: this.readString(
+            nestedTeam.abbreviation,
+            row.teamAbbreviation,
+            row.abbreviation,
+          ),
+          logos:
+            nestedTeam.logos ?? row.teamLogos ?? row.logos,
+          logo: this.readImage(
+            nestedTeam.logos,
+            nestedTeam.logo,
+            nestedTeam.crest,
+            row.teamLogo,
+            row.logo,
+          ),
+          country:
+            nestedTeam.country ?? row.teamCountry ?? row.country,
+          countryName: this.readString(
+            this.asRecord(nestedTeam.country)?.name,
+            this.asRecord(nestedTeam.country)?.displayName,
+            row.teamCountryName,
+            row.countryName,
+            typeof row.country === 'string' ? row.country : undefined,
+          ),
+          location: this.readString(
+            nestedTeam.location,
+            nestedTeam.city,
+            row.teamLocation,
+            row.location,
+            row.city,
+          ),
+        };
+        // normalizeTeam accepts ESPN's optional `{ team: ... }` envelope.
+        // This candidate is already flattened, so remove the original nested
+        // reference to avoid normalizeTeam ignoring the recovered display data.
+        delete candidate.team;
+
+        const name = this.readString(
+          candidate.displayName,
+          candidate.name,
+          candidate.shortDisplayName,
+          candidate.nickname,
+        );
+        if (!name) continue;
+
+        const fixtureCollectedAt =
+          fixture.source.collectedAt instanceof Date
+            ? fixture.source.collectedAt
+            : new Date(String(fixture.source.collectedAt));
+        const snapshotCollectedAt = Number.isFinite(
+          fixtureCollectedAt.getTime(),
+        )
+          ? fixtureCollectedAt
+          : collectedAt;
+        const snapshot = this.normalizeTeam(
+          candidate,
+          leagueId,
+          snapshotCollectedAt,
+          `${fixture.source.endpoint}#team:${espnId}`,
+        );
+        const existing = teamsById.get(snapshot.id);
+        const snapshotScore = this.teamIdentityScore(snapshot);
+        const existingScore = existing
+          ? this.teamIdentityScore(existing)
+          : -1;
+        const snapshotTime = snapshot.source.collectedAt.getTime();
+        const existingTime = existing?.source.collectedAt.getTime() ?? -1;
+        if (
+          !existing ||
+          snapshotScore > existingScore ||
+          (snapshotScore === existingScore && snapshotTime > existingTime)
+        ) {
+          teamsById.set(snapshot.id, snapshot);
+        }
+      }
+    }
+
+    return [...teamsById.values()];
+  }
+
+  private teamIdentityScore(team: SportsTeamRecord): number {
+    return [
+      team.name,
+      team.displayName,
+      team.shortName,
+      team.abbreviation,
+      team.logo,
+      team.country,
+      team.location,
+    ].filter((value) => Boolean(String(value ?? '').trim())).length;
   }
 
   normalizeFixture(
@@ -1724,5 +1913,6 @@ export class EspnV2Normalizer {
     return undefined;
   }
 }
+
 
 

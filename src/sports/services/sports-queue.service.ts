@@ -325,6 +325,51 @@ export class SportsQueueService {
     return Boolean(found);
   }
 
+  /**
+   * Return team IDs with a recent team-detail job in any state. This gives the
+   * catalogue recovery pass a cooldown and prevents one failed identity record
+   * from generating a new ESPN request on every catalogue refresh.
+   */
+  async getRecentTeamDetailJobTeamIds(
+    leagueId: string,
+    teamIds: string[],
+    since: Date,
+  ): Promise<Set<string>> {
+    const normalizedLeagueId = String(leagueId ?? '').trim().toLowerCase();
+    const identifiers = [
+      ...new Set(
+        teamIds
+          .map((value) => String(value ?? '').trim())
+          .filter(Boolean)
+          .map((id) => id.replace(/^team:/i, ''))
+          .filter(Boolean),
+      ),
+    ];
+    if (!normalizedLeagueId || !identifiers.length) return new Set();
+    const scopedTeamIds = [
+      ...identifiers,
+      ...identifiers.map((id) => `team:${id}`),
+    ];
+
+    const rows = await this.queueModel
+      .find({
+        type: SportsQueueJobType.TEAM_DETAIL_REFRESH,
+        'scope.leagueId': normalizedLeagueId,
+        'scope.teamId': { $in: scopedTeamIds },
+        updatedAt: { $gte: since },
+      })
+      .select({ 'scope.teamId': 1 })
+      .lean()
+      .exec();
+
+    return new Set(
+      (rows as Array<{ scope?: { teamId?: unknown } }>)
+        .map((row) => String(row.scope?.teamId ?? '').trim())
+        .map((teamId) => teamId.replace(/^team:/i, ''))
+        .filter(Boolean),
+    );
+  }
+
   async hasActiveFixtureJob(
     type: SportsQueueJobType,
     fixtureId: string,
@@ -698,3 +743,4 @@ export class SportsQueueService {
       ]));
   }
 }
+

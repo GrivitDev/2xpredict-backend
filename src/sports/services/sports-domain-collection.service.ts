@@ -231,6 +231,98 @@ export class SportsDomainCollectionService {
     return this.persistence.getTeamsForLeague(leagueId);
   }
 
+  async getTeamsByIdentifiers(teamIds: string[]): Promise<SportsTeamRecord[]> {
+    return this.persistence.getTeamsByIdentifiers(teamIds);
+  }
+
+  /**
+   * Recover incomplete team documents from already-collected current-season
+   * fixture competitor snapshots. This pass is local-only and consumes no
+   * additional ESPN requests.
+   */
+  async recoverTeamSnapshotsFromFixtures(
+    leagueId: string,
+    competitionId: string,
+    seasonId: string,
+    teamIds: string[],
+    currentTeams: SportsTeamRecord[],
+  ): Promise<number> {
+    if (!teamIds.length) return 0;
+    const fixtures =
+      await this.persistence.getCurrentSeasonFixtureTeamIdentitySources(
+        competitionId,
+        seasonId,
+        teamIds,
+      );
+    const snapshots = this.provider.normalizeTeamsFromFixtures(
+      fixtures,
+      leagueId,
+      teamIds,
+    );
+    if (!snapshots.length) return 0;
+
+    const existingById = new Map<string, SportsTeamRecord>(
+      currentTeams.map(
+        (team): [string, SportsTeamRecord] => [String(team.id), team],
+      ),
+    );
+    const hasText = (value: unknown): boolean =>
+      typeof value === 'string' && value.trim().length > 0;
+    const recoveredTeams = snapshots.flatMap((snapshot) => {
+      const existing = existingById.get(String(snapshot.id));
+      if (!existing) return [snapshot];
+
+      // A fixture snapshot is a fallback, not a replacement for a richer
+      // team-detail record. Fill only missing identity fields so historical
+      // fixture data cannot overwrite a newer name, logo or country.
+      const merged: SportsTeamRecord = {
+        ...snapshot,
+        name: hasText(existing.name) ? existing.name : snapshot.name,
+        displayName: hasText(existing.displayName)
+          ? existing.displayName
+          : snapshot.displayName,
+        shortName: hasText(existing.shortName)
+          ? existing.shortName
+          : snapshot.shortName,
+        abbreviation: hasText(existing.abbreviation)
+          ? existing.abbreviation
+          : snapshot.abbreviation,
+        slug: hasText(existing.slug) ? existing.slug : snapshot.slug,
+        logo: hasText(existing.logo) ? existing.logo : snapshot.logo,
+        country: hasText(existing.country) ? existing.country : snapshot.country,
+        location: hasText(existing.location)
+          ? existing.location
+          : snapshot.location,
+        primaryColor: hasText(existing.primaryColor)
+          ? existing.primaryColor
+          : snapshot.primaryColor,
+        alternateColor: hasText(existing.alternateColor)
+          ? existing.alternateColor
+          : snapshot.alternateColor,
+        rawPayload: {
+          ...(snapshot.rawPayload ?? {}),
+          ...(existing.rawPayload ?? {}),
+        },
+        source:
+          existing.source.collectedAt.getTime() >
+          snapshot.source.collectedAt.getTime()
+            ? existing.source
+            : snapshot.source,
+        createdAt: existing.createdAt,
+      };
+
+      const improved =
+        (!hasText(existing.name) && hasText(merged.name)) ||
+        (!hasText(existing.logo) && hasText(merged.logo)) ||
+        (!hasText(existing.country) && hasText(merged.country));
+      return improved ? [merged] : [];
+    });
+
+    if (!recoveredTeams.length) return 0;
+    await this.persistence.saveTeams(recoveredTeams);
+    return recoveredTeams.length;
+  }
+
   async collectTeamDetails(
     leagueId: string,
     espnTeamId: string,
@@ -1385,4 +1477,5 @@ export class SportsDomainCollectionService {
     };
   }
 }
+
 

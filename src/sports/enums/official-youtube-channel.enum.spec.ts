@@ -4,13 +4,13 @@ import {
 } from './official-youtube-channel.enum';
 
 describe('YouTube highlight channel search plans', () => {
-  it('uses a general football source before falling back to unrestricted search', () => {
+  it('checks the competition and both club channels before unrestricted search', () => {
     const plan = getYoutubeHighlightSearchPlan('eng.1', 'Arsenal', 'Chelsea');
 
     expect(plan).toEqual([
       OfficialYoutubeChannel.PREMIER_LEAGUE,
       OfficialYoutubeChannel.ARSENAL,
-      OfficialYoutubeChannel.SPORTY_TV,
+      OfficialYoutubeChannel.CHELSEA,
       null,
     ]);
   });
@@ -23,9 +23,11 @@ describe('YouTube highlight channel search plans', () => {
     );
 
     expect(plan).toContain(OfficialYoutubeChannel.ARSENAL);
+    expect(plan).toContain(OfficialYoutubeChannel.CHELSEA);
     expect(plan).toContain(OfficialYoutubeChannel.SPORTY_TV);
     expect(plan[plan.length - 1]).toBeNull();
     expect(new Set(plan.filter(Boolean)).size).toBe(plan.filter(Boolean).length);
   });
 });
+
 

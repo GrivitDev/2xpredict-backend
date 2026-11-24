@@ -200,9 +200,12 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
 
     service.youtube = {
       isEnabled: jest.fn().mockReturnValue(true),
-      findHighlight: jest.fn(),
+      findHighlightWithDiagnostics: jest.fn(),
     };
-    service.quota = { getRemainingDailyRequests: jest.fn().mockResolvedValue(0) };
+    service.quota = {
+      getRemainingDailyRequests: jest.fn().mockResolvedValue(0),
+      getQuotaResumeAt: jest.fn().mockReturnValue(new Date('2026-11-17T08:00:00.000Z')),
+    };
     service.queue = {
       hasActiveFixtureJob: jest.fn().mockResolvedValue(false),
       enqueue,
@@ -229,12 +232,12 @@ describe('SportsYoutubeHighlightCollectionService reliability', () => {
     ).resolves.toBe('QUOTA_EXHAUSTED');
 
     expect(findOneAndUpdate).not.toHaveBeenCalled();
-    expect(service.youtube.findHighlight).not.toHaveBeenCalled();
+    expect(service.youtube.findHighlightWithDiagnostics).not.toHaveBeenCalled();
     expect(enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
         type: SportsQueueJobType.YOUTUBE_HIGHLIGHT,
         scope: expect.objectContaining({ fixtureId: 'fixture-1', youtubeAttempt: 1 }),
-        scheduledFor: new Date('2026-11-16T23:00:00.000Z'),
+        scheduledFor: new Date('2026-11-17T08:00:00.000Z'),
       }),
     );
     expect(service.queue.hasActiveFixtureJob).toHaveBeenCalledWith(
@@ -295,18 +298,39 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
       lean: jest.fn().mockReturnThis(),
       exec: jest.fn().mockResolvedValue({ retryCount: 1 }),
     }));
-    const findHighlight = jest.fn().mockResolvedValue({
-      videoId: 'video-1',
-      videoUrl: 'https://www.youtube.com/watch?v=video-1',
-      title: 'Match highlights',
-      channelTitle: 'Sports',
+    const findHighlightWithDiagnostics = jest.fn().mockResolvedValue({
+      video: {
+        videoId: 'video-1',
+        videoUrl: 'https://www.youtube.com/watch?v=video-1',
+        title: 'Match highlights',
+        channelTitle: 'Sports',
+      },
+      diagnostics: {
+        searchedAt: new Date('2026-11-16T10:00:00.000Z'),
+        query: 'Arsenal Chelsea',
+        channelId: 'UC-test',
+        itemsReturned: 1,
+        videoCandidates: 1,
+        acceptedCandidates: 1,
+        rejected: {
+          invalidPublicationTime: 0,
+          publishedBeforeKickoff: 0,
+          publishedInFuture: 0,
+          missingMetadata: 0,
+          insufficientFixtureIdentity: 0,
+          contradictoryMatchDate: 0,
+          nonHighlightContent: 0,
+          notHighlightLike: 0,
+          channelMismatch: 0,
+        },
+      },
     });
     const service = Object.create(
       SportsYoutubeHighlightCollectionService.prototype,
     ) as any;
     service.youtube = {
       isEnabled: jest.fn().mockReturnValue(true),
-      findHighlight,
+      findHighlightWithDiagnostics,
     };
     service.quota = { getRemainingDailyRequests: jest.fn().mockResolvedValue(10) };
     service.queue = { hasActiveFixtureJob: jest.fn().mockResolvedValue(false) };
@@ -326,10 +350,15 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
       service.processAttempt('fixture-missing-team-name', 1),
     ).resolves.toBe('FOUND');
 
-    expect(findHighlight).toHaveBeenCalled();
-    expect(findHighlight.mock.calls[0][0]).toBe('Arsenal');
-    expect(findHighlight.mock.calls[0][1]).toBe('Chelsea');
-    expect(findHighlight.mock.calls[0][2]).toEqual(expect.any(Date));
+    expect(findHighlightWithDiagnostics).toHaveBeenCalled();
+    expect(findHighlightWithDiagnostics.mock.calls[0][0]).toBe('Arsenal');
+    expect(findHighlightWithDiagnostics.mock.calls[0][1]).toBe('Chelsea');
+    expect(findHighlightWithDiagnostics.mock.calls[0][2]).toEqual(expect.any(Date));
+    const saveCall = updateOne.mock.calls.find(
+      ([filter]: any[]) => filter.status === 'SEARCHING',
+    );
+    expect(saveCall?.[1].$push.searchDiagnostics.$slice).toBe(-4);
+    expect(saveCall?.[1].$set.lastSearchDiagnostics.query).toBe('Arsenal Chelsea');
   });
 
   it('defers missing normalized team names without consuming a YouTube attempt', async () => {
@@ -337,14 +366,14 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
     const updateOne = jest.fn(() => ({
       exec: jest.fn().mockResolvedValue({ modifiedCount: 1 }),
     }));
-    const findHighlight = jest.fn();
+    const findHighlightWithDiagnostics = jest.fn();
     const service = Object.create(
       SportsYoutubeHighlightCollectionService.prototype,
     ) as any;
 
     service.youtube = {
       isEnabled: jest.fn().mockReturnValue(true),
-      findHighlight,
+      findHighlightWithDiagnostics,
     };
     service.fixtureModel = {
       findOne: jest.fn(() => query(completedFixture)),
@@ -384,7 +413,7 @@ describe('SportsYoutubeHighlightCollectionService incomplete fixture team data',
       }),
       { upsert: true, setDefaultsOnInsert: true },
     );
-    expect(findHighlight).not.toHaveBeenCalled();
+    expect(findHighlightWithDiagnostics).not.toHaveBeenCalled();
     expect(service.logger.debug).toHaveBeenCalledWith(
       expect.stringContaining('Deferring YouTube highlight for fixture fixture-missing-team-name'),
     );
@@ -492,3 +521,4 @@ describe('SportsYoutubeHighlightCollectionService ranked scheduling', () => {
     );
   });
 });
+

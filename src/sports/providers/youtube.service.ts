@@ -11,6 +11,8 @@ import { ConfigService } from '@nestjs/config';
 import axios, { AxiosError, AxiosInstance } from 'axios';
 
 import {
+  YouTubeHighlightSearchDiagnostics,
+  YouTubeHighlightSearchResult,
   YouTubeSearchOptions,
   YouTubeSearchResponse,
   YouTubeVideoResult,
@@ -157,9 +159,34 @@ export class YoutubeService implements OnModuleInit {
     awayTeam: string,
     matchDate: Date,
     channelId?: string,
+    competitionName?: string,
   ): Promise<YouTubeVideoResult | null> {
+    const result = await this.findHighlightWithDiagnostics(
+      homeTeam,
+      awayTeam,
+      matchDate,
+      channelId,
+      competitionName,
+    );
+    return result.video;
+  }
+
+  /**
+   * Performs one bounded search and returns compact diagnostics with its
+   * selected result. Diagnostics are returned with the request (rather than
+   * stored in mutable service state) so concurrent fixture searches cannot
+   * overwrite one another's counters.
+   */
+  async findHighlightWithDiagnostics(
+    homeTeam: string,
+    awayTeam: string,
+    matchDate: Date,
+    channelId?: string,
+    competitionName?: string,
+  ): Promise<YouTubeHighlightSearchResult> {
     const normalizedHome = homeTeam?.trim();
     const normalizedAway = awayTeam?.trim();
+    const normalizedCompetition = competitionName?.trim();
 
     if (!normalizedHome || !normalizedAway) {
       throw new BadRequestException('Both homeTeam and awayTeam are required');
@@ -167,70 +194,126 @@ export class YoutubeService implements OnModuleInit {
     if (!(matchDate instanceof Date) || Number.isNaN(matchDate.getTime())) {
       throw new BadRequestException('A valid match date is required');
     }
+
+    // Keep the actual search broad enough to return official clips whose
+    // metadata omits the competition name. Competition and fixture date are
+    // used below to rank results, not as mandatory search tokens.
+    const query = [normalizedHome, normalizedAway].join(' ');
+    const diagnostics: YouTubeHighlightSearchDiagnostics = {
+      searchedAt: new Date(),
+      query,
+      itemsReturned: 0,
+      videoCandidates: 0,
+      acceptedCandidates: 0,
+      rejected: {
+        invalidPublicationTime: 0,
+        publishedBeforeKickoff: 0,
+        publishedInFuture: 0,
+        missingMetadata: 0,
+        insufficientFixtureIdentity: 0,
+        contradictoryMatchDate: 0,
+        nonHighlightContent: 0,
+        notHighlightLike: 0,
+        channelMismatch: 0,
+      },
+    };
+
     if (matchDate.getTime() > Date.now()) {
       this.logger.warn(
         `Skipping YouTube highlight search because match kickoff is in the future: ${matchDate.toISOString()}`,
       );
-      return null;
+      return { video: null, diagnostics };
     }
 
     // Registry entries may be immutable channel IDs or official @handles.
     const channelReference = channelId?.trim() || undefined;
+    if (channelReference) diagnostics.channelReference = channelReference;
     const resolvedChannelId = channelReference
       ? await this.resolveChannelId(channelReference)
       : undefined;
     if (channelReference && !resolvedChannelId) {
+      diagnostics.channelResolutionFailed = true;
       this.logger.warn(
         `Could not resolve configured YouTube channel ${channelReference}`,
       );
-      return null;
+      return { video: null, diagnostics };
     }
+    if (resolvedChannelId) diagnostics.channelId = resolvedChannelId;
 
-    // Keep the query broad. Requiring a literal "highlights" term here can
-    // suppress player-centred uploads whose descriptions identify the fixture.
+    // The fixture competition improves relevance without making a competition
+    // name mandatory in a broadcaster's title or description. publishedAfter
+    // remains the hard publication boundary.
     const searchResponse = await this.searchVideos({
-      query: `${normalizedHome} ${normalizedAway}`,
+      query,
       maxResults: YOUTUBE_CONFIG.searchWorkflow.maxResultsPerSearch,
       order: 'relevance',
       publishedAfter: matchDate.toISOString(),
       channelId: resolvedChannelId,
     });
 
-    const candidates: YouTubeVideoResult[] = (searchResponse.items ?? [])
-      .filter(
-        (item) => item.id?.kind === 'youtube#video' && Boolean(item.id.videoId),
-      )
-      .map((item) => {
-        const videoId = item.id!.videoId!;
-        return {
-          videoId,
-          channelId: item.snippet?.channelId,
-          channelTitle: item.snippet?.channelTitle,
-          title: item.snippet?.title ?? '',
-          description: item.snippet?.description,
-          publishedAt: item.snippet?.publishedAt,
-          thumbnailUrl:
-            item.snippet?.thumbnails?.high?.url ??
-            item.snippet?.thumbnails?.medium?.url ??
-            item.snippet?.thumbnails?.default?.url,
-          embeddable: true,
-          videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
-        };
-      })
-      .filter(
-        (video) =>
-          (!resolvedChannelId || video.channelId === resolvedChannelId) &&
-          this.isValidHighlightCandidate(
-            video,
-            normalizedHome,
-            normalizedAway,
-            matchDate,
-          ),
-      );
+    const items = searchResponse.items ?? [];
+    diagnostics.itemsReturned = items.length;
 
-    return candidates.length
-      ? this.selectBestHighlight(candidates, normalizedHome, normalizedAway)
+    const videoItems = items.filter(
+      (item) => item.id?.kind === 'youtube#video' && Boolean(item.id.videoId),
+    );
+    diagnostics.videoCandidates = videoItems.length;
+
+    const candidates: YouTubeVideoResult[] = [];
+    for (const item of videoItems) {
+      const videoId = item.id!.videoId!;
+      const video: YouTubeVideoResult = {
+        videoId,
+        channelId: item.snippet?.channelId,
+        channelTitle: item.snippet?.channelTitle,
+        title: item.snippet?.title ?? '',
+        description: item.snippet?.description,
+        publishedAt: item.snippet?.publishedAt,
+        thumbnailUrl:
+          item.snippet?.thumbnails?.high?.url ??
+          item.snippet?.thumbnails?.medium?.url ??
+          item.snippet?.thumbnails?.default?.url,
+        embeddable: true,
+        videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      };
+
+      if (resolvedChannelId && video.channelId !== resolvedChannelId) {
+        diagnostics.rejected.channelMismatch += 1;
+        continue;
+      }
+
+      const rejection = this.getCandidateRejectionReason(
+        video,
+        normalizedHome,
+        normalizedAway,
+        matchDate,
+        normalizedCompetition,
+        Boolean(resolvedChannelId),
+      );
+      if (rejection) {
+        diagnostics.rejected[rejection] += 1;
+        continue;
+      }
+      candidates.push(video);
+    }
+
+    diagnostics.acceptedCandidates = candidates.length;
+    const selected = candidates.length
+      ? this.selectBestHighlight(
+          candidates,
+          normalizedHome,
+          normalizedAway,
+          matchDate,
+          normalizedCompetition,
+          Boolean(resolvedChannelId),
+        )
       : null;
+
+    this.logger.debug(
+      `YouTube highlight search completed: candidates=${diagnostics.videoCandidates}, accepted=${diagnostics.acceptedCandidates}, rejected=${JSON.stringify(diagnostics.rejected)}, channel=${resolvedChannelId ?? 'unrestricted'}.`,
+    );
+
+    return { video: selected, diagnostics };
   }
 
   /**
@@ -280,41 +363,225 @@ export class YoutubeService implements OnModuleInit {
   // HIGHLIGHT VALIDATION
   // ============================================================
 
-  private isValidHighlightCandidate(
+  private getCandidateRejectionReason(
     video: YouTubeVideoResult,
     homeTeam: string,
     awayTeam: string,
     matchDate: Date,
-  ): boolean {
-    if (!video.publishedAt) return false;
+    competitionName: string | undefined,
+    trustedChannel: boolean,
+  ): keyof YouTubeHighlightSearchDiagnostics['rejected'] | null {
+    if (!video.publishedAt) return 'invalidPublicationTime';
 
     const publishedAt = new Date(video.publishedAt);
     const now = Date.now();
-    if (
-      Number.isNaN(publishedAt.getTime()) ||
-      publishedAt.getTime() < matchDate.getTime() ||
-      publishedAt.getTime() > now
-    ) {
+    if (Number.isNaN(publishedAt.getTime())) return 'invalidPublicationTime';
+    if (publishedAt.getTime() < matchDate.getTime()) {
       // The kickoff boundary is strict. Earlier uploads can never qualify.
-      return false;
+      return 'publishedBeforeKickoff';
     }
+    if (publishedAt.getTime() > now) return 'publishedInFuture';
 
     const title = this.normalize(video.title);
     const description = this.normalize(video.description ?? '');
     const searchableText = `${title} ${description}`.trim();
-    if (!title || !searchableText) return false;
+    if (!title || !searchableText) return 'missingMetadata';
 
-    // The fixture may be identified in the description while the title uses
-    // the names of scorers or other key players. Both teams must still be
-    // established somewhere in the video metadata to avoid generic/fake hits.
-    if (
-      !this.teamAppearsInText(searchableText, homeTeam) ||
-      !this.teamAppearsInText(searchableText, awayTeam)
-    ) {
-      return false;
+    // If the title explicitly identifies a different match date, do not attach
+    // an older meeting between the same clubs to this fixture. Absence of a
+    // date remains acceptable because many official clips omit it.
+    if (this.hasContradictoryMatchDate(video.title, matchDate)) {
+      return 'contradictoryMatchDate';
     }
 
-    return this.isHighlightLike(title, description, video.channelTitle);
+    if (this.containsClearlyNonHighlightContent(title, description)) {
+      return 'nonHighlightContent';
+    }
+
+    const homeMatches = this.teamAppearsInText(searchableText, homeTeam);
+    const awayMatches = this.teamAppearsInText(searchableText, awayTeam);
+    const bothTeamsMatch = homeMatches && awayMatches;
+    const oneTeamMatches = homeMatches || awayMatches;
+    const competitionMatches = Boolean(
+      competitionName &&
+        this.teamAppearsInText(searchableText, competitionName),
+    );
+    const dateMatches = this.matchDateAppearsInText(searchableText, matchDate);
+
+    const hasTitleHighlightMarker = this.hasHighlightMarker(title);
+    const hasDescriptionHighlightMarker = this.hasHighlightMarker(description);
+    const hasActionLanguage = this.hasMatchActionLanguage(title);
+    const recognizedPublisher = this.isRecognizedFootballPublisher(
+      video.channelTitle ?? '',
+    );
+    const hasScoreline = /\b\d{1,2}\s*[-–:]\s*\d{1,2}\b/.test(title);
+
+    // A restricted search is already scoped to a configured official channel.
+    // In that case, one club plus a strong highlight marker can be sufficient
+    // when publishers omit the opponent from player-centred titles. Unrestricted
+    // results still need both sides of the fixture in their metadata.
+    const fixtureIdentityMatches =
+      bothTeamsMatch ||
+      (trustedChannel &&
+        oneTeamMatches &&
+        (competitionMatches || dateMatches || hasTitleHighlightMarker));
+    if (!fixtureIdentityMatches) return 'insufficientFixtureIdentity';
+
+    const highlightLike =
+      hasTitleHighlightMarker ||
+      (hasDescriptionHighlightMarker &&
+        (hasActionLanguage || recognizedPublisher || trustedChannel)) ||
+      (hasActionLanguage &&
+        (recognizedPublisher || trustedChannel) &&
+        (bothTeamsMatch || competitionMatches || dateMatches)) ||
+      (hasScoreline && bothTeamsMatch && recognizedPublisher);
+
+    if (!highlightLike) return 'notHighlightLike';
+    return null;
+  }
+
+  private containsClearlyNonHighlightContent(
+    title: string,
+    description: string,
+  ): boolean {
+    // The title is the strongest content-type signal. Do not reject a valid
+    // match recap solely because the description includes a broadcaster's
+    // interview, analysis, or programme tags.
+    const titleExclusions =
+      /\b(interviews?|press conferences?|previews?|predictions?|reactions?|watchalongs?|watch along|podcasts?|livestreams?|live streams?|full match live|commentary only|efootball|pes gameplay|gameplay|gaming|virtual football|virtual soccer|lego|cartoons?|animated|animation|fifa 2[0-9]|fc 2[0-9]|ultimate team)\b/;
+    if (titleExclusions.test(title)) return true;
+
+    // Full-match replays are not highlights. Preserve titles such as "Full
+    // Match Highlights" because the explicit highlight marker makes that
+    // content type unambiguous.
+    if (
+      /\b(full match|full game|full replay|full 90|full 90 minutes)\b/.test(title) &&
+      !this.hasHighlightMarker(title)
+    ) {
+      return true;
+    }
+
+    const syntheticContentExclusions =
+      /\b(lego|cartoons?|animated|animation|virtual football|virtual soccer|gameplay|gaming|efootball|pes gameplay|fifa ultimate team)\b/;
+    return syntheticContentExclusions.test(`${title} ${description}`);
+  }
+
+  private hasMatchActionLanguage(title: string): boolean {
+    return /\b(goals?|brace|hat trick|hat-trick|penalt(?:y|ies)|assists?|saves?|masterclass|performance|moments?|vs|versus|scor(?:ed|ing)|winner|equaliser|equalizer|red card|own goal|match action)\b/.test(
+      title,
+    );
+  }
+
+  private hasContradictoryMatchDate(title: string, matchDate: Date): boolean {
+    const explicitDates: string[] = [];
+    const addValidDate = (year: number, month: number, day: number) => {
+      const parsed = new Date(Date.UTC(year, month - 1, day));
+      if (
+        parsed.getUTCFullYear() === year &&
+        parsed.getUTCMonth() + 1 === month &&
+        parsed.getUTCDate() === day
+      ) {
+        explicitDates.push(parsed.toISOString().slice(0, 10));
+      }
+    };
+
+    const isoDatePattern = /\b(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])\b/g;
+    for (const match of title.matchAll(isoDatePattern)) {
+      addValidDate(Number(match[1]), Number(match[2]), Number(match[3]));
+    }
+
+    // Also understand common day-first and month-first numeric formats. Both
+    // interpretations are retained because the title's locale is not known.
+    const numericDatePattern = /\b(0?[1-9]|[12]\d|3[01])[-/.](0?[1-9]|1[0-2])[-/.](20\d{2})\b/g;
+    for (const match of title.matchAll(numericDatePattern)) {
+      const first = Number(match[1]);
+      const second = Number(match[2]);
+      const year = Number(match[3]);
+      addValidDate(year, second, first);
+      addValidDate(year, first, second);
+    }
+
+    const monthPattern =
+      'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+    const dayMonthYear = new RegExp(
+      `\\b(0?[1-9]|[12]\\d|3[01])\\s+(${monthPattern})[,\\s]+(20\\d{2})\\b`,
+      'gi',
+    );
+    const monthDayYear = new RegExp(
+      `\\b(${monthPattern})\\s+(0?[1-9]|[12]\\d|3[01])[,\\s]+(20\\d{2})\\b`,
+      'gi',
+    );
+    for (const match of title.matchAll(dayMonthYear)) {
+      const parsed = new Date(`${match[1]} ${match[2]} ${match[3]} 00:00:00 UTC`);
+      if (!Number.isNaN(parsed.getTime())) explicitDates.push(parsed.toISOString().slice(0, 10));
+    }
+    for (const match of title.matchAll(monthDayYear)) {
+      const parsed = new Date(`${match[1]} ${match[2]} ${match[3]} 00:00:00 UTC`);
+      if (!Number.isNaN(parsed.getTime())) explicitDates.push(parsed.toISOString().slice(0, 10));
+    }
+
+    if (!explicitDates.length) return false;
+
+    // A fixture's local calendar date can differ from UTC by one day depending
+    // on the venue timezone. Accept that valid boundary rather than falsely
+    // rejecting official clips whose title uses the local match date.
+    const utcMidnight = Date.UTC(
+      matchDate.getUTCFullYear(),
+      matchDate.getUTCMonth(),
+      matchDate.getUTCDate(),
+    );
+    const fixtureDateKeys = new Set(
+      [-1, 0, 1].map((offset) =>
+        new Date(utcMidnight + offset * 24 * 60 * 60_000)
+          .toISOString()
+          .slice(0, 10),
+      ),
+    );
+    return !explicitDates.some((dateKey) => fixtureDateKeys.has(dateKey));
+  }
+
+  private matchDateAppearsInText(text: string, date: Date): boolean {
+    const variants = new Set<string>();
+    const addDateVariants = (year: number, month: number, day: number) => {
+      const value = new Date(Date.UTC(year, month - 1, day));
+      const dayNumber = value.getUTCDate();
+      const monthLong = value.toLocaleString('en-US', {
+        month: 'long',
+        timeZone: 'UTC',
+      }).toLowerCase();
+      const monthShort = value.toLocaleString('en-US', {
+        month: 'short',
+        timeZone: 'UTC',
+      }).toLowerCase();
+      variants.add(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
+      variants.add(`${dayNumber}/${String(month).padStart(2, '0')}/${year}`);
+      variants.add(`${String(month).padStart(2, '0')}/${dayNumber}/${year}`);
+      variants.add(`${dayNumber} ${monthLong} ${year}`);
+      variants.add(`${monthLong} ${dayNumber} ${year}`);
+      variants.add(`${dayNumber} ${monthShort} ${year}`);
+      variants.add(`${monthShort} ${dayNumber} ${year}`);
+    };
+
+    // Score local-title dates as supporting evidence. Venue-local match dates
+    // can fall one calendar day either side of the UTC kickoff date.
+    const utcMidnight = Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate(),
+    );
+    for (const offset of [-1, 0, 1]) {
+      const day = new Date(utcMidnight + offset * 24 * 60 * 60_000);
+      addDateVariants(
+        day.getUTCFullYear(),
+        day.getUTCMonth() + 1,
+        day.getUTCDate(),
+      );
+    }
+
+    const normalizedText = this.normalize(text);
+    return [...variants].some((variant) =>
+      this.containsPhrase(normalizedText, this.normalize(variant)),
+    );
   }
 
   // ============================================================
@@ -325,23 +592,37 @@ export class YoutubeService implements OnModuleInit {
     videos: YouTubeVideoResult[],
     homeTeam: string,
     awayTeam: string,
+    matchDate: Date,
+    competitionName: string | undefined,
+    trustedChannel: boolean,
   ): YouTubeVideoResult | null {
     if (!videos.length) return null;
 
     const scored = videos.map((video) => {
       const title = this.normalize(video.title);
       const description = this.normalize(video.description ?? '');
+      const searchableText = `${title} ${description}`;
       const channel = this.normalize(video.channelTitle ?? '');
+      const homeTitle = this.teamAppearsInText(title, homeTeam);
+      const awayTitle = this.teamAppearsInText(title, awayTeam);
+      const homeText = this.teamAppearsInText(searchableText, homeTeam);
+      const awayText = this.teamAppearsInText(searchableText, awayTeam);
+      const competitionMatch = Boolean(
+        competitionName &&
+          this.teamAppearsInText(searchableText, competitionName),
+      );
+      const dateMatch = this.matchDateAppearsInText(searchableText, matchDate);
       let score = 0;
 
-      // Give the strongest weight to fixture identity in the title, but do not
-      // reject a player-focused title when the description identifies the match.
-      score += this.teamAppearsInText(title, homeTeam) ? 10 : 4;
-      score += this.teamAppearsInText(title, awayTeam) ? 10 : 4;
-      if (this.hasHighlightMarker(title)) score += 6;
-      else if (this.hasHighlightMarker(description)) score += 3;
+      score += homeTitle ? 14 : homeText ? 9 : 0;
+      score += awayTitle ? 14 : awayText ? 9 : 0;
+      score += competitionMatch ? 5 : 0;
+      score += dateMatch ? 5 : 0;
+      if (this.hasHighlightMarker(title)) score += 9;
+      else if (this.hasHighlightMarker(description)) score += 5;
+      if (this.hasMatchActionLanguage(title)) score += 3;
+      if (trustedChannel) score += 3;
       if (this.isRecognizedFootballPublisher(channel)) score += 2;
-      if (/\b(extended|full|official|all goals|matchday)\b/.test(title)) score += 1;
 
       const publishedTime = video.publishedAt
         ? new Date(video.publishedAt).getTime()
@@ -349,7 +630,7 @@ export class YoutubeService implements OnModuleInit {
       return { video, score, publishedTime };
     });
 
-    // Relevance comes first. Publication recency is only a tie-breaker.
+    // Fixture relevance comes first. Publication recency is only a tie-breaker.
     scored.sort((a, b) =>
       b.score - a.score || b.publishedTime - a.publishedTime,
     );
@@ -450,40 +731,9 @@ export class YoutubeService implements OnModuleInit {
     return new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(text);
   }
 
-  private isHighlightLike(
-    title: string,
-    description: string,
-    channelTitle?: string,
-  ): boolean {
-    const titleText = this.normalize(title);
-    const descriptionText = this.normalize(description);
-    const channelText = this.normalize(channelTitle ?? '');
-
-    // Explicitly reject formats that are commonly returned for team searches.
-    const nonHighlightPattern =
-      /\b(interviews?|press conference|preview|predictions?|reaction|watchalong|watch along|podcasts?|livestream|live stream|full match live|commentary only|tactical analysis|analysis|tactics|efootball|pes gameplay|gameplay|gaming|virtual football|virtual soccer|lego|cartoon|animated|animation|fifa 2[0-9]|fc 2[0-9]|ultimate team)\b/;
-    if (nonHighlightPattern.test(titleText)) return false;
-
-    // Game-play/animation exclusions apply to the wider metadata too.
-    if (
-      /\b(lego|cartoon|animated|animation|virtual football|virtual soccer|gameplay|gaming|efootball|pes gameplay|fifa ultimate team)\b/.test(
-        `${titleText} ${descriptionText}`,
-      )
-    ) {
-      return false;
-    }
-
-    if (this.hasHighlightMarker(titleText)) return true;
-
-    // Allow a player-centred title only when the video description itself
-    // carries highlight language and the title describes match action, or the
-    // uploader is a recognisable football broadcaster/competition channel.
-    const playerOrMatchActionPattern =
-      /\b(goals?|brace|hat trick|hat-trick|penalt(?:y|ies)|assists?|saves?|masterclass|performance|moments?|vs|versus|match action)\b/;
-    return (
-      this.hasHighlightMarker(descriptionText) &&
-      (playerOrMatchActionPattern.test(titleText) ||
-        this.isRecognizedFootballPublisher(channelText))
+  private isRecognizedFootballPublisher(channelTitle: string): boolean {
+    return /\b(official|league|football|soccer|sports|sport|dazn|bein|espn|fifa|uefa|premier|sky|fox|tnt|sporty|sportytv|supersport)\b/.test(
+      this.normalize(channelTitle),
     );
   }
 
@@ -494,11 +744,6 @@ export class YoutubeService implements OnModuleInit {
     return highlightPattern.test(text);
   }
 
-  private isRecognizedFootballPublisher(channelTitle: string): boolean {
-    return /\b(official|league|football|soccer|sports|sport|dazn|bein|espn|fifa|uefa|premier|sky|fox|tnt|sporty|sportytv|supersport)\b/.test(
-      this.normalize(channelTitle),
-    );
-  }
 
   // ============================================================
   // REQUEST
@@ -527,12 +772,20 @@ export class YoutubeService implements OnModuleInit {
           this.logApiError(error, endpoint);
 
           if (this.isDailyQuotaExhaustion(error)) {
-            // Persist the exhausted state in the shared provider quota record.
-            // Every worker then sees zero remaining capacity and stops for the
-            // rest of the configured quota day, including after a restart.
-            await this.providerRateLimitService.markDailyQuotaExhausted(
-              'youtube',
-            );
+            if (rateLimitEndpoint === 'search') {
+              // search.list has its own daily request bucket. Mark only this
+              // application's reserved search allowance as exhausted.
+              await this.providerRateLimitService.markDailyQuotaExhausted(
+                'youtube',
+              );
+            } else {
+              // channels.list consumes the general YouTube API quota pool.
+              // Pause this provider lane without incorrectly consuming all
+              // 90 reserved search.list requests.
+              await this.providerRateLimitService.markProviderDailyQuotaBlocked(
+                'youtube',
+              );
+            }
             throw new SportsProviderQuotaExceededError('youtube', 'daily');
           }
 
@@ -625,6 +878,7 @@ export class YoutubeService implements OnModuleInit {
     this.logger.error(`YouTube API request failed: ${endpoint}`, error);
   }
 }
+
 
 
 

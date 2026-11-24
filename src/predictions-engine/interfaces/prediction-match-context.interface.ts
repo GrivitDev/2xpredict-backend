@@ -126,6 +126,8 @@ export interface PredictionMatchContext {
   fixture: PredictionFixtureCore;
   /** Monotonic Sports source revision for the normalized fixture facts used by this run. */
   fixtureSourceRevision: number;
+  /** Deterministic revision fingerprint across every Sports entity used by this fixture forecast. */
+  sourceRevisionFingerprint: string;
   /** Compatibility shell for older internal consumers. This is normalized Sports context, never an ESPN Summary payload. */
   summary: Record<string, any>;
   summaryAvailable: boolean;
@@ -187,7 +189,8 @@ export interface ExpectedGoalsModel {
   awayPeriodSplitSamples: number;
   calculationMethod: string;
   independentEvidenceAvailable: boolean;
-  evidenceLevel: 'STRONG' | 'PARTIAL' | 'INSUFFICIENT';
+  /** Evidence coverage classification; PRIOR_ONLY still contains a calculable baseline estimate. */
+  evidenceLevel: 'STRONG' | 'DEVELOPING' | 'LIMITED' | 'PRIOR_ONLY';
   historicalHeadToHeadMatches: number;
   homeRecentFormSamples: number;
   awayRecentFormSamples: number;
@@ -219,4 +222,5 @@ export interface PredictionModelInput {
   marketOdds: MarketOddsBaseline | null;
   modelVersion: string;
 }
+
 

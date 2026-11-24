@@ -624,8 +624,9 @@ function getTeamChannel(teamName?: string): OfficialYoutubeChannel | undefined {
 
 /**
  * Returns the ordered, per-fixture search plan:
- * league channel → one club channel → general football source(s) → broad search.
- * Duplicate channels are removed and the plan is capped by the configured request limit.
+ * competition publisher → home club → away club → any remaining broad publisher
+ * slots → unrestricted search. Keeping both clubs ahead of generic fallbacks
+ * prevents the away club's official channel from being silently starved.
  */
 export function getYoutubeHighlightSearchPlan(
   competitionId?: string,
@@ -636,28 +637,21 @@ export function getYoutubeHighlightSearchPlan(
   const competitionChannels = normalizedCompetitionId
     ? (CHANNELS_BY_COMPETITION[normalizedCompetitionId] ?? [])
     : [];
-  const teamChannels = [
-    getTeamChannel(homeTeam),
-    getTeamChannel(awayTeam),
-  ].filter((channel): channel is OfficialYoutubeChannel => Boolean(channel));
+  const homeChannel = getTeamChannel(homeTeam);
+  const awayChannel = getTeamChannel(awayTeam);
   const fallbacks = GENERAL_YOUTUBE_HIGHLIGHT_FALLBACKS.slice(
     0,
     YOUTUBE_CONFIG.searchWorkflow.maximumFallbackChannels,
   );
 
-  // Keep the search stages diverse. The previous concatenation could fill
-  // all three channel-restricted slots with the league + both clubs, meaning
-  // none of the general highlight publishers were ever searched for major
-  // competitions. Reserve one slot for a general football source before the
-  // final unrestricted search.
   const configuredChannels = [
     competitionChannels[0],
-    teamChannels[0],
-    fallbacks[0],
+    homeChannel,
+    awayChannel,
     ...competitionChannels.slice(1),
-    ...teamChannels.slice(1),
-    ...fallbacks.slice(1),
+    ...fallbacks,
   ].filter((channel): channel is OfficialYoutubeChannel => Boolean(channel));
+
   const seen = new Set<OfficialYoutubeChannel>();
   const uniqueChannels = configuredChannels.filter((channel) => {
     if (seen.has(channel)) return false;
@@ -688,6 +682,7 @@ export function getYoutubeHighlightChannelIds(
     awayTeam,
   ).filter((channel): channel is OfficialYoutubeChannel => channel !== null);
 }
+
 
 
 

@@ -46,7 +46,7 @@ const makeStatAggregate = () => ({
 describe('OddsPricingEngineService Sports readiness integration', () => {
   const engine = new OddsPricingEngineService();
 
-  it('prices only statistics whose individual Sports readiness is approved', () => {
+  it('always prices baseline 1X2 while retaining individual Sports readiness for statistics', () => {
     const context = {
       match: {
         fixture: {
@@ -74,8 +74,9 @@ describe('OddsPricingEngineService Sports readiness integration', () => {
     const prices = engine.calculate(context);
     const marketIds = [...new Set(prices.map((price) => price.marketId))];
 
-    expect(marketIds.length).toBeGreaterThan(0);
-    expect(marketIds.every((marketId) => marketId.includes('CORNER'))).toBe(true);
+    expect(marketIds).toContain('MATCH_RESULT');
+    expect(marketIds.some((marketId) => marketId.includes('CORNER'))).toBe(true);
+    expect(marketIds.filter((marketId) => marketId !== 'MATCH_RESULT').every((marketId) => marketId.includes('CORNER'))).toBe(true);
     expect(marketIds).not.toContain('TOTAL_SHOTS_OVER_UNDER');
     expect(marketIds).not.toContain('RED_CARD');
   });
@@ -108,3 +109,4 @@ describe('OddsPricingEngineService Sports readiness integration', () => {
     expect(isMarketReady(FOOTBALL_MARKET_CATALOG.find((market) => market.id === 'OWN_GOAL_SCORED')!, readiness)).toBe(false);
   });
 });
+

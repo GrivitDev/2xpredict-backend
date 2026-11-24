@@ -52,6 +52,14 @@ export class SportsYoutubeHighlight implements Omit<SportsYoutubeHighlightRecord
   @Prop({ trim: true })
   thumbnailUrl?: string;
 
+  /** Most recent bounded search diagnostics; no full descriptions or candidate payloads. */
+  @Prop({ type: Object })
+  lastSearchDiagnostics?: SportsYoutubeHighlightRecord['lastSearchDiagnostics'];
+
+  /** Retains at most four compact attempts, matching the fixture search cap. */
+  @Prop({ type: [Object], default: [] })
+  searchDiagnostics?: SportsYoutubeHighlightRecord['searchDiagnostics'];
+
   @Prop({ type: String })
   error?: string;
 
@@ -62,4 +70,5 @@ export class SportsYoutubeHighlight implements Omit<SportsYoutubeHighlightRecord
 export const SportsYoutubeHighlightSchema = SchemaFactory.createForClass(SportsYoutubeHighlight);
 SportsYoutubeHighlightSchema.index({ status: 1, nextRetryAt: 1, createdAt: 1 });
 SportsYoutubeHighlightSchema.index({ competitionId: 1, status: 1 });
+
 

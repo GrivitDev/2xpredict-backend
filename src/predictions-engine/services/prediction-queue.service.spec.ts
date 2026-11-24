@@ -16,8 +16,8 @@ describe('PredictionQueueService MongoDB update operators', () => {
       updatedAt: sourceUpdatedAt,
       status: { state: 'SCHEDULED', isFinal: false },
       competitors: [
-        { homeAway: 'HOME', score: null },
-        { homeAway: 'AWAY', score: null },
+        { homeAway: 'HOME', teamId: 'team-home', score: null },
+        { homeAway: 'AWAY', teamId: 'team-away', score: null },
       ],
     };
 
@@ -55,7 +55,7 @@ describe('PredictionQueueService MongoDB update operators', () => {
     return { service, queueModel, fixture };
   }
 
-  it('initializes attempts only with $setOnInsert for a new WAITING_FOR_ODDS row', async () => {
+  it('queues a new fixture as PENDING even when Odds are not ready', async () => {
     const { service, queueModel } = createService();
 
     await service.syncUpcomingFixtures();
@@ -65,16 +65,34 @@ describe('PredictionQueueService MongoDB update operators', () => {
     const update = operations[0].updateOne.update;
 
     expect(operations[0].updateOne.upsert).toBe(true);
-    expect(update.$set.status).toBe(PredictionQueueStatus.WAITING_FOR_ODDS);
+    expect(update.$set.status).toBe(PredictionQueueStatus.PENDING);
     expect(update.$set).not.toHaveProperty('attempts');
+    expect(update.$set).not.toHaveProperty('errorMessage');
     expect(update.$setOnInsert).toEqual({ attempts: 0, refreshCount: 0 });
   });
 
-  it('resets attempts with $set for an existing row and does not add $setOnInsert', async () => {
+  it('still queues predictions when the optional Odds readiness lookup fails', async () => {
+    const { service, queueModel } = createService();
+    (service as any).oddsService.getPredictionReadinessForEvents.mockRejectedValue(
+      new Error('Odds read unavailable'),
+    );
+
+    await expect(service.syncUpcomingFixtures()).resolves.toMatchObject({
+      scannedFixtures: 1,
+      eligibleFixtures: 1,
+      enqueued: 1,
+      oddsNotReady: 1,
+    });
+
+    const update = queueModel.bulkWrite.mock.calls[0][0][0].updateOne.update;
+    expect(update.$set.status).toBe(PredictionQueueStatus.PENDING);
+  });
+
+  it('promotes a legacy WAITING_FOR_ODDS row and resets attempts without $setOnInsert', async () => {
     const { service, queueModel } = createService([
       {
         eventId,
-        status: PredictionQueueStatus.PENDING,
+        status: PredictionQueueStatus.WAITING_FOR_ODDS,
         attempts: 4,
       },
     ]);
@@ -86,8 +104,9 @@ describe('PredictionQueueService MongoDB update operators', () => {
     const update = operations[0].updateOne.update;
 
     expect(operations[0].updateOne.upsert).toBe(false);
-    expect(update.$set.status).toBe(PredictionQueueStatus.WAITING_FOR_ODDS);
+    expect(update.$set.status).toBe(PredictionQueueStatus.PENDING);
     expect(update.$set.attempts).toBe(0);
+    expect(update.$set.reason).toBe('LEGACY_WAITING_FOR_ODDS_PROMOTED');
     expect(update).not.toHaveProperty('$setOnInsert');
   });
 });

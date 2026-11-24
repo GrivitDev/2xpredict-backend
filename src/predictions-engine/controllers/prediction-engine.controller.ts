@@ -76,6 +76,19 @@ export class PredictionEngineController {
     return this.monitor.getMarketCoverageAudit(eventId);
   }
 
+  @Get('monitor/fixture-coverage')
+  getFixtureCoverageInventory(
+    @Query() query: Record<string, string | undefined>,
+  ) {
+    return this.monitor.getFixtureCoverageInventory({
+      from: query.from,
+      to: query.to,
+      leagueId: query.leagueId,
+      cursor: query.cursor,
+      pageSize: this.numberOr(query.pageSize, 50),
+    });
+  }
+
   @Get('monitor/market-coverage')
   getMarketCoverageInventory(
     @Query() query: Record<string, string | undefined>,
@@ -266,8 +279,3 @@ export class PredictionEngineController {
     return Number.isNaN(parsed.getTime()) ? undefined : parsed;
   }
 }
-
-
-
-
-

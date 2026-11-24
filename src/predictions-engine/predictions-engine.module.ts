@@ -17,6 +17,10 @@ import {
   MarketPredictionSchema,
 } from './schemas/market-prediction.schema';
 import {
+  MarketPredictionHistory,
+  MarketPredictionHistorySchema,
+} from './schemas/market-prediction-history.schema';
+import {
   PredictionRun,
   PredictionRunSchema,
 } from './schemas/prediction-run.schema';
@@ -82,6 +86,7 @@ import { SettlementModule } from '../settlement/settlement.module';
     SettlementModule,
     MongooseModule.forFeature([
       { name: MarketPrediction.name, schema: MarketPredictionSchema },
+      { name: MarketPredictionHistory.name, schema: MarketPredictionHistorySchema },
       { name: PredictionRun.name, schema: PredictionRunSchema },
       { name: PredictionQueue.name, schema: PredictionQueueSchema },
       { name: PickCenter.name, schema: PickCenterSchema },
